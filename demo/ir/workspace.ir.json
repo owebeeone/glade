@@ -1,0 +1,125 @@
+{
+  "version": 1,
+  "shapes": {
+    "unary": {
+      "payload": "whole",
+      "history": "none",
+      "initiation": "pull",
+      "writers": "single",
+      "events": [
+        "value"
+      ],
+      "delivery": "once"
+    },
+    "atom": {
+      "payload": "whole-state",
+      "history": "latest",
+      "initiation": "pull|push",
+      "writers": "single",
+      "events": [
+        "replace"
+      ],
+      "delivery": "stream"
+    },
+    "log": {
+      "payload": "whole",
+      "history": "append-only",
+      "initiation": "pull|push",
+      "writers": "source",
+      "events": [
+        "append"
+      ],
+      "delivery": "stream"
+    },
+    "stream": {
+      "payload": "whole-or-delta",
+      "history": "none",
+      "initiation": "push",
+      "writers": "source",
+      "events": [
+        "event"
+      ],
+      "delivery": "stream"
+    },
+    "swmr": {
+      "payload": "delta",
+      "history": "reconstructible",
+      "initiation": "push",
+      "writers": "single",
+      "events": [
+        "delta",
+        "reset",
+        "snapshot"
+      ],
+      "delivery": "stream"
+    },
+    "snapshot_delta": {
+      "payload": "delta",
+      "history": "reconstructible",
+      "initiation": "push",
+      "writers": "single",
+      "events": [
+        "delta",
+        "snapshot"
+      ],
+      "delivery": "stream"
+    },
+    "crdt": {
+      "payload": "ops",
+      "history": "reconstructible",
+      "initiation": "push-bidi",
+      "writers": "multi-merge",
+      "events": [
+        "op",
+        "sync"
+      ],
+      "delivery": "stream"
+    }
+  },
+  "enums": [],
+  "messages": [
+    {
+      "name": "ChatLine",
+      "reserved_tags": [],
+      "reserved_names": [],
+      "next_id": null,
+      "fields": [
+        {
+          "name": "ts",
+          "tag": 1,
+          "type": {
+            "k": "scalar",
+            "scalar": "int"
+          },
+          "optional": false,
+          "transient": false,
+          "merge": null
+        },
+        {
+          "name": "user",
+          "tag": 2,
+          "type": {
+            "k": "scalar",
+            "scalar": "str"
+          },
+          "optional": false,
+          "transient": false,
+          "merge": null
+        },
+        {
+          "name": "text",
+          "tag": 3,
+          "type": {
+            "k": "scalar",
+            "scalar": "str"
+          },
+          "optional": false,
+          "transient": false,
+          "merge": null
+        }
+      ]
+    }
+  ],
+  "services": [],
+  "extensions": []
+}

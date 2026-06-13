@@ -3,13 +3,38 @@
 // The binder owns the session and folding; the client is pure transport.
 
 import gladeIr from "../../../taut/corpus/glade.ir.json";
+import workspaceIr from "../ir/workspace.ir.json";
 import { loadSchema } from "../../client-ts/src/taut/schema.ts";
+import * as tautCodec from "../../client-ts/src/taut/codec.ts";
 import { Session } from "../../client-ts/src/session.ts";
 import { GladeClient } from "../../client-ts/src/client.ts";
-import { GripShareBinder, SHARE } from "../../grip-share/src/binder.ts";
+import { GripShareBinder, SHARE, type PayloadCodec } from "../../grip-share/src/binder.ts";
 import { grok } from "./runtime";
 
 const schema = loadSchema(gladeIr as never);
+
+// The app surface types (taut) — the declared payload for typed surfaces.
+const appSchema = loadSchema(workspaceIr as never);
+
+/** One activity-log entry — the declared `ChatLine` taut message. */
+export interface ChatLine {
+  ts: number;
+  user: string;
+  text: string;
+}
+
+/** glade id -> typed taut codec. app:activity carries ChatLine; the rest
+ *  fall back to the binder's default JSON codec. (This map is what the .glade
+ *  compiler will eventually generate from the surface declarations.) */
+const codecs = new Map<string, PayloadCodec>([
+  [
+    "app:activity",
+    {
+      encode: (v) => tautCodec.encode(appSchema, "ChatLine", v as never),
+      decode: (b) => tautCodec.decode(appSchema, "ChatLine", b),
+    },
+  ],
+]);
 
 const GLADE_IDS = ["app:selection", "app:notes", "app:activity"];
 
@@ -31,6 +56,7 @@ const session = new Session(schema, origin);
 const binder = new GripShareBinder(
   { listSharedTaps: () => grok.listSharedTaps() as never },
   session,
+  codecs,
 );
 const client = new GladeClient(schema, origin, session);
 
@@ -65,7 +91,7 @@ export async function startGladeSync(url: string): Promise<void> {
   }
 }
 
-/** Append one entry to the shared activity log. */
-export function postActivity(entry: string): void {
-  binder.appendLog("app:activity", entry);
+/** Append one entry to the shared activity log — a typed ChatLine. */
+export function postActivity(text: string): void {
+  binder.appendLog("app:activity", { ts: Date.now(), user: origin, text } satisfies ChatLine);
 }

@@ -100,6 +100,14 @@ input {
   padding: 0.15rem 0;
   border-bottom: 1px solid #20242e;
 }
+.entry .ts {
+  color: #5a6172;
+  font-variant-numeric: tabular-nums;
+  margin-right: 0.3rem;
+}
+.entry b {
+  color: #7aa2e8;
+}
 .empty {
   color: #5a6172;
 }

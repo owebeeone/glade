@@ -29,14 +29,18 @@ export interface GrokLike {
   listSharedTaps(): SharableTap[];
 }
 
-// Value <-> opaque payload. JSON is fine: the payload is opaque to glade, and
-// the fold only ever compares/sequences whole payloads.
-function encodeValue(v: unknown): Uint8Array {
-  return utf8(JSON.stringify(v ?? null));
+/** Encode/decode a surface's payload to/from the opaque bytes glade carries.
+ *  The default is JSON; a *typed* surface (a declared taut message, keyed by
+ *  glade id) supplies its own codec. The payload stays opaque to glade — only
+ *  the binder and the app know the type. */
+export interface PayloadCodec {
+  encode(v: unknown): Uint8Array;
+  decode(b: Uint8Array): unknown;
 }
-function decodeValue(b: Uint8Array): unknown {
-  return JSON.parse(new TextDecoder().decode(b));
-}
+const JSON_CODEC: PayloadCodec = {
+  encode: (v) => utf8(JSON.stringify(v ?? null)),
+  decode: (b) => JSON.parse(new TextDecoder().decode(b)),
+};
 
 /** Sorted distinct glade ids declared by a grok's shared taps (GQ-6 manifest input). */
 export function collectGladeIds(grok: GrokLike): string[] {
@@ -54,9 +58,17 @@ export class GripShareBinder {
   /** Set by a transport to forward locally-produced ops to peers/node. */
   onLocalOps?: (ops: Op[]) => void;
 
-  constructor(grok: GrokLike, session: Session) {
+  // per-surface payload codecs (glade id -> codec); default JSON.
+  private codecs: Map<string, PayloadCodec>;
+
+  constructor(grok: GrokLike, session: Session, codecs?: Map<string, PayloadCodec>) {
     this.grok = grok;
     this.session = session;
+    this.codecs = codecs ?? new Map();
+  }
+
+  private codecFor(gladeId: string): PayloadCodec {
+    return this.codecs.get(gladeId) ?? JSON_CODEC;
   }
 
   /** Bind every share-declared tap: hydrate from existing state, then wire
@@ -77,7 +89,7 @@ export class GripShareBinder {
       if (shape !== "log" && tap.subscribeShare) {
         const off = tap.subscribeShare(() => {
           if (this.applying) return; // echo guard: remote applies must not re-emit
-          const payload = encodeValue(tap.getShareValue?.());
+          const payload = this.codecFor(gladeId).encode(tap.getShareValue?.());
           const op = this.session.append(SHARE, gladeId, shape, payload);
           this.onLocalOps?.([op]);
         });
@@ -90,7 +102,7 @@ export class GripShareBinder {
    *  The materialized ordered list is folded back onto the bound tap. */
   appendLog(gladeId: string, entry: unknown): Op {
     const shape = this.shapes.get(gladeId) ?? "log";
-    const op = this.session.append(SHARE, gladeId, shape, encodeValue(entry));
+    const op = this.session.append(SHARE, gladeId, shape, this.codecFor(gladeId).encode(entry));
     this.applyFolded(gladeId); // reflect the new entry locally
     this.onLocalOps?.([op]);
     return op;
@@ -117,12 +129,13 @@ export class GripShareBinder {
     if (!tap?.applyShareValue || !shape) return;
     const folded = this.session.fold(SHARE, gladeId, shape);
     if (folded == null) return;
+    const codec = this.codecFor(gladeId);
     this.applying = true;
     try {
       if (shape === "log") {
-        tap.applyShareValue((folded as Uint8Array[]).map((b) => decodeValue(b)));
+        tap.applyShareValue((folded as Uint8Array[]).map((b) => codec.decode(b)));
       } else {
-        tap.applyShareValue(decodeValue(folded as Uint8Array));
+        tap.applyShareValue(codec.decode(folded as Uint8Array));
       }
     } finally {
       this.applying = false;

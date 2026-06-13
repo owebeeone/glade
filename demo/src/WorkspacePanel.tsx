@@ -33,7 +33,7 @@ export function WorkspacePanel() {
               className={f === selection ? "file active" : "file"}
               onClick={() => {
                 selTap?.set(f);
-                postActivity(`${origin} selected ${f}`);
+                postActivity(`selected ${f}`);
               }}
             >
               {f}
@@ -58,14 +58,17 @@ export function WorkspacePanel() {
         <div className="activity">
           {activity.length === 0 && <div className="empty">no activity yet</div>}
           {activity.map((a, i) => (
-            <div key={i} className="entry">{a}</div>
+            <div key={i} className="entry">
+              <span className="ts">{new Date(a.ts).toLocaleTimeString()}</span>{" "}
+              <b>{a.user}</b> {a.text}
+            </div>
           ))}
         </div>
         <form
           onSubmit={(e) => {
             e.preventDefault();
             if (msg.trim()) {
-              postActivity(`${origin}: ${msg.trim()}`);
+              postActivity(msg.trim());
               setMsg("");
             }
           }}
