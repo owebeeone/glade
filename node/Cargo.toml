@@ -1,0 +1,11 @@
+[package]
+name = "glade-node"
+version = "0.0.0"
+edition = "2021"
+description = "Glade node (GLP-0005) — localhost glade server: per-(share,origin) log store, WS carrier, routing, chain verification, echo provider."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+glade-wire = { path = "../wire-rs" }
