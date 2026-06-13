@@ -1,0 +1,10 @@
+{
+  "name": "@glade/client-ts",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Glade TS session client (GLP-0005 P2) — browser-side session, lww+log folds, per-origin log store, WS carrier. Conforms byte-for-byte to taut's glade corpus + fold + hash oracles.",
+  "scripts": {
+    "test": "node --experimental-strip-types --test test/*.test.ts"
+  }
+}
