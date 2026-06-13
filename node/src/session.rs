@@ -7,9 +7,10 @@
 
 use std::collections::BTreeMap;
 
-use glade_wire::generated::Op;
+use glade_wire::generated::{Error, ErrorCode, Op};
 
-use crate::store::Store;
+use crate::frame::Frame;
+use crate::store::{Store, StoreError};
 
 /// A peer's per-origin heads for `share` (origin -> highest seq held).
 pub type Heads = BTreeMap<String, i64>;
@@ -30,11 +31,35 @@ pub fn missing_for(store: &Store, share: &str, their: &Heads) -> Vec<Op> {
     out
 }
 
+/// Map a rejected append to a diagnostic `Error` frame (P1.S4): a fork is
+/// surfaced, never propagated or silently dropped.
+pub fn error_frame(err: &StoreError, share: &str, glade_id: &str) -> Frame {
+    let (code, message) = match err {
+        StoreError::Equivocation { origin, seq } => {
+            (ErrorCode::Equivocation, format!("forked chain at ({origin},{seq})"))
+        }
+        StoreError::ChainBreak { origin, seq } => {
+            (ErrorCode::Protocol, format!("chain break at ({origin},{seq})"))
+        }
+        StoreError::Gap { expected, got } => {
+            (ErrorCode::Protocol, format!("gap: expected {expected}, got {got}"))
+        }
+        StoreError::Io(e) => (ErrorCode::Internal, format!("io: {e}")),
+    };
+    Frame::Error(Error {
+        code,
+        message,
+        share: Some(share.into()),
+        glade_id: Some(glade_id.into()),
+        corr: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::store::Store;
-    use glade_wire::generated::{Op, Shape};
+    use glade_wire::generated::{ErrorCode, Op, Shape};
     use std::path::PathBuf;
 
     fn fresh(name: &str) -> PathBuf {
@@ -103,6 +128,20 @@ mod tests {
         ];
         assert_eq!(snapshot(&server), want);
         assert_eq!(snapshot(&client), want);
+    }
+
+    #[test]
+    fn forked_op_surfaces_error_frame_not_silent() {
+        let mut s = Store::open(fresh("err")).unwrap();
+        s.append(op("a", 0, b"p0")).unwrap();
+        let err = s.append(op("a", 0, b"p0-fork")).unwrap_err(); // forked chain
+        let frame = error_frame(&err, "sh", "g");
+        match &frame {
+            Frame::Error(e) => assert_eq!(e.code, ErrorCode::Equivocation),
+            other => panic!("expected Error frame, got {other:?}"),
+        }
+        // and it survives the wire
+        assert!(matches!(Frame::from_bytes(&frame.to_bytes()).unwrap(), Frame::Error(_)));
     }
 
     #[test]

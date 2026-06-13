@@ -6,6 +6,7 @@
 //! verification (P1.S4), and the echo provider (P1.S6). Conforms to the frozen
 //! wire IR + corpus (`glade-wire`) and the fold oracle.
 
+pub mod chain;
 pub mod frame;
 pub mod session;
 pub mod store;

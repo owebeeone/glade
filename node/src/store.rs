@@ -15,12 +15,14 @@ use std::path::{Path, PathBuf};
 use glade_wire::cbor;
 use glade_wire::generated::Op;
 
+use crate::chain::op_hash;
+
 /// Outcome of an append.
 #[derive(Debug, PartialEq)]
 pub enum Append {
     /// New op, persisted and indexed.
     Appended,
-    /// `seq` already present (idempotent re-delivery) — ignored.
+    /// `seq` already present with the *same* hash (idempotent re-delivery).
     Duplicate,
 }
 
@@ -28,6 +30,11 @@ pub enum Append {
 pub enum StoreError {
     /// Non-contiguous: an origin's log must advance by exactly one.
     Gap { expected: i64, got: i64 },
+    /// A second op at an existing `(origin, seq)` with a *different* hash — a
+    /// forked per-origin chain (GQ-9). Rejected, never folded.
+    Equivocation { origin: String, seq: i64 },
+    /// A new op's `prev` does not match its predecessor's hash.
+    ChainBreak { origin: String, seq: i64 },
     Io(std::io::Error),
 }
 
@@ -68,18 +75,32 @@ impl Store {
         Ok(Store { root, logs })
     }
 
-    /// Append `op` to its `(share, origin)` log. Contiguity: the first op sets
-    /// the baseline; each later op must be `last.seq + 1`. `seq <= last.seq` is
-    /// treated as already-seen (idempotent). A forward gap is an error.
+    /// Append `op` to its `(share, origin)` log, with per-origin chain checks
+    /// (P1.S4, GQ-9):
+    /// - `seq <= last.seq`: idempotent if the stored op has the same hash;
+    ///   **equivocation** (rejected) if a different hash — a forked chain.
+    /// - `seq == last.seq + 1`: if `prev` is present it must equal the
+    ///   predecessor's hash (else **chain break**); absent `prev` is accepted
+    ///   unverified (M-LIMP lenient — honest clients always set it).
+    /// - otherwise a forward **gap**.
     pub fn append(&mut self, op: Op) -> Result<Append, StoreError> {
         let key = (op.share.clone(), op.origin.clone());
         let log = self.logs.entry(key).or_default();
         if let Some(last) = log.last() {
             if op.seq <= last.seq {
-                return Ok(Append::Duplicate);
+                return match log.iter().find(|o| o.seq == op.seq) {
+                    Some(stored) if op_hash(stored) == op_hash(&op) => Ok(Append::Duplicate),
+                    Some(_) => Err(StoreError::Equivocation { origin: op.origin, seq: op.seq }),
+                    None => Ok(Append::Duplicate), // below retained range — treat as seen
+                };
             }
             if op.seq != last.seq + 1 {
                 return Err(StoreError::Gap { expected: last.seq + 1, got: op.seq });
+            }
+            if let Some(prev) = &op.prev {
+                if prev.as_slice() != op_hash(last) {
+                    return Err(StoreError::ChainBreak { origin: op.origin, seq: op.seq });
+                }
             }
         }
         append_to_log(&self.root, &op)?;
@@ -208,6 +229,44 @@ mod tests {
                 assert_eq!((expected, got), (3, 5));
             }
             other => panic!("expected Gap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn valid_chain_appends() {
+        let mut s = Store::open(fresh("chain-ok")).unwrap();
+        let a0 = op("sh", "a", 0, b"p0"); // prev None (baseline)
+        s.append(a0.clone()).unwrap();
+        let mut a1 = op("sh", "a", 1, b"p1");
+        a1.prev = Some(crate::chain::op_hash(&a0).to_vec());
+        s.append(a1.clone()).unwrap();
+        let mut a2 = op("sh", "a", 2, b"p2");
+        a2.prev = Some(crate::chain::op_hash(&a1).to_vec());
+        assert_eq!(s.append(a2).unwrap(), Append::Appended);
+    }
+
+    #[test]
+    fn equivocation_rejected_redelivery_idempotent() {
+        let mut s = Store::open(fresh("equiv")).unwrap();
+        s.append(op("sh", "a", 0, b"p0")).unwrap();
+        // same (origin, seq), different payload -> forked chain, rejected
+        match s.append(op("sh", "a", 0, b"p0-fork")) {
+            Err(StoreError::Equivocation { origin, seq }) => assert_eq!((origin.as_str(), seq), ("a", 0)),
+            other => panic!("expected Equivocation, got {other:?}"),
+        }
+        // exact re-delivery of the real op is still idempotent
+        assert_eq!(s.append(op("sh", "a", 0, b"p0")).unwrap(), Append::Duplicate);
+    }
+
+    #[test]
+    fn chain_break_rejected() {
+        let mut s = Store::open(fresh("break")).unwrap();
+        s.append(op("sh", "a", 0, b"p0")).unwrap();
+        let mut a1 = op("sh", "a", 1, b"p1");
+        a1.prev = Some(vec![0xde, 0xad, 0xbe, 0xef]); // does not match hash(a0)
+        match s.append(a1) {
+            Err(StoreError::ChainBreak { origin, seq }) => assert_eq!((origin.as_str(), seq), ("a", 1)),
+            other => panic!("expected ChainBreak, got {other:?}"),
         }
     }
 
