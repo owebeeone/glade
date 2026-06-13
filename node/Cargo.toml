@@ -7,6 +7,10 @@ description = "Glade node (GLP-0005) — localhost glade server: per-(share,orig
 [lib]
 path = "src/lib.rs"
 
+[[bin]]
+name = "glade-node"
+path = "src/bin/glade-node.rs"
+
 [dependencies]
 glade-wire = { path = "../wire-rs" }
 sha2 = "0.10"
