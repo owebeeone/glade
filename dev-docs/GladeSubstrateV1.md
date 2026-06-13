@@ -324,3 +324,44 @@ multi-node, grazel authority session, MV folds, security enforcement.
 GQ-1 is sidestepped, not decided: M-LIMP declares only conflict-free folds
 (`lww`, `log`). MV is an additive fold kind plus an optional conflicts-grip;
 nothing in M-LIMP forecloses either answer.
+
+## 12. M-LIMP reached (retro, 2026-06-14)
+
+Built on branch `gladev2` (GLP-0005), tags `gladev2/p0-start` →
+`gladev2/p4-mlimp`. The §11 scenario passes as a single scripted acceptance
+test (converge lww+log → node restart resume → offline-write/reconnect
+reconcile → echo EXCHANGE), and a live React demo (`glade/demo`, the gryth
+workspace panel) converges two participants through the real node in a browser.
+The substrate exists: rust node + glade wire + TS client folds + grip-share
+binder + grip-core base-tap `share`, all over the frozen wire/fold/hash oracles.
+
+What landed, by layer: `taut/ir/glade.taut.py` + corpus + fold + op-hash
+oracles (byte-parity Rust/TS/Python); `glade/node` (store, resume, routing,
+GQ-9 chain verify, echo); `glade/client-ts` (session, lww+log folds, WS,
+exchange, browser-safe sync sha256); `glade/grip-share` (binder, value+log
+bindings, resync); grip-core `share` decl + `listSharedTaps` (GQ-5);
+`glade/demo`.
+
+Deviations / decisions folded from the build (see plan `Decisions.md`):
+- **D8** authoritative log is per `(share, origin)`; the wire `StreamHeads`
+  (per-stream) is reinterpreted as share-scoped origin heads for M-LIMP.
+- **D9** node logic built carrier-first; the WS socket is one adapter.
+- **D10** op-hash = `sha256(canonical_cbor(op))`; cross-language for free off
+  the wire corpus. TS uses a sync pure-JS sha256 (Web Crypto is async-only).
+- **GQ-5** sharability is a base-tap feature (resolved). **GQ-7** late-join uses
+  full gap-ship; the opaque cached-fold optimization stays deferred (ratified).
+- Resume over WS reconciles by re-shipping ops (idempotent dedup), not yet a
+  heads-vector exchange on reconnect — sufficient for M-LIMP, tighten later.
+
+Known gaps (M-LIMP-acceptable, recorded honestly):
+- The priority `OutQueue` (interactive preempts bulk) is unit-tested but the WS
+  server's outbound is FIFO mpsc — not wired. Localhost control RTT is
+  sub-ms (p50 0.13ms / p90 0.32ms / max 0.88ms over 50), so FIFO is fine here.
+- IndexedDB client destination deferred (memory + node-backed persistence
+  cover the demo); MV folds, keyed bindings, reassembler, iroh, security
+  enforcement are all post-LIMP per §8 non-goals.
+
+Post-LIMP order (unchanged): keyed async/stream bindings + canonical keys →
+reassembler + interest regions → iroh carrier/mesh → grazel authority session →
+security model (per `GladeGrythSecurityModelAnalysisPrompt.md`). Each is an
+addition on these rails, not a redesign — the M-LIMP premise.
