@@ -38,6 +38,9 @@ export class GladeClient {
    *  own session — lets a grip-share binder own the session and folding. */
   onOps?: (ops: Op[]) => void;
 
+  private exCorr = 0;
+  private exWaiters = new Map<string, (r: { ok: boolean; payload?: Uint8Array; error?: string }) => void>();
+
   constructor(schema: SchemaIndex, origin: string, session?: Session) {
     this.schema = schema;
     this.session = session ?? new Session(schema, origin);
@@ -62,6 +65,13 @@ export class GladeClient {
       else this.session.applyRemote(value.ops as Op[]);
     } else if (tag === TAG.Heads) {
       this.subAcks.shift()?.();
+    } else if (tag === TAG.ExchangeRes) {
+      this.exWaiters.get(value.corr as string)?.({
+        ok: value.ok as boolean,
+        payload: value.payload as Uint8Array | undefined,
+        error: value.error as string | undefined,
+      });
+      this.exWaiters.delete(value.corr as string);
     }
   }
 
@@ -85,6 +95,15 @@ export class GladeClient {
   /** Ship already-built ops to the node (the binder appends; the client carries). */
   sendOps(ops: Op[]): void {
     this.send(frame(this.schema, TAG.Ops, "Ops", { ops, pri: null }));
+  }
+
+  /** A directed request/response to a provider (e.g. the echo provider). */
+  exchange(share: string, gladeId: string, payload: Uint8Array): Promise<{ ok: boolean; payload?: Uint8Array; error?: string }> {
+    const corr = `c${++this.exCorr}`;
+    return new Promise((resolve) => {
+      this.exWaiters.set(corr, resolve);
+      this.send(frame(this.schema, TAG.ExchangeReq, "ExchangeReq", { share, glade_id: gladeId, corr, payload }));
+    });
   }
 
   fold(share: string, gladeId: string, shape: string): Uint8Array | Uint8Array[] | null {

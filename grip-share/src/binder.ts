@@ -96,6 +96,13 @@ export class GripShareBinder {
     return op;
   }
 
+  /** Re-ship every known op to the transport — e.g. after reconnect, so writes
+   *  made while offline reach the node (which dedups by (origin, seq)). */
+  resync(): void {
+    const ops = this.session.dump();
+    if (ops.length) this.onLocalOps?.(ops);
+  }
+
   /** Ops arriving from a peer/node: store, then re-fold + apply affected taps. */
   applyRemote(ops: Op[]): void {
     this.session.applyRemote(ops);
