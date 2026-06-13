@@ -7,6 +7,8 @@
 //! wire IR + corpus (`glade-wire`) and the fold oracle.
 
 pub mod chain;
+pub mod echo;
 pub mod frame;
+pub mod router;
 pub mod session;
 pub mod store;
