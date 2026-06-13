@@ -1,0 +1,24 @@
+{
+  "name": "gryth-workspace-demo",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Gryth workspace panel (GLP-0005 P3.S4) — share-first demo over the gryth toolchain: rust glade-node + glade client + grip-react. Shared selection (lww), notes (lww), activity log (log).",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@owebeeone/grip-react": "file:../../grip-react",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1"
+  },
+  "devDependencies": {
+    "@types/react": "^19.1.9",
+    "@types/react-dom": "^19.1.7",
+    "@vitejs/plugin-react": "^4.7.0",
+    "typescript": "~5.8.3",
+    "vite": "^7.1.0"
+  }
+}

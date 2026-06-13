@@ -1,0 +1,122 @@
+:root {
+  color-scheme: light dark;
+  font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+}
+body {
+  margin: 0;
+  background: #0f1115;
+  color: #e6e6e6;
+}
+.panel {
+  max-width: 560px;
+  margin: 2rem auto;
+  padding: 0 1rem 2rem;
+}
+header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  border-bottom: 1px solid #2a2f3a;
+  padding-bottom: 0.5rem;
+}
+h1 {
+  font-size: 1.3rem;
+  margin: 0.5rem 0;
+}
+h2 {
+  font-size: 0.9rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #8b93a7;
+  margin: 1.5rem 0 0.5rem;
+}
+.meta {
+  font-size: 0.8rem;
+  color: #8b93a7;
+}
+.dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #888;
+}
+.dot.live {
+  background: #3ad17a;
+}
+.dot.connecting {
+  background: #e0b341;
+}
+.dot.offline {
+  background: #e05a5a;
+}
+.files {
+  display: flex;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+.file {
+  background: #1a1e27;
+  border: 1px solid #2a2f3a;
+  color: #cdd3e0;
+  padding: 0.35rem 0.6rem;
+  border-radius: 6px;
+  cursor: pointer;
+  font-family: ui-monospace, monospace;
+  font-size: 0.85rem;
+}
+.file.active {
+  background: #284a8a;
+  border-color: #3a6fd0;
+  color: #fff;
+}
+.current {
+  margin-top: 0.6rem;
+  font-size: 0.85rem;
+  color: #8b93a7;
+}
+textarea,
+input {
+  width: 100%;
+  box-sizing: border-box;
+  background: #1a1e27;
+  border: 1px solid #2a2f3a;
+  color: #e6e6e6;
+  border-radius: 6px;
+  padding: 0.5rem;
+  font: inherit;
+}
+.activity {
+  background: #1a1e27;
+  border: 1px solid #2a2f3a;
+  border-radius: 6px;
+  padding: 0.5rem;
+  min-height: 4rem;
+  max-height: 12rem;
+  overflow-y: auto;
+  font-size: 0.85rem;
+}
+.entry {
+  padding: 0.15rem 0;
+  border-bottom: 1px solid #20242e;
+}
+.empty {
+  color: #5a6172;
+}
+form {
+  display: flex;
+  gap: 0.4rem;
+  margin-top: 0.5rem;
+}
+form input {
+  flex: 1;
+}
+button[type="submit"],
+form button {
+  background: #284a8a;
+  border: 1px solid #3a6fd0;
+  color: #fff;
+  border-radius: 6px;
+  padding: 0 0.9rem;
+  cursor: pointer;
+}
