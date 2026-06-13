@@ -1,0 +1,10 @@
+{
+  "name": "@glade/grip-share",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Grip Share binder (GLP-0005 P3) — binds grok's share-declared taps to a glade session by glade id. grip-core-agnostic: operates on the structural share hooks, bridges to the glade Session/folds.",
+  "scripts": {
+    "test": "node --experimental-strip-types --test test/*.test.ts"
+  }
+}
