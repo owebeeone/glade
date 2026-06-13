@@ -8,6 +8,9 @@ import { opHash } from "./hash.ts";
 import { Store, type Op } from "./store.ts";
 import type { SchemaIndex } from "./taut/schema.ts";
 
+// Op is part of the Session API surface (append/applyRemote/dump) — re-export it.
+export type { Op } from "./store.ts";
+
 export class Session {
   private lamport = 0;
   private store: Store;

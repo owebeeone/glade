@@ -1,6 +1,7 @@
 import { createAtomValueTap } from "@owebeeone/grip-react";
 import { grok } from "./runtime";
 import { SELECTION, SELECTION_TAP, NOTES, NOTES_TAP, ACTIVITY } from "./grips";
+import type { ChatLine } from "./glade";
 
 // Each tap declares a glade `share` — that is the *entire* opt-in to sharing
 // (GQ-5). The grip-share binder discovers them via grok.listSharedTaps().
@@ -23,7 +24,7 @@ export function registerAllTaps(): void {
   // binder (postActivity), not by setting a whole value.
   grok.registerTap(
     createAtomValueTap(ACTIVITY, {
-      initial: [] as string[],
+      initial: [] as ChatLine[],
       share: { gladeId: "app:activity", shape: "log" },
     }),
   );
