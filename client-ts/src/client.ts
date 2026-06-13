@@ -34,9 +34,13 @@ export class GladeClient {
   private ws: WebSocket | null = null;
   private subAcks: Array<() => void> = [];
 
-  constructor(schema: SchemaIndex, origin: string) {
+  /** When set, inbound ops are handed here instead of applied to this client's
+   *  own session — lets a grip-share binder own the session and folding. */
+  onOps?: (ops: Op[]) => void;
+
+  constructor(schema: SchemaIndex, origin: string, session?: Session) {
     this.schema = schema;
-    this.session = new Session(schema, origin);
+    this.session = session ?? new Session(schema, origin);
   }
 
   connect(url: string): Promise<void> {
@@ -54,7 +58,8 @@ export class GladeClient {
     const tag = bytes[0];
     const value = codec.decode(this.schema, MSG_BY_TAG[tag], bytes.slice(1)) as Record<string, unknown>;
     if (tag === TAG.Ops) {
-      this.session.applyRemote(value.ops as Op[]);
+      if (this.onOps) this.onOps(value.ops as Op[]);
+      else this.session.applyRemote(value.ops as Op[]);
     } else if (tag === TAG.Heads) {
       this.subAcks.shift()?.();
     }
@@ -70,11 +75,16 @@ export class GladeClient {
     });
   }
 
-  /** Append a local op and ship it to the node. */
+  /** Append a local op and ship it to the node (standalone use). */
   append(share: string, gladeId: string, shape: string, payload: Uint8Array): Op {
     const op = this.session.append(share, gladeId, shape, payload);
     this.send(frame(this.schema, TAG.Ops, "Ops", { ops: [op], pri: null }));
     return op;
+  }
+
+  /** Ship already-built ops to the node (the binder appends; the client carries). */
+  sendOps(ops: Op[]): void {
+    this.send(frame(this.schema, TAG.Ops, "Ops", { ops, pri: null }));
   }
 
   fold(share: string, gladeId: string, shape: string): Uint8Array | Uint8Array[] | null {
