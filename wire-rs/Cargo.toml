@@ -1,0 +1,11 @@
+[package]
+name = "glade-wire"
+version = "0.0.0"
+edition = "2021"
+description = "Glade wire codec (GLP-0005) — IR-driven CBOR codec for the glade framing protocol, byte-parity with taut's Python reference corpus."
+
+[lib]
+path = "src/lib.rs"
+
+# No dependencies: the codec is self-contained (cbor.rs runtime + generated.rs).
+[dependencies]
