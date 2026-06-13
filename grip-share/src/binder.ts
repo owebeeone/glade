@@ -72,7 +72,9 @@ export class GripShareBinder {
       // hydrate from any already-known folded state
       this.applyFolded(gladeId);
 
-      if (tap.subscribeShare) {
+      // value shapes mirror the whole value on every local change; log shapes
+      // append discrete entries via appendLog (not a whole-value subscribe).
+      if (shape !== "log" && tap.subscribeShare) {
         const off = tap.subscribeShare(() => {
           if (this.applying) return; // echo guard: remote applies must not re-emit
           const payload = encodeValue(tap.getShareValue?.());
@@ -82,6 +84,16 @@ export class GripShareBinder {
         this.offs.push(off);
       }
     }
+  }
+
+  /** Append one entry to a `log`-shaped binding — each entry is its own op.
+   *  The materialized ordered list is folded back onto the bound tap. */
+  appendLog(gladeId: string, entry: unknown): Op {
+    const shape = this.shapes.get(gladeId) ?? "log";
+    const op = this.session.append(SHARE, gladeId, shape, encodeValue(entry));
+    this.applyFolded(gladeId); // reflect the new entry locally
+    this.onLocalOps?.([op]);
+    return op;
   }
 
   /** Ops arriving from a peer/node: store, then re-fold + apply affected taps. */
