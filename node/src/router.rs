@@ -33,6 +33,13 @@ impl Router {
         }
     }
 
+    /// Drop a session from every subscription (connection teardown).
+    pub fn unsubscribe_all(&mut self, session: SessionId) {
+        for set in self.subs.values_mut() {
+            set.remove(&session);
+        }
+    }
+
     /// Sessions subscribed to `(share, glade_id)` except `from` — the fan-out
     /// targets for an op originating at `from` (never echoed to itself).
     pub fn route(&self, from: SessionId, share: &str, glade_id: &str) -> Vec<SessionId> {
