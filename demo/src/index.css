@@ -75,6 +75,15 @@ h2 {
   font-size: 0.85rem;
   color: #8b93a7;
 }
+.zone-private {
+  color: #d8923f;
+}
+.zone-commons {
+  color: #3fb07a;
+}
+.zone-account {
+  color: #8a9bff;
+}
 textarea,
 input {
   width: 100%;

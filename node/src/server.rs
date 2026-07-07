@@ -82,7 +82,9 @@ async fn handle(shared: Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
     });
 
     let mut echo = Echo::new();
-    let mut client_heads: BTreeMap<String, BTreeMap<String, i64>> = BTreeMap::new();
+    // resume vectors the client has announced/sent, per zone-surface
+    // (share, glade_id, key) -> origin -> seq.
+    let mut client_heads: BTreeMap<(String, String, Vec<u8>), BTreeMap<String, i64>> = BTreeMap::new();
 
     loop {
         let bytes = match reader.read().await {
@@ -108,7 +110,7 @@ async fn handle(shared: Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
         match frame {
             Frame::Hello(h) => {
                 for sh in &h.heads {
-                    let m = client_heads.entry(sh.share.clone()).or_default();
+                    let m = client_heads.entry((sh.share.clone(), sh.glade_id.clone(), sh.key.clone())).or_default();
                     for hd in &sh.heads {
                         m.insert(hd.origin.clone(), hd.seq);
                     }
@@ -116,17 +118,21 @@ async fn handle(shared: Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
                 send(&shared, sid, &Frame::Welcome(Welcome { session: h.session, protocol: 1, heads: vec![] })).await;
             }
             Frame::Subscribe(s) => {
-                shared.router.lock().await.subscribe(sid, &s.share, &s.glade_id);
-                let their = client_heads.get(&s.share).cloned().unwrap_or_default();
+                // A subscription is to one zone-surface (share, glade_id, key);
+                // absent key = the commons zone. Register, then ship only that
+                // zone's gap — a private zone never reaches another subscriber.
+                let key = s.key.clone().unwrap_or_default();
+                shared.router.lock().await.subscribe(sid, &s.share, &s.glade_id, &key);
+                let their = client_heads.get(&(s.share.clone(), s.glade_id.clone(), key.clone())).cloned().unwrap_or_default();
                 let (server_heads, gap) = {
                     let st = shared.store.lock().await;
-                    (heads_map(&st, &s.share), missing_for(&st, &s.share, &their))
+                    (heads_map(&st, &s.share, &s.glade_id, &key), missing_for(&st, &s.share, &s.glade_id, &key, &their))
                 };
                 let ack = Frame::Heads(Heads {
                     streams: vec![StreamHeads {
                         share: s.share.clone(),
-                        glade_id: String::new(),
-                        key: vec![],
+                        glade_id: s.glade_id.clone(),
+                        key: key.clone(),
                         heads: server_heads
                             .iter()
                             .map(|(o, sq)| Head { origin: o.clone(), seq: *sq, hash: None })
@@ -140,12 +146,15 @@ async fn handle(shared: Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
             }
             Frame::Ops(ops) => {
                 for op in ops.ops {
-                    let (share, glade_id) = (op.share.clone(), op.glade_id.clone());
-                    client_heads.entry(share.clone()).or_default().insert(op.origin.clone(), op.seq);
+                    let (share, glade_id, key) = (op.share.clone(), op.glade_id.clone(), op.key.clone());
+                    client_heads
+                        .entry((share.clone(), glade_id.clone(), key.clone()))
+                        .or_default()
+                        .insert(op.origin.clone(), op.seq);
                     let res = shared.store.lock().await.append(op.clone());
                     match res {
                         Ok(Append::Appended) => {
-                            let targets = shared.router.lock().await.route(sid, &share, &glade_id);
+                            let targets = shared.router.lock().await.route(sid, &share, &glade_id, &key);
                             let frame = Frame::Ops(Ops { ops: vec![op], pri: None });
                             for t in targets {
                                 send(&shared, t, &frame).await;
@@ -194,6 +203,15 @@ mod tests {
     }
     fn subscribe() -> Vec<u8> {
         Frame::Subscribe(Subscribe { share: "sh".into(), glade_id: "g".into(), key: None, from: None }).to_bytes()
+    }
+    fn subscribe_key(key: Option<Vec<u8>>) -> Vec<u8> {
+        Frame::Subscribe(Subscribe { share: "sh".into(), glade_id: "g".into(), key, from: None }).to_bytes()
+    }
+    fn keyed_op(origin: &str, seq: i64, key: &[u8], payload: &[u8]) -> Op {
+        Op { key: key.to_vec(), ..op(origin, seq, payload) }
+    }
+    fn ops_frame(o: Op) -> Vec<u8> {
+        Frame::Ops(Ops { ops: vec![o], pri: None }).to_bytes()
     }
     async fn recv(r: &mut ws::WsReader) -> Frame {
         match r.read().await.unwrap() {
@@ -259,6 +277,43 @@ mod tests {
                 assert_eq!(res.payload.as_deref(), Some(b"ping".as_slice()));
             }
             other => panic!("client 1 expected ExchangeRes, got {other:?}"),
+        }
+    }
+
+    /// Privacy by keying, end-to-end: a private-zone op (key `self:p`) is fanned
+    /// out only to that zone's subscriber; the commons subscriber receives just
+    /// the commons op, never the private one (GladeZones.md).
+    #[tokio::test]
+    async fn private_zone_isolated_from_commons() {
+        let dir = std::env::temp_dir().join("glade-server-zones");
+        let _ = std::fs::remove_dir_all(&dir);
+        let server = Server::open(&dir).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(server.run(listener));
+
+        let (mut rc, wc) = ws::connect("127.0.0.1", port).await.unwrap(); // commons subscriber
+        let (mut rp, wp) = ws::connect("127.0.0.1", port).await.unwrap(); // private subscriber
+        let (_rw, ww) = ws::connect("127.0.0.1", port).await.unwrap(); // writer
+
+        wc.send_binary(&subscribe_key(None)).await.unwrap(); // commons
+        assert!(matches!(recv(&mut rc).await, Frame::Heads(_)));
+        wp.send_binary(&subscribe_key(Some(b"self:p".to_vec()))).await.unwrap();
+        assert!(matches!(recv(&mut rp).await, Frame::Heads(_)));
+
+        // writer emits a private op then a commons op (independent chains, both seq 0)
+        ww.send_binary(&ops_frame(keyed_op("w", 0, b"self:p", b"secret"))).await.unwrap();
+        ww.send_binary(&ops_frame(keyed_op("w", 0, b"", b"public"))).await.unwrap();
+
+        // the private subscriber sees the secret; the commons subscriber's only
+        // delivered op is the public one — the secret never crosses the zone.
+        match recv(&mut rp).await {
+            Frame::Ops(o) => assert_eq!(o.ops[0].payload, b"secret"),
+            other => panic!("private subscriber expected the private op, got {other:?}"),
+        }
+        match recv(&mut rc).await {
+            Frame::Ops(o) => assert_eq!(o.ops[0].payload, b"public"),
+            other => panic!("commons subscriber expected only the commons op, got {other:?}"),
         }
     }
 }

@@ -13,7 +13,8 @@ import { dirname, join } from "node:path";
 import { loadSchema } from "../../client-ts/src/taut/schema.ts";
 import { Session } from "../../client-ts/src/session.ts";
 import { GladeClient } from "../../client-ts/src/client.ts";
-import { GripShareBinder, SHARE, type GrokLike, type SharableTap } from "../src/binder.ts";
+import { utf8 } from "../../client-ts/src/bytes.ts";
+import { GripShareBinder, SHARE, type GrokLike, type Scope, type SharableTap } from "../src/binder.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const corpus = join(here, "..", "..", "..", "taut", "corpus");
@@ -119,6 +120,62 @@ test("workspace panel converges through the rust node (lww + log)", async () => 
 
     A.client.close();
     B.client.close();
+  } finally {
+    child.kill();
+  }
+});
+
+// A surface that declares its zone (commons | private). The scope maps the
+// zone to a wire key; private => self-keyed, so two users never share it.
+function zonedAtom(gladeId: string, zone: string, initial: unknown) {
+  return { ...fakeAtom(gladeId, initial), share: { gladeId, shape: "value", domain: "doc", zone } };
+}
+function scopeFor(user: string): Scope {
+  return {
+    resolve: (decl) => ({
+      share: "doc:1", // the document domain
+      key: decl.zone === "private" ? utf8(`self:${user}`) : new Uint8Array(),
+    }),
+  };
+}
+async function makeZonedBrowser(user: string, url: string) {
+  const selection = zonedAtom("app:selection", "private", ""); // mine, this doc
+  const notes = zonedAtom("app:notes", "commons", ""); // everyone, this doc
+  const session = new Session(schema, user);
+  const binder = new GripShareBinder(grokOf(selection, notes), session, undefined, scopeFor(user));
+  const client = new GladeClient(schema, user, session);
+  client.onOps = (ops) => binder.applyRemote(ops);
+  binder.onLocalOps = (ops) => client.sendOps(ops);
+  await client.connect(url);
+  binder.bind(); // resolves zone addresses
+  for (const s of binder.subscriptions()) await client.subscribe(s.share, s.gladeId, s.key);
+  return { selection, notes, binder, client };
+}
+
+test("zones: commons converges, private stays per-user", async () => {
+  const { port, child } = await startNode();
+  const url = `ws://127.0.0.1:${port}`;
+  try {
+    const alice = await makeZonedBrowser("alice", url);
+    const bob = await makeZonedBrowser("bob", url);
+
+    // commons zone (empty key): alice's note reaches bob
+    alice.notes.set("shared agenda");
+    await until(() => bob.notes.get() === "shared agenda");
+
+    // private zone (self-keyed): each picks a selection; neither crosses
+    alice.selection.set("src/main.rs");
+    bob.selection.set("Cargo.toml");
+    await until(() => bob.selection.get() === "Cargo.toml");
+    await until(() => alice.selection.get() === "src/main.rs");
+    // let any (erroneous) cross-delivery arrive, then assert isolation held
+    await new Promise((r) => setTimeout(r, 120));
+    assert.equal(alice.selection.get(), "src/main.rs"); // never bob's "Cargo.toml"
+    assert.equal(bob.selection.get(), "Cargo.toml"); // never alice's "src/main.rs"
+    assert.equal(alice.notes.get(), "shared agenda"); // commons still shared
+
+    alice.client.close();
+    bob.client.close();
   } finally {
     child.kill();
   }

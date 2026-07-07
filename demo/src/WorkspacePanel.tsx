@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { useGrip } from "@owebeeone/grip-react";
-import { SELECTION, SELECTION_TAP, NOTES, NOTES_TAP, ACTIVITY } from "./grips";
-import { origin, postActivity, onStatus, type GladeStatus } from "./glade";
+import { SELECTION, SELECTION_TAP, NOTES, NOTES_TAP, ACTIVITY, STATUS, STATUS_TAP } from "./grips";
+import { doc, user, postActivity, onStatus, type GladeStatus } from "./glade";
 
 const FILES = ["src/main.rs", "src/lib.rs", "Cargo.toml", "README.md"];
 
@@ -11,21 +11,33 @@ export function WorkspacePanel() {
   const notes = useGrip(NOTES);
   const notesTap = useGrip(NOTES_TAP);
   const activity = useGrip(ACTIVITY) ?? [];
+  const status_ = useGrip(STATUS);
+  const statusTap = useGrip(STATUS_TAP);
   const [msg, setMsg] = useState("");
-  const [status, setStatus] = useState<GladeStatus>("connecting");
-  useEffect(() => onStatus(setStatus), []);
+  const [conn, setConn] = useState<GladeStatus>("connecting");
+  useEffect(() => onStatus(setConn), []);
 
   return (
     <div className="panel">
       <header>
         <h1>Gryth Workspace</h1>
         <div className="meta">
-          <span className={`dot ${status}`} /> {status} · you are <b>{origin}</b>
+          <span className={`dot ${conn}`} /> {conn} · <b>doc:{doc}</b> · you are <b>{user}</b>
         </div>
       </header>
 
       <section>
-        <h2>Selection</h2>
+        <h2>Status · account domain</h2>
+        <input
+          value={status_ ?? ""}
+          placeholder="your status (follows you across documents)…"
+          onChange={(e) => statusTap?.set(e.target.value)}
+        />
+        <div className="current zone-account">account:{user} · commons — same on every doc you open</div>
+      </section>
+
+      <section>
+        <h2>Selection · private zone</h2>
         <div className="files">
           {FILES.map((f) => (
             <button
@@ -40,21 +52,24 @@ export function WorkspacePanel() {
             </button>
           ))}
         </div>
-        <div className="current">current: <b>{selection || "(none)"}</b></div>
+        <div className="current zone-private">
+          self:{user} · private — only you see this, even when the doc is shared: <b>{selection || "(none)"}</b>
+        </div>
       </section>
 
       <section>
-        <h2>Notes</h2>
+        <h2>Notes · commons zone</h2>
         <textarea
           value={notes ?? ""}
           rows={4}
           placeholder="shared notes…"
           onChange={(e) => notesTap?.set(e.target.value)}
         />
+        <div className="current zone-commons">doc:{doc} · commons — everyone in this document</div>
       </section>
 
       <section>
-        <h2>Activity</h2>
+        <h2>Activity · commons zone</h2>
         <div className="activity">
           {activity.length === 0 && <div className="empty">no activity yet</div>}
           {activity.map((a, i) => (

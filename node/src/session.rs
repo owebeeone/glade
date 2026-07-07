@@ -15,18 +15,19 @@ use crate::store::{Store, StoreError};
 /// A peer's per-origin heads for `share` (origin -> highest seq held).
 pub type Heads = BTreeMap<String, i64>;
 
-pub fn heads_map(store: &Store, share: &str) -> Heads {
-    store.heads(share).into_iter().collect()
+pub fn heads_map(store: &Store, share: &str, glade_id: &str, key: &[u8]) -> Heads {
+    store.heads(share, glade_id, key).into_iter().collect()
 }
 
-/// The ops in `store` for `share` that a peer holding `their` heads is missing:
-/// for each origin, everything above the peer's head (or the whole log if the
-/// peer has never seen that origin).
-pub fn missing_for(store: &Store, share: &str, their: &Heads) -> Vec<Op> {
+/// The ops in `store` for a zone `(share, glade_id, key)` that a peer holding
+/// `their` heads is missing: for each origin, everything above the peer's head
+/// (or the whole chain if the peer has never seen that origin). Scoped to the
+/// zone so a subscriber never receives another zone's (e.g. private) ops.
+pub fn missing_for(store: &Store, share: &str, glade_id: &str, key: &[u8], their: &Heads) -> Vec<Op> {
     let mut out = Vec::new();
-    for (origin, _head) in store.heads(share) {
+    for (origin, _head) in store.heads(share, glade_id, key) {
         let from = their.get(&origin).copied().unwrap_or(i64::MIN);
-        out.extend(store.scan(share, &origin, from));
+        out.extend(store.scan(share, glade_id, key, &origin, from));
     }
     out
 }
@@ -81,11 +82,11 @@ mod tests {
             payload: payload.to_vec(),
         }
     }
-    /// Sorted (origin, seq, payload) identity of a share's full op set.
+    /// Sorted (origin, seq, payload) identity of a zone's full op set.
     fn snapshot(store: &Store) -> Vec<(String, i64, Vec<u8>)> {
         let mut all = Vec::new();
-        for (origin, _) in store.heads("sh") {
-            for o in store.scan("sh", &origin, i64::MIN) {
+        for (origin, _) in store.heads("sh", "g", &[]) {
+            for o in store.scan("sh", "g", &[], &origin, i64::MIN) {
                 all.push((o.origin, o.seq, o.payload));
             }
         }
@@ -94,7 +95,7 @@ mod tests {
     }
     /// Ship `store`'s missing ops into `dst` (a one-direction sync).
     fn ship(src: &Store, dst: &mut Store) {
-        for o in missing_for(src, "sh", &heads_map(dst, "sh")) {
+        for o in missing_for(src, "sh", "g", &[], &heads_map(dst, "sh", "g", &[])) {
             dst.append(o).unwrap();
         }
     }
@@ -151,7 +152,7 @@ mod tests {
         client.append(op("a", 1, b"a1")).unwrap();
         ship(&client, &mut server);
         // second sync ships nothing
-        assert!(missing_for(&server, "sh", &heads_map(&client, "sh")).is_empty());
-        assert!(missing_for(&client, "sh", &heads_map(&server, "sh")).is_empty());
+        assert!(missing_for(&server, "sh", "g", &[], &heads_map(&client, "sh", "g", &[])).is_empty());
+        assert!(missing_for(&client, "sh", "g", &[], &heads_map(&server, "sh", "g", &[])).is_empty());
     }
 }

@@ -75,19 +75,20 @@ export class GladeClient {
     }
   }
 
-  /** Subscribe to a stream; resolves on the node's Heads ack. */
-  subscribe(share: string, gladeId: string): Promise<void> {
+  /** Subscribe to a zone-surface (share, gladeId, key); resolves on the node's
+   *  Heads ack. An absent/empty key is the commons zone. */
+  subscribe(share: string, gladeId: string, key?: Uint8Array): Promise<void> {
     return new Promise((resolve) => {
       this.subAcks.push(resolve);
       this.send(frame(this.schema, TAG.Subscribe, "Subscribe", {
-        share, glade_id: gladeId, key: null, from: null,
+        share, glade_id: gladeId, key: key && key.length ? key : null, from: null,
       }));
     });
   }
 
-  /** Append a local op and ship it to the node (standalone use). */
-  append(share: string, gladeId: string, shape: string, payload: Uint8Array): Op {
-    const op = this.session.append(share, gladeId, shape, payload);
+  /** Append a local op in a zone (default commons) and ship it to the node. */
+  append(share: string, gladeId: string, shape: string, payload: Uint8Array, key?: Uint8Array): Op {
+    const op = this.session.append(share, gladeId, shape, payload, key);
     this.send(frame(this.schema, TAG.Ops, "Ops", { ops: [op], pri: null }));
     return op;
   }
@@ -106,8 +107,8 @@ export class GladeClient {
     });
   }
 
-  fold(share: string, gladeId: string, shape: string): Uint8Array | Uint8Array[] | null {
-    return this.session.fold(share, gladeId, shape);
+  fold(share: string, gladeId: string, shape: string, key?: Uint8Array): Uint8Array | Uint8Array[] | null {
+    return this.session.fold(share, gladeId, shape, key);
   }
 
   close(): void {

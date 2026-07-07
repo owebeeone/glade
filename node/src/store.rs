@@ -1,11 +1,14 @@
-//! Per-(share, origin) append-log store (P1.S1).
+//! Per-chain append-log store (P1.S1; zones, GladeZones.md).
 //!
-//! The authoritative unit is the **(share, origin) log**: one monotonic `seq`
-//! sequence per origin within a share (GladeSubstrateV1 §6, Decisions D8). An
-//! op carries `(glade_id, key)` as routing/fold addressing, not a separate log
-//! axis. Restart-safe: each log is a length-prefixed CBOR append file replayed
-//! on `open`. Chain-hash / equivocation verification arrives in P1.S4; here the
-//! store enforces per-origin seq contiguity and idempotent re-delivery.
+//! The authoritative unit is the **chain** `(share, glade_id, key, origin)`: one
+//! monotonic `seq` sequence per origin within a `(share, glade_id, key)` zone.
+//! The zone `key` is part of the chain axis — a private zone must be filterable
+//! from what a peer receives, and a hash chain can't be filtered and still
+//! verify (the `prev` links break), so each zone is its own chain (this refines
+//! Decisions D8; `glade_id` rides the axis as before). The on-disk journal stays
+//! per-`(share, origin)` — it is just an op log, regrouped into chains on `open`
+//! by replaying each op's own `(share, glade_id, key, origin)`. Chain-hash /
+//! equivocation verification (P1.S4) is per-chain.
 
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
@@ -44,30 +47,42 @@ impl From<std::io::Error> for StoreError {
     }
 }
 
-/// Append-only per-(share, origin) op store, persisted under `root`.
+/// A chain identity: `(share, glade_id, key, origin)`. The zone `key` joins the
+/// axis so each zone is an independently contiguous, independently shippable
+/// chain (GladeZones.md).
+type ChainId = (String, String, Vec<u8>, String);
+
+fn chain_of(op: &Op) -> ChainId {
+    (op.share.clone(), op.glade_id.clone(), op.key.clone(), op.origin.clone())
+}
+
+/// Append-only per-chain op store, persisted under `root`.
 pub struct Store {
     root: PathBuf,
-    logs: BTreeMap<(String, String), Vec<Op>>,
+    logs: BTreeMap<ChainId, Vec<Op>>,
 }
 
 impl Store {
-    /// Open (and replay) a store rooted at `root`, creating it if absent.
+    /// Open (and replay) a store rooted at `root`, creating it if absent. The
+    /// journal is per-`(share, origin)` file; each op is regrouped into its
+    /// chain `(share, glade_id, key, origin)` from its own fields, so one file
+    /// can feed several zone-chains. File order preserves per-chain seq order.
     pub fn open(root: impl Into<PathBuf>) -> Result<Store, StoreError> {
         let root = root.into();
-        let mut logs: BTreeMap<(String, String), Vec<Op>> = BTreeMap::new();
+        let mut logs: BTreeMap<ChainId, Vec<Op>> = BTreeMap::new();
         if root.exists() {
             for share_ent in fs::read_dir(&root)? {
                 let share_ent = share_ent?;
                 if !share_ent.file_type()?.is_dir() {
                     continue;
                 }
-                let share = unhex(&share_ent.file_name().to_string_lossy());
                 for log_ent in fs::read_dir(share_ent.path())? {
                     let log_ent = log_ent?;
                     let fname = log_ent.file_name().to_string_lossy().to_string();
-                    if let Some(origin_hex) = fname.strip_suffix(".log") {
-                        let origin = unhex(origin_hex);
-                        logs.insert((share.clone(), origin), read_log(&log_ent.path())?);
+                    if fname.ends_with(".log") {
+                        for op in read_log(&log_ent.path())? {
+                            logs.entry(chain_of(&op)).or_default().push(op);
+                        }
                     }
                 }
             }
@@ -75,8 +90,8 @@ impl Store {
         Ok(Store { root, logs })
     }
 
-    /// Append `op` to its `(share, origin)` log, with per-origin chain checks
-    /// (P1.S4, GQ-9):
+    /// Append `op` to its `(share, glade_id, key, origin)` chain, with per-chain
+    /// checks (P1.S4, GQ-9):
     /// - `seq <= last.seq`: idempotent if the stored op has the same hash;
     ///   **equivocation** (rejected) if a different hash — a forked chain.
     /// - `seq == last.seq + 1`: if `prev` is present it must equal the
@@ -84,8 +99,7 @@ impl Store {
     ///   unverified (M-LIMP lenient — honest clients always set it).
     /// - otherwise a forward **gap**.
     pub fn append(&mut self, op: Op) -> Result<Append, StoreError> {
-        let key = (op.share.clone(), op.origin.clone());
-        let log = self.logs.entry(key).or_default();
+        let log = self.logs.entry(chain_of(&op)).or_default();
         if let Some(last) = log.last() {
             if op.seq <= last.seq {
                 return match log.iter().find(|o| o.seq == op.seq) {
@@ -108,20 +122,22 @@ impl Store {
         Ok(Append::Appended)
     }
 
-    /// Ops for `(share, origin)` with `seq > from_seq`, in order (the resume tail).
-    pub fn scan(&self, share: &str, origin: &str, from_seq: i64) -> Vec<Op> {
+    /// Ops for a chain `(share, glade_id, key, origin)` with `seq > from_seq`, in
+    /// order (the resume tail for one origin within a zone).
+    pub fn scan(&self, share: &str, glade_id: &str, key: &[u8], origin: &str, from_seq: i64) -> Vec<Op> {
         self.logs
-            .get(&(share.to_string(), origin.to_string()))
+            .get(&(share.to_string(), glade_id.to_string(), key.to_vec(), origin.to_string()))
             .map(|log| log.iter().filter(|o| o.seq > from_seq).cloned().collect())
             .unwrap_or_default()
     }
 
-    /// Per-origin head seq for `share` — the resume vector (origin -> max seq).
-    pub fn heads(&self, share: &str) -> Vec<(String, i64)> {
+    /// Per-origin head seq for a zone `(share, glade_id, key)` — its resume
+    /// vector (origin -> max seq). Different zones (keys) never mix.
+    pub fn heads(&self, share: &str, glade_id: &str, key: &[u8]) -> Vec<(String, i64)> {
         self.logs
             .iter()
-            .filter(|((s, _), _)| s == share)
-            .filter_map(|((_, origin), log)| log.last().map(|o| (origin.clone(), o.seq)))
+            .filter(|((s, g, k, _), _)| s == share && g == glade_id && k.as_slice() == key)
+            .filter_map(|((_, _, _, origin), log)| log.last().map(|o| (origin.clone(), o.seq)))
             .collect()
     }
 }
@@ -160,14 +176,6 @@ fn hex(s: &str) -> String {
     s.bytes().map(|b| format!("{:02x}", b)).collect()
 }
 
-fn unhex(s: &str) -> String {
-    let bytes: Vec<u8> = (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-        .collect();
-    String::from_utf8(bytes).unwrap_or_default()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,10 +208,10 @@ mod tests {
         for n in 1..=3 {
             assert_eq!(s.append(op("sh", "a", n, &[n as u8])).unwrap(), Append::Appended);
         }
-        assert_eq!(s.scan("sh", "a", 0).len(), 3); // all
-        assert_eq!(s.scan("sh", "a", 1).len(), 2); // seq > 1
-        assert_eq!(s.scan("sh", "a", 3).len(), 0); // caught up
-        assert_eq!(s.scan("sh", "missing", 0).len(), 0);
+        assert_eq!(s.scan("sh", "g", &[], "a", 0).len(), 3); // all
+        assert_eq!(s.scan("sh", "g", &[], "a", 1).len(), 2); // seq > 1
+        assert_eq!(s.scan("sh", "g", &[], "a", 3).len(), 0); // caught up
+        assert_eq!(s.scan("sh", "g", &[], "missing", 0).len(), 0);
     }
 
     #[test]
@@ -212,9 +220,30 @@ mod tests {
         s.append(op("sh", "a", 1, b"x")).unwrap();
         s.append(op("sh", "a", 2, b"y")).unwrap();
         s.append(op("sh", "b", 1, b"z")).unwrap();
-        let mut h = s.heads("sh");
+        let mut h = s.heads("sh", "g", &[]);
         h.sort();
         assert_eq!(h, vec![("a".to_string(), 2), ("b".to_string(), 1)]);
+    }
+
+    /// Zones (keys) are independent chains: the *same* (share, glade_id, origin)
+    /// in two different keys keeps two separate seq sequences, and one zone's
+    /// heads/scan never sees the other's ops (the privacy-by-keying property).
+    #[test]
+    fn keys_are_independent_chains() {
+        let mut s = Store::open(fresh("zones")).unwrap();
+        let commons = |seq, p: &[u8]| op("sh", "a", seq, p); // key = []
+        let private = |seq, p: &[u8]| Op { key: b"self:a".to_vec(), ..op("sh", "a", seq, p) };
+        // both chains start at seq 0 — independent, no equivocation across keys
+        s.append(commons(0, b"c0")).unwrap();
+        s.append(private(0, b"p0")).unwrap();
+        s.append(commons(1, b"c1")).unwrap();
+        // each zone sees only its own ops
+        assert_eq!(s.heads("sh", "g", &[]), vec![("a".to_string(), 1)]);
+        assert_eq!(s.heads("sh", "g", b"self:a"), vec![("a".to_string(), 0)]);
+        assert_eq!(s.scan("sh", "g", &[], "a", -1).len(), 2);
+        let priv_ops = s.scan("sh", "g", b"self:a", "a", -1);
+        assert_eq!(priv_ops.len(), 1);
+        assert_eq!(priv_ops[0].payload, b"p0");
     }
 
     #[test]
@@ -280,11 +309,11 @@ mod tests {
             s.append(op("sh", "b", 1, b"bee")).unwrap();
         } // dropped — only the on-disk log remains
         let s = Store::open(&root).unwrap();
-        let a = s.scan("sh", "a", 0);
+        let a = s.scan("sh", "g", &[], "a", 0);
         assert_eq!(a.len(), 2);
         assert_eq!(a[0].payload, b"one");
         assert_eq!(a[1].payload, b"two");
-        let mut h = s.heads("sh");
+        let mut h = s.heads("sh", "g", &[]);
         h.sort();
         assert_eq!(h, vec![("a".to_string(), 2), ("b".to_string(), 1)]);
     }

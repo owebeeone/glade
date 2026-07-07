@@ -1,8 +1,10 @@
-// In-memory per-(share, origin) append-log store (P2.S3, local destination) —
-// the TS port of the rust node's store, with the same chain/equivocation rules
-// (P1.S4). Serializable for hydration (memory now; IndexedDB is the same shape).
+// In-memory per-chain append-log store (P2.S3, local destination) — the TS port
+// of the rust node's store, with the same chain/equivocation rules (P1.S4). The
+// chain identity is (share, glade_id, key, origin): the zone `key` is part of
+// the axis so each zone is independently contiguous (GladeZones.md). Serializable
+// for hydration (memory now; IndexedDB is the same shape).
 
-import { bytesEq } from "./bytes.ts";
+import { bytesEq, hex } from "./bytes.ts";
 import { opHash } from "./hash.ts";
 import type { SchemaIndex } from "./taut/schema.ts";
 
@@ -32,7 +34,7 @@ export class ChainBreak extends Error {}
 export class Gap extends Error {}
 
 export class Store {
-  // "share\x00origin" -> ordered ops
+  // chainKey "share\x00gladeId\x00keyHex\x00origin" -> ordered ops
   private logs = new Map<string, Op[]>();
   private schema: SchemaIndex;
 
@@ -40,13 +42,13 @@ export class Store {
     this.schema = schema;
   }
 
-  private key(share: string, origin: string): string {
-    return `${share}\x00${origin}`;
+  private chainKey(share: string, gladeId: string, key: Uint8Array, origin: string): string {
+    return `${share}\x00${gladeId}\x00${hex(key)}\x00${origin}`;
   }
 
-  /** Append with per-origin chain checks (mirrors the rust store). */
+  /** Append with per-chain checks (mirrors the rust store). */
   append(op: Op): AppendResult {
-    const k = this.key(op.share, op.origin);
+    const k = this.chainKey(op.share, op.glade_id, op.key, op.origin);
     const log = this.logs.get(k) ?? [];
     const last = log[log.length - 1];
     if (last) {
@@ -68,36 +70,39 @@ export class Store {
     return "appended";
   }
 
-  /** Ops for (share, origin) with seq > fromSeq, in order. */
-  scan(share: string, origin: string, fromSeq: number): Op[] {
-    return (this.logs.get(this.key(share, origin)) ?? []).filter((o) => o.seq > fromSeq);
+  /** Ops for a chain (share, glade_id, key, origin) with seq > fromSeq, in order. */
+  scan(share: string, gladeId: string, key: Uint8Array, origin: string, fromSeq: number): Op[] {
+    return (this.logs.get(this.chainKey(share, gladeId, key, origin)) ?? []).filter((o) => o.seq > fromSeq);
   }
 
-  /** Per-origin head seq for a share (the resume vector). */
+  /** Per-chain head seq for a share (the resume vector, keyed by chain so two
+   *  zones of one origin stay distinct). */
   heads(share: string): Map<string, number> {
     const out = new Map<string, number>();
     for (const [k, log] of this.logs) {
-      const [s, origin] = k.split("\x00");
-      if (s === share && log.length) out.set(origin, log[log.length - 1].seq);
+      if (k.startsWith(`${share}\x00`) && log.length) out.set(k, log[log.length - 1].seq);
     }
     return out;
   }
 
-  /** Every op in a share (all origins), for folding a binding. */
-  opsForShare(share: string): Op[] {
+  /** Every op in a zone-surface (share, glade_id, key), across origins — the
+   *  fold input for one bound surface. A different zone's ops are never included. */
+  opsFor(share: string, gladeId: string, key: Uint8Array): Op[] {
+    const prefix = `${share}\x00${gladeId}\x00${hex(key)}\x00`;
     const out: Op[] = [];
     for (const [k, log] of this.logs) {
-      if (k.startsWith(`${share}\x00`)) out.push(...log);
+      if (k.startsWith(prefix)) out.push(...log);
     }
     return out;
   }
 
-  /** Ops the peer holding `their` heads is missing (the gap to ship). */
+  /** Ops the peer holding `their` (chain-keyed) heads is missing — the gap to ship. */
   missingFor(share: string, their: Map<string, number>): Op[] {
     const out: Op[] = [];
-    for (const [origin, _seq] of this.heads(share)) {
-      const from = their.get(origin) ?? -Infinity;
-      out.push(...this.scan(share, origin, from));
+    for (const [k, log] of this.logs) {
+      if (!k.startsWith(`${share}\x00`)) continue;
+      const from = their.get(k) ?? -Infinity;
+      out.push(...log.filter((o) => o.seq > from));
     }
     return out;
   }

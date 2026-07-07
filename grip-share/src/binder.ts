@@ -10,7 +10,7 @@
 import { Session, type Op } from "../../client-ts/src/session.ts";
 import { utf8 } from "../../client-ts/src/bytes.ts";
 
-/** The single M-LIMP share namespace (one share for the app). */
+/** The default share namespace when a scope doesn't map a domain. */
 export const SHARE = "app";
 
 /** grip-core's share hooks, structurally (no grip-core import). */
@@ -18,6 +18,10 @@ export interface ShareDecl {
   gladeId: string;
   shape: string;
   authority?: string;
+  /** Replicated world (maps to the wire `share` via the scope). */
+  domain?: string;
+  /** Converging partition (maps to the wire `key` via the scope). */
+  zone?: string;
 }
 export interface SharableTap {
   share?: ShareDecl;
@@ -28,6 +32,25 @@ export interface SharableTap {
 export interface GrokLike {
   listSharedTaps(): SharableTap[];
 }
+
+/** A surface's wire address: which replicated world, and which zone within it. */
+export interface Addr {
+  share: string;
+  key: Uint8Array;
+}
+
+/** Resolves a surface's declared `domain`/`zone` to its wire `(share, key)`.
+ *  domain -> share, zone -> key (GladeZones.md). The app supplies the policy
+ *  (it knows the current user/document); the binder stays generic. */
+export interface Scope {
+  resolve(decl: ShareDecl): Addr;
+}
+
+/** The trivial scope: one `app` share, the commons zone — preserves the
+ *  single-surface M-LIMP behaviour when no zones are declared. */
+export const DEFAULT_SCOPE: Scope = {
+  resolve: () => ({ share: SHARE, key: new Uint8Array() }),
+};
 
 /** Encode/decode a surface's payload to/from the opaque bytes glade carries.
  *  The default is JSON; a *typed* surface (a declared taut message, keyed by
@@ -52,6 +75,7 @@ export class GripShareBinder {
   private grok: GrokLike;
   private taps = new Map<string, SharableTap>(); // gladeId -> tap
   private shapes = new Map<string, string>(); // gladeId -> shape
+  private addrs = new Map<string, Addr>(); // gladeId -> resolved (share, key)
   private applying = false;
   private offs: Array<() => void> = [];
 
@@ -60,11 +84,17 @@ export class GripShareBinder {
 
   // per-surface payload codecs (glade id -> codec); default JSON.
   private codecs: Map<string, PayloadCodec>;
+  private scope: Scope;
 
-  constructor(grok: GrokLike, session: Session, codecs?: Map<string, PayloadCodec>) {
+  constructor(grok: GrokLike, session: Session, codecs?: Map<string, PayloadCodec>, scope: Scope = DEFAULT_SCOPE) {
     this.grok = grok;
     this.session = session;
     this.codecs = codecs ?? new Map();
+    this.scope = scope;
+  }
+
+  private addrFor(gladeId: string): Addr {
+    return this.addrs.get(gladeId) ?? { share: SHARE, key: new Uint8Array() };
   }
 
   private codecFor(gladeId: string): PayloadCodec {
@@ -78,8 +108,10 @@ export class GripShareBinder {
       const decl = tap.share;
       if (!decl) continue;
       const { gladeId, shape } = decl;
+      const addr = this.scope.resolve(decl); // domain+zone -> (share, key)
       this.taps.set(gladeId, tap);
       this.shapes.set(gladeId, shape);
+      this.addrs.set(gladeId, addr);
 
       // hydrate from any already-known folded state
       this.applyFolded(gladeId);
@@ -90,7 +122,7 @@ export class GripShareBinder {
         const off = tap.subscribeShare(() => {
           if (this.applying) return; // echo guard: remote applies must not re-emit
           const payload = this.codecFor(gladeId).encode(tap.getShareValue?.());
-          const op = this.session.append(SHARE, gladeId, shape, payload);
+          const op = this.session.append(addr.share, gladeId, shape, payload, addr.key);
           this.onLocalOps?.([op]);
         });
         this.offs.push(off);
@@ -98,11 +130,18 @@ export class GripShareBinder {
     }
   }
 
+  /** The distinct zone-surfaces `(share, gladeId, key)` this binder needs the
+   *  transport to subscribe — one per bound surface. Call after `bind()`. */
+  subscriptions(): Array<{ share: string; gladeId: string; key: Uint8Array }> {
+    return [...this.addrs.entries()].map(([gladeId, a]) => ({ share: a.share, gladeId, key: a.key }));
+  }
+
   /** Append one entry to a `log`-shaped binding — each entry is its own op.
    *  The materialized ordered list is folded back onto the bound tap. */
   appendLog(gladeId: string, entry: unknown): Op {
     const shape = this.shapes.get(gladeId) ?? "log";
-    const op = this.session.append(SHARE, gladeId, shape, this.codecFor(gladeId).encode(entry));
+    const addr = this.addrFor(gladeId);
+    const op = this.session.append(addr.share, gladeId, shape, this.codecFor(gladeId).encode(entry), addr.key);
     this.applyFolded(gladeId); // reflect the new entry locally
     this.onLocalOps?.([op]);
     return op;
@@ -126,8 +165,9 @@ export class GripShareBinder {
   private applyFolded(gladeId: string): void {
     const tap = this.taps.get(gladeId);
     const shape = this.shapes.get(gladeId);
-    if (!tap?.applyShareValue || !shape) return;
-    const folded = this.session.fold(SHARE, gladeId, shape);
+    const addr = this.addrs.get(gladeId);
+    if (!tap?.applyShareValue || !shape || !addr) return;
+    const folded = this.session.fold(addr.share, gladeId, shape, addr.key);
     if (folded == null) return;
     const codec = this.codecFor(gladeId);
     this.applying = true;

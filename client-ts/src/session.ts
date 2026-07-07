@@ -23,15 +23,16 @@ export class Session {
     this.store = store ?? new Store(schema);
   }
 
-  /** Append a local op to this origin's chain and return it. */
-  append(share: string, gladeId: string, shape: string, payload: Uint8Array): Op {
-    const ownLog = this.store.scan(share, this.origin, -Infinity);
+  /** Append a local op to this origin's chain within a zone (default commons)
+   *  and return it. The zone `key` selects the chain — its own seq/prev. */
+  append(share: string, gladeId: string, shape: string, payload: Uint8Array, key: Uint8Array = new Uint8Array()): Op {
+    const ownLog = this.store.scan(share, gladeId, key, this.origin, -Infinity);
     const last = ownLog[ownLog.length - 1];
     this.lamport += 1;
     const op: Op = {
       share,
       glade_id: gladeId,
-      key: new Uint8Array(),
+      key,
       origin: this.origin,
       seq: last ? last.seq + 1 : 0,
       prev: last ? opHash(this.schema, last as never) : null,
@@ -57,9 +58,9 @@ export class Session {
     }
   }
 
-  /** Materialize a bound surface by folding its ops. */
-  fold(share: string, gladeId: string, shape: string): Uint8Array | Uint8Array[] | null {
-    const ops: FoldOp[] = this.store.opsForShare(share).filter((o) => o.glade_id === gladeId);
+  /** Materialize a bound surface by folding its zone-surface ops (default commons). */
+  fold(share: string, gladeId: string, shape: string, key: Uint8Array = new Uint8Array()): Uint8Array | Uint8Array[] | null {
+    const ops: FoldOp[] = this.store.opsFor(share, gladeId, key);
     return shape === "log" ? foldLog(ops) : foldValue(ops);
   }
 

@@ -1,7 +1,10 @@
 //! Subscription routing + outbound priority (P1.S3).
 //!
-//! The router fans an op out to the sessions subscribed to its
-//! `(share, glade_id)` — **minus the origin's own session** (no self-echo).
+//! The router fans an op out to the sessions subscribed to its **zone-surface**
+//! `(share, glade_id, key)` — **minus the origin's own session** (no self-echo).
+//! The zone `key` is part of the subscription identity: a peer subscribed to a
+//! commons zone never receives a private zone's ops, because it is not in that
+//! `(share, glade_id, key)` set (privacy by keying, GladeZones.md).
 //! Each session's outbound is a two-lane priority queue: interactive/control
 //! frames preempt bulk log backfill, so a keystroke never waits behind a big
 //! backfill on the single socket (GladeSubstrateV1 §6).
@@ -12,10 +15,10 @@ use glade_wire::generated::Priority;
 
 pub type SessionId = u64;
 
-/// `(share, glade_id) -> subscribed sessions`.
+/// `(share, glade_id, key) -> subscribed sessions` — one entry per zone-surface.
 #[derive(Default)]
 pub struct Router {
-    subs: BTreeMap<(String, String), BTreeSet<SessionId>>,
+    subs: BTreeMap<(String, String, Vec<u8>), BTreeSet<SessionId>>,
 }
 
 impl Router {
@@ -23,12 +26,12 @@ impl Router {
         Self::default()
     }
 
-    pub fn subscribe(&mut self, session: SessionId, share: &str, glade_id: &str) {
-        self.subs.entry((share.into(), glade_id.into())).or_default().insert(session);
+    pub fn subscribe(&mut self, session: SessionId, share: &str, glade_id: &str, key: &[u8]) {
+        self.subs.entry((share.into(), glade_id.into(), key.to_vec())).or_default().insert(session);
     }
 
-    pub fn unsubscribe(&mut self, session: SessionId, share: &str, glade_id: &str) {
-        if let Some(set) = self.subs.get_mut(&(share.into(), glade_id.into())) {
+    pub fn unsubscribe(&mut self, session: SessionId, share: &str, glade_id: &str, key: &[u8]) {
+        if let Some(set) = self.subs.get_mut(&(share.into(), glade_id.into(), key.to_vec())) {
             set.remove(&session);
         }
     }
@@ -40,11 +43,11 @@ impl Router {
         }
     }
 
-    /// Sessions subscribed to `(share, glade_id)` except `from` — the fan-out
-    /// targets for an op originating at `from` (never echoed to itself).
-    pub fn route(&self, from: SessionId, share: &str, glade_id: &str) -> Vec<SessionId> {
+    /// Sessions subscribed to `(share, glade_id, key)` except `from` — the
+    /// fan-out targets for an op originating at `from` (never echoed to itself).
+    pub fn route(&self, from: SessionId, share: &str, glade_id: &str, key: &[u8]) -> Vec<SessionId> {
         self.subs
-            .get(&(share.to_string(), glade_id.to_string()))
+            .get(&(share.to_string(), glade_id.to_string(), key.to_vec()))
             .map(|set| set.iter().copied().filter(|&s| s != from).collect())
             .unwrap_or_default()
     }
@@ -111,12 +114,26 @@ mod tests {
     #[test]
     fn route_reaches_others_minus_origin() {
         let mut r = Router::new();
-        r.subscribe(1, "sh", "g");
-        r.subscribe(2, "sh", "g");
-        r.subscribe(3, "sh", "other"); // different stream
-        assert_eq!(r.route(1, "sh", "g"), vec![2]); // 2 gets it, 1 (origin) does not, 3 not subscribed
-        assert_eq!(r.route(9, "sh", "g"), vec![1, 2]); // a non-member origin reaches both
-        assert!(r.route(1, "sh", "absent").is_empty());
+        r.subscribe(1, "sh", "g", &[]);
+        r.subscribe(2, "sh", "g", &[]);
+        r.subscribe(3, "sh", "other", &[]); // different stream
+        assert_eq!(r.route(1, "sh", "g", &[]), vec![2]); // 2 gets it, 1 (origin) does not, 3 not subscribed
+        assert_eq!(r.route(9, "sh", "g", &[]), vec![1, 2]); // a non-member origin reaches both
+        assert!(r.route(1, "sh", "absent", &[]).is_empty());
+    }
+
+    /// Zone isolation: same (share, glade_id), different key = different audience.
+    /// A commons subscriber and a private subscriber never receive each other's
+    /// ops — the routing half of privacy-by-keying (GladeZones.md).
+    #[test]
+    fn keys_isolate_subscribers() {
+        let mut r = Router::new();
+        r.subscribe(1, "sh", "g", b""); // commons
+        r.subscribe(2, "sh", "g", b""); // commons
+        r.subscribe(3, "sh", "g", b"self:c"); // c's private zone
+        assert_eq!(r.route(1, "sh", "g", b""), vec![2]); // commons op -> only commons peers
+        assert_eq!(r.route(9, "sh", "g", b"self:c"), vec![3]); // private op -> only that zone
+        assert!(r.route(9, "sh", "g", b"self:other").is_empty()); // nobody in another private zone
     }
 
     #[test]
@@ -136,14 +153,14 @@ mod tests {
         let mut router = Router::new();
         let mut out: std::collections::BTreeMap<SessionId, OutQueue> = Default::default();
         for s in [1u64, 2] {
-            router.subscribe(s, "sh", "g");
+            router.subscribe(s, "sh", "g", &[]);
             out.insert(s, OutQueue::new());
         }
         // session 1 (origin "a") submits an op: node stores it, fans out to others
         let o = op("a", 0, b"hello");
         store.append(o.clone()).unwrap();
         let frame = Frame::Ops(Ops { ops: vec![o.clone()], pri: None }).to_bytes();
-        for target in router.route(1, "sh", "g") {
+        for target in router.route(1, "sh", "g", &[]) {
             out.get_mut(&target).unwrap().push(Priority::Interactive, frame.clone());
         }
         // session 2 receives the op; session 1 (origin) gets nothing
