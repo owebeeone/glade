@@ -9,8 +9,16 @@
 pub mod chain;
 pub mod echo;
 pub mod frame;
+pub mod registry;
 pub mod router;
 pub mod server;
 pub mod session;
 pub mod store;
+pub mod sysdata;
+pub mod sysdir;
 pub mod ws;
+
+// Re-export the wire CBOR runtime as `crate::cbor` so the taut-generated
+// `sysdata.rs` (which emits `use crate::cbor::Cbor;`) resolves against the ONE
+// codec runtime the wire crate owns — no second, hand-edited copy.
+pub use glade_wire::cbor;
