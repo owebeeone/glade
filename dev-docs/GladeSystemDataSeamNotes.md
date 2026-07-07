@@ -59,6 +59,20 @@ nothing here changes an existing trace.
    real principal/operator model is owned by the security analysis. It only
    labels this node's `NodeRecord` for `nodes_of(operator)`.
 
+7. **Sysdir boot is OPT-IN — the legacy serve form is unchanged.** (Regression
+   fix: the first cut booted unconditionally, colliding concurrent test spawns
+   on the global `~/.glade/sys/glade-local/instance.lock` and writing the real
+   `$HOME` — breaking the grip-share integration suite.) The two forms:
+
+   | Invocation | Sysdir boot | Touches on disk |
+   | --- | --- | --- |
+   | `glade-node <port> [store_dir]` (legacy, no flags) | none | only `store_dir` (default: a temp dir); NEVER `~/.glade` |
+   | `glade-node --profile P [--name N] [--operator O] [port] [store_dir]` | yes | `$GLADE_HOME` else `$HOME/.glade`, at `sys/<name>/` (+ `store_dir`, default `sys/<name>/cache/store/`) |
+
+   `--name` alone also opts in (profile defaults to `local`). Tests that boot
+   set `GLADE_HOME` to a temp dir; the legacy form needs no isolation because
+   it never looks at the sysdir at all.
+
 ## Regenerating `sysdata.rs`
 
 Never hand-edit the generated file. From the gwz workspace:
