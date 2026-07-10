@@ -1,0 +1,150 @@
+// Glial wiring seam (Lane T step 3b — the GC-3 per-binding cutover).
+//
+// ONE session + ONE WS client for the whole app, glial's instance registry, and
+// the manifest-derived decl/fill/route/codec for each surface. During the
+// cutover the remaining grip-share binder shares this session; when the last
+// binding moves, glial holds the only session reference (GlialClientRuntime
+// §Boundaries: grip-share shrinks to declaration plumbing).
+//
+// Wire-byte compatibility is BY CONSTRUCTION: the route (share, key) comes from
+// the SAME manifestScope the grip-share binder used, the payload codecs are the
+// SAME (JSON default, taut ChatLine), and ops are minted by the SAME
+// client-ts Session — nothing about the stored bytes changes.
+
+import gladeIr from "../../../taut/corpus/glade.ir.json";
+import workspaceIr from "../ir/workspace.ir.json";
+import { loadSchema } from "../../client-ts/src/taut/schema.ts";
+import * as tautCodec from "../../client-ts/src/taut/codec.ts";
+import { Session, type Op } from "../../client-ts/src/session.ts";
+import { GladeClient } from "../../client-ts/src/client.ts";
+import {
+  GlialBinder,
+  MemoryStoreEngine,
+  SessionDestination,
+  type Fill,
+  type OpBus,
+  type SessionLike,
+  type WireOp,
+} from "@owebeeone/glial-runtime";
+import type { PayloadCodec } from "@owebeeone/glial-runtime/grip";
+import type { BindingDecl, DomainAnchor, Shape, ZoneKind } from "@owebeeone/glade-decl";
+import { manifestScope, surfaceDecl } from "../../grip-share/src/manifest.ts";
+import { WORKSPACE_MANIFEST, stubGrant } from "./manifest";
+
+const schema = loadSchema(gladeIr as never);
+const appSchema = loadSchema(workspaceIr as never);
+
+/** One activity-log entry — the declared `ChatLine` taut message. */
+export interface ChatLine {
+  ts: number;
+  user: string;
+  text: string;
+}
+
+/** taut codecs keyed by the manifest's surface `type`. Types absent here
+ *  (e.g. "Text") use the JSON default — the same bytes as before the cutover. */
+export const CODECS_BY_TYPE: Record<string, PayloadCodec> = {
+  ChatLine: {
+    encode: (v) => tautCodec.encode(appSchema, "ChatLine", v as never),
+    decode: (b) => tautCodec.decode(appSchema, "ChatLine", b),
+  },
+};
+
+// Stable per-tab origin across reloads, so the node resumes our own log rather
+// than treating every reload as a new participant.
+function stableOrigin(): string {
+  const key = "glade-origin";
+  let o = localStorage.getItem(key);
+  if (!o) {
+    o = Math.random().toString(36).slice(2, 8);
+    localStorage.setItem(key, o);
+  }
+  return o;
+}
+
+const params = new URLSearchParams(location.search);
+export const origin = stableOrigin();
+/** The participant identity — keys the private zone. Defaults to this tab, so
+ *  two tabs are different users (private selection stays separate); `?user=alice`
+ *  on both makes them the same user (private selection converges). */
+export const user = params.get("user") ?? origin;
+/** The open document — its own replicated world. `?doc=7` joins another. */
+export const doc = params.get("doc") ?? "1";
+
+// The share-space policy is manifest data; identity/doc come from the grant.
+export const grant = stubGrant(user, doc);
+export const scope = manifestScope(WORKSPACE_MANIFEST, grant);
+
+// --- the one session + WS carrier ------------------------------------------
+
+export const session = new Session(schema, origin);
+export const client = new GladeClient(schema, origin, session);
+
+/** The WS carrier as glial's `OpBus`: publish ships to the node; inbound node
+ *  ops fan to every subscriber (each `SessionDestination` filters its route,
+ *  echo-guarded by origin). */
+class ClientBus implements OpBus {
+  private handlers = new Set<(ops: WireOp[]) => void>();
+  publish(ops: WireOp[]): void {
+    client.sendOps(ops as unknown as Op[]);
+  }
+  onOps(handler: (ops: WireOp[]) => void): () => void {
+    this.handlers.add(handler);
+    return () => this.handlers.delete(handler);
+  }
+  /** Inbound node ops (wired to `client.onOps` in glade.ts). */
+  deliver(ops: Op[]): void {
+    for (const h of [...this.handlers]) h(ops as unknown as WireOp[]);
+  }
+}
+export const bus = new ClientBus();
+
+/** glial's instance registry — persistence first (in-memory engine for now,
+ *  GC-4), connectivity configured per mount via `destFor`. */
+export const glial = new GlialBinder(new MemoryStoreEngine(), origin);
+
+// --- manifest-derived declaration data per surface --------------------------
+
+const ANCHOR: Record<string, DomainAnchor> = { doc: "document", account: "account" };
+
+/** The app-static `BindingDecl` for a manifest surface (glade-decl vocabulary). */
+export function declFor(gladeId: string): BindingDecl {
+  const s = WORKSPACE_MANIFEST.surfaces[gladeId];
+  if (!s) throw new Error(`manifest has no surface ${gladeId}`);
+  return {
+    glade_id: { id: gladeId },
+    shape: s.shape as Shape,
+    authority: "share",
+    source: null,
+    domain: ANCHOR[s.domain] ?? "deployment",
+    zone: s.zone as ZoneKind,
+    retention: { policy: "from_cursor", ttl_ms: null },
+  };
+}
+
+/** The concrete fill for a surface: the decl's domain anchor filled with the
+ *  open doc / the account owner; private zones keyed to the participant. */
+export function fillFor(gladeId: string): Fill {
+  const s = WORKSPACE_MANIFEST.surfaces[gladeId];
+  if (!s) throw new Error(`manifest has no surface ${gladeId}`);
+  const fill: Fill = { domain: s.domain === "doc" ? doc : user, zone: s.zone };
+  if (s.zone === "private") fill.key = user;
+  return fill;
+}
+
+/** Connectivity, config-as-data: the session-backed glade destination for a
+ *  surface. The route's (share, key) comes from the SAME manifest scope the
+ *  grip-share binder resolved — identical wire address, identical bytes. */
+export function destFor(gladeId: string): (fill: Fill) => SessionDestination {
+  const s = WORKSPACE_MANIFEST.surfaces[gladeId];
+  if (!s) throw new Error(`manifest has no surface ${gladeId}`);
+  const addr = scope.resolve(surfaceDecl(WORKSPACE_MANIFEST, gladeId));
+  const route = { share: addr.share, gladeId, shape: s.shape, key: addr.key };
+  return () => new SessionDestination(session as unknown as SessionLike, bus, route);
+}
+
+/** The surface's payload codec (undefined = the adapter's JSON default). */
+export function codecFor(gladeId: string): PayloadCodec | undefined {
+  const s = WORKSPACE_MANIFEST.surfaces[gladeId];
+  return s ? CODECS_BY_TYPE[s.type] : undefined;
+}

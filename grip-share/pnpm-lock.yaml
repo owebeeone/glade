@@ -1,0 +1,16 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    devDependencies:
+      '@owebeeone/glade-decl':
+        specifier: link:../../glade-decl-ts
+        version: link:../../glade-decl-ts
+      '@owebeeone/glial-runtime':
+        specifier: link:../../glial
+        version: link:../../glial

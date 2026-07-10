@@ -9,7 +9,10 @@ import type { ChatLine } from "./glade";
 // owns the surface's domain/zone/shape (GladeZones.md, GladeManifest sketch).
 // That declaration is the entire opt-in to sharing (GQ-5); the binder's
 // (manifest-derived) scope maps domain+zone to the wire (share, key).
-const share = (gladeId: string) => surfaceDecl(WORKSPACE_MANIFEST, gladeId);
+// (`as never`: grip-core's dist now types ShareDecl.shape/domain as the
+// glade-decl unions while grip-share's structural ShareDecl is stringly — a
+// pre-existing drift; this whole helper dies with the GC-3 cutover.)
+const share = (gladeId: string) => surfaceDecl(WORKSPACE_MANIFEST, gladeId) as never;
 
 export function registerAllTaps(): void {
   // PRIVATE: my selection in this document — keyed to me, never shared.
