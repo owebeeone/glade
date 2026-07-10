@@ -14,10 +14,11 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 import { loadSchema } from "../../client-ts/src/taut/schema.ts";
+import { encode as tautEncode, decode as tautDecode } from "../../client-ts/src/taut/codec.ts";
 import { Session, type Op } from "../../client-ts/src/session.ts";
 import { GladeClient } from "../../client-ts/src/client.ts";
 import { utf8 } from "../../client-ts/src/bytes.ts";
-import { GripShareBinder, type GrokLike, type Scope, type SharableTap } from "../src/binder.ts";
+import { GripShareBinder, type GrokLike, type PayloadCodec, type Scope, type SharableTap } from "../src/binder.ts";
 import {
   GlialBinder,
   MemoryStoreEngine,
@@ -69,9 +70,7 @@ const jsonBytes = (v: unknown) => utf8(JSON.stringify(v ?? null));
 class ClientBus implements OpBus {
   published: WireOp[] = [];
   private handlers = new Set<(ops: WireOp[]) => void>();
-  constructor(private readonly client: GladeClient) {
-    client.onOps = (ops) => this.deliver(ops);
-  }
+  constructor(private readonly client: GladeClient) {}
   publish(ops: WireOp[]): void {
     this.published.push(...ops);
     this.client.sendOps(ops as unknown as Op[]);
@@ -97,11 +96,29 @@ function decl(id: string, shape: "value" | "log", domain: "account" | "document"
   };
 }
 
-/** A glial-era participant: one mounted binding over the real node. */
-async function glialParticipant(origin: string, url: string, d: BindingDecl, fill: Fill, route: Route) {
+/** A glial-era participant: one mounted binding over the real node. `codec`
+ *  defaults to the JSON default codec; a typed surface passes its own. */
+async function glialParticipant(
+  origin: string,
+  url: string,
+  d: BindingDecl,
+  fill: Fill,
+  route: Route,
+  codec: { encode(v: unknown): Uint8Array; decode(b: Uint8Array): unknown } = {
+    encode: jsonBytes,
+    decode: (b) => JSON.parse(dec.decode(b)),
+  },
+) {
   const session = new Session(schema, origin);
   const client = new GladeClient(schema, origin, session);
   const bus = new ClientBus(client);
+  // the demo's carrier wiring (glade.ts): the session sees EVERY inbound op —
+  // truthful heads AND own-chain resume for a fresh page session (own-origin
+  // ops are echo-guarded out of the instance path; the session store dedups).
+  client.onOps = (ops) => {
+    session.applyRemote(ops);
+    bus.deliver(ops);
+  };
   // mount BEFORE subscribe (the demo's order: registerAllTaps then
   // startGladeSync) so the replay the node sends on subscribe is not dropped.
   const glial = new GlialBinder(new MemoryStoreEngine(), origin);
@@ -116,12 +133,19 @@ async function glialParticipant(origin: string, url: string, d: BindingDecl, fil
     bus,
     events,
     mount,
-    /** decoded JSON view of a value surface */
+    session,
+    /** decoded view of a value surface */
     value: () => {
       const e = events[events.length - 1];
-      return e?.value ? JSON.parse(dec.decode(e.value)) : undefined;
+      return e?.value ? codec.decode(e.value) : undefined;
+    },
+    /** decoded ordered view of a log surface */
+    records: () => {
+      const e = events[events.length - 1];
+      return (e?.records ?? []).map((r) => codec.decode(r.payload));
     },
     setJson: (v: unknown) => mount.instance.write(jsonBytes(v)),
+    append: (v: unknown) => mount.instance.write(codec.encode(v)),
   };
 }
 
@@ -151,10 +175,10 @@ function fakeAtom(gladeId: string, shape = "value") {
     },
   };
 }
-async function binderParticipant(origin: string, url: string, tap: SharableTap, scope: Scope) {
+async function binderParticipant(origin: string, url: string, tap: SharableTap, scope: Scope, codecs?: Map<string, PayloadCodec>) {
   const session = new Session(schema, origin);
   const grok: GrokLike = { listSharedTaps: () => [tap] };
-  const binder = new GripShareBinder(grok, session, undefined, scope);
+  const binder = new GripShareBinder(grok, session, codecs, scope);
   const client = new GladeClient(schema, origin, session);
   const shipped: Op[] = [];
   client.onOps = (ops) => binder.applyRemote(ops);
@@ -292,6 +316,116 @@ test("cutover 3/4 app:selection: private zone stays per-user across eras; key by
 
     alice.client.close();
     bob.client.close();
+  } finally {
+    child.kill();
+  }
+});
+
+// ---- binding 4: app:activity (log, doc domain, commons, taut ChatLine) ------
+
+const appSchema = loadSchema(
+  JSON.parse(readFileSync(join(here, "..", "..", "demo", "ir", "workspace.ir.json"), "utf8")),
+);
+interface ChatLine {
+  ts: number;
+  user: string;
+  text: string;
+}
+const chatCodec = {
+  encode: (v: unknown) => tautEncode(appSchema, "ChatLine", v as never),
+  decode: (b: Uint8Array) => tautDecode(appSchema, "ChatLine", b),
+};
+
+test("cutover 4/4 app:activity: typed log interleaves across eras; taut payload bytes identical", async () => {
+  const { port, child } = await startNode("activity");
+  const url = `ws://127.0.0.1:${port}`;
+  try {
+    const share = "doc:1";
+    const scope: Scope = { resolve: () => ({ share, key: new Uint8Array() }) };
+    const route: Route = { share, gladeId: "app:activity", shape: "log", key: new Uint8Array() };
+
+    // binder-era participant: log tap + the ChatLine codec (the demo's old wiring).
+    let list: unknown[] = [];
+    const logTap: SharableTap = {
+      share: { gladeId: "app:activity", shape: "log" },
+      applyShareValue: (v: unknown) => (list = v as unknown[]),
+    };
+    const A = await binderParticipant("a", url, logTap, scope, new Map([["app:activity", chatCodec]]));
+    const B = await glialParticipant(
+      "b",
+      url,
+      decl("app:activity", "log", "document", "commons"),
+      { domain: "1" },
+      route,
+      chatCodec,
+    );
+
+    const l1: ChatLine = { ts: 1000, user: "alice", text: "opened src/main.rs" };
+    const l2: ChatLine = { ts: 2000, user: "bob", text: "posted from glial" };
+    const l3: ChatLine = { ts: 3000, user: "alice", text: "replied" };
+
+    A.binder.appendLog("app:activity", l1);
+    await until(() => B.records().length === 1);
+    B.append(l2);
+    await until(() => list.length === 2);
+    A.binder.appendLog("app:activity", l3);
+    await until(() => B.records().length === 3);
+
+    // both eras converge to the SAME ordered, decoded list.
+    assert.deepEqual(B.records(), list);
+    assert.deepEqual(
+      (list as ChatLine[]).map((l) => l.text),
+      ["opened src/main.rs", "posted from glial", "replied"],
+    );
+
+    // wire-byte evidence: the glial-era entry is the taut ChatLine encoding,
+    // byte-identical to what the binder era ships for the same entry.
+    const gOp = B.bus.published[0];
+    assert.equal(gOp.glade_id, "app:activity");
+    assert.deepEqual([...gOp.payload], [...chatCodec.encode(l2)]);
+    const bOp = A.shipped[0];
+    assert.deepEqual([...bOp.payload], [...chatCodec.encode(l1)]);
+
+    A.client.close();
+    B.client.close();
+  } finally {
+    child.kill();
+  }
+});
+
+// ---- regression: reload-resume (same origin, fresh session) -----------------
+// A tab reload keeps its stable origin but rebuilds session + binder. The
+// session must resume its own chain off the node replay (the demo carrier
+// feeds every inbound op to the session) — otherwise the next write restarts
+// at seq 0: a forked chain the node rightly drops (observed live, 2026-07-10).
+
+test("cutover regression: a reloaded tab (same origin, fresh session) resumes its chain", async () => {
+  const { port, child } = await startNode("reload");
+  const url = `ws://127.0.0.1:${port}`;
+  try {
+    const share = "doc:1";
+    const route: Route = { share, gladeId: "app:notes", shape: "value", key: new Uint8Array() };
+    const d = decl("app:notes", "value", "document", "commons");
+
+    // page life 1: write, then the tab goes away.
+    const P1 = await glialParticipant("tab-x", url, d, { domain: "1" }, route);
+    P1.setJson("first note");
+    await new Promise((r) => setTimeout(r, 100));
+    P1.client.close();
+
+    // page life 2: SAME origin, fresh session/binder — the reload.
+    const P2 = await glialParticipant("tab-x", url, d, { domain: "1" }, route);
+    await until(() => P2.session.dump().length >= 1); // replay hydrated the session
+    P2.setJson("second note");
+
+    // the op continued the chain (seq 1, not a forked seq 0)...
+    assert.equal(P2.bus.published[0].seq, 1);
+    // ...so the node accepts it and a witness converges to the NEW value.
+    const W = await glialParticipant("witness", url, d, { domain: "1" }, route);
+    await until(() => W.value() === "second note");
+
+    P2.client.close();
+    W.client.close();
   } finally {
     child.kill();
   }

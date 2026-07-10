@@ -14,6 +14,7 @@ export const NOTES = defineGrip<string>("Notes", "");
 export const NOTES_TAP = defineGrip<any>("Notes.tap", undefined);
 
 export const ACTIVITY = defineGrip<ChatLine[]>("Activity", []);
+export const ACTIVITY_TAP = defineGrip<any>("Activity.tap", undefined);
 
 export const STATUS = defineGrip<string>("Status", "");
 export const STATUS_TAP = defineGrip<any>("Status.tap", undefined);

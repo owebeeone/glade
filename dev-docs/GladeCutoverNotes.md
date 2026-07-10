@@ -79,6 +79,32 @@ through the real rust node, plus absolute payload-byte asserts.
   registerAllTaps then startGladeSync), else the subscribe replay races the bus
   handler. Live demo: reloaded page folded the pre-cutover store value
   (existing-store compat), browser→probe and probe→browser both converged.
+- **RELOAD-RESUME GAP found during 4/4 (live-demo verification, 2026-07-10).**
+  With the binder's `applyRemote` gone, a tab reload (same stable origin,
+  fresh session) broke the README-promised "reload a tab and the node resyncs
+  it" in TWO ways: (a) the participant's OWN prior state no longer displayed
+  (glial's `SessionDestination` echo-guards own-origin ops out of the node
+  replay, and the in-memory store engine starts empty), and (b) the fresh
+  session restarted its chain at seq 0 — the node correctly treats the next
+  write as a forked chain and DROPS it (observed live: a `selected README.md`
+  op silently lost). The binder era masked both by applying every inbound op
+  to the session. Resolution — two DESIGNED seams, no glial edit, no
+  grip-share coupling:
+  1. carrier wiring (demo glade.ts): `client.onOps` feeds EVERY inbound op to
+     the session before the bus — truthful heads/resume vectors + own-chain
+     resume (session store dedups; SessionDestination's per-route
+     `applyRemote` double-apply is harmless);
+  2. a demo-grade `BrowserStoreEngine` (sessionStorage, per-tab) in glial's
+     GC-4 `StoreEngine` slot — rule-1 persistence proper, so own state
+     survives reload locally.
+  Regression test: glial_cutover "reloaded tab resumes its chain" (asserts
+  seq continues at 1 and a witness converges to the post-reload write).
+  **Glial should own this natively** (report filed with the cutover): a
+  session-hydration story for `attachGlade`/SessionDestination (own-origin
+  replay must reach the session it minted from, even though it must not
+  re-fold into the instance) + the real GC-4 persistent engine. Residual until
+  then: offline-from-boot writes after a reload (no node replay to hydrate
+  seq) can still fork — same hole the binder era had.
 - **3/4 `app:selection`** — private zone: the `self:{user}` key rides the
   glial route (from the same manifest scope). Interop test "cutover 3/4":
   binder-era alice + glial-era bob each pick privately, isolation holds both
@@ -87,3 +113,18 @@ through the real rust node, plus absolute payload-byte asserts.
   `self:alice` on the node; a bob probe's pick stayed under `self:bob`;
   neither crossed. (Browser-driving aside: preview_click didn't reach React's
   onClick; element.click() via eval did — app behavior itself fine.)
+- **4/4 `app:activity`** — the typed log: taut ChatLine codec rides the glial
+  mount (`codecFor`); `postActivity` writes through the glial controller
+  (`ACTIVITY_TAP` handle grip, `append` = one op per entry); the demo-side
+  grip-share binder wiring is gone (glade.ts no longer imports the binder).
+  Interop test "cutover 4/4": binder-era and glial-era participants interleave
+  ChatLines through the real node to the same ordered decoded list; glial op
+  payload asserted byte-identical to `taut encode(ChatLine)`. Live demo: 22
+  binder-era taut entries hydrated + decoded; post + selection-click entries
+  landed (chain seq 0→1→2 across three page lives, verified in the node op
+  dump); probe append appeared in the browser.
+- **Pre-existing (not introduced here, not fixed):** two tabs of the SAME
+  browser profile share the localStorage `glade-origin`, so concurrent writes
+  from both tabs can fork that origin's chain — binder era had the identical
+  hole (the README's two-tab flow works because replay usually hydrates before
+  a write, and distinct surfaces have distinct chains).

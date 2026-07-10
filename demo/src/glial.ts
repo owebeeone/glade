@@ -19,11 +19,13 @@ import { Session, type Op } from "../../client-ts/src/session.ts";
 import { GladeClient } from "../../client-ts/src/client.ts";
 import {
   GlialBinder,
-  MemoryStoreEngine,
   SessionDestination,
   type Fill,
+  type InstanceStore,
   type OpBus,
   type SessionLike,
+  type StoredOp,
+  type StoreEngine,
   type WireOp,
 } from "@owebeeone/glial-runtime";
 import type { PayloadCodec } from "@owebeeone/glial-runtime/grip";
@@ -99,9 +101,74 @@ class ClientBus implements OpBus {
 }
 export const bus = new ClientBus();
 
-/** glial's instance registry — persistence first (in-memory engine for now,
- *  GC-4), connectivity configured per mount via `destFor`. */
-export const glial = new GlialBinder(new MemoryStoreEngine(), origin);
+// --- the browser store engine (glial rule 1, the GC-4 seam) -----------------
+//
+// Persistence first: every instance's op log rides sessionStorage, so a tab
+// RELOAD restores the participant's OWN writes locally (remote state refills
+// off the node replay; own-origin ops are echo-guarded out of it by design).
+// sessionStorage (not localStorage) keeps the store per-tab, matching the
+// per-tab origin/session model. Demo-grade: JSON+base64, no quota/eviction
+// policy — the real engine (IndexedDB, retention-aware) is GC-4's.
+
+const b64 = (b: Uint8Array) => btoa(String.fromCharCode(...b));
+const unb64 = (s: string) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+
+class BrowserInstanceStore implements InstanceStore {
+  private ops: StoredOp[] = [];
+  constructor(private readonly storageKey: string) {
+    try {
+      const raw = sessionStorage.getItem(storageKey);
+      if (raw) {
+        this.ops = (JSON.parse(raw) as Array<Record<string, unknown>>).map((o) => ({
+          origin: o.origin as string,
+          seq: o.seq as number,
+          lamport: o.lamport as number,
+          prev: o.prev == null ? null : unb64(o.prev as string),
+          payload: unb64(o.payload as string),
+        }));
+      }
+    } catch {
+      this.ops = []; // a corrupt entry never wedges the app; the node refills
+    }
+  }
+  append(op: StoredOp): void {
+    // dedup by (origin, seq) — a re-delivered op is not stored twice.
+    if (this.ops.some((o) => o.origin === op.origin && o.seq === op.seq)) return;
+    this.ops.push(op);
+    try {
+      sessionStorage.setItem(
+        this.storageKey,
+        JSON.stringify(
+          this.ops.map((o) => ({
+            origin: o.origin,
+            seq: o.seq,
+            lamport: o.lamport,
+            prev: o.prev == null ? null : b64(o.prev),
+            payload: b64(o.payload),
+          })),
+        ),
+      );
+    } catch {
+      // quota: keep serving from memory; persistence degrades, app does not.
+    }
+  }
+  all(): StoredOp[] {
+    return this.ops.slice();
+  }
+}
+
+class BrowserStoreEngine implements StoreEngine {
+  open(instanceKey: string): InstanceStore {
+    return new BrowserInstanceStore(`glial:ops:${instanceKey}`);
+  }
+  drop(instanceKey: string): void {
+    sessionStorage.removeItem(`glial:ops:${instanceKey}`);
+  }
+}
+
+/** glial's instance registry — persistence first (browser store engine in the
+ *  GC-4 seam), connectivity configured per mount via `destFor`. */
+export const glial = new GlialBinder(new BrowserStoreEngine(), origin);
 
 // --- manifest-derived declaration data per surface --------------------------
 
