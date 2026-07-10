@@ -1,9 +1,24 @@
-import { createAtomValueTap } from "@owebeeone/grip-react";
+import { createAtomValueTap, type Grip } from "@owebeeone/grip-react";
+import { glialTap } from "@owebeeone/glial-runtime/grip";
 import { surfaceDecl } from "../../grip-share/src/manifest.ts";
 import { grok } from "./runtime";
 import { SELECTION, SELECTION_TAP, NOTES, NOTES_TAP, ACTIVITY, STATUS, STATUS_TAP } from "./grips";
 import { WORKSPACE_MANIFEST } from "./manifest";
+import { codecFor, declFor, destFor, fillFor, glial } from "./glial";
 import type { ChatLine } from "./glade";
+
+/** A cut-over surface: a glial mount consumed through the adapter tap. Decl,
+ *  fill, destination and codec are all manifest-derived data (GC-3). */
+const glialSurface = <T,>(gladeId: string, grip: Grip<T>, handleGrip?: Grip<any>) =>
+  glialTap<T>({
+    binder: glial,
+    decl: declFor(gladeId),
+    grip,
+    fill: fillFor(gladeId),
+    codec: codecFor(gladeId),
+    handleGrip,
+    gladeFor: destFor(gladeId),
+  });
 
 // A tap declares only *which* surface it provides (its glade id); the manifest
 // owns the surface's domain/zone/shape (GladeZones.md, GladeManifest sketch).
@@ -30,7 +45,6 @@ export function registerAllTaps(): void {
   );
   // ACCOUNT domain: my status follows me across documents (a different domain,
   // not this document) — proving a session is attached to several domains.
-  grok.registerTap(
-    createAtomValueTap(STATUS, { initial: "", handleGrip: STATUS_TAP, share: share("app:status") }),
-  );
+  // CUT OVER (GC-3 1/4): a glial mount; the grip-share binder no longer sees it.
+  grok.registerTap(glialSurface("app:status", STATUS, STATUS_TAP) as never);
 }

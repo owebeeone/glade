@@ -61,4 +61,14 @@ through the real rust node, plus absolute payload-byte asserts.
 
 ## Per-binding log
 
-- (pending)
+- **1/4 `app:status`** — glial mount via `glialSurface()` in taps.ts
+  (decl/fill/codec/dest all manifest-derived data). Interop test
+  `glial_cutover.test.ts` "cutover 1/4": binder-era tab and glial-era tab of
+  the same user converge both directions through the real node; the glial op's
+  `(share, key, shape, payload)` asserted byte-identical to the binder era
+  (JSON payload bytes). Live demo check: browser (glial) wrote
+  `account:alice`/`app:status`; a headless client-ts probe read it back and
+  wrote a reply that appeared in the browser input. Note: grip-share's test
+  runner moved `--experimental-strip-types` → `--experimental-transform-types`
+  (glial's `SessionDestination` uses TS parameter properties, which strip-only
+  mode rejects; transform mode is the same built-in loader).
