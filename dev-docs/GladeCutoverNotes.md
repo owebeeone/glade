@@ -128,3 +128,42 @@ through the real rust node, plus absolute payload-byte asserts.
   from both tabs can fork that origin's chain — binder era had the identical
   hole (the README's two-tab flow works because replay usually hydrates before
   a write, and distinct surfaces have distinct chains).
+
+## The deletion (final commit) — what remains in grip-share and why
+
+`src/binder.ts` (the `GripShareBinder` class: bind/appendLog/applyRemote/
+resync/subscriptions — the direct tap↔glade session coupling) is DELETED.
+grip-share keeps exactly the declaration plumbing GlialClientRuntime
+§Boundaries says survives:
+
+- `src/decl.ts` — the share-space vocabulary: `ShareDecl` (the structural
+  share hooks grip-core's AtomValueTap exposes), `Scope`/`Addr` (domain/zone →
+  wire `(share, key)`), `PayloadCodec`, `SHARE`/`DEFAULT_SCOPE`,
+  `collectGladeIds` (GQ-6 manifest input). No session, no folds, no transport.
+- `src/manifest.ts` — unchanged: `Manifest`/`Grant`, `manifestScope`,
+  `surfaceDecl`, `manifestCodecs` (the share-space spec as data). The demo
+  still derives every glial route/codec from it.
+
+The compile wall: nothing under `grip-share/src` imports `client-ts` session
+or transport code anymore (decl.ts uses only `bytes.ts` for utf8).
+
+## Coverage mapping (the 12 binder-era tests → the 17 post-cutover tests)
+
+| binder-era test (12) | post-cutover home |
+| --- | --- |
+| binder: two binders converge lww, no echo | glial_path: two glial participants converge lww, no echo |
+| binder: consumer untouched (local set/get) | glial_path: mount with no glade destination serves local writes |
+| binder: collectGladeIds sorted/deduped | decl.test (unchanged behavior; moved with the code) |
+| binder: late binder hydrates from peer state | glial_path: late participant hydrates from captured ops |
+| log: append order + cold + cursor replay | log_binding (glial path, LocalMesh) |
+| log: two writers interleave deterministically | log_binding (glial path) |
+| manifest ×3 | manifest.test (untouched) |
+| mlimp §11 converge/restart/offline/echo | mlimp (glial participants: one session+client+binder, three mounts, reconnect resync) |
+| node_integration: workspace converge (lww+log) | node_integration (glial browser-shaped participants) |
+| node_integration: zones commons/private | node_integration (glial) |
+
+Plus the five cutover tests added during the migration (per-binding wire-format
+pins + the reload-resume regression). The cross-era (binder↔glial) interop
+runs live in git history fc0f7cf..5da0533; after the deletion the wire format
+is pinned absolutely (share/key/shape fields + payload bytes vs the
+era-invariant JSON / taut-ChatLine encodings).

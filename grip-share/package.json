@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Grip Share binder (GLP-0005 P3) \u2014 binds grok's share-declared taps to a glade session by glade id. grip-core-agnostic: operates on the structural share hooks, bridges to the glade Session/folds.",
+  "description": "Grip Share declaration plumbing (post GC-3): the share-space vocabulary — ShareDecl share hooks, manifest-driven domain/zone -> wire (share, key) scope, payload-codec shape, glade-id manifest input. The binder (direct tap<->glade session coupling) was deleted; bindings are glial mounts.",
   "scripts": {
     "test": "node --experimental-transform-types --test test/*.test.ts"
   },

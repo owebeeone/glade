@@ -9,7 +9,7 @@
 // a stub grant from the URL; nothing here changes when the agent issues it.
 
 import { utf8 } from "../../client-ts/src/bytes.ts";
-import type { Addr, PayloadCodec, Scope, ShareDecl } from "./binder.ts";
+import type { Addr, PayloadCodec, Scope, ShareDecl } from "./decl.ts";
 
 export interface SurfaceSpec {
   domain: string;
