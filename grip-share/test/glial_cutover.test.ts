@@ -249,3 +249,50 @@ test("cutover 2/4 app:notes: late glial joiner hydrates binder-era state; conver
     child.kill();
   }
 });
+
+// ---- binding 3: app:selection (value, doc domain, PRIVATE zone) --------------
+
+test("cutover 3/4 app:selection: private zone stays per-user across eras; key bytes identical", async () => {
+  const { port, child } = await startNode("selection");
+  const url = `ws://127.0.0.1:${port}`;
+  try {
+    const share = "doc:1";
+    const keyFor = (u: string) => utf8(`self:${u}`); // the demo manifest's private zone
+    // alice stays binder-era; bob is cut over to glial.
+    const aliceScope: Scope = { resolve: () => ({ share, key: keyFor("alice") }) };
+    const bobRoute: Route = { share, gladeId: "app:selection", shape: "value", key: keyFor("bob") };
+
+    const aliceSel = fakeAtom("app:selection");
+    const alice = await binderParticipant("alice", url, aliceSel, aliceScope);
+    const bob = await glialParticipant(
+      "bob",
+      url,
+      decl("app:selection", "value", "document", "private"),
+      { domain: "1", zone: "private", key: "bob" },
+      bobRoute,
+    );
+
+    aliceSel.set("src/main.rs");
+    bob.setJson("Cargo.toml");
+    await until(() => bob.value() === "Cargo.toml");
+    await until(() => aliceSel.get() === "src/main.rs");
+    // let any (erroneous) cross-delivery arrive, then assert isolation held.
+    await new Promise((r) => setTimeout(r, 120));
+    assert.equal(aliceSel.get(), "src/main.rs"); // never bob's pick
+    assert.equal(bob.value(), "Cargo.toml"); // never alice's pick
+
+    // wire-byte evidence: the glial op carries the same self-keyed zone key
+    // format and JSON payload the binder era wrote.
+    const gOp = bob.bus.published[0];
+    const bOp = alice.shipped[0];
+    assert.equal(gOp.share, bOp.share);
+    assert.deepEqual([...gOp.key], [...keyFor("bob")]);
+    assert.deepEqual([...bOp.key], [...keyFor("alice")]);
+    assert.deepEqual([...gOp.payload], [...jsonBytes("Cargo.toml")]);
+
+    alice.client.close();
+    bob.client.close();
+  } finally {
+    child.kill();
+  }
+});

@@ -31,9 +31,8 @@ const share = (gladeId: string) => surfaceDecl(WORKSPACE_MANIFEST, gladeId) as n
 
 export function registerAllTaps(): void {
   // PRIVATE: my selection in this document — keyed to me, never shared.
-  grok.registerTap(
-    createAtomValueTap(SELECTION, { initial: "", handleGrip: SELECTION_TAP, share: share("app:selection") }),
-  );
+  // CUT OVER (GC-3 3/4): a glial mount (the private-zone key rides the route).
+  grok.registerTap(glialSurface("app:selection", SELECTION, SELECTION_TAP) as never);
   // COMMONS: the document's shared notes — everyone in this document.
   // CUT OVER (GC-3 2/4): a glial mount.
   grok.registerTap(glialSurface("app:notes", NOTES, NOTES_TAP) as never);

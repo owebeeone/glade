@@ -79,3 +79,11 @@ through the real rust node, plus absolute payload-byte asserts.
   registerAllTaps then startGladeSync), else the subscribe replay races the bus
   handler. Live demo: reloaded page folded the pre-cutover store value
   (existing-store compat), browser→probe and probe→browser both converged.
+- **3/4 `app:selection`** — private zone: the `self:{user}` key rides the
+  glial route (from the same manifest scope). Interop test "cutover 3/4":
+  binder-era alice + glial-era bob each pick privately, isolation holds both
+  ways, key bytes asserted identical to the binder era (`self:bob` utf8) +
+  JSON payload bytes. Live demo: alice's (glial) pick landed under
+  `self:alice` on the node; a bob probe's pick stayed under `self:bob`;
+  neither crossed. (Browser-driving aside: preview_click didn't reach React's
+  onClick; element.click() via eval did — app behavior itself fine.)
