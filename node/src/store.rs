@@ -16,7 +16,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use glade_wire::cbor;
-use glade_wire::generated::Op;
+use glade_wire::generated::{Head, Op, StreamHeads};
 
 use crate::chain::op_hash;
 
@@ -27,6 +27,24 @@ pub enum Append {
     Appended,
     /// `seq` already present with the *same* hash (idempotent re-delivery).
     Duplicate,
+}
+
+/// A self-contained equivocation proof (GQ-9, SY4): two validly-shaped ops
+/// signed into the SAME `(origin, zone, seq)` slot with different hashes. The
+/// origin forked its own history; the proof convicts the origin, not the
+/// carrier. `a` is the op the store already held; `b` is the conflicting
+/// arrival. The chain id is derivable from either (both share it).
+#[derive(Debug, Clone, PartialEq)]
+pub struct EquivProof {
+    pub a: Op,
+    pub b: Op,
+}
+
+impl EquivProof {
+    /// The forked `(share, glade_id, key, origin, seq)` slot.
+    pub fn slot(&self) -> (String, String, Vec<u8>, String, i64) {
+        (self.a.share.clone(), self.a.glade_id.clone(), self.a.key.clone(), self.a.origin.clone(), self.a.seq)
+    }
 }
 
 #[derive(Debug)]
@@ -60,6 +78,9 @@ fn chain_of(op: &Op) -> ChainId {
 pub struct Store {
     root: PathBuf,
     logs: BTreeMap<ChainId, Vec<Op>>,
+    /// Recorded equivocation proofs (persisted under `<root>/proofs/`), in
+    /// detection order. A fork is data with a signature on it — kept, not lost.
+    proofs: Vec<EquivProof>,
 }
 
 impl Store {
@@ -76,6 +97,12 @@ impl Store {
                 if !share_ent.file_type()?.is_dir() {
                     continue;
                 }
+                // The equivocation-proof journal lives at `<root>/proofs/`; it is
+                // NOT a share (share dirs are hex, never "proofs") — skip it here,
+                // it is replayed separately below.
+                if share_ent.file_name() == "proofs" {
+                    continue;
+                }
                 for log_ent in fs::read_dir(share_ent.path())? {
                     let log_ent = log_ent?;
                     let fname = log_ent.file_name().to_string_lossy().to_string();
@@ -87,7 +114,8 @@ impl Store {
                 }
             }
         }
-        Ok(Store { root, logs })
+        let proofs = read_proofs(&proofs_path(&root))?;
+        Ok(Store { root, logs, proofs })
     }
 
     /// Append `op` to its `(share, glade_id, key, origin)` chain, with per-chain
@@ -99,27 +127,69 @@ impl Store {
     ///   unverified (M-LIMP lenient — honest clients always set it).
     /// - otherwise a forward **gap**.
     pub fn append(&mut self, op: Op) -> Result<Append, StoreError> {
-        let log = self.logs.entry(chain_of(&op)).or_default();
-        if let Some(last) = log.last() {
-            if op.seq <= last.seq {
-                return match log.iter().find(|o| o.seq == op.seq) {
-                    Some(stored) if op_hash(stored) == op_hash(&op) => Ok(Append::Duplicate),
-                    Some(_) => Err(StoreError::Equivocation { origin: op.origin, seq: op.seq }),
-                    None => Ok(Append::Duplicate), // below retained range — treat as seen
-                };
+        let chain = chain_of(&op);
+        // Classify against the current tail without holding a borrow of `logs`
+        // across the proof write / push (equivocation records into `proofs`).
+        match classify(self.logs.get(&chain), &op) {
+            Verdict::Duplicate => Ok(Append::Duplicate),
+            Verdict::Gap { expected, got } => Err(StoreError::Gap { expected, got }),
+            Verdict::ChainBreak => Err(StoreError::ChainBreak { origin: op.origin, seq: op.seq }),
+            Verdict::Equivocation(stored) => {
+                // Two signed ops, one slot — persist the fork proof, then reject.
+                self.record_equivocation(EquivProof { a: stored, b: op.clone() })?;
+                Err(StoreError::Equivocation { origin: op.origin, seq: op.seq })
             }
-            if op.seq != last.seq + 1 {
-                return Err(StoreError::Gap { expected: last.seq + 1, got: op.seq });
-            }
-            if let Some(prev) = &op.prev {
-                if prev.as_slice() != op_hash(last) {
-                    return Err(StoreError::ChainBreak { origin: op.origin, seq: op.seq });
-                }
+            Verdict::Appended => {
+                append_to_log(&self.root, &op)?;
+                self.logs.entry(chain).or_default().push(op);
+                Ok(Append::Appended)
             }
         }
-        append_to_log(&self.root, &op)?;
-        log.push(op);
-        Ok(Append::Appended)
+    }
+
+    /// Persist an equivocation proof (both ops) under `<root>/proofs/` and keep
+    /// it in memory. Idempotent-ish: the same fork re-detected appends again,
+    /// which is harmless (proofs are evidence, not state).
+    fn record_equivocation(&mut self, proof: EquivProof) -> Result<(), StoreError> {
+        append_proof(&proofs_path(&self.root), &proof)?;
+        self.proofs.push(proof);
+        Ok(())
+    }
+
+    /// Recorded equivocation proofs, in detection order.
+    pub fn equivocation_proofs(&self) -> &[EquivProof] {
+        &self.proofs
+    }
+
+    /// Every zone-surface `(share, glade_id, key)` this store holds, deduped.
+    pub fn zones(&self) -> Vec<(String, String, Vec<u8>)> {
+        let mut zs: Vec<_> = self
+            .logs
+            .keys()
+            .map(|(s, g, k, _)| (s.clone(), g.clone(), k.clone()))
+            .collect();
+        zs.dedup();
+        zs
+    }
+
+    /// Every zone's version vector as `StreamHeads` — the per-(origin, zone)
+    /// HEADS exchange unit. Each `Head` carries the origin's chain-head hash, so
+    /// a peer can spot a same-seq/different-head fork straight off the vectors.
+    pub fn all_heads(&self) -> Vec<StreamHeads> {
+        self.zones()
+            .into_iter()
+            .map(|(share, glade_id, key)| {
+                let heads = self
+                    .logs
+                    .iter()
+                    .filter(|((s, g, k, _), _)| *s == share && *g == glade_id && *k == key)
+                    .filter_map(|((_, _, _, origin), log)| {
+                        log.last().map(|o| Head { origin: origin.clone(), seq: o.seq, hash: Some(op_hash(o).to_vec()) })
+                    })
+                    .collect();
+                StreamHeads { share, glade_id, key, heads }
+            })
+            .collect()
     }
 
     /// Ops for a chain `(share, glade_id, key, origin)` with `seq > from_seq`, in
@@ -140,6 +210,64 @@ impl Store {
             .filter_map(|((_, _, _, origin), log)| log.last().map(|o| (origin.clone(), o.seq)))
             .collect()
     }
+}
+
+/// The append verdict for one op against its chain's current tail. Split out so
+/// `append` can decide without holding a borrow of `logs` across a proof write.
+enum Verdict {
+    Appended,
+    Duplicate,
+    Gap { expected: i64, got: i64 },
+    ChainBreak,
+    /// An op already sits at this `(origin, seq)` with a different hash — a fork.
+    /// Carries the stored op so the proof can be assembled.
+    Equivocation(Op),
+}
+
+fn classify(log: Option<&Vec<Op>>, op: &Op) -> Verdict {
+    let Some(last) = log.and_then(|l| l.last()) else { return Verdict::Appended };
+    if op.seq <= last.seq {
+        // Safe to unwrap the log: we found `last` in it.
+        return match log.unwrap().iter().find(|o| o.seq == op.seq) {
+            Some(stored) if op_hash(stored) == op_hash(op) => Verdict::Duplicate,
+            Some(stored) => Verdict::Equivocation(stored.clone()),
+            None => Verdict::Duplicate, // below retained range — treat as seen
+        };
+    }
+    if op.seq != last.seq + 1 {
+        return Verdict::Gap { expected: last.seq + 1, got: op.seq };
+    }
+    if let Some(prev) = &op.prev {
+        if prev.as_slice() != op_hash(last) {
+            return Verdict::ChainBreak;
+        }
+    }
+    Verdict::Appended
+}
+
+fn proofs_path(root: &Path) -> PathBuf {
+    root.join("proofs").join("equivocations.log")
+}
+
+/// Append a proof as two length-prefixed op CBORs (a then b), mirroring the op
+/// journal's framing. The chain/seq is recoverable from the ops themselves.
+fn append_proof(path: &Path, proof: &EquivProof) -> Result<(), StoreError> {
+    fs::create_dir_all(path.parent().unwrap())?;
+    let mut f = OpenOptions::new().create(true).append(true).open(path)?;
+    for op in [&proof.a, &proof.b] {
+        let bytes = cbor::encode(&op.to_cbor());
+        f.write_all(&(bytes.len() as u32).to_le_bytes())?;
+        f.write_all(&bytes)?;
+    }
+    Ok(())
+}
+
+fn read_proofs(path: &Path) -> Result<Vec<EquivProof>, StoreError> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let ops = read_log(path)?; // same framing — a flat run of ops, paired up
+    Ok(ops.chunks_exact(2).map(|p| EquivProof { a: p[0].clone(), b: p[1].clone() }).collect())
 }
 
 fn log_path(root: &Path, share: &str, origin: &str) -> PathBuf {
@@ -296,6 +424,45 @@ mod tests {
         match s.append(a1) {
             Err(StoreError::ChainBreak { origin, seq }) => assert_eq!((origin.as_str(), seq), ("a", 1)),
             other => panic!("expected ChainBreak, got {other:?}"),
+        }
+    }
+
+    /// SY4: two signed ops in one (origin, zone, seq) slot are detected AND the
+    /// proof (both ops) is persisted as a record — it survives a restart.
+    #[test]
+    fn equivocation_records_and_persists_proof() {
+        let root = fresh("equiv-proof");
+        {
+            let mut s = Store::open(&root).unwrap();
+            s.append(op("sh", "a", 0, b"p0")).unwrap();
+            let err = s.append(op("sh", "a", 0, b"p0-fork")).unwrap_err();
+            assert!(matches!(err, StoreError::Equivocation { .. }));
+            assert_eq!(s.equivocation_proofs().len(), 1);
+            let p = &s.equivocation_proofs()[0];
+            assert_eq!(p.a.payload, b"p0"); // the op we held
+            assert_eq!(p.b.payload, b"p0-fork"); // the conflicting arrival
+            assert_eq!(p.slot(), ("sh".into(), "g".into(), vec![], "a".into(), 0));
+        }
+        // reopen: the real op is in the journal, the proof in its own record.
+        let s = Store::open(&root).unwrap();
+        assert_eq!(s.equivocation_proofs().len(), 1);
+        assert_eq!(s.equivocation_proofs()[0].b.payload, b"p0-fork");
+        assert_eq!(s.scan("sh", "g", &[], "a", -1).len(), 1); // fork never folded
+    }
+
+    /// `all_heads` yields one `StreamHeads` per zone, each head carrying the
+    /// origin's 32-byte chain-head hash (the same-seq/different-head tripwire).
+    #[test]
+    fn all_heads_are_per_zone_with_chain_hash() {
+        let mut s = Store::open(fresh("all-heads")).unwrap();
+        s.append(op("sh", "a", 0, b"x")).unwrap(); // commons zone
+        s.append(Op { key: b"self:a".to_vec(), ..op("sh", "a", 0, b"y") }).unwrap(); // private zone
+        let ah = s.all_heads();
+        assert_eq!(ah.len(), 2); // two zones, independent
+        for sh in &ah {
+            assert_eq!(sh.heads.len(), 1);
+            assert_eq!(sh.heads[0].seq, 0);
+            assert_eq!(sh.heads[0].hash.as_ref().unwrap().len(), 32);
         }
     }
 

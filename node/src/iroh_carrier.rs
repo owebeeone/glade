@@ -111,6 +111,9 @@ impl PeerEndpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::peer::{pull_sync, serve_sync};
+    use crate::store::Store;
+    use glade_wire::generated::{Op, Shape};
 
     /// The DIAL over REAL iroh QUIC: dialer binds, acceptor binds, dialer dials
     /// by direct address, both complete the node<->node HELLO and each learns
@@ -132,5 +135,51 @@ mod tests {
 
         let served = acc.await.unwrap().unwrap().unwrap();
         assert_eq!(served.peer.peer_id, dial_id, "acceptor learns dialer node_id over iroh");
+    }
+
+    /// Full s-sync over REAL iroh QUIC: the acceptor serves a store with a
+    /// prev-linked chain; the dialer pulls it over the same HELLO'd connection
+    /// and converges, verified per op. Carrier + sync, end to end on localhost.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sync_over_iroh() {
+        let dir = std::env::temp_dir().join("glade-iroh-sync-srv");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut server = Store::open(&dir).unwrap();
+        let mut prev = None;
+        for seq in 0..4 {
+            let o = Op {
+                share: "sh".into(), glade_id: "g".into(), key: vec![], origin: "a".into(),
+                seq, prev: prev.clone(), lamport: seq, refs: vec![], shape: Shape::Value,
+                payload: format!("a{seq}").into_bytes(),
+            };
+            server.append(o.clone()).unwrap();
+            prev = Some(crate::chain::op_hash(&o).to_vec());
+        }
+
+        let acceptor = PeerEndpoint::bind().await.unwrap();
+        let dialer = PeerEndpoint::bind().await.unwrap();
+        let acc_addr = acceptor.addr().unwrap();
+
+        let acc_ep = acceptor.clone();
+        let acc = tokio::spawn(async move {
+            let mut link = acc_ep.accept().await.unwrap().unwrap();
+            let sent = serve_sync(&mut link.recv, &mut link.send, &server).await;
+            // Keep `link` (hence the connection) alive until the dialer has read
+            // the finished stream — dropping it early would reset the stream.
+            (link, sent)
+        });
+
+        let cdir = std::env::temp_dir().join("glade-iroh-sync-cli");
+        let _ = std::fs::remove_dir_all(&cdir);
+        let mut client = Store::open(&cdir).unwrap();
+        let mut link = dialer.dial(&acc_addr).await.unwrap();
+        let out = pull_sync(&mut link.recv, &mut link.send, &mut client).await.unwrap();
+        let (_served, sent) = acc.await.unwrap();
+        let sent = sent.unwrap();
+
+        assert_eq!(sent, 4);
+        assert_eq!(out.applied, 4);
+        assert!(out.rejected.is_empty());
+        assert_eq!(client.scan("sh", "g", &[], "a", -1).len(), 4);
     }
 }
