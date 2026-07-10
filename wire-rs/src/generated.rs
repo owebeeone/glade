@@ -17,6 +17,8 @@ pub enum FrameType {
     ChannelClose,
     Chunk,
     Error,
+    NodeHello,
+    NodeWelcome,
 }
 impl FrameType {
     pub fn wire(self) -> i64 { match self {
@@ -33,6 +35,8 @@ impl FrameType {
         Self::ChannelClose => 10,
         Self::Chunk => 11,
         Self::Error => 12,
+        Self::NodeHello => 13,
+        Self::NodeWelcome => 14,
     } }
     pub fn from_wire(v: i64) -> Self { match v {
         0 => Self::Hello,
@@ -48,6 +52,8 @@ impl FrameType {
         10 => Self::ChannelClose,
         11 => Self::Chunk,
         12 => Self::Error,
+        13 => Self::NodeHello,
+        14 => Self::NodeWelcome,
         _ => panic!("bad FrameType wire value {}", v),
     } }
 }
@@ -265,6 +271,52 @@ impl Welcome {
             session: c.get(1).text(),
             protocol: c.get(2).int(),
             heads: c.get(3).array().iter().map(|x| StreamHeads::from_cbor(x)).collect(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct NodeHello {
+    pub node_id: Vec<u8>,
+    pub protocol: i64,
+    pub sig: Option<Vec<u8>>,
+}
+impl NodeHello {
+    pub fn to_cbor(&self) -> Cbor {
+        Cbor::Map(vec![
+            (1, Cbor::Bytes(self.node_id.clone())),
+            (2, Cbor::Int(self.protocol)),
+            (3, match &self.sig { Some(v) => Cbor::Bytes(v.clone()), None => Cbor::Null }),
+        ])
+    }
+    pub fn from_cbor(c: &Cbor) -> Self {
+        Self {
+            node_id: c.get(1).bytes(),
+            protocol: c.get(2).int(),
+            sig: { let v = c.get(3); if v.is_null() { None } else { Some(v.bytes()) } },
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct NodeWelcome {
+    pub node_id: Vec<u8>,
+    pub protocol: i64,
+    pub sig: Option<Vec<u8>>,
+}
+impl NodeWelcome {
+    pub fn to_cbor(&self) -> Cbor {
+        Cbor::Map(vec![
+            (1, Cbor::Bytes(self.node_id.clone())),
+            (2, Cbor::Int(self.protocol)),
+            (3, match &self.sig { Some(v) => Cbor::Bytes(v.clone()), None => Cbor::Null }),
+        ])
+    }
+    pub fn from_cbor(c: &Cbor) -> Self {
+        Self {
+            node_id: c.get(1).bytes(),
+            protocol: c.get(2).int(),
+            sig: { let v = c.get(3); if v.is_null() { None } else { Some(v.bytes()) } },
         }
     }
 }
@@ -536,6 +588,8 @@ pub fn roundtrip(message: &str, bytes: &[u8]) -> Vec<u8> {
         "Op" => crate::cbor::encode(&Op::from_cbor(&c).to_cbor()),
         "Hello" => crate::cbor::encode(&Hello::from_cbor(&c).to_cbor()),
         "Welcome" => crate::cbor::encode(&Welcome::from_cbor(&c).to_cbor()),
+        "NodeHello" => crate::cbor::encode(&NodeHello::from_cbor(&c).to_cbor()),
+        "NodeWelcome" => crate::cbor::encode(&NodeWelcome::from_cbor(&c).to_cbor()),
         "Subscribe" => crate::cbor::encode(&Subscribe::from_cbor(&c).to_cbor()),
         "Unsubscribe" => crate::cbor::encode(&Unsubscribe::from_cbor(&c).to_cbor()),
         "Ops" => crate::cbor::encode(&Ops::from_cbor(&c).to_cbor()),
@@ -562,6 +616,8 @@ pub static VECTORS: &[(&str, &str, &str)] = &[
     ("Head", "Head", "a3016273310219012c0343030102"),
     ("Heads", "Heads", "a10181a4016273310262733203430301020481a3016273310219012c0343030102"),
     ("Hello", "Hello", "a5016273310219012c0362733304430401020581a4016273310262733203430301020481a3016273310219012c0343030102"),
+    ("NodeHello", "NodeHello", "a301430101020219012c0343030102"),
+    ("NodeWelcome", "NodeWelcome", "a301430101020219012c0343030102"),
     ("Op", "Op", "aa01627331026273320343030102046273340526064306010207000881a3016273310219012c034303010209000a430a0102"),
     ("Ops", "Ops", "a20181aa01627331026273320343030102046273340526064306010207000881a3016273310219012c034303010209000a430a01020202"),
     ("StreamHeads", "StreamHeads", "a4016273310262733203430301020481a3016273310219012c0343030102"),

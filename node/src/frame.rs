@@ -7,7 +7,7 @@
 use glade_wire::cbor;
 use glade_wire::generated::{
     ChannelClose, ChannelData, ChannelOpen, Error, ExchangeReq, ExchangeRes, FrameType, Heads,
-    Hello, Ops, Subscribe, Unsubscribe, Welcome,
+    Hello, NodeHello, NodeWelcome, Ops, Subscribe, Unsubscribe, Welcome,
 };
 
 /// One decoded frame.
@@ -15,6 +15,9 @@ use glade_wire::generated::{
 pub enum Frame {
     Hello(Hello),
     Welcome(Welcome),
+    // node<->node handshake seam (Lane R step 2): peer identity, not a session.
+    NodeHello(NodeHello),
+    NodeWelcome(NodeWelcome),
     Subscribe(Subscribe),
     Unsubscribe(Unsubscribe),
     Ops(Ops),
@@ -33,6 +36,8 @@ impl Frame {
         let (ty, body) = match self {
             Frame::Hello(m) => (FrameType::Hello, m.to_cbor()),
             Frame::Welcome(m) => (FrameType::Welcome, m.to_cbor()),
+            Frame::NodeHello(m) => (FrameType::NodeHello, m.to_cbor()),
+            Frame::NodeWelcome(m) => (FrameType::NodeWelcome, m.to_cbor()),
             Frame::Subscribe(m) => (FrameType::Subscribe, m.to_cbor()),
             Frame::Unsubscribe(m) => (FrameType::Unsubscribe, m.to_cbor()),
             Frame::Ops(m) => (FrameType::Ops, m.to_cbor()),
@@ -56,6 +61,8 @@ impl Frame {
         Ok(match FrameType::from_wire(tag as i64) {
             FrameType::Hello => Frame::Hello(Hello::from_cbor(&c)),
             FrameType::Welcome => Frame::Welcome(Welcome::from_cbor(&c)),
+            FrameType::NodeHello => Frame::NodeHello(NodeHello::from_cbor(&c)),
+            FrameType::NodeWelcome => Frame::NodeWelcome(NodeWelcome::from_cbor(&c)),
             FrameType::Subscribe => Frame::Subscribe(Subscribe::from_cbor(&c)),
             FrameType::Unsubscribe => Frame::Unsubscribe(Unsubscribe::from_cbor(&c)),
             FrameType::Ops => Frame::Ops(Ops::from_cbor(&c)),

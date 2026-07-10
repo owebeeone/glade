@@ -15,3 +15,7 @@ path = "src/bin/glade-node.rs"
 glade-wire = { path = "../wire-rs" }
 sha2 = "0.10"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+# node<->node QUIC carrier (Lane R step 2). Client-facing WS carrier (ws.rs) has
+# no new deps; iroh rides only the peer path. tls-ring gives the crypto provider
+# used by presets::Minimal (relay + discovery disabled — direct dial only).
+iroh = "1"

@@ -9,6 +9,8 @@
 pub mod chain;
 pub mod echo;
 pub mod frame;
+pub mod iroh_carrier;
+pub mod peer;
 pub mod registry;
 pub mod router;
 pub mod server;
