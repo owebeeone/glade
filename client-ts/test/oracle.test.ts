@@ -37,8 +37,12 @@ test("op_hash reproduces the chain oracle (glade_hashes.json)", () => {
   }
 });
 
-test("folds reproduce the fold oracle (glade_folds.json)", () => {
-  const folds = JSON.parse(readFileSync(join(corpus, "glade_folds.json"), "utf8"));
+test("folds reproduce the fold oracle (taut-shape fold.v0.json)", () => {
+  // Canonical fold semantics moved to taut-shape (Lane C P2, 2026-07-10);
+  // taut's glade_folds.json remains as the frozen source it was re-homed from.
+  const folds = JSON.parse(
+    readFileSync(join(here, "..", "..", "..", "taut-shape", "corpus", "fold.v0.json"), "utf8"),
+  ).vectors;
   for (const c of folds) {
     const ops: FoldOp[] = c.ops.map((o: any) => ({
       origin: o.origin,
