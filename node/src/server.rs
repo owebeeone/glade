@@ -14,7 +14,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
 
 use glade_wire::cbor;
-use glade_wire::generated::{Head, Heads, Op, Ops, StreamHeads, Welcome};
+use glade_wire::generated::{Error, ErrorCode, Head, Heads, Op, Ops, StreamHeads, Welcome};
 
 use crate::echo::Echo;
 use crate::frame::Frame;
@@ -144,29 +144,53 @@ async fn handle(shared: Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
             }
             Frame::Subscribe(s) => {
                 // A subscription is to one zone-surface (share, glade_id, key);
-                // absent key = the commons zone. Register, then ship only that
-                // zone's gap — a private zone never reaches another subscriber.
+                // absent key = the commons zone. The C2 routing decision picks
+                // where it is served (mesh-less nodes are always Local — the
+                // legacy contract, unchanged).
                 let key = s.key.clone().unwrap_or_default();
-                shared.router.lock().await.subscribe(sid, &s.share, &s.glade_id, &key);
-                let their = client_heads.get(&(s.share.clone(), s.glade_id.clone(), key.clone())).cloned().unwrap_or_default();
-                let (server_heads, gap) = {
-                    let st = shared.store.lock().await;
-                    (heads_map(&st, &s.share, &s.glade_id, &key), missing_for(&st, &s.share, &s.glade_id, &key, &their))
-                };
-                let ack = Frame::Heads(Heads {
-                    streams: vec![StreamHeads {
-                        share: s.share.clone(),
-                        glade_id: s.glade_id.clone(),
-                        key: key.clone(),
-                        heads: server_heads
-                            .iter()
-                            .map(|(o, sq)| Head { origin: o.clone(), seq: *sq, hash: None })
-                            .collect(),
-                    }],
-                });
-                send(&shared, sid, &ack).await;
-                if !gap.is_empty() {
-                    send(&shared, sid, &Frame::Ops(Ops { ops: gap, pri: None })).await;
+                match crate::mesh::route_subscribe(&shared, &s.share).await {
+                    crate::mesh::Route::Absent(reason) => {
+                        // The trace's STATUS step (E5): absence is data with a
+                        // reason, never silence — and the session stays usable.
+                        let status = Frame::Error(Error {
+                            code: ErrorCode::UnknownShare,
+                            message: reason,
+                            share: Some(s.share.clone()),
+                            glade_id: Some(s.glade_id.clone()),
+                            corr: None,
+                        });
+                        send(&shared, sid, &status).await;
+                    }
+                    route => {
+                        // Local AND Forward both register + ack + ship the gap
+                        // from the LOCAL replica (the replica serves the reads);
+                        // Forward additionally routes the interest to the
+                        // claim holder, whose ops arrive and fan out here.
+                        shared.router.lock().await.subscribe(sid, &s.share, &s.glade_id, &key);
+                        let their = client_heads.get(&(s.share.clone(), s.glade_id.clone(), key.clone())).cloned().unwrap_or_default();
+                        let (server_heads, gap) = {
+                            let st = shared.store.lock().await;
+                            (heads_map(&st, &s.share, &s.glade_id, &key), missing_for(&st, &s.share, &s.glade_id, &key, &their))
+                        };
+                        let ack = Frame::Heads(Heads {
+                            streams: vec![StreamHeads {
+                                share: s.share.clone(),
+                                glade_id: s.glade_id.clone(),
+                                key: key.clone(),
+                                heads: server_heads
+                                    .iter()
+                                    .map(|(o, sq)| Head { origin: o.clone(), seq: *sq, hash: None })
+                                    .collect(),
+                            }],
+                        });
+                        send(&shared, sid, &ack).await;
+                        if !gap.is_empty() {
+                            send(&shared, sid, &Frame::Ops(Ops { ops: gap, pri: None })).await;
+                        }
+                        if let crate::mesh::Route::Forward(peer) = route {
+                            crate::mesh::forward_interest(&shared, peer, s.share.clone(), s.glade_id.clone(), key.clone()).await;
+                        }
+                    }
                 }
             }
             Frame::Ops(ops) => {
