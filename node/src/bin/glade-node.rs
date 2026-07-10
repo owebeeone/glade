@@ -9,29 +9,43 @@
 //! singleton lock here would collide, and tests must never write $HOME).
 //!
 //! **Booted profile form** (opt-in): `glade-node --profile local|peer|server
-//! [--name NAME] [--operator OP] [PORT] [STORE_DIR]` — FIRST boots the
-//! system-data instance (GDL-036): acquires `~/.glade/sys/<name>/` (the
-//! profile picks the default name; `--name` overrides; `GLADE_HOME` overrides
-//! `$HOME/.glade`), runs the load-validation ladder, materialises the
-//! RegistryApi fold, and writes its own presence — the node serves itself from
-//! its own disk BEFORE any client connects (the s-boot trace). Then it serves
-//! the app-data carrier as before.
+//! [--name NAME] [--operator OP] [--peer ID@IP:PORT]... [PORT] [STORE_DIR]` —
+//! FIRST boots the system-data instance (GDL-036): acquires
+//! `~/.glade/sys/<name>/` (the profile picks the default name; `--name`
+//! overrides; `GLADE_HOME` overrides `$HOME/.glade`), runs the load-validation
+//! ladder, materialises the RegistryApi fold, and writes its own presence —
+//! the node serves itself from its own disk BEFORE any client connects (the
+//! s-boot trace). The registry then seeds the served store (the home share is
+//! an ORDINARY share, GDL-038), the iroh peer endpoint binds with the node's
+//! directory identity and accepts inbound peer links (prints
+//! `peer <endpoint-id> <ip:port>` — the dial target for a `--peer` flag on
+//! another node), and each `--peer` target is dialed and the home share
+//! converged. Then it serves the app-data carrier as before.
 //!
 //! Either form binds 127.0.0.1:<port> (0 = OS-assigned) and prints
 //! `listening <port>` so a parent process can read the actual port.
 
 use std::io::Write;
 
+use glade_node::iroh_carrier::{PeerAddr, PeerEndpoint};
 use glade_node::registry::{RegistryApi, HOME};
 use glade_node::server::Server;
 use glade_node::sysdir::{boot, now_ms, Profile};
 use tokio::net::TcpListener;
+
+/// Parse a `--peer` target: `<endpoint-id-hex>@<ip:port>` (the two values a
+/// peer prints as `peer <id> <addr>`).
+fn parse_peer(s: &str) -> Option<PeerAddr> {
+    let (id, sock) = s.split_once('@')?;
+    Some(PeerAddr { endpoint_id: id.parse().ok()?, socket: sock.parse().ok()? })
+}
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let mut profile: Option<Profile> = None;
     let mut name: Option<String> = None;
     let mut operator: Option<String> = None;
+    let mut peers: Vec<String> = Vec::new();
     let mut positional: Vec<String> = Vec::new();
 
     let mut args = std::env::args().skip(1);
@@ -40,6 +54,7 @@ async fn main() -> std::io::Result<()> {
             "--profile" => profile = args.next().and_then(|s| Profile::parse(&s)),
             "--name" => name = args.next(),
             "--operator" => operator = args.next(),
+            "--peer" => peers.extend(args.next()),
             _ => positional.push(a),
         }
     }
@@ -72,6 +87,27 @@ async fn main() -> std::io::Result<()> {
     });
 
     let server = Server::open(&dir)?;
+
+    // ---- peer fabric (booted forms only; the legacy form never binds it) ----
+    // Seed the served store from the boot registry (dir.* becomes an ordinary
+    // share on the ordinary rails), bind iroh with the DIRECTORY identity, run
+    // the accept loop, and converge with each `--peer` target.
+    if let Some(node) = &booted {
+        server.seed_registry(&node.registry.snapshot()).await;
+        let endpoint = PeerEndpoint::bind_with(node.identity()?).await?;
+        let addr = server.enable_mesh(endpoint).await?;
+        println!("peer {} {}", addr.endpoint_id, addr.socket);
+        for p in &peers {
+            match parse_peer(p) {
+                Some(target) => match server.connect_peer(&target).await {
+                    Ok(id) => println!("peer-connected {id}"),
+                    Err(e) => eprintln!("peer {p}: {e}"),
+                },
+                None => eprintln!("peer {p}: expected <endpoint-id>@<ip:port>"),
+            }
+        }
+    }
+
     let listener = TcpListener::bind(("127.0.0.1", port)).await?;
     let actual = listener.local_addr()?.port();
     println!("listening {actual}");

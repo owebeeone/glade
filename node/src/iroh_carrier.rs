@@ -27,6 +27,18 @@ fn other<E: Into<Box<dyn std::error::Error + Send + Sync>>>(e: E) -> io::Error {
     io::Error::new(io::ErrorKind::Other, e)
 }
 
+/// The one endpoint recipe both constructors share: localhost, `presets::Minimal`
+/// (relay + discovery disabled), the glade ALPN.
+async fn bind_endpoint() -> io::Result<Endpoint> {
+    Endpoint::builder(presets::Minimal)
+        .alpns(vec![ALPN.to_vec()])
+        .bind_addr((Ipv4Addr::LOCALHOST, 0))
+        .map_err(other)?
+        .bind()
+        .await
+        .map_err(other)
+}
+
 /// A dialable address for a peer: its endpoint id + a direct socket address
 /// (localhost, no relay). Enough for `Endpoint::connect` with discovery off.
 #[derive(Clone, Copy, Debug)]
@@ -61,15 +73,19 @@ impl PeerEndpoint {
     /// Bind a localhost QUIC endpoint (relay + discovery disabled). The glade
     /// identity is derived from the iroh key: `node_id = sha256(iroh pubkey)`.
     pub async fn bind() -> io::Result<PeerEndpoint> {
-        let endpoint = Endpoint::builder(presets::Minimal)
-            .alpns(vec![ALPN.to_vec()])
-            .bind_addr((Ipv4Addr::LOCALHOST, 0))
-            .map_err(other)?
-            .bind()
-            .await
-            .map_err(other)?;
+        let endpoint = bind_endpoint().await?;
         let key = *endpoint.secret_key().public().as_bytes();
         Ok(PeerEndpoint { endpoint, identity: NodeIdentity::from_key(key) })
+    }
+
+    /// Bind with an EXPLICIT glade identity (a booted node passes the identity
+    /// derived from its `node.key`, `sysdir::Boot::identity`). The iroh key
+    /// stays transport-only; the glade node_id spoken on the HELLO seam is then
+    /// the same identity the directory's records attribute — which is what lets
+    /// a folded `ServeClaim.node` match a live peer link.
+    pub async fn bind_with(identity: NodeIdentity) -> io::Result<PeerEndpoint> {
+        let endpoint = bind_endpoint().await?;
+        Ok(PeerEndpoint { endpoint, identity })
     }
 
     pub fn identity(&self) -> &NodeIdentity {

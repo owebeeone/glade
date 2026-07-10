@@ -31,6 +31,7 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
+use crate::peer::NodeIdentity;
 use crate::registry::{BlobStore, Record, Registry, RegistryApi, StoreApi, HOME};
 use crate::sysdata::{NodeRecord, ServeClaim};
 
@@ -114,7 +115,26 @@ pub struct Boot {
     pub store: BlobStore,
     /// records quarantined by verify-as-ingest (load evidence).
     pub rejected: usize,
+    /// The raw class-1 node key bytes — kept in memory ONLY to derive the peer
+    /// identity ([`Boot::identity`]); never shipped, never in any snapshot.
+    node_key: Vec<u8>,
     _lock: InstanceLock,
+}
+
+impl Boot {
+    /// The peer-link identity for this node: `NodeIdentity::from_key(node.key)`,
+    /// so the node_id spoken on the node<->node HELLO seam is the raw-bytes twin
+    /// of the hex NodeId in directory records — ONE identity, two renderings.
+    /// Claim routing depends on this: a folded `ServeClaim.node` (hex) must
+    /// match the id a peer link vouches.
+    pub fn identity(&self) -> io::Result<NodeIdentity> {
+        let key: [u8; 32] = self
+            .node_key
+            .as_slice()
+            .try_into()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "node.key is not 32 bytes"))?;
+        Ok(NodeIdentity::from_key(key))
+    }
 }
 
 /// Boot a node for `profile`, optionally overriding the instance name and the
@@ -132,7 +152,7 @@ pub fn boot_at(dir: PathBuf, operator: &str) -> io::Result<Boot> {
     let lock = InstanceLock::acquire(dir.join("instance.lock"))?;
 
     // ---- class 1: node.key -> NodeId (ssh-discipline perms) ----------------
-    let node_id = load_or_create_node_key(&dir)?;
+    let (node_key, node_id) = load_or_create_node_key(&dir)?;
 
     // ---- class 2: records.json -> verify-as-ingest -> the fold -------------
     let store = BlobStore::new(&dir);
@@ -161,13 +181,13 @@ pub fn boot_at(dir: PathBuf, operator: &str) -> io::Result<Boot> {
         store.save(&registry.snapshot())?; // rewritten tmp+rename
     }
 
-    Ok(Boot { dir, node_id, operator: operator.into(), registry, store, rejected, _lock: lock })
+    Ok(Boot { dir, node_id, operator: operator.into(), registry, store, rejected, node_key, _lock: lock })
 }
 
 /// Load `node.key` (refusing group/world-readable, the ssh discipline) or
 /// create it 0600 on first boot; derive the NodeId. Class-1 secret: never
 /// shipped, never in any snapshot.
-fn load_or_create_node_key(dir: &Path) -> io::Result<String> {
+fn load_or_create_node_key(dir: &Path) -> io::Result<(Vec<u8>, String)> {
     let path = dir.join("node.key");
     let key = if path.exists() {
         check_key_perms(&path)?;
@@ -179,7 +199,8 @@ fn load_or_create_node_key(dir: &Path) -> io::Result<String> {
         write_secret(&path, &key)?;
         key
     };
-    Ok(node_id_of(&key))
+    let node_id = node_id_of(&key);
+    Ok((key, node_id))
 }
 
 /// Wall-clock now in epoch ms — used only to STAMP write-time values (lease
@@ -328,6 +349,18 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
         drop(held); // releasing the lock lets a new writer in.
         assert!(boot_at(dir, "gianni").is_ok());
+    }
+
+    /// One identity, two renderings: the peer-link NodeIdentity derived from
+    /// node.key is the raw-bytes twin of the hex NodeId in directory records —
+    /// the identity match claim routing (WD §4) stands on.
+    #[test]
+    fn boot_identity_matches_directory_node_id() {
+        let dir = fresh("identity");
+        let boot = boot_at(dir, "gianni").unwrap();
+        let id = boot.identity().unwrap();
+        let hexed: String = id.node_id.iter().map(|b| format!("{:02x}", b)).collect();
+        assert_eq!(hexed, boot.node_id);
     }
 
     #[test]

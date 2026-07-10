@@ -8,30 +8,37 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
 
-use glade_wire::generated::{Head, Heads, Ops, StreamHeads, Welcome};
+use glade_wire::cbor;
+use glade_wire::generated::{Head, Heads, Op, Ops, StreamHeads, Welcome};
 
 use crate::echo::Echo;
 use crate::frame::Frame;
+use crate::mesh::Mesh;
 use crate::router::{Router, SessionId};
 use crate::session::{error_frame, heads_map, missing_for};
 use crate::store::{Append, Store, StoreError};
+use crate::sysdata::SystemSnapshot;
 use crate::ws::{self, Msg};
 
-struct Shared {
-    store: Mutex<Store>,
-    router: Mutex<Router>,
-    out: Mutex<BTreeMap<SessionId, mpsc::UnboundedSender<Vec<u8>>>>,
-    next: AtomicU64,
+pub(crate) struct Shared {
+    pub(crate) store: Mutex<Store>,
+    pub(crate) router: Mutex<Router>,
+    pub(crate) out: Mutex<BTreeMap<SessionId, mpsc::UnboundedSender<Vec<u8>>>>,
+    pub(crate) next: AtomicU64,
+    /// The peer mesh (accept loop + links + claim routing), set once by
+    /// `enable_mesh`. `None` = the legacy client-serve node: every subscribe is
+    /// served locally, exactly the pre-mesh contract.
+    pub(crate) mesh: OnceLock<Arc<Mesh>>,
 }
 
 /// A glade node bound to a store directory.
 pub struct Server {
-    shared: Arc<Shared>,
+    pub(crate) shared: Arc<Shared>,
 }
 
 impl Server {
@@ -43,8 +50,26 @@ impl Server {
                 router: Mutex::new(Router::new()),
                 out: Mutex::new(BTreeMap::new()),
                 next: AtomicU64::new(1),
+                mesh: OnceLock::new(),
             }),
         })
+    }
+
+    /// Seed the live replica with a boot registry snapshot: the home-share
+    /// records land in the SAME store the subscribe path serves, so
+    /// `dir.workspaces` is an ORDINARY share read the ordinary way (GDL-038) —
+    /// no privileged read path, no registry RPC. Idempotent (re-seeding the
+    /// same ops is a no-op); returns how many ops were newly appended.
+    pub async fn seed_registry(&self, snap: &SystemSnapshot) -> usize {
+        let mut store = self.shared.store.lock().await;
+        let mut appended = 0usize;
+        for bytes in &snap.records {
+            let op = Op::from_cbor(&cbor::decode(bytes));
+            if matches!(store.append(op), Ok(Append::Appended)) {
+                appended += 1;
+            }
+        }
+        appended
     }
 
     /// Accept connections until the listener errors.
@@ -59,7 +84,7 @@ impl Server {
     }
 }
 
-async fn send(shared: &Arc<Shared>, sid: SessionId, frame: &Frame) {
+pub(crate) async fn send(shared: &Arc<Shared>, sid: SessionId, frame: &Frame) {
     let tx = shared.out.lock().await.get(&sid).cloned();
     if let Some(tx) = tx {
         let _ = tx.send(frame.to_bytes());
