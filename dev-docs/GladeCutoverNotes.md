@@ -72,3 +72,10 @@ through the real rust node, plus absolute payload-byte asserts.
   runner moved `--experimental-strip-types` → `--experimental-transform-types`
   (glial's `SessionDestination` uses TS parameter properties, which strip-only
   mode rejects; transform mode is the same built-in loader).
+- **2/4 `app:notes`** — same pattern (doc domain, commons). Interop test
+  "cutover 2/4": a LATE glial joiner hydrates binder-era stored bytes off the
+  node's subscribe replay, then both directions converge live; byte assert on
+  the glial op. Test-helper lesson: mount BEFORE subscribe (the demo's order —
+  registerAllTaps then startGladeSync), else the subscribe replay races the bus
+  handler. Live demo: reloaded page folded the pre-cutover store value
+  (existing-store compat), browser→probe and probe→browser both converged.

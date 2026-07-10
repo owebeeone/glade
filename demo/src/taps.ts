@@ -35,9 +35,8 @@ export function registerAllTaps(): void {
     createAtomValueTap(SELECTION, { initial: "", handleGrip: SELECTION_TAP, share: share("app:selection") }),
   );
   // COMMONS: the document's shared notes — everyone in this document.
-  grok.registerTap(
-    createAtomValueTap(NOTES, { initial: "", handleGrip: NOTES_TAP, share: share("app:notes") }),
-  );
+  // CUT OVER (GC-3 2/4): a glial mount.
+  grok.registerTap(glialSurface("app:notes", NOTES, NOTES_TAP) as never);
   // COMMONS (log): the document's activity feed. Entries are appended via the
   // binder (postActivity), not by setting a whole value.
   grok.registerTap(

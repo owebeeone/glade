@@ -102,13 +102,15 @@ async function glialParticipant(origin: string, url: string, d: BindingDecl, fil
   const session = new Session(schema, origin);
   const client = new GladeClient(schema, origin, session);
   const bus = new ClientBus(client);
-  await client.connect(url);
-  await client.subscribe(route.share, route.gladeId, route.key.length ? route.key : undefined);
+  // mount BEFORE subscribe (the demo's order: registerAllTaps then
+  // startGladeSync) so the replay the node sends on subscribe is not dropped.
   const glial = new GlialBinder(new MemoryStoreEngine(), origin);
   const events: InstanceEvent[] = [];
   const mount = glial.mount(d, fill, (e) => events.push(e), {
     glade: new SessionDestination(session as unknown as SessionLike, bus, route),
   });
+  await client.connect(url);
+  await client.subscribe(route.share, route.gladeId, route.key.length ? route.key : undefined);
   return {
     client,
     bus,
@@ -200,6 +202,46 @@ test("cutover 1/4 app:status: binder-era <-> glial-era converge; ops byte-identi
     assert.deepEqual([...gOp.key], [...bOp.key]);
     assert.deepEqual([...gOp.payload], [...jsonBytes("away")]);
     assert.deepEqual([...bOp.payload], [...jsonBytes("busy")]);
+
+    A.client.close();
+    B.client.close();
+  } finally {
+    child.kill();
+  }
+});
+
+// ---- binding 2: app:notes (value, doc domain, commons) -----------------------
+
+test("cutover 2/4 app:notes: late glial joiner hydrates binder-era state; converge both ways", async () => {
+  const { port, child } = await startNode("notes");
+  const url = `ws://127.0.0.1:${port}`;
+  try {
+    const share = "doc:1"; // the demo manifest's doc domain, doc=1
+    const scope: Scope = { resolve: () => ({ share, key: new Uint8Array() }) };
+    const route: Route = { share, gladeId: "app:notes", shape: "value", key: new Uint8Array() };
+
+    // binder-era participant writes BEFORE the glial one exists — the store
+    // holds binder-era bytes the glial era must fold (existing-store compat).
+    const notesTap = fakeAtom("app:notes");
+    const A = await binderParticipant("a", url, notesTap, scope);
+    notesTap.set("agenda v1");
+    await new Promise((r) => setTimeout(r, 100));
+
+    // late glial joiner: subscribe replays the stored (binder-era) op.
+    const B = await glialParticipant("b", url, decl("app:notes", "value", "document", "commons"), { domain: "1" }, route);
+    await until(() => B.value() === "agenda v1");
+
+    // new -> old and old -> new still converge live.
+    B.setJson("agenda v2");
+    await until(() => notesTap.get() === "agenda v2");
+    notesTap.set("agenda v3");
+    await until(() => B.value() === "agenda v3");
+
+    // wire-byte evidence: glial op == binder-era encoding.
+    const gOp = B.bus.published[0];
+    assert.equal(gOp.share, share);
+    assert.equal(gOp.glade_id, "app:notes");
+    assert.deepEqual([...gOp.payload], [...jsonBytes("agenda v2")]);
 
     A.client.close();
     B.client.close();
