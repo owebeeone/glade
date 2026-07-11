@@ -91,6 +91,15 @@ SCHEMA = schema(
         F("name", 2, STR),
         F("glade_id", 3, STR)),
 
+    # ---- principals minimal (GLP-0006 P0.S7 — identity, NOT management) ----
+    # A principal known to the directory, landing in `dir.principals` (named
+    # by GDL-038) as an ordinary origin-attributed append: a session Hello
+    # naming an unknown principal auto-appends one. Stage-1 posture: identity
+    # as DATA, nothing enforced — lifecycle (enroll/attenuate/revoke) is
+    # P2/glade-users and deliberately NOT smeared into this record.
+    Msg("PrincipalRecord",
+        F("principal", 1, STR)),
+
     # ---- the create ceremony (GLP-0006 P0.S2 — audit F2, s-create D1–D3) ---
     # Rides ExchangeReq.payload on the reserved built-in `workspace.create`
     # surface, handled by the NODE (never a supplier): creation PRECEDES

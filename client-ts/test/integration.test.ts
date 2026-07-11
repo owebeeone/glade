@@ -75,3 +75,28 @@ test("two TS sessions converge through the rust node over websocket", async () =
     child.kill();
   }
 });
+
+test("hello binds a principal and resolves on the node's Welcome; plain sessions unchanged", async () => {
+  const { port, child } = await startNode();
+  const url = `ws://127.0.0.1:${port}`;
+  try {
+    // hello(principal) rides the existing wire field and is Welcomed.
+    const bound = new GladeClient(schema, "p1");
+    await bound.connect(url);
+    await bound.hello("alice");
+    // a helloed session stays fully usable (subscribe + write + fold).
+    await bound.subscribe("sh", "hp");
+    bound.append("sh", "hp", "value", utf8("from-alice"));
+    assert.equal(hex(bound.fold("sh", "hp", "value") as Uint8Array), hex(utf8("from-alice")));
+
+    // hello() with NO principal is also Welcomed (origin-as-identity).
+    const plain = new GladeClient(schema, "p2");
+    await plain.connect(url);
+    await plain.hello();
+
+    bound.close();
+    plain.close();
+  } finally {
+    child.kill();
+  }
+});

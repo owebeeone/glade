@@ -197,3 +197,21 @@ node-side cargo E2E is the stage-1 gate; malformed create payloads share the
 codebase-wide fail-open legacy-codec posture (empty payload IS guarded; the
 fail-closed migration lands with taut v0.10); stage-2 asks which principals
 may create on which nodes (GDL-016) — the check slot is `handle_create`.
+
+## Principals minimal (GLP-0006 P0.S7 — identity, NOT management)
+
+`Hello.principal` (a wire field frozen since P1, unused until now) is honored:
+a session whose Hello names a principal is BOUND to it (`Shared::principals`,
+session-scoped — the attribution seam P1 suppliers read); a session without
+one keeps origin-as-identity, byte-for-byte (grip-share's suite is the
+regression). An UNKNOWN principal auto-appends a minimal
+`PrincipalRecord {principal}` to `dir.principals` (the stream GDL-038 names)
+as an ordinary origin-attributed append through the same adopt_boot authority
+as every other directory mint, served through the ordinary subscribe path (the
+R3 precedent) and pushed to peers like any home record. Stage-1 posture:
+identity as DATA, nothing enforced — lifecycle (enroll/attenuate/revoke) is
+P2/glade-users and deliberately NOT smeared into this record; richer fields
+arrive with that ceremony, not here. Store-only (legacy) nodes bind nothing
+and mint nothing: there is no node chain to attribute the record to.
+`client-ts` grows an optional `hello(principal?)` (resolves on Welcome);
+`connect()` still sends nothing by default.

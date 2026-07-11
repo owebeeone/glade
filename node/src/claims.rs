@@ -30,10 +30,10 @@ use tokio::sync::Mutex;
 use glade_wire::cbor;
 use glade_wire::generated::Op;
 
-use crate::registry::{Record, RegistryApi, StoreApi, G_CLAIMS, HOME};
+use crate::registry::{Record, RegistryApi, StoreApi, G_CLAIMS, G_PRINCIPALS, HOME};
 use crate::server::{Server, Shared};
 use crate::store::Store;
-use crate::sysdata::{ServeClaim, WorkspaceCreateReq, WorkspaceCreateRes, WorkspaceEntry};
+use crate::sysdata::{PrincipalRecord, ServeClaim, WorkspaceCreateReq, WorkspaceCreateRes, WorkspaceEntry};
 use crate::sysdir::{now_ms, Boot};
 
 /// Default serve-lease TTL — matches the 30s the traces and tests use.
@@ -189,6 +189,46 @@ pub(crate) async fn create_workspace(shared: &Arc<Shared>, req: &WorkspaceCreate
         node: state.node_id.clone(),
         created,
     })
+}
+
+/// Principals minimal (GLP-0006 P0.S7): a session Hello naming an UNKNOWN
+/// principal auto-appends a minimal `PrincipalRecord` to `dir.principals` —
+/// identity as DATA, nothing enforced (lifecycle is P2/glade-users; the two
+/// layers stay unsmeared). No-op when the replica already knows the principal,
+/// and on a store-only node (no directory authority to attribute the append
+/// to — such sessions keep origin-as-identity, byte-for-byte).
+pub(crate) async fn note_principal(shared: &Arc<Shared>, principal: &str) {
+    let Some(state) = shared.dir.get() else { return };
+    {
+        let st = shared.store.lock().await;
+        if knows_principal(&st, principal) {
+            return; // already directory data — ours or a peer's witness
+        }
+    }
+    let node = state.node_id.clone();
+    let mut ops = Vec::new();
+    {
+        let mut dir = state.inner.lock().await;
+        // append_diffed re-checks under the lock: two racing Hellos for the
+        // same principal serialize here and the second diffs away.
+        if let Ok(Some(op)) = dir.append_diffed(Record::Principal(PrincipalRecord { principal: principal.into() }), &node) {
+            let _ = dir.persist();
+            ops.push(op);
+        }
+    }
+    publish(shared, ops).await;
+}
+
+/// Does the replica hold a PrincipalRecord for `principal` (any origin)?
+fn knows_principal(store: &Store, principal: &str) -> bool {
+    for (origin, _) in store.heads(HOME, G_PRINCIPALS, &[]) {
+        for op in store.scan(HOME, G_PRINCIPALS, &[], &origin, i64::MIN) {
+            if PrincipalRecord::from_cbor(&cbor::decode(&op.payload)).principal == principal {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Renew every served share's lease: same epoch, fresh absolute expiry — an
@@ -363,5 +403,111 @@ mod tests {
 
         // in-process idempotence: re-serving mints nothing new.
         assert!(!serve_workspace_on(&b.shared, "ws-live", "live").await.unwrap());
+    }
+
+    /// Principals minimal (P0.S7), end to end on a booted node: a session
+    /// Hello naming a principal BINDS and auto-appends a minimal record that
+    /// is served through the ORDINARY subscribe path on dir.principals
+    /// (origin-attributed to the node — the R3 precedent); a second Hello for
+    /// the same principal appends nothing; a session WITHOUT a Hello keeps
+    /// origin-as-identity and mints nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hello_principal_binds_and_lands_in_dir_principals() {
+        use crate::frame::Frame;
+        use crate::registry::G_PRINCIPALS;
+        use crate::ws;
+        use glade_wire::generated::{Hello, Subscribe};
+
+        let boot = boot_at(fresh("p-sys"), "gianni").unwrap();
+        let node_id = boot.node_id.clone();
+        let server = Server::open(fresh("p-store")).unwrap();
+        server.adopt_boot(boot).await.unwrap();
+        let shared = server.shared.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(server.run(listener));
+
+        let hello = |principal: Option<&str>| {
+            Frame::Hello(Hello {
+                session: "s".into(),
+                protocol: 1,
+                principal: principal.map(str::to_string),
+                capability: None,
+                heads: vec![],
+            })
+            .to_bytes()
+        };
+        let sub = Frame::Subscribe(Subscribe { share: HOME.into(), glade_id: G_PRINCIPALS.into(), key: None, from: None }).to_bytes();
+        async fn next(r: &mut ws::WsReader, what: &str) -> Frame {
+            let msg = tokio::time::timeout(Duration::from_secs(5), r.read())
+                .await
+                .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
+                .unwrap();
+            match msg {
+                ws::Msg::Binary(b) => Frame::from_bytes(&b).unwrap(),
+                _ => panic!("unexpected close waiting for {what}"),
+            }
+        }
+        fn principal_count(st: &Store, principal: &str) -> usize {
+            let mut n = 0;
+            for (origin, _) in st.heads(HOME, G_PRINCIPALS, &[]) {
+                for op in st.scan(HOME, G_PRINCIPALS, &[], &origin, i64::MIN) {
+                    if PrincipalRecord::from_cbor(&cbor::decode(&op.payload)).principal == principal {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        }
+
+        // (a) bind: Hello with a principal is Welcomed and the record lands.
+        let (mut r1, w1) = ws::connect("127.0.0.1", port).await.unwrap();
+        w1.send_binary(&hello(Some("alice"))).await.unwrap();
+        assert!(matches!(next(&mut r1, "welcome").await, Frame::Welcome(_)));
+        assert_eq!(shared.principals.lock().await.values().filter(|p| p.as_str() == "alice").count(), 1, "the session is BOUND");
+
+        // (b) served via the ORDINARY subscribe path, origin-attributed.
+        let (mut r2, w2) = ws::connect("127.0.0.1", port).await.unwrap();
+        w2.send_binary(&sub).await.unwrap();
+        assert!(matches!(next(&mut r2, "dir.principals ack").await, Frame::Heads(_)));
+        match next(&mut r2, "the alice record").await {
+            Frame::Ops(ops) => {
+                assert_eq!(ops.ops.len(), 1);
+                assert_eq!(ops.ops[0].origin, node_id, "attributed to the witnessing node's chain");
+                assert_eq!(PrincipalRecord::from_cbor(&cbor::decode(&ops.ops[0].payload)).principal, "alice");
+            }
+            other => panic!("expected the principal record, got {other:?}"),
+        }
+
+        // (c) a second Hello for the SAME principal appends nothing new...
+        let (mut r3, w3) = ws::connect("127.0.0.1", port).await.unwrap();
+        w3.send_binary(&hello(Some("alice"))).await.unwrap();
+        assert!(matches!(next(&mut r3, "second welcome").await, Frame::Welcome(_)));
+        // ...but a NEW principal lands (and reaches the live subscriber).
+        let (mut r4, w4) = ws::connect("127.0.0.1", port).await.unwrap();
+        w4.send_binary(&hello(Some("bob"))).await.unwrap();
+        assert!(matches!(next(&mut r4, "bob welcome").await, Frame::Welcome(_)));
+        match next(&mut r2, "the bob record, live").await {
+            Frame::Ops(ops) => {
+                assert_eq!(PrincipalRecord::from_cbor(&cbor::decode(&ops.ops[0].payload)).principal, "bob");
+            }
+            other => panic!("expected the live principal record, got {other:?}"),
+        }
+        {
+            let st = shared.store.lock().await;
+            assert_eq!(principal_count(&st, "alice"), 1, "no duplicate for a known principal");
+            assert_eq!(principal_count(&st, "bob"), 1);
+        }
+
+        // (d) no Hello (and a Hello with NO principal) = origin-as-identity,
+        // nothing minted — the back-compat contract.
+        let (mut r5, w5) = ws::connect("127.0.0.1", port).await.unwrap();
+        w5.send_binary(&hello(None)).await.unwrap();
+        assert!(matches!(next(&mut r5, "plain welcome").await, Frame::Welcome(_)));
+        {
+            let st = shared.store.lock().await;
+            let total: usize = st.heads(HOME, G_PRINCIPALS, &[]).iter().map(|(o, s)| { let _ = o; (*s + 1) as usize }).sum();
+            assert_eq!(total, 2, "exactly alice + bob — plain sessions mint nothing");
+        }
     }
 }

@@ -171,6 +171,23 @@ impl ServiceDefinition {
 }
 
 #[derive(Clone, Debug, PartialEq, Default)]
+pub struct PrincipalRecord {
+    pub principal: String,
+}
+impl PrincipalRecord {
+    pub fn to_cbor(&self) -> Cbor {
+        Cbor::Map(vec![
+            (1, Cbor::Text(self.principal.clone())),
+        ])
+    }
+    pub fn from_cbor(c: &Cbor) -> Self {
+        Self {
+            principal: c.get(1).text(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Default)]
 pub struct WorkspaceCreateReq {
     pub workspace: String,
     pub name: String,

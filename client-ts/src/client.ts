@@ -33,6 +33,7 @@ export class GladeClient {
   private schema: SchemaIndex;
   private ws: WebSocket | null = null;
   private subAcks: Array<() => void> = [];
+  private welcomeAcks: Array<() => void> = [];
 
   /** When set, inbound ops are handed here instead of applied to this client's
    *  own session — lets a grip-share binder own the session and folding. */
@@ -65,6 +66,8 @@ export class GladeClient {
       else this.session.applyRemote(value.ops as Op[]);
     } else if (tag === TAG.Heads) {
       this.subAcks.shift()?.();
+    } else if (tag === TAG.Welcome) {
+      this.welcomeAcks.shift()?.();
     } else if (tag === TAG.ExchangeRes) {
       this.exWaiters.get(value.corr as string)?.({
         ok: value.ok as boolean,
@@ -73,6 +76,21 @@ export class GladeClient {
       });
       this.exWaiters.delete(value.corr as string);
     }
+  }
+
+  /** Send the wire Hello, optionally BINDING this session to a principal
+   *  (principals minimal, GLP-0006 P0.S7): the node auto-appends an unknown
+   *  principal to dir.principals — identity as data, nothing enforced.
+   *  Resolves on the node's Welcome. Entirely optional: sessions that never
+   *  call it keep origin-as-identity, byte-for-byte the old behavior. */
+  hello(principal?: string): Promise<void> {
+    return new Promise((resolve) => {
+      this.welcomeAcks.push(resolve);
+      this.send(frame(this.schema, TAG.Hello, "Hello", {
+        session: this.session.origin, protocol: 1,
+        principal: principal ?? null, capability: null, heads: [],
+      }));
+    });
   }
 
   /** Subscribe to a zone-surface (share, gladeId, key); resolves on the node's

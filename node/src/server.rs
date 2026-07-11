@@ -45,6 +45,10 @@ pub(crate) struct Shared {
     /// `adopt_boot`. `None` = a store-only node: it serves and replicates but
     /// never mints directory records of its own.
     pub(crate) dir: OnceLock<crate::claims::DirState>,
+    /// Session -> bound principal (GLP-0006 P0.S7): a session that sent a
+    /// Hello naming a principal is BOUND to it — the attribution seam
+    /// suppliers read (P1). Sessions absent here keep origin-as-identity.
+    pub(crate) principals: Mutex<BTreeMap<SessionId, String>>,
 }
 
 /// A glade node bound to a store directory.
@@ -65,6 +69,7 @@ impl Server {
                 providers: Mutex::new(BTreeMap::new()),
                 pending: Mutex::new(BTreeMap::new()),
                 dir: OnceLock::new(),
+                principals: Mutex::new(BTreeMap::new()),
             }),
         })
     }
@@ -163,6 +168,14 @@ async fn handle(shared: Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
                         m.insert(hd.origin.clone(), hd.seq);
                     }
                 }
+                // Principals minimal (P0.S7): a Hello naming a principal BINDS
+                // the session to it, and an unknown principal auto-appends a
+                // minimal dir.principals record — identity as data, nothing
+                // enforced. No principal = origin-as-identity, unchanged.
+                if let Some(p) = h.principal.as_deref().filter(|p| !p.is_empty()) {
+                    shared.principals.lock().await.insert(sid, p.to_string());
+                    crate::claims::note_principal(&shared, p).await;
+                }
                 send(&shared, sid, &Frame::Welcome(Welcome { session: h.session, protocol: 1, heads: vec![] })).await;
             }
             Frame::Subscribe(s) => {
@@ -255,6 +268,8 @@ async fn handle(shared: Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
     shared.router.lock().await.unsubscribe_all(sid);
     // a departing authority provider releases its exchange surfaces.
     shared.providers.lock().await.retain(|_, v| *v != sid);
+    // the principal binding is session-scoped; the RECORD it minted stays.
+    shared.principals.lock().await.remove(&sid);
     wtask.abort();
     Ok(())
 }

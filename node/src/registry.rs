@@ -28,8 +28,8 @@ use glade_wire::generated::{Head, Op, Shape, StreamHeads};
 
 use crate::chain::op_hash;
 use crate::sysdata::{
-    BindingDecl, CapabilityGrant, CapabilityRevocation, NodeRecord, ServeClaim, ServiceDefinition,
-    SystemSnapshot, WorkspaceEntry,
+    BindingDecl, CapabilityGrant, CapabilityRevocation, NodeRecord, PrincipalRecord, ServeClaim,
+    ServiceDefinition, SystemSnapshot, WorkspaceEntry,
 };
 
 /// The home share — the user-scale system declaration space (WD §2). All
@@ -47,6 +47,9 @@ pub const G_REVOCATIONS: &str = "dir.revocations";
 // App declaration records (GDL-037): what an <app>.glade file registers.
 pub const G_BINDINGS: &str = "dir.bindings";
 pub const G_SERVICES: &str = "dir.services";
+// Principals minimal (GLP-0006 P0.S7; the stream GDL-038 names): identity as
+// data — session Hellos auto-append unknown principals; nothing enforced.
+pub const G_PRINCIPALS: &str = "dir.principals";
 
 /// One home-share record (WD §2). Each variant folds by its own semantics; the
 /// enum is the append surface so `append` stays typed and the glade-id/shape
@@ -60,6 +63,7 @@ pub enum Record {
     Revoke(CapabilityRevocation),
     Binding(BindingDecl),
     Service(ServiceDefinition),
+    Principal(PrincipalRecord),
 }
 
 impl Record {
@@ -73,6 +77,7 @@ impl Record {
             Record::Revoke(_) => G_REVOCATIONS,
             Record::Binding(_) => G_BINDINGS,
             Record::Service(_) => G_SERVICES,
+            Record::Principal(_) => G_PRINCIPALS,
         }
     }
 
@@ -91,6 +96,7 @@ impl Record {
             Record::Revoke(r) => r.to_cbor(),
             Record::Binding(r) => r.to_cbor(),
             Record::Service(r) => r.to_cbor(),
+            Record::Principal(r) => r.to_cbor(),
         };
         cbor::encode(&c)
     }
