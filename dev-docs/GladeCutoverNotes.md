@@ -123,11 +123,28 @@ through the real rust node, plus absolute payload-byte asserts.
   binder-era taut entries hydrated + decoded; post + selection-click entries
   landed (chain seq 0→1→2 across three page lives, verified in the node op
   dump); probe append appeared in the browser.
-- **Pre-existing (not introduced here, not fixed):** two tabs of the SAME
+- **Pre-existing (not introduced here):** two tabs of the SAME
   browser profile share the localStorage `glade-origin`, so concurrent writes
   from both tabs can fork that origin's chain — binder era had the identical
   hole (the README's two-tab flow works because replay usually hydrates before
-  a write, and distinct surfaces have distinct chains).
+  a write, and distinct surfaces have distinct chains). *Fixed 2026-07-11 by
+  the per-tab origin ruling — see the adoption bullet below.*
+- **RELOAD-RESUME adopted natively (2026-07-11).** glial owns the gap end to
+  end (glial DecisionLog GAP-9 complete + GAP-10 `IndexedDbStoreEngine`); the
+  demo's two workarounds are deleted. glade.ts now only fans the carrier to
+  the bus (`client.onOps = bus.deliver`); `feedSession(session, bus)` (glial,
+  wired in glial.ts) absorbs every inbound op; `SessionDestination`'s two-way
+  hydration + the SEMANTIC echo guard (append outcome, not origin filtering)
+  restore own state and resume the chain — including offline-from-boot, off
+  IndexedDB's wholesale wire records. The sessionStorage `BrowserStoreEngine`
+  is replaced by glial's `IndexedDbStoreEngine`, database keyed
+  `glial:{origin}`. **RULED (Gianni, 2026-07-11): identity is PER-TAB** — the
+  origin moves to sessionStorage so each tab is a distinct participant (the
+  two-participant demo is the product intent); per-profile identity + a
+  write-serializing store is explicitly NOT the demo's model. The ruling also
+  closes the pre-existing two-tabs-one-origin fork above, and keying the
+  per-profile IndexedDB by the per-tab origin keeps identities from crossing
+  in storage.
 
 ## The deletion (final commit) — what remains in grip-share and why
 

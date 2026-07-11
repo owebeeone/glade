@@ -16,16 +16,12 @@ import { bus, client, session, scope, user } from "./glial";
 export { origin, user, doc, type ChatLine } from "./glial";
 import type { ChatLine } from "./glial";
 
-// node -> client -> (session + glial bus). The session sees EVERY inbound op:
-// that keeps its heads/resume vectors truthful AND lets a fresh page session
-// resume its own chain off the node replay (own-origin ops are echo-guarded
-// out of the instance path, so without this a reload would restart seq at 0 —
-// a forked chain the node rightly drops). Duplicates dedup in the session
-// store. Each mounted instance then filters its own route off the bus.
-client.onOps = (ops) => {
-  session.applyRemote(ops);
-  bus.deliver(ops);
-};
+// node -> client -> glial bus. Feeding the session is glial's job now, not
+// app glue: `feedSession(session, bus)` (wired in glial.ts) absorbs every
+// inbound op — truthful heads/resume vectors + own-chain resume on reload —
+// and each mounted instance filters its route off the same bus (the semantic
+// echo guard folds a reloaded tab's own replay back in live).
+client.onOps = (ops) => bus.deliver(ops);
 
 export type GladeStatus = "connecting" | "live" | "offline";
 let statusListeners = new Set<(s: GladeStatus) => void>();
