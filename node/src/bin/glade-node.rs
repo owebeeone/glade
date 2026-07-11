@@ -83,14 +83,16 @@ async fn main() -> std::io::Result<()> {
         // Ordinary attributed appends under this node's chain, diffed against
         // the fold (idempotent), then persisted like any other record write.
         let registrant = node.node_id.clone();
+        let mut workspaces: Vec<(String, String)> = Vec::new();
         for path in &apps {
             let decl = glade_node::appdecl::load(path)?;
             let reg = glade_node::appdecl::register(&decl, &mut node.registry, &registrant)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}")))?;
             node.store.save(&node.registry.snapshot())?;
             println!("app {} registered (+{} record(s), {} unchanged)", decl.app, reg.appended, reg.unchanged);
+            workspaces.extend(decl.workspaces.iter().map(|w| (w.share.clone(), w.name.clone())));
         }
-        Some(node)
+        Some((node, workspaces))
     } else {
         None
     };
@@ -100,19 +102,22 @@ async fn main() -> std::io::Result<()> {
     // under the instance's class-4 cache (rebuildable, never load-bearing for
     // system data); else the legacy temp-dir default.
     let dir = positional.get(1).cloned().unwrap_or_else(|| match &booted {
-        Some(node) => node.dir.join("cache").join("store").to_string_lossy().into_owned(),
+        Some((node, _)) => node.dir.join("cache").join("store").to_string_lossy().into_owned(),
         None => std::env::temp_dir().join("glade-node-bin").to_string_lossy().into_owned(),
     });
 
     let server = Server::open(&dir)?;
 
     // ---- peer fabric (booted forms only; the legacy form never binds it) ----
-    // Seed the served store from the boot registry (dir.* becomes an ordinary
-    // share on the ordinary rails), bind iroh with the DIRECTORY identity, run
-    // the accept loop, and converge with each `--peer` target.
-    if let Some(node) = &booted {
-        server.seed_registry(&node.registry.snapshot()).await;
-        let endpoint = PeerEndpoint::bind_with(node.identity()?).await?;
+    // Adopt the boot instance (seeds the served store; the boot registry stays
+    // the chain authority for this node's own directory writes — claims.rs),
+    // bind iroh with the DIRECTORY identity, run the accept loop, converge
+    // with each `--peer` target, then start SERVING the declared workspaces:
+    // mint WorkspaceEntry + ServeClaim and renew while serving (audit F1).
+    if let Some((node, workspaces)) = booted {
+        let identity = node.identity()?;
+        server.adopt_boot(node).await?;
+        let endpoint = PeerEndpoint::bind_with(identity).await?;
         let addr = server.enable_mesh(endpoint).await?;
         println!("peer {} {}", addr.endpoint_id, addr.socket);
         for p in &peers {
@@ -123,6 +128,10 @@ async fn main() -> std::io::Result<()> {
                 },
                 None => eprintln!("peer {p}: expected <endpoint-id>@<ip:port>"),
             }
+        }
+        for (share, name) in &workspaces {
+            server.serve_workspace(share, name).await?;
+            println!("workspace {share} serving");
         }
     }
 

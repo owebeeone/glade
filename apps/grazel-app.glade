@@ -29,3 +29,10 @@ service grazel gwz.ops
 # records at registration; ordinary fold rules (revocation wins) from then on.
 seed owner grazel read.*
 seed owner grazel gwz.*
+
+# workspace <share> <name>
+# The workspace share this app serves from (audit F1): the node LOADING this
+# file registers the WorkspaceEntry with itself as eligible host and mints +
+# renews the ServeClaim while serving. Deployment picks the loader; the file
+# stays data.
+workspace ws-razel razel

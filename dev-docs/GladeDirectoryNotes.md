@@ -128,3 +128,39 @@ never a hang; the session stays usable.
    as its own dial target. Any booted profile binds the endpoint and accepts —
    profiles stay deployment labels, not protocol types; the legacy positional
    form never binds a peer endpoint and never touches `~/.glade`.
+
+## Live minting (GLP-0006 P0.S2 — audit F1+F2 fused)
+
+The audit's F1: nothing production minted `WorkspaceEntry`/`ServeClaim` — only
+tests did, via the registry API. Closed by `node/src/claims.rs`.
+
+**The workspace↔share association is a `.glade` declaration**:
+`workspace <share> <name>` (see `apps/grazel-app.glade`). Chosen over a CLI
+flag per GDL-037 — the file IS the legible app surface, and the plan's stage-1
+idiom (P1 chat groups PRE-DECLARED in grazel-app.glade) is the same shape.
+Registration mints an ordinary `WorkspaceEntry` with the REGISTRANT as the
+eligible host: whoever loads the file serves it — deployment picks the loader,
+the file stays data, nothing hardcodes grazel. Two nodes loading the same file
+each append their own entry; `replicas_of` stays LWW (latest entry wins) —
+the eligible-hosts union is an open fold question, unchanged here.
+
+**Serving**: the booted bin, after registering `--app` files, calls
+`serve_workspace(share, name)` for each declared workspace — mints the first
+`ServeClaim` (epoch = the SERVED replica's max for that share + 1, so a
+restart or takeover fences out any stale claim) and RENEWS on a cadence
+(TTL 30s, renew 10s; `adopt_boot_tuned` shortens both for tests). A renewal is
+an ordinary ServeClaim append — data, never a heartbeat protocol.
+
+**adopt_boot**: the server adopts the boot instance; the boot `Registry`
+stays the single chain authority for this node's own directory writes, so
+records.json always matches the journal and later boots can never fork the
+chains the runtime extended (renewals persist as ordinary records; the
+records.json growth this implies is a GAP-10 retention question, noted, not
+solved). The instance lock lives as long as the server.
+
+**Push (B9)**: directory records minted AFTER connect-time anti-entropy reach
+peers by a home-scoped Ops push on a fresh link stream (`mesh::push_home` →
+the `Frame::Ops` opener arm, home ops only, scoped ingest). Self-minted
+records only; receivers never re-push — transitive gossip deferred. Best
+effort: a lost push (or a push racing ahead of the connect pull) is dropped by
+the chain-gap check and healed at the next connect-time pull.

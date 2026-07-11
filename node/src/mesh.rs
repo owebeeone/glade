@@ -203,13 +203,48 @@ async fn run_link(shared: Arc<Shared>, mesh: Arc<Mesh>, link: PeerLink, dialed: 
 /// sync pull (serve the gap, close); `Subscribe` = a forwarded interest (this
 /// node is the claim holder — serve gap + live ops until the interest closes);
 /// `ExchangeReq` = a forwarded exchange (this node is the claim holder — the
-/// attached authority answers, one stream one exchange, `exchange.rs`).
+/// attached authority answers, one stream one exchange, `exchange.rs`);
+/// `Ops` = a peer's home-share PUSH (freshly-minted directory records, the B9
+/// step) — scoped ingest, home ops only, one frame per stream.
 async fn handle_peer_stream(shared: Arc<Shared>, mut send: SendStream, mut recv: RecvStream) -> io::Result<()> {
     match read_frame(&mut recv).await? {
         Frame::Heads(h) => serve_home(&shared, &mut send, h).await,
         Frame::Subscribe(s) => serve_peer_subscribe(shared, send, recv, s).await,
         Frame::ExchangeReq(x) => crate::exchange::serve_peer_exchange(shared, send, recv, x).await,
+        Frame::Ops(o) => {
+            let from = shared.next.fetch_add(1, Ordering::SeqCst);
+            for op in o.ops {
+                if op.share == HOME {
+                    ingest_and_fanout(&shared, from, op).await;
+                }
+            }
+            Ok(())
+        }
         _ => Ok(()), // unknown opener: drop the stream, never the connection
+    }
+}
+
+/// Push freshly-minted home-share ops to every live peer link — the traces'
+/// B9 "directory ops replicate" step for records written AFTER connect-time
+/// anti-entropy (claim mints, renewals, creates). Scoped to SELF-minted
+/// records by construction (only `claims::publish` calls it); the receiver
+/// ingests and never re-pushes — transitive gossip is deferred. Best-effort:
+/// a lost push is healed by the next connect-time pull.
+pub(crate) async fn push_home(shared: &Arc<Shared>, ops: Vec<Op>) {
+    let Some(mesh) = shared.mesh.get() else { return };
+    if ops.is_empty() {
+        return;
+    }
+    let links: Vec<Connection> = mesh.links.lock().await.values().cloned().collect();
+    for conn in links {
+        let ops = ops.clone();
+        tokio::spawn(async move {
+            if let Ok((mut send, _recv)) = conn.open_bi().await {
+                use tokio::io::AsyncWriteExt;
+                let _ = write_frame(&mut send, &Frame::Ops(Ops { ops, pri: None })).await;
+                let _ = send.shutdown().await;
+            }
+        });
     }
 }
 

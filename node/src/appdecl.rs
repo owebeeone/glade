@@ -18,6 +18,7 @@
 //! binding <glade_id> <shape> <authority> <zone> <retention>
 //! service <name> <exchange-glade-id>
 //! seed <principal> <share> <verb[,verb...]>
+//! workspace <share> <name>     # a workspace share this app serves from
 //! ```
 //!
 //! Registration is idempotent by DIFF (the GQ-6 pinning discipline): a record
@@ -33,7 +34,7 @@ use glade_wire::cbor;
 use glade_wire::generated::Op;
 
 use crate::registry::{Record, RegistryApi, RegistryError};
-use crate::sysdata::{BindingDecl, CapabilityGrant, ServiceDefinition};
+use crate::sysdata::{BindingDecl, CapabilityGrant, ServiceDefinition, WorkspaceEntry};
 
 /// The shapes a binding may declare (GladeSubstrateV1 §3 + decl surface).
 const SHAPES: [&str; 6] = ["value", "log", "message", "stream", "exchange", "window"];
@@ -48,6 +49,17 @@ pub struct AppDecl {
     pub bindings: Vec<BindingDecl>,
     pub services: Vec<ServiceDefinition>,
     pub seeds: Vec<CapabilityGrant>,
+    pub workspaces: Vec<WorkspaceDecl>,
+}
+
+/// A declared workspace↔share association (GLP-0006 P0.S2 / audit F1): the
+/// share this app serves its workspace from, plus its display name. Parse data
+/// only — the REGISTERED record is the existing `WorkspaceEntry`, with the
+/// registrant as the eligible host (whoever loads the file serves it).
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorkspaceDecl {
+    pub share: String,
+    pub name: String,
 }
 
 /// Parse + validate `<app>.glade` text. Errors carry the line number — the
@@ -143,6 +155,18 @@ pub fn parse(text: &str) -> Result<AppDecl, String> {
                     verbs: toks[3].split(',').map(str::to_string).collect(),
                 });
             }
+            "workspace" => {
+                if decl.app.is_empty() {
+                    return Err(format!("line {n}: `app` must be declared before any workspace"));
+                }
+                if toks.len() != 3 {
+                    return Err(format!("line {n}: `workspace <share> <name>`"));
+                }
+                if decl.workspaces.iter().any(|w| w.share == toks[1]) {
+                    return Err(format!("line {n}: duplicate workspace share `{}`", toks[1]));
+                }
+                decl.workspaces.push(WorkspaceDecl { share: toks[1].into(), name: toks[2].into() });
+            }
             other => return Err(format!("line {n}: unknown declaration `{other}`")),
         }
     }
@@ -212,7 +236,17 @@ pub fn register(
         .iter()
         .map(|b| Record::Binding(b.clone()))
         .chain(decl.services.iter().map(|s| Record::Service(s.clone())))
-        .chain(decl.seeds.iter().map(|g| Record::Grant(g.clone())));
+        .chain(decl.seeds.iter().map(|g| Record::Grant(g.clone())))
+        // a declared workspace registers as an ordinary WorkspaceEntry with
+        // the REGISTRANT as the eligible host — the node loading the file is
+        // the node that serves it (audit F1: production minting).
+        .chain(decl.workspaces.iter().map(|w| {
+            Record::Workspace(WorkspaceEntry {
+                workspace: w.share.clone(),
+                name: w.name.clone(),
+                eligible_hosts: vec![origin.to_string()],
+            })
+        }));
 
     let mut out = Registered::default();
     for rec in records {
@@ -239,7 +273,8 @@ mod tests {
     }
 
     /// The checked-in grazel-app.glade parses to exactly the s-app-register
-    /// trace's shape: 4 bindings, 1 service, 2 ACL seeds.
+    /// trace's shape: 4 bindings, 1 service, 2 ACL seeds — plus the declared
+    /// workspace share (audit F1: the workspace↔share association is DATA).
     #[test]
     fn grazel_file_matches_the_trace_shape() {
         let decl = parse(&grazel_file()).unwrap();
@@ -247,6 +282,7 @@ mod tests {
         assert_eq!(decl.bindings.len(), 4, "4 bindings (workspaces/files/diffs/terminals)");
         assert_eq!(decl.services.len(), 1, "1 service (grazel)");
         assert_eq!(decl.seeds.len(), 2, "2 ACL seeds");
+        assert_eq!(decl.workspaces, vec![WorkspaceDecl { share: "ws-razel".into(), name: "razel".into() }]);
         // the directed surface the service answers (discovery.ts phase D):
         assert_eq!(decl.services[0].glade_id, "gwz.ops");
         // key surface names ride as data:
@@ -275,6 +311,26 @@ mod tests {
         assert!(e.contains("line 2") && e.contains("`app` must be declared"), "{e}");
         // missing app entirely
         assert!(parse("glade-app v0\n").unwrap_err().contains("missing `app"));
+        // workspace: arity + duplicate share
+        let e = parse("glade-app v0\napp x\nworkspace ws-a\n").unwrap_err();
+        assert!(e.contains("line 3") && e.contains("workspace <share> <name>"), "{e}");
+        let e = parse("glade-app v0\napp x\nworkspace ws-a a\nworkspace ws-a b\n").unwrap_err();
+        assert!(e.contains("line 4") && e.contains("duplicate workspace share"), "{e}");
+    }
+
+    /// A declared workspace registers as an ordinary WorkspaceEntry whose
+    /// eligible host is the REGISTRANT — per-node data, diff-idempotent like
+    /// every other registered record.
+    #[test]
+    fn workspace_declaration_registers_the_registrant_as_host() {
+        let decl = parse("glade-app v0\napp demo\nworkspace ws-d demo-ws\n").unwrap();
+        let mut reg = Registry::new();
+        let out = register(&decl, &mut reg, "node-1").unwrap();
+        assert_eq!(out, Registered { appended: 1, unchanged: 0 });
+        assert_eq!(reg.replicas_of("ws-d"), vec!["node-1"]);
+        // re-registration diffs away (same registrant, same bytes).
+        let again = register(&decl, &mut reg, "node-1").unwrap();
+        assert_eq!(again, Registered { appended: 0, unchanged: 1 });
     }
 
     /// Registration = ordinary record appends: home-share wire Ops, origin-
@@ -312,10 +368,10 @@ mod tests {
         let decl = parse(&grazel_file()).unwrap();
         let mut reg = Registry::new();
         let first = register(&decl, &mut reg, "node-1").unwrap();
-        assert_eq!(first, Registered { appended: 7, unchanged: 0 }); // 4+1+2
+        assert_eq!(first, Registered { appended: 8, unchanged: 0 }); // 4+1+2+1 workspace
         let snap1 = reg.snapshot();
         let second = register(&decl, &mut reg, "node-1").unwrap();
-        assert_eq!(second, Registered { appended: 0, unchanged: 7 });
+        assert_eq!(second, Registered { appended: 0, unchanged: 8 });
         assert_eq!(reg.snapshot(), snap1, "re-registration is a byte-identical no-op");
     }
 

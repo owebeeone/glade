@@ -212,7 +212,7 @@ mod tests {
     use crate::iroh_carrier::PeerEndpoint;
     use crate::registry::{Record, Registry, RegistryApi, G_BINDINGS, G_GRANTS};
     use crate::server::Server;
-    use crate::sysdata::{CapabilityGrant, ServeClaim, WorkspaceEntry};
+    use crate::sysdata::{CapabilityGrant, ServeClaim};
     use crate::sysdir::{boot_at, now_ms};
     use crate::ws;
     use glade_wire::generated::{Op, Ops, Shape, Subscribe};
@@ -370,14 +370,7 @@ mod tests {
         let mut boot_b = boot_at(fresh("e2e-b-sys"), "gianni").unwrap();
         let b_id = boot_b.node_id.clone();
         let loaded = appdecl::register(&grazel_decl(), &mut boot_b.registry, &b_id).unwrap();
-        assert_eq!(loaded.appended, 7, "4 bindings + 1 service + 2 seeds registered");
-        boot_b
-            .registry
-            .append(
-                Record::Workspace(WorkspaceEntry { workspace: "ws-razel".into(), name: "razel".into(), eligible_hosts: vec![b_id.clone()] }),
-                &b_id,
-            )
-            .unwrap();
+        assert_eq!(loaded.appended, 8, "4 bindings + 1 service + 2 seeds + 1 workspace registered");
         boot_b
             .registry
             .append(

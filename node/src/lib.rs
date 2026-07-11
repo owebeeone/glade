@@ -8,6 +8,7 @@
 
 pub mod appdecl;
 pub mod chain;
+pub mod claims;
 pub mod echo;
 pub mod exchange;
 pub mod frame;

@@ -294,10 +294,11 @@ impl Registry {
         v.sort_by(|a, b| (a.origin.as_str(), a.seq).cmp(&(b.origin.as_str(), b.seq)));
         v
     }
-}
 
-impl RegistryApi for Registry {
-    fn append(&mut self, rec: Record, origin: &str) -> Result<(), RegistryError> {
+    /// Append `rec` under `origin`'s chain and hand back the built op — the
+    /// runtime directory-write path (`claims.rs`) seeds/fans/pushes the SAME
+    /// bytes it persisted; `RegistryApi::append` delegates here.
+    pub fn append_returning(&mut self, rec: Record, origin: &str) -> Result<Op, RegistryError> {
         let glade_id = rec.glade_id();
         let chain = (glade_id.to_string(), origin.to_string());
         let (seq, prev) = match self.tips.get(&chain) {
@@ -316,7 +317,20 @@ impl RegistryApi for Registry {
             shape: Shape::Log,
             payload: rec.encode(),
         };
-        self.ingest(op)
+        self.ingest(op.clone())?;
+        Ok(op)
+    }
+
+    /// Is a byte-identical record already in the fold? The diff basis for
+    /// idempotent minting — the same rule `appdecl::register` applies.
+    pub fn contains(&self, glade_id: &str, payload: &[u8]) -> bool {
+        self.ops.iter().any(|o| o.glade_id == glade_id && o.payload == payload)
+    }
+}
+
+impl RegistryApi for Registry {
+    fn append(&mut self, rec: Record, origin: &str) -> Result<(), RegistryError> {
+        self.append_returning(rec, origin).map(|_| ())
     }
 
     fn who_serves(&self, workspace: &str, now_ms: i64) -> Option<String> {

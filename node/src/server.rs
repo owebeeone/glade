@@ -41,6 +41,10 @@ pub(crate) struct Shared {
     /// In-flight exchanges: correlation id -> the requesting session, so a
     /// provider's `ExchangeRes` routes back 1:1 (never folded, never fanned).
     pub(crate) pending: Mutex<BTreeMap<String, SessionId>>,
+    /// The adopted directory-write authority (`claims.rs`), set once by
+    /// `adopt_boot`. `None` = a store-only node: it serves and replicates but
+    /// never mints directory records of its own.
+    pub(crate) dir: OnceLock<crate::claims::DirState>,
 }
 
 /// A glade node bound to a store directory.
@@ -60,6 +64,7 @@ impl Server {
                 mesh: OnceLock::new(),
                 providers: Mutex::new(BTreeMap::new()),
                 pending: Mutex::new(BTreeMap::new()),
+                dir: OnceLock::new(),
             }),
         })
     }
