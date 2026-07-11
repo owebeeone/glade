@@ -14,3 +14,16 @@ importers:
       '@owebeeone/glial-runtime':
         specifier: link:../../glial
         version: link:../../glial
+      fake-indexeddb:
+        specifier: ^6.2.5
+        version: 6.2.5
+
+packages:
+
+  fake-indexeddb@6.2.5:
+    resolution: {integrity: sha512-CGnyrvbhPlWYMngksqrSSUT1BAVP49dZocrHuK0SvtR0D5TMs5wP0o3j7jexDJW01KSadjBp1M/71o/KR3nD1w==}
+    engines: {node: '>=18'}
+
+snapshots:
+
+  fake-indexeddb@6.2.5: {}

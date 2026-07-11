@@ -9,6 +9,7 @@
   },
   "devDependencies": {
     "@owebeeone/glade-decl": "link:../../glade-decl-ts",
-    "@owebeeone/glial-runtime": "link:../../glial"
+    "@owebeeone/glial-runtime": "link:../../glial",
+    "fake-indexeddb": "^6.2.5"
   }
 }

@@ -14,6 +14,7 @@ import { Session, type Op } from "../../client-ts/src/session.ts";
 import { GladeClient } from "../../client-ts/src/client.ts";
 import { utf8 } from "../../client-ts/src/bytes.ts";
 import {
+  feedSession,
   GlialBinder,
   MemoryStoreEngine,
   SessionDestination,
@@ -22,6 +23,7 @@ import {
   type OpBus,
   type Route,
   type SessionLike,
+  type StoreEngine,
   type WireOp,
 } from "@owebeeone/glial-runtime";
 import type { BindingDecl } from "@owebeeone/glade-decl";
@@ -180,8 +182,9 @@ export function localParticipant(
 }
 
 /** A node-backed glial participant: one mounted binding over the real node,
- *  wired exactly like the demo (session sees every inbound op; mount before
- *  subscribe so the replay is not dropped). */
+ *  wired exactly like the demo (feedSession absorbs every inbound op; mount
+ *  before subscribe so the replay is not dropped). An injectable engine puts
+ *  glial's persistent store (IndexedDB) in the GC-4 slot for reload tests. */
 export async function glialParticipant(
   origin: string,
   url: string,
@@ -189,18 +192,17 @@ export async function glialParticipant(
   fill: Fill,
   route: Route,
   codec: Codec = JSON_PAYLOAD,
+  engine: StoreEngine = new MemoryStoreEngine(),
 ) {
   const session = new Session(schema, origin);
   const client = new GladeClient(schema, origin, session);
   const bus = new ClientBus();
   bus.client = client;
-  client.onOps = (ops) => {
-    session.applyRemote(ops);
-    bus.deliver(ops);
-  };
-  const binder = new GlialBinder(new MemoryStoreEngine(), origin);
+  client.onOps = (ops) => bus.deliver(ops);
+  feedSession(session as unknown as SessionLike, bus);
+  const binder = new GlialBinder(engine, origin);
   const view = mountView(binder, session, bus, d, fill, route, codec);
   await client.connect(url);
   await client.subscribe(route.share, route.gladeId, route.key.length ? route.key : undefined);
-  return { client, bus, session, binder, ...view };
+  return { client, bus, session, binder, engine, ...view };
 }

@@ -16,8 +16,11 @@ import { loadSchema } from "../../client-ts/src/taut/schema.ts";
 import { encode as tautEncode, decode as tautDecode } from "../../client-ts/src/taut/codec.ts";
 import { type Op } from "../../client-ts/src/session.ts";
 import { utf8 } from "../../client-ts/src/bytes.ts";
-import type { Route } from "@owebeeone/glial-runtime";
-import { decl, glialParticipant, here, jsonBytes, startNode, until } from "./helpers.ts";
+import { feedSession, GlialBinder, IndexedDbStoreEngine, type Route, type SessionLike } from "@owebeeone/glial-runtime";
+import { IDBFactory } from "fake-indexeddb";
+import { Session } from "../../client-ts/src/session.ts";
+import { GladeClient } from "../../client-ts/src/client.ts";
+import { ClientBus, decl, glialParticipant, here, jsonBytes, JSON_PAYLOAD, mountView, schema, startNode, until } from "./helpers.ts";
 
 // ---- binding 1: app:status (value, account domain, commons) -----------------
 
@@ -213,6 +216,62 @@ test("cutover regression: a reloaded tab (same origin, fresh session) resumes it
     await until(() => W.value() === "second note");
 
     P2.client.close();
+    W.client.close();
+  } finally {
+    child.kill();
+  }
+});
+
+test("cutover regression: offline-from-boot after a reload does not fork (persisted chain hydrates the session)", async () => {
+  const { port, child } = await startNode("cutover-offline");
+  const url = `ws://127.0.0.1:${port}`;
+  try {
+    const share = "doc:1";
+    const route: Route = { share, gladeId: "app:notes", shape: "value", key: new Uint8Array() };
+    const d = decl("app:notes", "value");
+    const fill = { domain: "1" };
+    const idb = new IDBFactory(); // one fake browser profile across page lives
+
+    // page life 1: connected, persistent engine (the demo's GC-4 slot), write.
+    const P1 = await glialParticipant(
+      "tab-off", url, d, fill, route, JSON_PAYLOAD,
+      await IndexedDbStoreEngine.open("glial:tab-off", idb),
+    );
+    P1.write("first note");
+    await new Promise((r) => setTimeout(r, 100));
+    await (P1.engine as IndexedDbStoreEngine).flush();
+    P1.client.close();
+
+    // page life 2: same origin + same IndexedDB, fresh session — and the node
+    // is UNREACHABLE at boot: no replay exists to hydrate the chain.
+    const engine2 = await IndexedDbStoreEngine.open("glial:tab-off", idb);
+    const session2 = new Session(schema, "tab-off");
+    const client2 = new GladeClient(schema, "tab-off", session2);
+    const bus2 = new ClientBus(); // client attached only once "online" below
+    client2.onOps = (ops) => bus2.deliver(ops);
+    feedSession(session2 as unknown as SessionLike, bus2);
+    const binder2 = new GlialBinder(engine2, "tab-off");
+    const view2 = mountView(binder2, session2, bus2, d, fill, route, JSON_PAYLOAD);
+
+    // own state is visible from IndexedDB alone (no node)...
+    assert.equal(view2.value(), "first note");
+    // ...and the OFFLINE write continues the persisted chain, not a fork at 0
+    // (attachGlade hydrated the fresh session from the wholesale records).
+    view2.write("second note");
+    assert.equal((bus2.published[0] as unknown as Op).seq, 1);
+
+    // the tab comes online later: connect, subscribe, re-ship (demo boot path).
+    bus2.client = client2;
+    await client2.connect(url);
+    await client2.subscribe(route.share, route.gladeId, undefined);
+    client2.sendOps(session2.dump() as Op[]);
+
+    // the node ACCEPTED the offline write — a witness converges to it (a
+    // forked chain would have been dropped and left "first note").
+    const W = await glialParticipant("witness-off", url, d, fill, route);
+    await until(() => W.value() === "second note");
+
+    client2.close();
     W.client.close();
   } finally {
     child.kill();
