@@ -11,6 +11,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@owebeeone/glade-chat": "link:../../glade-chat",
     "@owebeeone/glade-decl": "link:../../glade-decl-ts",
     "@owebeeone/glial-runtime": "link:../../glial",
     "@owebeeone/grip-react": "file:../../grip-react",

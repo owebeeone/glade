@@ -45,8 +45,9 @@ export interface ChatLine {
   principal?: string;
 }
 
-/** The taut `ChatLine` codec — the one non-JSON payload. */
-const CHATLINE_CODEC: PayloadCodec = {
+/** The taut `ChatLine` codec — the one non-JSON payload. Shared with the Chat
+ *  tab's group-log mounts (chat.ts): the same taut message carries chat lines. */
+export const CHATLINE_CODEC: PayloadCodec = {
   encode: (v) => tautCodec.encode(appSchema, "ChatLine", v as never),
   decode: (b) => tautCodec.decode(appSchema, "ChatLine", b),
 };

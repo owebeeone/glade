@@ -8,6 +8,9 @@ importers:
 
   .:
     dependencies:
+      '@owebeeone/glade-chat':
+        specifier: link:../../glade-chat
+        version: link:../../glade-chat
       '@owebeeone/glade-decl':
         specifier: link:../../glade-decl-ts
         version: link:../../glade-decl-ts

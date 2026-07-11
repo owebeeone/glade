@@ -8,6 +8,7 @@ import type { ComponentType } from "react";
 import { useGrip } from "@owebeeone/grip-react";
 import { CURRENT_TAB, CURRENT_TAB_TAP } from "./grips";
 import { WorkspacePanel } from "./WorkspacePanel";
+import { ChatPanel } from "./ChatPanel";
 
 /** A registered tab: a stable id, a bar label, and the panel to render. */
 export interface TabDef {
@@ -41,6 +42,7 @@ function AboutPanel() {
 /** The tab registry — the ONLY place a tab is declared. */
 export const TABS: readonly TabDef[] = [
   { id: "workspace", label: "Workspace", component: WorkspacePanel },
+  { id: "chat", label: "Chat", component: ChatPanel },
   { id: "about", label: "About", component: AboutPanel },
 ];
 

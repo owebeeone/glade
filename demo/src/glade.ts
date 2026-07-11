@@ -9,6 +9,7 @@ import { M } from "./manifest";
 import { grok, main } from "./runtime";
 import { ACTIVITY_TAP } from "./grips";
 import { bus, client, session, resolveAddr, user } from "./glial";
+import { chatSubscriptions } from "./chat";
 
 // Identity + payload types live in glial.ts; re-exported so consumers
 // (WorkspacePanel, grips.ts) are untouched.
@@ -38,10 +39,17 @@ function setStatus(s: GladeStatus) {
 export async function startGladeSync(url: string): Promise<void> {
   try {
     await client.connect(url);
+    // P0.S7: bind the participant as this session's principal (replaces the
+    // ?user= stub as identity — chat lines are attributed to it). Best-effort.
+    await client.hello?.(user);
     // subscribe every declared surface's zone address (commons + our private).
     for (const s of Object.values(M)) {
       const a = resolveAddr(s);
       await client.subscribe(a.share, s.glade_id.id, a.key);
+    }
+    // subscribe the chat group logs (node interest + late-join history replay).
+    for (const c of chatSubscriptions()) {
+      await client.subscribe(c.share, c.gladeId, c.key);
     }
     // re-ship anything already in the session (e.g. writes made before the
     // socket opened) — the node dedups by (origin, seq).

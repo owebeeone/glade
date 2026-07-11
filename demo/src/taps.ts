@@ -8,6 +8,7 @@ import {
 import { codecFor, destFor, fillFor, glial } from "./glial";
 import { M, type Surface } from "./manifest";
 import type { ChatLine } from "./glade";
+import { registerChatTaps } from "./chat";
 
 /** A cut-over surface: a glial mount consumed through the adapter tap. The typed
  *  `Surface` handle IS the `BindingDecl`; fill, destination and codec derive
@@ -46,4 +47,7 @@ export function registerAllTaps(): void {
       handleGrip: CURRENT_TAB_TAP,
     }) as never,
   );
+  // Chat tab (GLP-0006 P1.S1): the group-keyed commons log mounts + the
+  // selected-group atom — declared via the glade-chat manifest (chat.ts).
+  registerChatTaps();
 }
