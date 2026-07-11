@@ -1,3 +1,4 @@
+// DEPRECATED (--legacy-codec): fail-OPEN legacy codec (from_cbor -> Self, panics on malformed input). Fail-closed decode is the taut v0.8.0 default; this opt-out is removed at v0.10.0 — regenerate without --legacy-codec to migrate. See dev-docs/RustFailClosed.md.
 // GENERATED native Rust types + codec — do not edit.
 #![allow(dead_code)]
 use crate::cbor::Cbor;
@@ -110,6 +111,61 @@ impl CapabilityRevocation {
         Self {
             principal: c.get(1).text(),
             share: c.get(2).text(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct BindingDecl {
+    pub app: String,
+    pub glade_id: String,
+    pub shape: String,
+    pub authority: String,
+    pub zone: String,
+    pub retention: String,
+}
+impl BindingDecl {
+    pub fn to_cbor(&self) -> Cbor {
+        Cbor::Map(vec![
+            (1, Cbor::Text(self.app.clone())),
+            (2, Cbor::Text(self.glade_id.clone())),
+            (3, Cbor::Text(self.shape.clone())),
+            (4, Cbor::Text(self.authority.clone())),
+            (5, Cbor::Text(self.zone.clone())),
+            (6, Cbor::Text(self.retention.clone())),
+        ])
+    }
+    pub fn from_cbor(c: &Cbor) -> Self {
+        Self {
+            app: c.get(1).text(),
+            glade_id: c.get(2).text(),
+            shape: c.get(3).text(),
+            authority: c.get(4).text(),
+            zone: c.get(5).text(),
+            retention: c.get(6).text(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct ServiceDefinition {
+    pub app: String,
+    pub name: String,
+    pub glade_id: String,
+}
+impl ServiceDefinition {
+    pub fn to_cbor(&self) -> Cbor {
+        Cbor::Map(vec![
+            (1, Cbor::Text(self.app.clone())),
+            (2, Cbor::Text(self.name.clone())),
+            (3, Cbor::Text(self.glade_id.clone())),
+        ])
+    }
+    pub fn from_cbor(c: &Cbor) -> Self {
+        Self {
+            app: c.get(1).text(),
+            name: c.get(2).text(),
+            glade_id: c.get(3).text(),
         }
     }
 }

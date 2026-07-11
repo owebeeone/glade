@@ -28,7 +28,8 @@ use glade_wire::generated::{Head, Op, Shape, StreamHeads};
 
 use crate::chain::op_hash;
 use crate::sysdata::{
-    CapabilityGrant, CapabilityRevocation, NodeRecord, ServeClaim, SystemSnapshot, WorkspaceEntry,
+    BindingDecl, CapabilityGrant, CapabilityRevocation, NodeRecord, ServeClaim, ServiceDefinition,
+    SystemSnapshot, WorkspaceEntry,
 };
 
 /// The home share — the user-scale system declaration space (WD §2). All
@@ -43,6 +44,9 @@ pub const G_WORKSPACES: &str = "dir.workspaces";
 pub const G_CLAIMS: &str = "dir.claims";
 pub const G_GRANTS: &str = "dir.grants";
 pub const G_REVOCATIONS: &str = "dir.revocations";
+// App declaration records (GDL-037): what an <app>.glade file registers.
+pub const G_BINDINGS: &str = "dir.bindings";
+pub const G_SERVICES: &str = "dir.services";
 
 /// One home-share record (WD §2). Each variant folds by its own semantics; the
 /// enum is the append surface so `append` stays typed and the glade-id/shape
@@ -54,6 +58,8 @@ pub enum Record {
     Serve(ServeClaim),
     Grant(CapabilityGrant),
     Revoke(CapabilityRevocation),
+    Binding(BindingDecl),
+    Service(ServiceDefinition),
 }
 
 impl Record {
@@ -65,6 +71,8 @@ impl Record {
             Record::Serve(_) => G_CLAIMS,
             Record::Grant(_) => G_GRANTS,
             Record::Revoke(_) => G_REVOCATIONS,
+            Record::Binding(_) => G_BINDINGS,
+            Record::Service(_) => G_SERVICES,
         }
     }
 
@@ -74,13 +82,15 @@ impl Record {
         matches!(glade_id, G_GRANTS | G_REVOCATIONS)
     }
 
-    fn encode(&self) -> Vec<u8> {
+    pub(crate) fn encode(&self) -> Vec<u8> {
         let c = match self {
             Record::Node(r) => r.to_cbor(),
             Record::Workspace(r) => r.to_cbor(),
             Record::Serve(r) => r.to_cbor(),
             Record::Grant(r) => r.to_cbor(),
             Record::Revoke(r) => r.to_cbor(),
+            Record::Binding(r) => r.to_cbor(),
+            Record::Service(r) => r.to_cbor(),
         };
         cbor::encode(&c)
     }

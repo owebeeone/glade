@@ -1,0 +1,31 @@
+# grazel-app.glade — gryth's workspace app, declared as DATA (GDL-037/038).
+#
+# This file is LOADED, never compiled: a node registers each declaration as an
+# ordinary home-share record under the registrant's chain (byte-identical to
+# what dynamic configuration writes), and each ACL seed COMPILES TO a
+# CapabilityGrant record at registration. The fold stays the only runtime
+# authority — a runtime revocation beats a re-registered seed, always.
+# Base glade knows nothing in this file; grazel is just the first contributor.
+#
+# Executable spec: ggg-viz s-app-register (4 bindings, 1 service, 2 ACL seeds).
+glade-app v0
+app grazel
+
+# binding <glade_id> <shape> <authority> <zone> <retention>
+# App-static surfaces: no share/key here — the ServeClaim selects the node,
+# the mount fills domain/zone/key (GladeDeclSurface.md).
+binding ws.tree   value share commons latest
+binding ws.files  log   share commons from-cursor
+binding ws.diff   log   share private from-cursor
+binding term.log  log   share commons windowed
+
+# service <name> <exchange-glade-id>
+# The authority provider grazel attaches, and the DIRECTED surface it answers.
+# Exchanges never fan out: only the claim-holding node's provider replies.
+service grazel gwz.ops
+
+# seed <principal> <share> <verb[,verb...]>
+# Bootstrap shortcuts, not a parallel ACL system: compiled to CapabilityGrant
+# records at registration; ordinary fold rules (revocation wins) from then on.
+seed owner grazel read.*
+seed owner grazel gwz.*

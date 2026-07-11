@@ -62,6 +62,32 @@ SCHEMA = schema(
         F("principal", 1, STR),
         F("share", 2, STR)),
 
+    # ---- app declaration records (GDL-037/038, Lane R step 4) --------------
+    # A <app>.glade file's declarations REGISTERED as ordinary records: the
+    # loader appends these under the registrant's chain — byte-identical to
+    # what dynamic configuration would write. Base glade folds them without
+    # knowing any app; grazel is just the first contributor.
+    #
+    # A declared binding surface (glade-decl vocabulary, GladeDeclSurface.md):
+    # app-static — no share/key here; the ServeClaim selects the node and the
+    # mount fills domain/zone/key. shape/authority/zone/retention ride as
+    # strings (data, not enums) so the record evolves additively.
+    Msg("BindingDecl",
+        F("app", 1, STR),
+        F("glade_id", 2, STR),
+        F("shape", 3, STR),
+        F("authority", 4, STR),
+        F("zone", 5, STR),
+        F("retention", 6, STR)),
+
+    # A declared service: the authority provider an app attaches, named with
+    # the EXCHANGE glade id it answers (directed frames route to it — never a
+    # replica; the fan-out asymmetry).
+    Msg("ServiceDefinition",
+        F("app", 1, STR),
+        F("name", 2, STR),
+        F("glade_id", 3, STR)),
+
     # ---- the snapshot wrapper (substrate vocabulary, not a hack) -----------
     # The whole system state as ONE taut message: a cached fold + heads.
     # records[i] = CBOR(wire Op)   heads[j] = CBOR(wire StreamHeads).

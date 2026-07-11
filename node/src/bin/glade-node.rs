@@ -9,7 +9,8 @@
 //! singleton lock here would collide, and tests must never write $HOME).
 //!
 //! **Booted profile form** (opt-in): `glade-node --profile local|peer|server
-//! [--name NAME] [--operator OP] [--peer ID@IP:PORT]... [PORT] [STORE_DIR]` —
+//! [--name NAME] [--operator OP] [--app FILE.glade]... [--peer ID@IP:PORT]...
+//! [PORT] [STORE_DIR]` —
 //! FIRST boots the system-data instance (GDL-036): acquires
 //! `~/.glade/sys/<name>/` (the profile picks the default name; `--name`
 //! overrides; `GLADE_HOME` overrides `$HOME/.glade`), runs the load-validation
@@ -22,13 +23,17 @@
 //! another node), and each `--peer` target is dialed and the home share
 //! converged. Then it serves the app-data carrier as before.
 //!
+//! Each `--app FILE.glade` is LOADED as data and REGISTERED (GDL-037): its
+//! declarations append as ordinary records, its ACL seeds compile to grant
+//! records — under this node's chain, diffed against the fold (idempotent).
+//!
 //! Either form binds 127.0.0.1:<port> (0 = OS-assigned) and prints
 //! `listening <port>` so a parent process can read the actual port.
 
 use std::io::Write;
 
 use glade_node::iroh_carrier::{PeerAddr, PeerEndpoint};
-use glade_node::registry::{RegistryApi, HOME};
+use glade_node::registry::{RegistryApi, StoreApi, HOME};
 use glade_node::server::Server;
 use glade_node::sysdir::{boot, now_ms, Profile};
 use tokio::net::TcpListener;
@@ -45,6 +50,7 @@ async fn main() -> std::io::Result<()> {
     let mut profile: Option<Profile> = None;
     let mut name: Option<String> = None;
     let mut operator: Option<String> = None;
+    let mut apps: Vec<String> = Vec::new();
     let mut peers: Vec<String> = Vec::new();
     let mut positional: Vec<String> = Vec::new();
 
@@ -54,6 +60,7 @@ async fn main() -> std::io::Result<()> {
             "--profile" => profile = args.next().and_then(|s| Profile::parse(&s)),
             "--name" => name = args.next(),
             "--operator" => operator = args.next(),
+            "--app" => apps.extend(args.next()),
             "--peer" => peers.extend(args.next()),
             _ => positional.push(a),
         }
@@ -64,7 +71,7 @@ async fn main() -> std::io::Result<()> {
     // Only an explicit --profile/--name boots the system-data instance; the
     // legacy positional form keeps its pre-seam contract exactly.
     let booted = if profile.is_some() || name.is_some() {
-        let node = boot(profile.unwrap_or(Profile::Local), name.as_deref(), operator.as_deref())?;
+        let mut node = boot(profile.unwrap_or(Profile::Local), name.as_deref(), operator.as_deref())?;
         println!("instance {}", node.dir.display());
         println!("node {}", node.node_id);
         if node.rejected > 0 {
@@ -72,6 +79,17 @@ async fn main() -> std::io::Result<()> {
         }
         let serves_home = node.registry.who_serves(HOME, now_ms()).is_some();
         println!("registry ready (home served: {serves_home})");
+        // ---- app registration (GDL-037): <app>.glade loaded as data --------
+        // Ordinary attributed appends under this node's chain, diffed against
+        // the fold (idempotent), then persisted like any other record write.
+        let registrant = node.node_id.clone();
+        for path in &apps {
+            let decl = glade_node::appdecl::load(path)?;
+            let reg = glade_node::appdecl::register(&decl, &mut node.registry, &registrant)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}")))?;
+            node.store.save(&node.registry.snapshot())?;
+            println!("app {} registered (+{} record(s), {} unchanged)", decl.app, reg.appended, reg.unchanged);
+        }
         Some(node)
     } else {
         None
