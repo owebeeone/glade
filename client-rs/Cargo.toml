@@ -1,0 +1,18 @@
+[package]
+name = "glade-client"
+version = "0.0.0"
+edition = "2021"
+description = "Glade rust wire client (GLP-0006 P0.S3) — a supplier-side mirror of the TS session client: WS carrier, per-origin chain store + folds, subscribe/append/exchange, the provider loop (answer ExchangeReq), and a thin supplier helper. Depends on the wire + tokio only — no node internals (P00-a)."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+glade-wire = { path = "../wire-rs" }
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+
+[dev-dependencies]
+# tests spawn the glade-node BINARY over the wire (no node internals — P00-a);
+# `process` reads its `listening <port>` line, the rest match the lib features.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "sync", "time", "process"] }
