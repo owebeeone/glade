@@ -34,6 +34,13 @@ pub(crate) struct Shared {
     /// `enable_mesh`. `None` = the legacy client-serve node: every subscribe is
     /// served locally, exactly the pre-mesh contract.
     pub(crate) mesh: OnceLock<Arc<Mesh>>,
+    /// Attached authority providers for DECLARED exchange surfaces:
+    /// `(share, glade_id) -> session`. Exchanges route here, never to a replica
+    /// (the fan-out asymmetry, `exchange.rs`).
+    pub(crate) providers: Mutex<BTreeMap<(String, String), SessionId>>,
+    /// In-flight exchanges: correlation id -> the requesting session, so a
+    /// provider's `ExchangeRes` routes back 1:1 (never folded, never fanned).
+    pub(crate) pending: Mutex<BTreeMap<String, SessionId>>,
 }
 
 /// A glade node bound to a store directory.
@@ -51,6 +58,8 @@ impl Server {
                 out: Mutex::new(BTreeMap::new()),
                 next: AtomicU64::new(1),
                 mesh: OnceLock::new(),
+                providers: Mutex::new(BTreeMap::new()),
+                pending: Mutex::new(BTreeMap::new()),
             }),
         })
     }
@@ -121,10 +130,12 @@ async fn handle(shared: Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
             Err(_) => continue,
         };
 
-        // directed frames -> echo provider (not replicated)
+        // directed channel frames -> echo provider (not replicated). Exchange
+        // frames route through `exchange.rs` (declared surfaces reach the
+        // authority; undeclared ids keep this same echo, inside handle_request).
         if matches!(
             frame,
-            Frame::ExchangeReq(_) | Frame::ChannelOpen(_) | Frame::ChannelData(_) | Frame::ChannelClose(_)
+            Frame::ChannelOpen(_) | Frame::ChannelData(_) | Frame::ChannelClose(_)
         ) {
             for out in echo.handle(&frame) {
                 send(&shared, sid, &out).await;
@@ -133,6 +144,13 @@ async fn handle(shared: Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
         }
 
         match frame {
+            Frame::ExchangeReq(req) => {
+                crate::exchange::handle_request(&shared, sid, req, &mut echo).await;
+            }
+            Frame::ExchangeRes(res) => {
+                // an attached authority provider answering: 1:1 by corr.
+                crate::exchange::handle_response(&shared, res).await;
+            }
             Frame::Hello(h) => {
                 for sh in &h.heads {
                     let m = client_heads.entry((sh.share.clone(), sh.glade_id.clone(), sh.key.clone())).or_default();
@@ -148,6 +166,16 @@ async fn handle(shared: Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
                 // where it is served (mesh-less nodes are always Local — the
                 // legacy contract, unchanged).
                 let key = s.key.clone().unwrap_or_default();
+                // A SUBSCRIBE to a DECLARED exchange surface is an authority
+                // provider attaching (trace C4) — directed routing, no replica.
+                let declared = {
+                    let st = shared.store.lock().await;
+                    crate::exchange::declared_exchange(&st, &s.glade_id)
+                };
+                if declared {
+                    crate::exchange::attach_provider(&shared, sid, &s.share, &s.glade_id, key).await;
+                    continue;
+                }
                 match crate::mesh::route_subscribe(&shared, &s.share).await {
                     crate::mesh::Route::Absent(reason) => {
                         // The trace's STATUS step (E5): absence is data with a
@@ -220,6 +248,8 @@ async fn handle(shared: Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
 
     shared.out.lock().await.remove(&sid);
     shared.router.lock().await.unsubscribe_all(sid);
+    // a departing authority provider releases its exchange surfaces.
+    shared.providers.lock().await.retain(|_, v| *v != sid);
     wtask.abort();
     Ok(())
 }

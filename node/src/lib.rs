@@ -9,6 +9,7 @@
 pub mod appdecl;
 pub mod chain;
 pub mod echo;
+pub mod exchange;
 pub mod frame;
 pub mod iroh_carrier;
 pub mod mesh;

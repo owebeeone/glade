@@ -201,11 +201,14 @@ async fn run_link(shared: Arc<Shared>, mesh: Arc<Mesh>, link: PeerLink, dialed: 
 
 /// Serve one inbound peer stream by its first frame: `Heads` = a home-scoped
 /// sync pull (serve the gap, close); `Subscribe` = a forwarded interest (this
-/// node is the claim holder — serve gap + live ops until the interest closes).
+/// node is the claim holder — serve gap + live ops until the interest closes);
+/// `ExchangeReq` = a forwarded exchange (this node is the claim holder — the
+/// attached authority answers, one stream one exchange, `exchange.rs`).
 async fn handle_peer_stream(shared: Arc<Shared>, mut send: SendStream, mut recv: RecvStream) -> io::Result<()> {
     match read_frame(&mut recv).await? {
         Frame::Heads(h) => serve_home(&shared, &mut send, h).await,
         Frame::Subscribe(s) => serve_peer_subscribe(shared, send, recv, s).await,
+        Frame::ExchangeReq(x) => crate::exchange::serve_peer_exchange(shared, send, recv, x).await,
         _ => Ok(()), // unknown opener: drop the stream, never the connection
     }
 }
