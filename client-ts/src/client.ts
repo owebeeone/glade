@@ -28,6 +28,25 @@ function frame(schema: SchemaIndex, tag: number, message: string, value: unknown
   return out;
 }
 
+/** An inbound directed request routed to this session as the attached provider —
+ *  the wire `ExchangeReq` (tag 6), decoded. `corr` MUST be echoed 1:1 in the
+ *  answer. Structurally the glial supplier kit's `ExchangeRequest`. */
+export interface InboundExchangeReq {
+  share: string;
+  glade_id: string;
+  corr: string;
+  payload: Uint8Array;
+}
+
+/** The provider's answer to one request, shipped as a tag-7 `ExchangeRes` with
+ *  `corr` preserved. Structurally the glial supplier kit's `ExchangeReply`. */
+export interface OutboundExchangeRes {
+  corr: string;
+  ok: boolean;
+  payload?: Uint8Array;
+  error?: string;
+}
+
 export class GladeClient {
   readonly session: Session;
   private schema: SchemaIndex;
@@ -42,6 +61,16 @@ export class GladeClient {
   private exCorr = 0;
   private exWaiters = new Map<string, (r: { ok: boolean; payload?: Uint8Array; error?: string }) => void>();
 
+  // Fan-out registries (GLP-0006 P0.S3 supplier seam): a supplier serving
+  // several surfaces over one session needs many listeners, so these are Sets
+  // returning an unsubscribe — unlike the single `onOps` field (kept for
+  // grip-share/demo). The field owns folding when set; listeners are additive.
+  private opsListeners = new Set<(ops: Op[]) => void>();
+  private exReqHandlers = new Set<(req: InboundExchangeReq) => void>();
+  private dropHandlers = new Set<() => void>();
+  /** A caller-initiated `close()` must NOT look like a link drop (no reattach). */
+  private closing = false;
+
   constructor(schema: SchemaIndex, origin: string, session?: Session) {
     this.schema = schema;
     this.session = session ?? new Session(schema, origin);
@@ -55,6 +84,11 @@ export class GladeClient {
       ws.onopen = () => resolve();
       ws.onerror = () => reject(new Error("websocket error"));
       ws.onmessage = (ev: MessageEvent) => this.onMessage(new Uint8Array(ev.data as ArrayBuffer));
+      ws.onclose = () => {
+        // A link drop (node death, network loss) — fire drop listeners so a
+        // supplier reattaches. A deliberate `close()` is not a drop.
+        if (!this.closing) for (const h of [...this.dropHandlers]) h();
+      };
     });
   }
 
@@ -62,12 +96,28 @@ export class GladeClient {
     const tag = bytes[0];
     const value = codec.decode(this.schema, MSG_BY_TAG[tag], bytes.slice(1)) as Record<string, unknown>;
     if (tag === TAG.Ops) {
-      if (this.onOps) this.onOps(value.ops as Op[]);
-      else this.session.applyRemote(value.ops as Op[]);
+      const ops = value.ops as Op[];
+      // The `onOps` field keeps its exact contract (grip-share owns folding
+      // when set; else the session folds). Op listeners are an additive
+      // fan-out for suppliers serving shares — byte-for-byte for the field.
+      if (this.onOps) this.onOps(ops);
+      else this.session.applyRemote(ops);
+      for (const h of [...this.opsListeners]) h(ops);
     } else if (tag === TAG.Heads) {
       this.subAcks.shift()?.();
     } else if (tag === TAG.Welcome) {
       this.welcomeAcks.shift()?.();
+    } else if (tag === TAG.ExchangeReq) {
+      // Inbound directed request: this session is the attached provider. The
+      // node already routed it here (it decodes-and-drops without a handler),
+      // so surface it to every registered provider handler, corr intact.
+      const req: InboundExchangeReq = {
+        share: value.share as string,
+        glade_id: value.glade_id as string,
+        corr: value.corr as string,
+        payload: value.payload as Uint8Array,
+      };
+      for (const h of [...this.exReqHandlers]) h(req);
     } else if (tag === TAG.ExchangeRes) {
       this.exWaiters.get(value.corr as string)?.({
         ok: value.ok as boolean,
@@ -116,6 +166,42 @@ export class GladeClient {
     this.send(frame(this.schema, TAG.Ops, "Ops", { ops, pri: null }));
   }
 
+  /** Register an additional inbound-ops listener (fan-out); returns an
+   *  unsubscribe. Complements the single `onOps` field: a supplier serving
+   *  several surfaces over one session registers one listener per surface. */
+  addOpsListener(handler: (ops: Op[]) => void): () => void {
+    this.opsListeners.add(handler);
+    return () => this.opsListeners.delete(handler);
+  }
+
+  /** Surface inbound directed requests (tag-6 `ExchangeReq`) to a provider
+   *  handler; returns an unsubscribe. Pairs with {@link respondExchange} — this
+   *  session is THE attached provider once it has Subscribed a declared exchange
+   *  surface (`exchange.rs::attach_provider`). */
+  onExchangeReq(handler: (req: InboundExchangeReq) => void): () => void {
+    this.exReqHandlers.add(handler);
+    return () => this.exReqHandlers.delete(handler);
+  }
+
+  /** Answer a directed request: ship a tag-7 `ExchangeRes`, `corr` preserved
+   *  1:1 (the node relays it to the recorded requester). Failure is data —
+   *  pass `ok:false` with an `error`, never hang. */
+  respondExchange(res: OutboundExchangeRes): void {
+    this.send(frame(this.schema, TAG.ExchangeRes, "ExchangeRes", {
+      corr: res.corr,
+      ok: res.ok,
+      payload: res.payload ?? null,
+      error: res.error ?? null,
+    }));
+  }
+
+  /** Register a link-drop listener (ws close that was NOT a deliberate
+   *  `close()`); returns an unsubscribe. Drives supplier reattach-on-drop. */
+  onDrop(handler: () => void): () => void {
+    this.dropHandlers.add(handler);
+    return () => this.dropHandlers.delete(handler);
+  }
+
   /** A directed request/response to a provider (e.g. the echo provider). */
   exchange(share: string, gladeId: string, payload: Uint8Array): Promise<{ ok: boolean; payload?: Uint8Array; error?: string }> {
     const corr = `c${++this.exCorr}`;
@@ -130,6 +216,7 @@ export class GladeClient {
   }
 
   close(): void {
+    this.closing = true;
     this.ws?.close();
   }
 

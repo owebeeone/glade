@@ -5,6 +5,6 @@
   "type": "module",
   "description": "Glade TS session client (GLP-0005 P2) — browser-side session, lww+log folds, per-origin log store, WS carrier. Conforms byte-for-byte to taut's glade corpus + fold + hash oracles.",
   "scripts": {
-    "test": "node --experimental-strip-types --test test/*.test.ts"
+    "test": "node --experimental-transform-types --test test/*.test.ts"
   }
 }
