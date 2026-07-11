@@ -35,11 +35,14 @@ import { M, WORKSPACE_MANIFEST, stubGrant, type Surface } from "./manifest";
 const schema = loadSchema(gladeIr as never);
 const appSchema = loadSchema(workspaceIr as never);
 
-/** One activity-log entry — the declared `ChatLine` taut message. */
+/** One activity-log entry — the declared `ChatLine` taut message. `principal` is
+ *  the NEW optional attribution field (GLP-0006 P1.S1, tag 4) — additive beside
+ *  `user`, never a reinterpretation of it (absent on legacy lines). */
 export interface ChatLine {
   ts: number;
   user: string;
   text: string;
+  principal?: string;
 }
 
 /** The taut `ChatLine` codec — the one non-JSON payload. */

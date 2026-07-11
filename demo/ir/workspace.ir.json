@@ -116,6 +116,17 @@
           "optional": false,
           "transient": false,
           "merge": null
+        },
+        {
+          "name": "principal",
+          "tag": 4,
+          "type": {
+            "k": "scalar",
+            "scalar": "str"
+          },
+          "optional": true,
+          "transient": false,
+          "merge": null
         }
       ]
     }

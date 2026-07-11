@@ -24,6 +24,11 @@ SCHEMA = schema(
     # one activity-log entry: when, who, what.
     Msg("ChatLine",
         F("ts", 1, INT),       # epoch millis
-        F("user", 2, STR),     # origin / author
-        F("text", 3, STR)),    # the message
+        F("user", 2, STR),     # origin / author (never reinterpreted)
+        F("text", 3, STR),     # the message
+        # GLP-0006 P1.S1 (Decisions 2026-07-12): attribution as a NEW OPTIONAL
+        # field beside `user` — additive-only decl versioning, NOT a
+        # reinterpretation of `user`. The acting principal (P0.S7) stamped per
+        # line; absent on legacy lines, so old bytes still decode.
+        F("principal", 4, STR, optional=True)),  # acting principal (attribution)
 )
