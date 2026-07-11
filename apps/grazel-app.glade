@@ -7,7 +7,12 @@
 # authority — a runtime revocation beats a re-registered seed, always.
 # Base glade knows nothing in this file; grazel is just the first contributor.
 #
-# Executable spec: ggg-viz s-app-register (4 bindings, 1 service, 2 ACL seeds).
+# DUAL-MAINTENANCE NOTE (P1.S3): this file is kept BYTE-IDENTICAL in two homes —
+# grazel/apps/grazel-app.glade (grazel owns its declaration) and
+# glade/apps/grazel-app.glade (the demo's copy). Edit both together until a
+# single shared source is factored out (future dedup item).
+#
+# Executable spec: ggg-viz s-app-register.
 glade-app v0
 app grazel
 
@@ -18,6 +23,15 @@ binding ws.tree   value share commons latest
 binding ws.files  log   share commons from-cursor
 binding ws.diff   log   share private from-cursor
 binding term.log  log   share commons windowed
+
+# Supplier surfaces grazel composes (P1.S3): glade-gwz's long-op output stream,
+# and glade-chat's group-keyed message log + group-list value. Pre-declared so
+# the surfaces exist node-side regardless of a running supplier host — the chat
+# supplier is TS/in-process in the UI host (grazel does NOT run it in P1), so its
+# surfaces are declared here rather than by a grazel-spawned process.
+binding gwz.output  log   share commons from-cursor
+binding chat.msgs   log   share commons from-cursor
+binding chat.groups value share commons latest
 
 # service <name> <exchange-glade-id>
 # The authority provider grazel attaches, and the DIRECTED surface it answers.
@@ -34,5 +48,6 @@ seed owner grazel gwz.*
 # The workspace share this app serves from (audit F1): the node LOADING this
 # file registers the WorkspaceEntry with itself as eligible host and mints +
 # renews the ServeClaim while serving. Deployment picks the loader; the file
-# stays data.
+# stays data. Required for `(ws-razel, gwz.ops)` to route to the composed
+# glade-gwz supplier.
 workspace ws-razel razel

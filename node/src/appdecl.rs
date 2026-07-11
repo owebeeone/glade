@@ -272,21 +272,29 @@ mod tests {
         std::fs::read_to_string(path).unwrap()
     }
 
-    /// The checked-in grazel-app.glade parses to exactly the s-app-register
-    /// trace's shape: 4 bindings, 1 service, 2 ACL seeds — plus the declared
-    /// workspace share (audit F1: the workspace↔share association is DATA).
+    /// The checked-in grazel-app.glade parses to the app-register shape grazel
+    /// composes at P1.S3: 7 bindings — the 4 workspace surfaces (ws.tree/ws.files/
+    /// ws.diff/term.log) PLUS the 3 pre-declared supplier surfaces (gwz.output
+    /// from glade-gwz; chat.msgs + chat.groups from glade-chat, declared here so
+    /// they exist node-side regardless of a running TS chat host) — 1 service, 2
+    /// ACL seeds, and the declared workspace share (audit F1: the workspace↔share
+    /// association is DATA).
     #[test]
     fn grazel_file_matches_the_trace_shape() {
         let decl = parse(&grazel_file()).unwrap();
         assert_eq!(decl.app, "grazel");
-        assert_eq!(decl.bindings.len(), 4, "4 bindings (workspaces/files/diffs/terminals)");
+        assert_eq!(decl.bindings.len(), 7, "4 workspace + 3 composed-supplier surfaces");
         assert_eq!(decl.services.len(), 1, "1 service (grazel)");
         assert_eq!(decl.seeds.len(), 2, "2 ACL seeds");
         assert_eq!(decl.workspaces, vec![WorkspaceDecl { share: "ws-razel".into(), name: "razel".into() }]);
         // the directed surface the service answers (discovery.ts phase D):
         assert_eq!(decl.services[0].glade_id, "gwz.ops");
-        // key surface names ride as data:
+        // key surface names ride as data — the workspace tree + the composed
+        // gwz.output long-op stream + the chat group-keyed log:
         assert!(decl.bindings.iter().any(|b| b.glade_id == "ws.tree" && b.shape == "value"));
+        assert!(decl.bindings.iter().any(|b| b.glade_id == "gwz.output" && b.shape == "log"));
+        assert!(decl.bindings.iter().any(|b| b.glade_id == "chat.msgs" && b.shape == "log"));
+        assert!(decl.bindings.iter().any(|b| b.glade_id == "chat.groups" && b.shape == "value"));
         assert!(decl.bindings.iter().all(|b| b.app == "grazel"));
     }
 
@@ -368,10 +376,10 @@ mod tests {
         let decl = parse(&grazel_file()).unwrap();
         let mut reg = Registry::new();
         let first = register(&decl, &mut reg, "node-1").unwrap();
-        assert_eq!(first, Registered { appended: 8, unchanged: 0 }); // 4+1+2+1 workspace
+        assert_eq!(first, Registered { appended: 11, unchanged: 0 }); // 7 bindings +1 service +2 seeds +1 workspace
         let snap1 = reg.snapshot();
         let second = register(&decl, &mut reg, "node-1").unwrap();
-        assert_eq!(second, Registered { appended: 0, unchanged: 8 });
+        assert_eq!(second, Registered { appended: 0, unchanged: 11 });
         assert_eq!(reg.snapshot(), snap1, "re-registration is a byte-identical no-op");
     }
 

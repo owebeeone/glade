@@ -601,7 +601,7 @@ mod tests {
         let mut boot_b = boot_at(fresh("e2e-b-sys"), "gianni").unwrap();
         let b_id = boot_b.node_id.clone();
         let loaded = appdecl::register(&grazel_decl(), &mut boot_b.registry, &b_id).unwrap();
-        assert_eq!(loaded.appended, 8, "4 bindings + 1 service + 2 seeds + 1 workspace registered");
+        assert_eq!(loaded.appended, 11, "7 bindings + 1 service + 2 seeds + 1 workspace registered");
         boot_b
             .registry
             .append(
@@ -651,7 +651,7 @@ mod tests {
         wc.send_binary(&sub(HOME, G_BINDINGS)).await.unwrap();
         assert!(matches!(next_frame(&mut rc, "dir.bindings ack").await, Frame::Heads(_)));
         let mut bindings = Vec::new();
-        while bindings.len() < 4 {
+        while bindings.len() < 7 {
             if let Frame::Ops(ops) = next_frame(&mut rc, "BindingDecl records").await {
                 for op in ops.ops {
                     assert_eq!(op.origin, b_id, "declarations ride the registrant's chain");
@@ -660,7 +660,12 @@ mod tests {
             }
         }
         bindings.sort();
-        assert_eq!(bindings, vec!["term.log", "ws.diff", "ws.files", "ws.tree"]);
+        // the 4 workspace surfaces + the 3 pre-declared composed-supplier surfaces
+        // (gwz.output, chat.msgs, chat.groups) — P1.S3.
+        assert_eq!(
+            bindings,
+            vec!["chat.groups", "chat.msgs", "gwz.output", "term.log", "ws.diff", "ws.files", "ws.tree"]
+        );
         // the ACL seeds compiled to ORDINARY grant records (s-app-register A5).
         wc.send_binary(&sub(HOME, G_GRANTS)).await.unwrap();
         assert!(matches!(next_frame(&mut rc, "dir.grants ack").await, Frame::Heads(_)));
