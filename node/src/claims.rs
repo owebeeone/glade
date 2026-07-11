@@ -33,7 +33,7 @@ use glade_wire::generated::Op;
 use crate::registry::{Record, RegistryApi, StoreApi, G_CLAIMS, HOME};
 use crate::server::{Server, Shared};
 use crate::store::Store;
-use crate::sysdata::{ServeClaim, WorkspaceEntry};
+use crate::sysdata::{ServeClaim, WorkspaceCreateReq, WorkspaceCreateRes, WorkspaceEntry};
 use crate::sysdir::{now_ms, Boot};
 
 /// Default serve-lease TTL — matches the 30s the traces and tests use.
@@ -169,6 +169,26 @@ pub(crate) async fn serve_workspace_on(shared: &Arc<Shared>, share: &str, name: 
     }
     publish(shared, ops).await;
     Ok(true)
+}
+
+/// The glade-side create ceremony at the TARGET node (s-create D3→K1→H1,
+/// audit F2): mint the WorkspaceEntry + first ServeClaim under our own origin
+/// and join the renewal set — exactly [`serve_workspace_on`]. gwz-core
+/// MATERIALIZATION (repos on disk) is deliberately EXTERNAL: grazel hooks it
+/// around this ceremony (the app-owned-storage seam); the ceremony creates the
+/// glade-side records only. Idempotent by diff: re-creating a workspace this
+/// node already serves appends nothing and answers `created: false`.
+pub(crate) async fn create_workspace(shared: &Arc<Shared>, req: &WorkspaceCreateReq) -> io::Result<WorkspaceCreateRes> {
+    let Some(state) = shared.dir.get() else {
+        return Err(other("no directory authority at the create target"));
+    };
+    let name = if req.name.is_empty() { req.workspace.clone() } else { req.name.clone() };
+    let created = serve_workspace_on(shared, &req.workspace, &name).await?;
+    Ok(WorkspaceCreateRes {
+        workspace: req.workspace.clone(),
+        node: state.node_id.clone(),
+        created,
+    })
 }
 
 /// Renew every served share's lease: same epoch, fresh absolute expiry — an

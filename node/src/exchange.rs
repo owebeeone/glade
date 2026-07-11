@@ -30,7 +30,12 @@ use crate::registry::{G_BINDINGS, G_SERVICES, HOME};
 use crate::router::SessionId;
 use crate::server::{send, Shared};
 use crate::store::Store;
-use crate::sysdata::{BindingDecl, ServiceDefinition};
+use crate::sysdata::{BindingDecl, ServiceDefinition, WorkspaceCreateReq};
+
+/// The reserved built-in create surface (s-create D1–D3, audit F2): a system
+/// glade id the NODE answers itself, never a supplier — creation precedes
+/// claims, so it cannot ride claim routing. Reserved like the `dir.*` ids.
+pub const WORKSPACE_CREATE: &str = "workspace.create";
 
 /// How long the claim holder waits on its attached provider.
 const PROVIDER_TIMEOUT: Duration = Duration::from_secs(10);
@@ -86,9 +91,14 @@ pub(crate) async fn attach_provider(shared: &Arc<Shared>, sid: SessionId, share:
 }
 
 /// Route one inbound `ExchangeReq` from session `sid` (trace D1/D2 · X1):
+/// the reserved `workspace.create` id → the built-in TARGET-routed handler;
 /// undeclared → the legacy echo provider; declared → the C2 decision on the
 /// SHARE, and the replica never answers regardless of what it caches.
 pub(crate) async fn handle_request(shared: &Arc<Shared>, sid: SessionId, req: ExchangeReq, echo: &mut Echo) {
+    if req.glade_id == WORKSPACE_CREATE {
+        handle_create(shared, sid, req).await;
+        return;
+    }
     let declared = {
         let st = shared.store.lock().await;
         declared_exchange(&st, &req.glade_id)
@@ -129,6 +139,54 @@ pub(crate) async fn handle_request(shared: &Arc<Shared>, sid: SessionId, req: Ex
             // the exchange twin of the subscribe path's Error/UnknownShare.
             send(shared, sid, &res_err(&req.corr, &reason)).await;
         }
+    }
+}
+
+/// Route one `workspace.create` exchange (s-create D1–D3, audit F2). The
+/// request names its TARGET node IN THE PAYLOAD (`WorkspaceCreateReq` — the
+/// wire is untouched; the target rides the opaque exchange payload): creation
+/// is the one routed operation that cannot consult a ServeClaim, because it
+/// MAKES the thing claims will be about. Target == self → perform locally
+/// (mint entry + claim under our own origin, `claims::create_workspace`);
+/// target == a linked peer → forward the frame unchanged over the peer link
+/// (corr preserved 1:1; `serve_peer_exchange` at the target re-enters here and
+/// hits the self arm); anything else → `ExchangeRes{ok:false}` with the
+/// reason — an unlinked target fails as DATA, never a hang.
+async fn handle_create(shared: &Arc<Shared>, sid: SessionId, req: ExchangeReq) {
+    if req.payload.is_empty() {
+        send(shared, sid, &res_err(&req.corr, "workspace.create needs a WorkspaceCreateReq payload")).await;
+        return;
+    }
+    let create = WorkspaceCreateReq::from_cbor(&glade_wire::cbor::decode(&req.payload));
+    if create.workspace.is_empty() || create.target.is_empty() {
+        send(shared, sid, &res_err(&req.corr, "workspace.create needs {workspace, target}")).await;
+        return;
+    }
+    let Some(mesh) = shared.mesh.get() else {
+        send(shared, sid, &res_err(&req.corr, "workspace.create requires a booted node (no mesh)")).await;
+        return;
+    };
+    if create.target == mesh.self_id {
+        let frame = match crate::claims::create_workspace(shared, &create).await {
+            Ok(res) => Frame::ExchangeRes(ExchangeRes {
+                corr: req.corr.clone(),
+                ok: true,
+                payload: Some(glade_wire::cbor::encode(&res.to_cbor())),
+                error: None,
+            }),
+            Err(e) => res_err(&req.corr, &format!("create failed at target: {e}")),
+        };
+        send(shared, sid, &frame).await;
+        return;
+    }
+    if mesh.links.lock().await.contains_key(&create.target) {
+        let (shared, peer) = (shared.clone(), create.target.clone());
+        tokio::spawn(async move {
+            forward_exchange(&shared, peer, req, sid).await;
+        });
+    } else {
+        let reason = format!("create target {} is not self or a linked peer", create.target);
+        send(shared, sid, &res_err(&req.corr, &reason)).await;
     }
 }
 
@@ -347,6 +405,179 @@ mod tests {
             refs: vec![],
             shape: Shape::Value,
             payload: payload.to_vec(),
+        }
+    }
+
+    /// Poll until `pred` (over the node's store) holds, or panic after ~5s.
+    async fn wait_store<F: Fn(&Store) -> bool>(shared: &Arc<Shared>, pred: F, what: &str) {
+        for _ in 0..500 {
+            if pred(&*shared.store.lock().await) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    fn create_payload(workspace: &str, name: &str, target: &str) -> Vec<u8> {
+        glade_wire::cbor::encode(
+            &crate::sysdata::WorkspaceCreateReq { workspace: workspace.into(), name: name.into(), target: target.into() }.to_cbor(),
+        )
+    }
+
+    /// Read frames until the next `ExchangeRes` — a session subscribed to
+    /// directory streams legitimately interleaves fanned-out Ops with it.
+    async fn next_exchange_res(r: &mut ws::WsReader, what: &str) -> ExchangeRes {
+        loop {
+            if let Frame::ExchangeRes(res) = next_frame(r, what).await {
+                return res;
+            }
+        }
+    }
+
+    fn max_claim_epoch_for(st: &Store, share: &str) -> i64 {
+        let mut max = 0;
+        for (origin, _) in st.heads(HOME, crate::registry::G_CLAIMS, &[]) {
+            for op in st.scan(HOME, crate::registry::G_CLAIMS, &[], &origin, i64::MIN) {
+                let c = ServeClaim::from_cbor(&glade_wire::cbor::decode(&op.payload));
+                if c.share == share && c.epoch > max {
+                    max = c.epoch;
+                }
+            }
+        }
+        max
+    }
+
+    /// The s-create golden path (trace D1–D3 · K1 · H1, audit F2), E2E over
+    /// real iroh + real websockets. A client on A asks `workspace.create`
+    /// naming B as TARGET — no claim exists yet (creation PRECEDES claims;
+    /// the target rides the exchange payload, the wire untouched):
+    ///
+    ///   (a) the request routes to B by TARGET, B mints WorkspaceEntry +
+    ///       ServeClaim under its OWN origin and answers, corr preserved 1:1;
+    ///   (b) the minted records replicate back (B9 push), A's LOCAL fold
+    ///       routes the new share to B, and a subscribe flows THROUGH the new
+    ///       claim — authority content reaches the A-side client live;
+    ///   (c) re-create is idempotent: records diff away (`created:false`,
+    ///       entry heads + claim epoch unchanged at B);
+    ///   (d) a create naming an UNLINKED target answers `ok:false` data with
+    ///       the reason, and the session stays usable;
+    ///   (e) target == self performs locally, same ceremony.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn workspace_create_routes_to_target_end_to_end() {
+        let boot_a = boot_at(fresh("cr-a-sys"), "gianni").unwrap();
+        let boot_b = boot_at(fresh("cr-b-sys"), "gianni").unwrap();
+        let (a_id, b_id) = (boot_a.node_id.clone(), boot_b.node_id.clone());
+
+        let a = Server::open(fresh("cr-a-store")).unwrap();
+        let b = Server::open(fresh("cr-b-store")).unwrap();
+        let (id_a, id_b) = (boot_a.identity().unwrap(), boot_b.identity().unwrap());
+        a.adopt_boot(boot_a).await.unwrap();
+        b.adopt_boot(boot_b).await.unwrap();
+
+        let ep_a = PeerEndpoint::bind_with(id_a).await.unwrap();
+        let ep_b = PeerEndpoint::bind_with(id_b).await.unwrap();
+        a.enable_mesh(ep_a).await.unwrap();
+        let addr_b = b.enable_mesh(ep_b).await.unwrap();
+        a.connect_peer(&addr_b).await.unwrap();
+
+        let (a_shared, b_shared) = (a.shared.clone(), b.shared.clone());
+        let lis_a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let lis_b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (port_a, port_b) = (lis_a.local_addr().unwrap().port(), lis_b.local_addr().unwrap().port());
+        tokio::spawn(a.run(lis_a));
+        tokio::spawn(b.run(lis_b));
+
+        let (mut rc, wc) = ws::connect("127.0.0.1", port_a).await.unwrap();
+
+        // ---- (a) create at B, asked from A ----------------------------------
+        wc.send_binary(&xreq(HOME, WORKSPACE_CREATE, "cr-1", &create_payload("ws-new", "new", &b_id))).await.unwrap();
+        match next_frame(&mut rc, "create response").await {
+            Frame::ExchangeRes(res) => {
+                assert!(res.ok, "create succeeded, corr intact: {:?}", res.error);
+                assert_eq!(res.corr, "cr-1");
+                let out = crate::sysdata::WorkspaceCreateRes::from_cbor(&glade_wire::cbor::decode(&res.payload.unwrap()));
+                assert_eq!((out.workspace.as_str(), out.node.as_str(), out.created), ("ws-new", b_id.as_str(), true), "the TARGET performed the creation under its own origin");
+            }
+            other => panic!("expected ExchangeRes, got {other:?}"),
+        }
+
+        // ---- (b) the minted records reached A (B9 push): routing follows ----
+        {
+            let bid = b_id.clone();
+            wait_store(&a_shared, move |st| crate::mesh::who_serves(st, "ws-new", now_ms()) == Some(bid.clone()), "A's fold to route ws-new to B").await;
+        }
+        wc.send_binary(&sub("ws-new", "ws.tree")).await.unwrap();
+        assert!(matches!(next_frame(&mut rc, "ws-new subscribe ack (routed, not absent)").await, Frame::Heads(_)));
+        // B's authority session writes; the op reaches the A-side client live.
+        let (_rp, wp) = ws::connect("127.0.0.1", port_b).await.unwrap();
+        let op = Op {
+            share: "ws-new".into(),
+            glade_id: "ws.tree".into(),
+            key: vec![],
+            origin: "prov-b".into(),
+            seq: 0,
+            prev: None,
+            lamport: 0,
+            refs: vec![],
+            shape: Shape::Value,
+            payload: b"new-tree-v0".to_vec(),
+        };
+        wp.send_binary(&Frame::Ops(Ops { ops: vec![op], pri: None }).to_bytes()).await.unwrap();
+        loop {
+            if let Frame::Ops(ops) = next_frame(&mut rc, "content through the new claim").await {
+                if ops.ops.iter().any(|o| o.payload == b"new-tree-v0") {
+                    break;
+                }
+            }
+        }
+
+        // ---- (c) re-create is idempotent: the records diff -------------------
+        let (entry_heads, epoch_before) = {
+            let st = b_shared.store.lock().await;
+            (st.heads(HOME, crate::registry::G_WORKSPACES, &[]), max_claim_epoch_for(&st, "ws-new"))
+        };
+        wc.send_binary(&xreq(HOME, WORKSPACE_CREATE, "cr-2", &create_payload("ws-new", "new", &b_id))).await.unwrap();
+        match next_frame(&mut rc, "re-create response").await {
+            Frame::ExchangeRes(res) => {
+                assert!(res.ok);
+                let out = crate::sysdata::WorkspaceCreateRes::from_cbor(&glade_wire::cbor::decode(&res.payload.unwrap()));
+                assert!(!out.created, "already served: nothing new minted");
+            }
+            other => panic!("expected ExchangeRes, got {other:?}"),
+        }
+        {
+            let st = b_shared.store.lock().await;
+            assert_eq!(st.heads(HOME, crate::registry::G_WORKSPACES, &[]), entry_heads, "no duplicate WorkspaceEntry");
+            assert_eq!(max_claim_epoch_for(&st, "ws-new"), epoch_before, "no re-claim: the epoch is stable");
+        }
+
+        // ---- (d) an unlinked target fails as data ----------------------------
+        wc.send_binary(&xreq(HOME, WORKSPACE_CREATE, "cr-3", &create_payload("ws-nope", "nope", "deadbeef"))).await.unwrap();
+        match next_frame(&mut rc, "unlinked-target failure data").await {
+            Frame::ExchangeRes(res) => {
+                assert_eq!(res.corr, "cr-3");
+                assert!(!res.ok);
+                assert!(res.error.unwrap().contains("not self or a linked peer"), "the reason rides the response");
+            }
+            other => panic!("expected ExchangeRes failure data, got {other:?}"),
+        }
+        // failure is data, not a dead session: the next ask still answers.
+        wc.send_binary(&sub(HOME, crate::registry::G_WORKSPACES)).await.unwrap();
+        assert!(matches!(next_frame(&mut rc, "post-failure ack").await, Frame::Heads(_)));
+
+        // ---- (e) target == self performs locally -----------------------------
+        wc.send_binary(&xreq(HOME, WORKSPACE_CREATE, "cr-4", &create_payload("ws-mine", "mine", &a_id))).await.unwrap();
+        {
+            let res = next_exchange_res(&mut rc, "self-target create response").await;
+            assert!(res.ok, "{:?}", res.error);
+            assert_eq!(res.corr, "cr-4");
+            let out = crate::sysdata::WorkspaceCreateRes::from_cbor(&glade_wire::cbor::decode(&res.payload.unwrap()));
+            assert_eq!((out.node.as_str(), out.created), (a_id.as_str(), true));
+        }
+        {
+            let st = a_shared.store.lock().await;
+            assert_eq!(crate::mesh::who_serves(&st, "ws-mine", now_ms()), Some(a_id.clone()));
         }
     }
 

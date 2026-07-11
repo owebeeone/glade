@@ -18,8 +18,11 @@ Two layers:
 
 REGENERATE (never hand-edit the generated .rs):
     cd glade-wz/taut && PYTHONPATH=src python3 -m taut.cli gen \
-        ../glade/node/ir/sysdata.taut.py -o /tmp/sysdata-gen -l rust --api-only
+        ../glade/node/ir/sysdata.taut.py -o /tmp/sysdata-gen -l rust --api-only \
+        --legacy-codec
     # then copy /tmp/sysdata-gen/rust/api.rs -> glade/node/src/sysdata.rs
+    # --legacy-codec matches glade-wire's frozen cbor runtime (fail-open);
+    # removed at taut v0.10 — see GladeGrazelAttachNotes.md ambiguity #1.
 """
 
 import sys
@@ -28,7 +31,7 @@ from pathlib import Path
 # glade/node/ir -> glade-wz/taut/src (the taut builder, a sibling gwz member).
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "taut" / "src"))
 
-from taut.ir.dsl import BYTES, INT, STR, F, List, Msg, schema
+from taut.ir.dsl import BOOL, BYTES, INT, STR, F, List, Msg, schema
 
 SCHEMA = schema(
     # ---- home-share record kinds (WD §2) ----------------------------------
@@ -87,6 +90,23 @@ SCHEMA = schema(
         F("app", 1, STR),
         F("name", 2, STR),
         F("glade_id", 3, STR)),
+
+    # ---- the create ceremony (GLP-0006 P0.S2 — audit F2, s-create D1–D3) ---
+    # Rides ExchangeReq.payload on the reserved built-in `workspace.create`
+    # surface, handled by the NODE (never a supplier): creation PRECEDES
+    # claims, so the request names its TARGET node explicitly — the one routed
+    # operation that cannot consult a ServeClaim (it makes the thing claims
+    # will be about). Node-local system data; the wire IR is untouched.
+    Msg("WorkspaceCreateReq",
+        F("workspace", 1, STR),
+        F("name", 2, STR),
+        F("target", 3, STR)),
+    # The answer: which node performed it. created=False = the target already
+    # served that workspace (re-create is idempotent — records diff away).
+    Msg("WorkspaceCreateRes",
+        F("workspace", 1, STR),
+        F("node", 2, STR),
+        F("created", 3, BOOL)),
 
     # ---- the snapshot wrapper (substrate vocabulary, not a hack) -----------
     # The whole system state as ONE taut message: a cached fold + heads.

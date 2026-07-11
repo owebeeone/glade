@@ -171,6 +171,52 @@ impl ServiceDefinition {
 }
 
 #[derive(Clone, Debug, PartialEq, Default)]
+pub struct WorkspaceCreateReq {
+    pub workspace: String,
+    pub name: String,
+    pub target: String,
+}
+impl WorkspaceCreateReq {
+    pub fn to_cbor(&self) -> Cbor {
+        Cbor::Map(vec![
+            (1, Cbor::Text(self.workspace.clone())),
+            (2, Cbor::Text(self.name.clone())),
+            (3, Cbor::Text(self.target.clone())),
+        ])
+    }
+    pub fn from_cbor(c: &Cbor) -> Self {
+        Self {
+            workspace: c.get(1).text(),
+            name: c.get(2).text(),
+            target: c.get(3).text(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct WorkspaceCreateRes {
+    pub workspace: String,
+    pub node: String,
+    pub created: bool,
+}
+impl WorkspaceCreateRes {
+    pub fn to_cbor(&self) -> Cbor {
+        Cbor::Map(vec![
+            (1, Cbor::Text(self.workspace.clone())),
+            (2, Cbor::Text(self.node.clone())),
+            (3, Cbor::Bool(self.created)),
+        ])
+    }
+    pub fn from_cbor(c: &Cbor) -> Self {
+        Self {
+            workspace: c.get(1).text(),
+            node: c.get(2).text(),
+            created: c.get(3).boolean(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Default)]
 pub struct SystemSnapshot {
     pub records: Vec<Vec<u8>>,
     pub heads: Vec<Vec<u8>>,

@@ -164,3 +164,36 @@ the `Frame::Ops` opener arm, home ops only, scoped ingest). Self-minted
 records only; receivers never re-push — transitive gossip deferred. Best
 effort: a lost push (or a push racing ahead of the connect pull) is dropped by
 the chain-gap check and healed at the next connect-time pull.
+
+## Target-routed creation (audit F2 — s-create D1–D3, BUILT per P00-c)
+
+`workspace.create` is a RESERVED system glade id the NODE answers itself,
+never a supplier (the glade-sys direction, GDL-038 — wired built-in; the
+`glade-sys.glade` file itself is still not needed). Creation is the one routed
+operation that cannot consult a ServeClaim: it MAKES the thing claims will be
+about, so the request names its TARGET node explicitly.
+
+**The wire is untouched.** `ExchangeReq` has no target field and needs none:
+the target rides the opaque exchange payload as a node-local taut message
+(`WorkspaceCreateReq {workspace, name, target}` /
+`WorkspaceCreateRes {workspace, node, created}` in `node/ir/sysdata.taut.py`,
+regenerated with `--legacy-codec`). Routing in `exchange::handle_create`:
+target == self → perform locally (`claims::create_workspace` = the same
+`serve_workspace` ceremony: mint entry + claim under our own origin, join
+renewal); target == a linked peer → forward the frame unchanged over the peer
+link (corr preserved 1:1; the target's `serve_peer_exchange` re-enters the
+handler and hits the self arm); anything else → `ExchangeRes{ok:false}` with
+the reason — an unlinked target fails as DATA. Re-create is idempotent by
+diff: `created:false`, no new entry, no epoch bump.
+
+**The gwz-core seam**: disk materialization (manifest + member clones +
+workspace.lock, trace D3) is deliberately EXTERNAL — the ceremony creates the
+glade-side records only; grazel/glade-gwz hooks gwz-core around it (P1). The
+lock-precedes-claim discipline therefore binds at that layer, not here.
+
+Resolved smallest-faithful calls: the create payload's cross-language shape
+(a TS client minting creates) waits for sysdata IR to grow a TS target —
+node-side cargo E2E is the stage-1 gate; malformed create payloads share the
+codebase-wide fail-open legacy-codec posture (empty payload IS guarded; the
+fail-closed migration lands with taut v0.10); stage-2 asks which principals
+may create on which nodes (GDL-016) — the check slot is `handle_create`.
