@@ -18,3 +18,9 @@ export const ACTIVITY_TAP = defineGrip<any>("Activity.tap", undefined);
 
 export const STATUS = defineGrip<string>("Status", "");
 export const STATUS_TAP = defineGrip<any>("Status.tap", undefined);
+
+// The selected tab — grip-style shared state (no React state hook). The default
+// is the first registered tab (tabs.tsx `TABS[0]`, "workspace"); the *_TAP
+// handle lets the tab bar switch it (handle.set(id)).
+export const CURRENT_TAB = defineGrip<string>("CurrentTab", "workspace");
+export const CURRENT_TAB_TAP = defineGrip<any>("CurrentTab.tap", undefined);

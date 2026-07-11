@@ -28,9 +28,9 @@ import {
   type WireOp,
 } from "@owebeeone/glial-runtime";
 import type { PayloadCodec } from "@owebeeone/glial-runtime/grip";
-import type { BindingDecl, DomainAnchor, Shape, ZoneKind } from "@owebeeone/glade-decl";
-import { manifestScope, surfaceDecl } from "../../grip-share/src/manifest.ts";
-import { WORKSPACE_MANIFEST, stubGrant } from "./manifest";
+import type { Addr } from "../../grip-share/src/decl.ts";
+import { manifestScope } from "../../grip-share/src/manifest.ts";
+import { M, WORKSPACE_MANIFEST, stubGrant, type Surface } from "./manifest";
 
 const schema = loadSchema(gladeIr as never);
 const appSchema = loadSchema(workspaceIr as never);
@@ -42,14 +42,15 @@ export interface ChatLine {
   text: string;
 }
 
-/** taut codecs keyed by the manifest's surface `type`. Types absent here
- *  (e.g. "Text") use the JSON default — the same bytes as before the cutover. */
-export const CODECS_BY_TYPE: Record<string, PayloadCodec> = {
-  ChatLine: {
-    encode: (v) => tautCodec.encode(appSchema, "ChatLine", v as never),
-    decode: (b) => tautCodec.decode(appSchema, "ChatLine", b),
-  },
+/** The taut `ChatLine` codec — the one non-JSON payload. */
+const CHATLINE_CODEC: PayloadCodec = {
+  encode: (v) => tautCodec.encode(appSchema, "ChatLine", v as never),
+  decode: (b) => tautCodec.decode(appSchema, "ChatLine", b),
 };
+
+/** Per-surface codec overrides, keyed by the typed handle. A surface absent
+ *  here uses the adapter's JSON default — the same bytes as before the cutover. */
+const CODEC_BY_SURFACE = new Map<Surface, PayloadCodec>([[M.activity, CHATLINE_CODEC]]);
 
 // Identity is PER-TAB by ruling (Gianni, 2026-07-11): each tab is a distinct
 // participant — the two-participant demo IS the product intent. The origin
@@ -124,48 +125,36 @@ feedSession(session as unknown as SessionLike, bus);
  *  connectivity configured per mount via `destFor`. */
 export const glial = new GlialBinder(await IndexedDbStoreEngine.open(`glial:${origin}`), origin);
 
-// --- manifest-derived declaration data per surface --------------------------
+// --- handle-derived declaration data per surface ----------------------------
+//
+// Each consumer passes a typed `Surface` handle (`M.notes`, …). A handle IS a
+// `BindingDecl`, so the mount takes it directly (see taps.ts) — no `declFor`.
+// The wire address still resolves through the SAME `manifestScope` + `Grant`.
 
-const ANCHOR: Record<string, DomainAnchor> = { doc: "document", account: "account" };
-
-/** The app-static `BindingDecl` for a manifest surface (glade-decl vocabulary). */
-export function declFor(gladeId: string): BindingDecl {
-  const s = WORKSPACE_MANIFEST.surfaces[gladeId];
-  if (!s) throw new Error(`manifest has no surface ${gladeId}`);
-  return {
-    glade_id: { id: gladeId },
-    shape: s.shape as Shape,
-    authority: "share",
-    source: null,
-    domain: ANCHOR[s.domain] ?? "deployment",
-    zone: s.zone as ZoneKind,
-    retention: { policy: "from_cursor", ttl_ms: null },
-  };
+/** The surface's wire `(share, key)`, resolved through the manifest scope +
+ *  grant. The handle carries the domain anchor / zone; the scope owns the
+ *  domain -> share / zone -> key policy — identical address, identical bytes. */
+export function resolveAddr(s: Surface): Addr {
+  return scope.resolve({ gladeId: s.glade_id.id, shape: s.shape, domain: s.domain, zone: s.zone });
 }
 
-/** The concrete fill for a surface: the decl's domain anchor filled with the
- *  open doc / the account owner; private zones keyed to the participant. */
-export function fillFor(gladeId: string): Fill {
-  const s = WORKSPACE_MANIFEST.surfaces[gladeId];
-  if (!s) throw new Error(`manifest has no surface ${gladeId}`);
-  const fill: Fill = { domain: s.domain === "doc" ? doc : user, zone: s.zone };
+/** The concrete fill for a surface: document-domain surfaces fill the open doc,
+ *  account-domain surfaces fill the account owner; private zones key to you. */
+export function fillFor(s: Surface): Fill {
+  const fill: Fill = { domain: s.domain === "document" ? doc : user, zone: s.zone };
   if (s.zone === "private") fill.key = user;
   return fill;
 }
 
 /** Connectivity, config-as-data: the session-backed glade destination for a
- *  surface. The route's (share, key) comes from the SAME manifest scope the
- *  grip-share binder resolved — identical wire address, identical bytes. */
-export function destFor(gladeId: string): (fill: Fill) => SessionDestination {
-  const s = WORKSPACE_MANIFEST.surfaces[gladeId];
-  if (!s) throw new Error(`manifest has no surface ${gladeId}`);
-  const addr = scope.resolve(surfaceDecl(WORKSPACE_MANIFEST, gladeId));
-  const route = { share: addr.share, gladeId, shape: s.shape, key: addr.key };
+ *  surface, addressed by the handle-resolved route. */
+export function destFor(s: Surface): (fill: Fill) => SessionDestination {
+  const addr = resolveAddr(s);
+  const route = { share: addr.share, gladeId: s.glade_id.id, shape: s.shape, key: addr.key };
   return () => new SessionDestination(session as unknown as SessionLike, bus, route);
 }
 
 /** The surface's payload codec (undefined = the adapter's JSON default). */
-export function codecFor(gladeId: string): PayloadCodec | undefined {
-  const s = WORKSPACE_MANIFEST.surfaces[gladeId];
-  return s ? CODECS_BY_TYPE[s.type] : undefined;
+export function codecFor(s: Surface): PayloadCodec | undefined {
+  return CODEC_BY_SURFACE.get(s);
 }

@@ -104,6 +104,18 @@ A zone's `key` is a tuple of the *included* partition axes:
 - future axes compose the same way: **device**, **cohort** (a group/team),
   a transient **tab**. A surface declares which axes it weaves into its key.
 
+## Typed manifest (GLP-0006 P0.S5b, 2026-07-12)
+
+The demo's surface table is now typed handles (`defineManifest` → `M.notes` …,
+the declared-surface compile wall). The grip-share `manifestScope`/`Grant` policy
+is unchanged, with ONE faithful edit: `WORKSPACE_MANIFEST.domains` is keyed by the
+canonical `DomainAnchor` the handle carries (`document`/`account`) instead of the
+ad-hoc labels (`doc`/`account`). The share-template VALUES (`doc:{doc}`,
+`account:{self}`) and the zone→key mapping are identical, so the wire address /
+bytes are unchanged; the rekey just lets the scope resolve straight off the typed
+handle's `domain`, retiring the old `ANCHOR` name→anchor translation table. The
+surfaces moved out of `WORKSPACE_MANIFEST` (now empty there) into `M`.
+
 ## Open
 
 - The full axis vocabulary beyond `self` (device, cohort, …).

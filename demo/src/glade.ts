@@ -5,11 +5,10 @@
 // glial.ts; grip-share contributes declaration plumbing only (manifest scope).
 
 import { type Op } from "../../client-ts/src/session.ts";
-import { surfaceDecl } from "../../grip-share/src/manifest.ts";
-import { WORKSPACE_MANIFEST } from "./manifest";
+import { M } from "./manifest";
 import { grok, main } from "./runtime";
 import { ACTIVITY_TAP } from "./grips";
-import { bus, client, session, scope, user } from "./glial";
+import { bus, client, session, resolveAddr, user } from "./glial";
 
 // Identity + payload types live in glial.ts; re-exported so consumers
 // (WorkspacePanel, grips.ts) are untouched.
@@ -39,10 +38,10 @@ function setStatus(s: GladeStatus) {
 export async function startGladeSync(url: string): Promise<void> {
   try {
     await client.connect(url);
-    // subscribe every manifest surface's zone address (commons + our private).
-    for (const id of Object.keys(WORKSPACE_MANIFEST.surfaces)) {
-      const a = scope.resolve(surfaceDecl(WORKSPACE_MANIFEST, id));
-      await client.subscribe(a.share, id, a.key);
+    // subscribe every declared surface's zone address (commons + our private).
+    for (const s of Object.values(M)) {
+      const a = resolveAddr(s);
+      await client.subscribe(a.share, s.glade_id.id, a.key);
     }
     // re-ship anything already in the session (e.g. writes made before the
     // socket opened) — the node dedups by (origin, seq).

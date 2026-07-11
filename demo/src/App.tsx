@@ -1,5 +1,5 @@
-import { WorkspacePanel } from "./WorkspacePanel";
+import { Tabs } from "./tabs";
 
 export default function App() {
-  return <WorkspacePanel />;
+  return <Tabs />;
 }

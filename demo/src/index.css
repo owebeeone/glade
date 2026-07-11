@@ -7,9 +7,36 @@ body {
   background: #0f1115;
   color: #e6e6e6;
 }
+.tabs {
+  max-width: 560px;
+  margin: 1.5rem auto 0;
+  padding: 0 1rem;
+  display: flex;
+  gap: 0.4rem;
+  border-bottom: 1px solid #2a2f3a;
+}
+.tab {
+  background: #1a1e27;
+  border: 1px solid #2a2f3a;
+  border-bottom: none;
+  color: #cdd3e0;
+  padding: 0.4rem 0.9rem;
+  border-radius: 6px 6px 0 0;
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.9rem;
+}
+.tab.active {
+  background: #284a8a;
+  border-color: #3a6fd0;
+  color: #fff;
+}
+.tab:disabled {
+  cursor: default;
+}
 .panel {
   max-width: 560px;
-  margin: 2rem auto;
+  margin: 1.5rem auto 2rem;
   padding: 0 1rem 2rem;
 }
 header {

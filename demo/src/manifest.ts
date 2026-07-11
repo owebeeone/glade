@@ -1,34 +1,69 @@
-// The gryth-workspace share-space, as data (GladeManifest sketch). This single
-// manifest replaces three things that used to be hardcoded and scattered:
-//   - per-tap domain/zone/shape decls (was taps.ts)
-//   - the domain/zone -> share/key policy (was a hand-written scope in glade.ts)
-//   - the glade-id -> payload-type map (was the codecs map in glade.ts)
+// The gryth-workspace surface table, now TYPED (GLP-0006 P0.S5b). The stringly
+// table + per-glade-id lookups are gone: consumers reference `M.notes` /
+// `M.selection` / `M.activity` / `M.status` — each a typed `Surface` handle (a
+// frozen `BindingDecl`) — never the string "app:notes". An undefined or typo'd
+// surface (`M.nope`) is a TypeScript BUILD ERROR by construction: the declared-
+// surface compile wall, adopted from glial's `defineManifest` (P0.S5a).
 //
-// Today the manifest and a stub grant live client-side. Tomorrow the agent
-// publishes the manifest and issues the grant on auth — at which point `self`
-// becomes authenticated rather than a URL param, and nothing else changes.
+// The grip-share manifest plumbing is UNCHANGED and still working: the
+// `WORKSPACE_MANIFEST` below keeps the domain/zone -> share/key POLICY
+// (templates), and `manifestScope` / `Grant` / `stubGrant` resolve each session's
+// concrete wire address exactly as before (glial.ts). The typed handle CARRIES
+// the same data (glade id, shape, domain anchor, zone), so the scope resolves off
+// the handle — which is why the surfaces table moved OUT of `WORKSPACE_MANIFEST`
+// into `M`. The one policy edit: the `domains` map is keyed by the canonical
+// `DomainAnchor` ("document"/"account") the handle already uses (was "doc"/
+// "account"); the share-template VALUES are identical — see `dev-docs/
+// GladeZones.md` (Typed manifest note, 2026-07-12).
 
+import { defineManifest, type Surface } from "@owebeeone/glial-runtime/manifest";
 import type { Manifest, Grant } from "../../grip-share/src/manifest.ts";
 
+/** The app's declared surfaces — the legible app surface, as typed handles.
+ *  `share` is the domain's share TEMPLATE (the grant resolves the concrete
+ *  replicated world per session; grazel config resolves it later). `retention`
+ *  is `from_cursor` (the demo's log/value replay contract). */
+export const M = defineManifest({
+  // ACCOUNT domain, commons — your status; follows you across documents.
+  status: {
+    id: "app:status", shape: "value", share: "account:{self}",
+    domain: "account", zone: "commons", retention: { policy: "from_cursor", ttl_ms: null },
+  },
+  // DOCUMENT domain, private — your selection; keyed to you, never shared.
+  selection: {
+    id: "app:selection", shape: "value", share: "doc:{doc}",
+    domain: "document", zone: "private", retention: { policy: "from_cursor", ttl_ms: null },
+  },
+  // DOCUMENT domain, commons — the document's shared notes.
+  notes: {
+    id: "app:notes", shape: "value", share: "doc:{doc}",
+    domain: "document", zone: "commons", retention: { policy: "from_cursor", ttl_ms: null },
+  },
+  // DOCUMENT domain, commons (a log) — the document's activity feed (ChatLine).
+  activity: {
+    id: "app:activity", shape: "log", share: "doc:{doc}",
+    domain: "document", zone: "commons", retention: { policy: "from_cursor", ttl_ms: null },
+  },
+});
+export type { Surface };
+
+/** The share-space POLICY, as data: domain -> wire `share`, zone -> wire `key`.
+ *  Identity placeholders (`{self}`) fill from the grant (agent-bound); session
+ *  placeholders (`{doc}`) fill client-side. Surfaces now live in `M` — the scope
+ *  resolves off each handle's domain/zone, so the `surfaces` table is empty. */
 export const WORKSPACE_MANIFEST: Manifest = {
   manifest: "gryth-workspace",
   version: 1,
-  // {self} is identity (agent-bound); {doc} is a session param (client-supplied).
   params: { self: { from: "identity" }, doc: { from: "session" } },
   domains: {
-    doc: { share: "doc:{doc}" }, // the open document — its own replicated world
+    document: { share: "doc:{doc}" }, // the open document — its own replicated world
     account: { share: "account:{self}" }, // your account — follows you across docs
   },
   zones: {
     commons: { key: "" }, // everyone in the domain
     private: { key: "self:{self}" }, // keyed to you; never shared
   },
-  surfaces: {
-    "app:notes": { domain: "doc", zone: "commons", shape: "value", type: "Text" },
-    "app:activity": { domain: "doc", zone: "commons", shape: "log", type: "ChatLine" },
-    "app:selection": { domain: "doc", zone: "private", shape: "value", type: "Text" },
-    "app:status": { domain: "account", zone: "commons", shape: "value", type: "Text" },
-  },
+  surfaces: {}, // moved to `M` (typed handles); scope resolves off the handle.
 };
 
 /** STUB grant — minted client-side from the URL. The real one is agent-issued
