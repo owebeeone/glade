@@ -36,8 +36,11 @@ use glade_wire::generated::Op;
 use crate::registry::{Record, RegistryApi, RegistryError};
 use crate::sysdata::{BindingDecl, CapabilityGrant, ServiceDefinition, WorkspaceEntry};
 
-/// The shapes a binding may declare (GladeSubstrateV1 §3 + decl surface).
-const SHAPES: [&str; 6] = ["value", "log", "message", "stream", "exchange", "window"];
+/// Legacy wire/declaration names remain recognizable so diagnostics can be
+/// precise and numeric wire values remain reserved. New binding declarations
+/// are capability-gated to the two fold adapters implemented by both clients.
+const KNOWN_SHAPES: [&str; 6] = ["value", "log", "message", "stream", "exchange", "window"];
+const BINDING_SHAPES: [&str; 2] = ["value", "log"];
 /// The authority kinds (decl surface): the share is the source of record, or
 /// the share caches external truth.
 const AUTHORITIES: [&str; 2] = ["share", "external"];
@@ -109,8 +112,14 @@ pub fn parse(text: &str) -> Result<AppDecl, String> {
                         "line {n}: `binding <glade_id> <shape> <authority> <zone> <retention>`"
                     ));
                 }
-                if !SHAPES.contains(&toks[2]) {
-                    return Err(format!("line {n}: unknown shape `{}` (one of {SHAPES:?})", toks[2]));
+                if !KNOWN_SHAPES.contains(&toks[2]) {
+                    return Err(format!("line {n}: unknown shape `{}` (known: {KNOWN_SHAPES:?})", toks[2]));
+                }
+                if !BINDING_SHAPES.contains(&toks[2]) {
+                    return Err(format!(
+                        "line {n}: unsupported binding shape `{}` (implemented: {BINDING_SHAPES:?}; exchange uses `service`)",
+                        toks[2]
+                    ));
                 }
                 if !AUTHORITIES.contains(&toks[3]) {
                     return Err(format!(
@@ -308,6 +317,15 @@ mod tests {
         // bad shape
         let e = parse("glade-app v0\napp x\nbinding g blob share commons latest\n").unwrap_err();
         assert!(e.contains("line 3") && e.contains("blob"), "{e}");
+        // Known legacy/future enum values remain decodable on the wire but are
+        // not authorable bindings until an exact runtime adapter exists.
+        for shape in ["message", "stream", "exchange", "window"] {
+            let text = format!(
+                "glade-app v0\napp x\nbinding g {shape} share commons latest\n"
+            );
+            let e = parse(&text).unwrap_err();
+            assert!(e.contains("line 3") && e.contains("unsupported binding shape") && e.contains(shape), "{e}");
+        }
         // duplicate glade id (frozen-once-shared, GQ-6)
         let e = parse(
             "glade-app v0\napp x\nbinding g value share commons latest\nbinding g log share commons latest\n",

@@ -9,6 +9,7 @@ import { dirname, join } from "node:path";
 
 import { loadSchema } from "../src/taut/schema.ts";
 import { Session } from "../src/session.ts";
+import { UnsupportedShapeError } from "../src/shapes.ts";
 import { hex, utf8 } from "../src/bytes.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -71,4 +72,41 @@ test("offline writes survive hydration and reconcile on reconnect", () => {
     hex(restored.fold("sh", "g", "value") as Uint8Array),
     hex(peer.fold("sh", "g", "value") as Uint8Array),
   );
+});
+
+for (const shape of ["message", "stream", "exchange", "window"] as const) {
+  test(`unsupported ${shape} fails before session mutation`, () => {
+    const s = new Session(schema, "a");
+    assert.throws(() => s.append("sh", "g", shape, utf8("bad")), (error) => {
+      assert(error instanceof UnsupportedShapeError);
+      assert.equal(error.code, "GLADE_UNSUPPORTED_SHAPE");
+      assert.equal(error.shape, shape);
+      assert.equal(error.operation, "append");
+      return true;
+    });
+    assert.deepEqual(s.dump(), []);
+
+    // The failed append did not consume a sequence or lamport number.
+    const first = s.append("sh", "g", "value", utf8("ok"));
+    assert.equal(first.seq, 0);
+    assert.equal(first.lamport, 1);
+  });
+}
+
+test("unsupported fold does not fall through to value", () => {
+  const s = new Session(schema, "a");
+  s.append("sh", "g", "value", utf8("kept"));
+  assert.throws(() => s.fold("sh", "g", "atom"), UnsupportedShapeError);
+  assert.equal(s.dump().length, 1);
+});
+
+test("an unsupported remote batch is rejected atomically", () => {
+  const peer = new Session(schema, "peer");
+  const good = peer.append("sh", "g", "value", utf8("good"));
+  const bad = { ...good, origin: "legacy", shape: "message" };
+  const target = new Session(schema, "target");
+
+  assert.throws(() => target.applyRemote([good, bad]), UnsupportedShapeError);
+  assert.deepEqual(target.dump(), []);
+  assert.throws(() => Session.restore(schema, "target", [bad]), UnsupportedShapeError);
 });

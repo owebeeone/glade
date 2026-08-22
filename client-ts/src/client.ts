@@ -7,6 +7,7 @@ import { Session } from "./session.ts";
 import * as codec from "./taut/codec.ts";
 import type { SchemaIndex } from "./taut/schema.ts";
 import type { Op } from "./store.ts";
+import { requireFoldShape } from "./shapes.ts";
 
 const TAG = {
   Hello: 0, Welcome: 1, Subscribe: 2, Unsubscribe: 3, Ops: 4, Heads: 5,
@@ -97,6 +98,8 @@ export class GladeClient {
     const value = codec.decode(this.schema, MSG_BY_TAG[tag], bytes.slice(1)) as Record<string, unknown>;
     if (tag === TAG.Ops) {
       const ops = value.ops as Op[];
+      // Reject the whole batch before session storage or consumer callbacks.
+      for (const op of ops) requireFoldShape(op.shape, "receive");
       // The `onOps` field keeps its exact contract (grip-share owns folding
       // when set; else the session folds). Op listeners are an additive
       // fan-out for suppliers serving shares — byte-for-byte for the field.
@@ -163,6 +166,7 @@ export class GladeClient {
 
   /** Ship already-built ops to the node (the binder appends; the client carries). */
   sendOps(ops: Op[]): void {
+    for (const op of ops) requireFoldShape(op.shape, "sendOps");
     this.send(frame(this.schema, TAG.Ops, "Ops", { ops, pri: null }));
   }
 

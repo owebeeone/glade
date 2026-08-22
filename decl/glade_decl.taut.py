@@ -7,7 +7,10 @@
 # bootstrap when this gains its first generated consumer).
 
 SKETCH = """
-enum Shape { value, log, message, stream, exchange, window }   # text_crdt later (consolidation P4)
+# Numeric values/spellings are preserved for legacy wire decode; do not reorder.
+# New BindingDecl authoring is currently capability-gated to value|log. Exchange
+# is declared through ServiceDefinition, never folded as a binding shape.
+enum Shape { value, log, message, stream, exchange, window }   # message/window reserved; stream unsupported
 
 enum Authority { share, external }        # external carries a source name
 

@@ -7,6 +7,7 @@ import { foldLog, foldValue, type FoldOp } from "./fold.ts";
 import { opHash } from "./hash.ts";
 import { Store, type Op } from "./store.ts";
 import type { SchemaIndex } from "./taut/schema.ts";
+import { requireFoldShape } from "./shapes.ts";
 
 // Op is part of the Session API surface (append/applyRemote/dump) — re-export it.
 export type { Op } from "./store.ts";
@@ -26,6 +27,8 @@ export class Session {
   /** Append a local op to this origin's chain within a zone (default commons)
    *  and return it. The zone `key` selects the chain — its own seq/prev. */
   append(share: string, gladeId: string, shape: string, payload: Uint8Array, key: Uint8Array = new Uint8Array()): Op {
+    // Resolve capability before advancing lamport or touching the store.
+    const foldShape = requireFoldShape(shape, "append");
     const ownLog = this.store.scan(share, gladeId, key, this.origin, -Infinity);
     const last = ownLog[ownLog.length - 1];
     this.lamport += 1;
@@ -38,7 +41,7 @@ export class Session {
       prev: last ? opHash(this.schema, last as never) : null,
       lamport: this.lamport,
       refs: [],
-      shape,
+      shape: foldShape,
       payload,
     };
     this.store.append(op);
@@ -47,6 +50,9 @@ export class Session {
 
   /** Apply ops received from a peer/node; advance the lamport clock. */
   applyRemote(ops: Op[]): void {
+    // Preflight the whole batch so one unsupported op cannot leave a partially
+    // mutated store before the error is reported.
+    for (const op of ops) requireFoldShape(op.shape, "applyRemote");
     for (const op of ops) {
       try {
         this.store.append(op);
@@ -60,8 +66,14 @@ export class Session {
 
   /** Materialize a bound surface by folding its zone-surface ops (default commons). */
   fold(share: string, gladeId: string, shape: string, key: Uint8Array = new Uint8Array()): Uint8Array | Uint8Array[] | null {
+    const foldShape = requireFoldShape(shape, "fold");
     const ops: FoldOp[] = this.store.opsFor(share, gladeId, key);
-    return shape === "log" ? foldLog(ops) : foldValue(ops);
+    switch (foldShape) {
+      case "value":
+        return foldValue(ops);
+      case "log":
+        return foldLog(ops);
+    }
   }
 
   /** This session's per-origin heads for a share (resume vector). */
@@ -79,6 +91,7 @@ export class Session {
     return this.store.dump();
   }
   static restore(schema: SchemaIndex, origin: string, ops: Op[]): Session {
+    for (const op of ops) requireFoldShape(op.shape, "restore");
     return new Session(schema, origin, Store.load(schema, ops));
   }
 }

@@ -7,19 +7,33 @@
 //! does — one shape (§2 of `GladeSupplierModel.md`).
 
 use std::collections::HashMap;
+use std::io;
 
 use glade_wire::generated::{Op, Shape};
 
 use crate::hash::op_hash;
 
-/// Map a surface's shape word to the wire `Shape`. Only value/log op-serve
-/// (exchange is directed, never appended; window is P3), so anything not `log`
-/// folds as a value — byte-for-byte with the TS client's `shape === "log"`.
-pub fn shape_of(shape: &str) -> Shape {
-    if shape == "log" {
-        Shape::Log
-    } else {
-        Shape::Value
+/// Resolve an exact op/fold capability. Exchange is directed and never
+/// appended; legacy/future names must not be reinterpreted as Value.
+pub fn shape_of(shape: &str) -> io::Result<Shape> {
+    match shape {
+        "value" => Ok(Shape::Value),
+        "log" => Ok(Shape::Log),
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsupported Glade op/fold shape {other:?}; supported: value, log"),
+        )),
+    }
+}
+
+/// Validate an already-decoded wire shape before an op enters session state.
+pub fn require_fold_shape(shape: Shape, operation: &str) -> io::Result<Shape> {
+    match shape {
+        Shape::Value | Shape::Log => Ok(shape),
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsupported Glade op/fold shape {other:?} for {operation}; supported: Value, Log"),
+        )),
     }
 }
 
@@ -120,13 +134,19 @@ impl Session {
     }
 
     /// Apply ops received from the node; advance the lamport clock.
-    pub fn apply_remote(&mut self, ops: &[Op]) {
+    pub fn apply_remote(&mut self, ops: &[Op]) -> io::Result<()> {
+        // Preflight the whole batch: rejection is atomic with respect to store
+        // and lamport mutation.
+        for op in ops {
+            require_fold_shape(op.shape, "apply_remote")?;
+        }
         for op in ops {
             let lam = op.lamport;
             if self.store.append(op.clone()) && lam > self.lamport {
                 self.lamport = lam;
             }
         }
+        Ok(())
     }
 
     /// lww value fold: winner = max by (lamport, origin). `None` if empty.
@@ -188,7 +208,7 @@ mod tests {
         assert_eq!(a.fold_value("s", "g", &[]), Some(b"a0".to_vec()));
         // a remote op from "b" with a higher lamport wins.
         let b_op = Op { origin: "b".into(), lamport: 9, ..sample("s", "g", b"b0") };
-        a.apply_remote(&[b_op]);
+        a.apply_remote(&[b_op]).unwrap();
         assert_eq!(a.fold_value("s", "g", &[]), Some(b"b0".to_vec()));
     }
 
@@ -201,6 +221,28 @@ mod tests {
         s.append("s", "g", Shape::Log, b"private".to_vec(), b"self:a".to_vec());
         assert_eq!(s.fold_log("s", "g", &[]), vec![b"l0".to_vec(), b"l1".to_vec()]);
         assert_eq!(s.fold_log("s", "g", b"self:a"), vec![b"private".to_vec()]);
+    }
+
+    #[test]
+    fn unsupported_shapes_fail_closed() {
+        for shape in ["message", "stream", "exchange", "window", "atom"] {
+            let err = shape_of(shape).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+            assert!(err.to_string().contains(shape));
+        }
+        assert_eq!(shape_of("value").unwrap(), Shape::Value);
+        assert_eq!(shape_of("log").unwrap(), Shape::Log);
+    }
+
+    #[test]
+    fn unsupported_remote_batch_is_rejected_atomically() {
+        let good = sample("s", "g", b"good");
+        let bad = Op { origin: "legacy".into(), shape: Shape::Stream, ..sample("s", "g", b"bad") };
+        let mut target = Session::new("target");
+
+        let err = target.apply_remote(&[good, bad]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(target.fold_value("s", "g", &[]), None);
     }
 
     fn sample(share: &str, glade_id: &str, payload: &[u8]) -> Op {

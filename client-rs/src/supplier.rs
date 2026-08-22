@@ -27,6 +27,7 @@ use tokio::sync::Mutex;
 use glade_wire::generated::{ExchangeReq, ExchangeRes, Op};
 
 use crate::client::GladeClient;
+use crate::session::shape_of;
 
 /// The declared surface a supplier stands behind, as addressed on the wire:
 /// `(share, glade_id, shape, key)`. An absent/empty `key` is the commons zone.
@@ -152,6 +153,12 @@ impl Supplier {
     where
         H: Fn(&ExchangeReq) -> Result<Vec<u8>, String> + Send + Sync + 'static,
     {
+        if surface.shape != "exchange" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("serve_exchange {} requires shape \"exchange\", got {:?}", surface.glade_id, surface.shape),
+            ));
+        }
         self.ensure_hello().await;
         self.state.servings.lock().await.push(surface.clone());
         self.client.subscribe(&surface.share, &surface.glade_id, surface.key_slice()).await?;
@@ -184,6 +191,7 @@ impl Supplier {
     where
         F: Fn(Op) + Send + Sync + 'static,
     {
+        shape_of(&surface.shape)?;
         self.ensure_hello().await;
         self.state.servings.lock().await.push(surface.clone());
         self.client.subscribe(&surface.share, &surface.glade_id, surface.key_slice()).await?;
@@ -258,5 +266,30 @@ impl Supplier {
             self.client.subscribe(&s.share, &s.glade_id, s.key_slice()).await?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn serving_paths_reject_wrong_shapes_before_connectivity() {
+        let supplier = Supplier::attach(GladeClient::new("test"), SupplierConfig::default());
+
+        for shape in ["message", "stream", "exchange", "window"] {
+            let err = supplier
+                .serve_share(SupplierSurface::new("s", "g", shape), |_| {})
+                .await
+                .err()
+                .expect("unsupported share must fail");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        }
+
+        let err = supplier
+            .serve_exchange(SupplierSurface::new("s", "g", "value"), |_| Ok(vec![]))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 }
