@@ -20,7 +20,7 @@ app grazel
 # App-static surfaces: no share/key here — the ServeClaim selects the node,
 # the mount fills domain/zone/key (GladeDeclSurface.md).
 binding ws.tree   value share commons latest
-binding ws.files  log   share commons from-cursor
+binding ws.files  swmr  share commons from-cursor
 binding ws.diff   log   share private from-cursor
 binding term.log  log   share commons windowed
 

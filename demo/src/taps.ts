@@ -4,12 +4,14 @@ import { grok } from "./runtime";
 import {
   SELECTION, SELECTION_TAP, NOTES, NOTES_TAP, ACTIVITY, ACTIVITY_TAP,
   STATUS, STATUS_TAP, CURRENT_TAB, CURRENT_TAB_TAP,
+  FILE_WINDOW, FILE_WINDOW_TAP,
 } from "./grips";
 import { codecFor, destFor, fillFor, glial } from "./glial";
 import { M, type Surface } from "./manifest";
 import type { ChatLine } from "./glade";
 import { registerChatTaps } from "./chat";
 import { registerGwzTaps } from "./gwz";
+import { FILE_CODEC, projectFileEvent } from "./files";
 
 /** A cut-over surface: a glial mount consumed through the adapter tap. The typed
  *  `Surface` handle IS the `BindingDecl`; fill, destination and codec derive
@@ -40,6 +42,18 @@ export function registerAllTaps(): void {
   // ACCOUNT domain: my status follows me across documents (a different domain,
   // not this document) — proving a session is attached to several domains.
   grok.registerTap(glialSurface(M.status, STATUS, STATUS_TAP) as never);
+  // Canonical SWMR: Glial assembles snapshot/delta/reset through SwmrNode, then
+  // this typed projector exposes one generation-coherent 4 KiB file window.
+  grok.registerTap(glialTap({
+    binder: glial,
+    decl: M.files,
+    grip: FILE_WINDOW,
+    fill: fillFor(M.files),
+    codec: FILE_CODEC,
+    projectEvent: projectFileEvent,
+    handleGrip: FILE_WINDOW_TAP,
+    gladeFor: destFor(M.files),
+  }) as never);
   // Tab selection: shared state as a grip atom tap (no React state hook). The
   // tab bar switches it via CURRENT_TAB_TAP.set(id).
   grok.registerTap(

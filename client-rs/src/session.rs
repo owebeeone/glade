@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::io;
 
 use glade_wire::generated::{Op, Shape};
+use glade_wire::swmr::decode_swmr;
 
 use crate::hash::op_hash;
 
@@ -19,9 +20,30 @@ pub fn shape_of(shape: &str) -> io::Result<Shape> {
     match shape {
         "value" => Ok(Shape::Value),
         "log" => Ok(Shape::Log),
+        "swmr" => Ok(Shape::Swmr),
         other => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("unsupported Glade op/fold shape {other:?}; supported: value, log"),
+            format!("unsupported Glade op shape {other:?}; supported: value, log, swmr"),
+        )),
+    }
+}
+
+/// Validate an exact durable op capability and its shape-specific envelope.
+pub fn require_op(shape: Shape, payload: &[u8], operation: &str) -> io::Result<Shape> {
+    match shape {
+        Shape::Value | Shape::Log => Ok(shape),
+        Shape::Swmr => {
+            decode_swmr(payload).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("invalid SWMR action envelope for {operation}: {error:?}"),
+                )
+            })?;
+            Ok(shape)
+        }
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsupported Glade op shape {other:?} for {operation}; supported: Value, Log, Swmr"),
         )),
     }
 }
@@ -108,7 +130,8 @@ impl Session {
 
     /// Append a local op to this origin's chain within a zone (default commons)
     /// and return it. The zone `key` selects the chain — its own seq/prev.
-    pub fn append(&mut self, share: &str, glade_id: &str, shape: Shape, payload: Vec<u8>, key: Vec<u8>) -> Op {
+    pub fn append(&mut self, share: &str, glade_id: &str, shape: Shape, payload: Vec<u8>, key: Vec<u8>) -> io::Result<Op> {
+        require_op(shape, &payload, "append")?;
         let (seq, prev) = {
             let own = self.store.scan(share, glade_id, &key, &self.origin, i64::MIN);
             match own.last() {
@@ -130,7 +153,7 @@ impl Session {
             payload,
         };
         self.store.append(op.clone());
-        op
+        Ok(op)
     }
 
     /// Apply ops received from the node; advance the lamport clock.
@@ -138,7 +161,7 @@ impl Session {
         // Preflight the whole batch: rejection is atomic with respect to store
         // and lamport mutation.
         for op in ops {
-            require_fold_shape(op.shape, "apply_remote")?;
+            require_op(op.shape, &op.payload, "apply_remote")?;
         }
         for op in ops {
             let lam = op.lamport;
@@ -171,7 +194,8 @@ fn dedup<'a>(ops: &[&'a Op]) -> Vec<&'a Op> {
 }
 
 fn fold_value(ops: &[&Op]) -> Option<Vec<u8>> {
-    let live = dedup(ops);
+    let value_ops: Vec<&Op> = ops.iter().copied().filter(|op| op.shape == Shape::Value).collect();
+    let live = dedup(&value_ops);
     let mut win: Option<&Op> = None;
     for o in live {
         let better = match win {
@@ -186,7 +210,8 @@ fn fold_value(ops: &[&Op]) -> Option<Vec<u8>> {
 }
 
 fn fold_log(ops: &[&Op]) -> Vec<Vec<u8>> {
-    let mut live = dedup(ops);
+    let log_ops: Vec<&Op> = ops.iter().copied().filter(|op| op.shape == Shape::Log).collect();
+    let mut live = dedup(&log_ops);
     live.sort_by(|a, b| {
         a.lamport
             .cmp(&b.lamport)
@@ -204,7 +229,7 @@ mod tests {
     #[test]
     fn value_fold_is_lww() {
         let mut a = Session::new("a");
-        a.append("s", "g", Shape::Value, b"a0".to_vec(), vec![]);
+        a.append("s", "g", Shape::Value, b"a0".to_vec(), vec![]).unwrap();
         assert_eq!(a.fold_value("s", "g", &[]), Some(b"a0".to_vec()));
         // a remote op from "b" with a higher lamport wins.
         let b_op = Op { origin: "b".into(), lamport: 9, ..sample("s", "g", b"b0") };
@@ -216,9 +241,9 @@ mod tests {
     #[test]
     fn log_fold_orders_and_zones_isolate() {
         let mut s = Session::new("a");
-        s.append("s", "g", Shape::Log, b"l0".to_vec(), vec![]);
-        s.append("s", "g", Shape::Log, b"l1".to_vec(), vec![]);
-        s.append("s", "g", Shape::Log, b"private".to_vec(), b"self:a".to_vec());
+        s.append("s", "g", Shape::Log, b"l0".to_vec(), vec![]).unwrap();
+        s.append("s", "g", Shape::Log, b"l1".to_vec(), vec![]).unwrap();
+        s.append("s", "g", Shape::Log, b"private".to_vec(), b"self:a".to_vec()).unwrap();
         assert_eq!(s.fold_log("s", "g", &[]), vec![b"l0".to_vec(), b"l1".to_vec()]);
         assert_eq!(s.fold_log("s", "g", b"self:a"), vec![b"private".to_vec()]);
     }
@@ -232,12 +257,51 @@ mod tests {
         }
         assert_eq!(shape_of("value").unwrap(), Shape::Value);
         assert_eq!(shape_of("log").unwrap(), Shape::Log);
+        assert_eq!(shape_of("swmr").unwrap(), Shape::Swmr);
     }
 
     #[test]
     fn unsupported_remote_batch_is_rejected_atomically() {
         let good = sample("s", "g", b"good");
         let bad = Op { origin: "legacy".into(), shape: Shape::Stream, ..sample("s", "g", b"bad") };
+        let mut target = Session::new("target");
+
+        let err = target.apply_remote(&[good, bad]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(target.fold_value("s", "g", &[]), None);
+    }
+
+    #[test]
+    fn swmr_actions_are_validated_before_local_mutation_and_are_not_generic_folds() {
+        use glade_wire::swmr::{encode_swmr, SwmrAction};
+
+        let mut s = Session::new("writer-a");
+        let err = s.append("s", "ws.files", Shape::Swmr, vec![1, 99], vec![]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        let op = s
+            .append(
+                "s",
+                "ws.files",
+                Shape::Swmr,
+                encode_swmr(SwmrAction::Snapshot, b"whole"),
+                vec![],
+            )
+            .unwrap();
+        assert_eq!((op.seq, op.lamport), (0, 1));
+        assert_eq!(s.fold_value("s", "ws.files", &[]), None);
+        assert!(s.fold_log("s", "ws.files", &[]).is_empty());
+    }
+
+    #[test]
+    fn malformed_swmr_remote_batch_is_rejected_atomically() {
+        let good = sample("s", "g", b"good");
+        let bad = Op {
+            origin: "writer-a".into(),
+            shape: Shape::Swmr,
+            payload: vec![2, 0],
+            ..sample("s", "ws.files", b"")
+        };
         let mut target = Session::new("target");
 
         let err = target.apply_remote(&[good, bad]).unwrap_err();

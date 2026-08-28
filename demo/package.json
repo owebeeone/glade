@@ -5,6 +5,7 @@
   "type": "module",
   "description": "Gryth workspace panel (GLP-0005 P3.S4) — share-first demo over the gryth toolchain: rust glade-node + glade client + grip-react. Shared selection (lww), notes (lww), activity log (log).",
   "scripts": {
+    "test": "node --experimental-transform-types --test test/*.test.ts",
     "dev": "vite",
     "typecheck": "tsc --noEmit",
     "build": "tsc --noEmit && vite build",

@@ -234,7 +234,11 @@ where
             }
             match store.append(op) {
                 Ok(_) => out.applied += 1,
-                Err(StoreError::ChainBreak { .. }) | Err(StoreError::Gap { .. }) => out.rejected.push(ck),
+                Err(StoreError::ChainBreak { .. })
+                | Err(StoreError::Gap { .. })
+                | Err(StoreError::InvalidSwmrPayload { .. })
+                | Err(StoreError::SwmrWriterConflict { .. })
+                | Err(StoreError::ShapeConflict { .. }) => out.rejected.push(ck),
                 Err(StoreError::Equivocation { .. }) => {} // proof recorded in the store
                 Err(StoreError::Io(e)) => return Err(e),
             }

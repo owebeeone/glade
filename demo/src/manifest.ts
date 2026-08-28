@@ -44,6 +44,11 @@ export const M = defineManifest({
     id: "app:activity", shape: "log", share: "doc:{doc}",
     domain: "document", zone: "commons", retention: { policy: "from_cursor", ttl_ms: null },
   },
+  // DOCUMENT domain, commons — one canonical single-writer file generation.
+  files: {
+    id: "ws.files", shape: "swmr", share: "doc:{doc}",
+    domain: "document", zone: "commons", retention: { policy: "from_cursor", ttl_ms: null },
+  },
 });
 export type { Surface };
 

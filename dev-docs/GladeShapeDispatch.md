@@ -1,6 +1,6 @@
 # Glade shape dispatch and declaration inventory
 
-Status: Step 0.3 implementation record
+Status: exact capability record; SWMR adapter built 2026-08-29
 
 Decision source: `../../dev-docs/TautShapeCatalogDecision.md`
 
@@ -11,9 +11,10 @@ compatibility surface does not grant runtime capability.
 
 | Path | Accepted name | Behavior |
 | --- | --- | --- |
-| Binding declaration | `value`, `log` | Accepted and registered |
-| TypeScript/Rust op and fold | `value`, `log` | Exact adapter dispatch |
-| Glial delivery assembly | `value`, `log` | Exact adapter dispatch |
+| Binding declaration | `value`, `log`, `swmr` | Accepted and registered |
+| TypeScript/Rust durable op | `value`, `log`, `swmr` | Exact adapter dispatch; SWMR action envelope validated |
+| TypeScript/Rust fold | `value`, `log` | Exact local fold dispatch; SWMR is not reinterpreted |
+| Glial durable assembly | `value`, `log`, `swmr` | value/log folds; SWMR delegates to released `SwmrNode` |
 | Service declaration/provider | `exchange` | Dedicated correlated request/response path |
 | Binding declaration | `message`, `stream`, `exchange`, `window` | Rejected before registration |
 | Op/fold dispatch | every other name | Rejected before chain/store mutation |
@@ -21,7 +22,7 @@ compatibility surface does not grant runtime capability.
 `exchange` is intentionally absent from every fold registry. `message` and
 `window` remain reserved legacy decode values. `stream` is a canonical Taut
 engine name, but Glade must reject it until a versioned adapter capability and
-tests exist.
+tests exist. SWMR is specified by `GladeSwmrAdapter.md`.
 
 ## Checked-in application inventory
 
@@ -31,7 +32,7 @@ repository.
 | Declaration | Shape | Retention token | Classification |
 | --- | --- | --- | --- |
 | `ws.tree` | `value` | `latest` | Compatible materialized-winner policy |
-| `ws.files` | `log` | `from-cursor` | Compatible replay/cursor policy |
+| `ws.files` | `swmr` | `from-cursor` | Canonical single-writer generation; file window is an application projection |
 | `ws.diff` | `log` | `from-cursor` | Compatible replay/cursor policy |
 | `term.log` | `log` | `windowed` | Ambiguous legacy token; owner decision required |
 | `gwz.output` | `log` | `from-cursor` | Compatible replay/cursor policy |

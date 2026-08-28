@@ -9,11 +9,13 @@
 
 pub mod cbor;
 pub mod generated;
+pub mod swmr;
 
 #[cfg(test)]
 mod codec_tests {
     use crate::cbor;
     use crate::generated::{self, Op, Shape, VECTORS};
+    use crate::swmr::{decode_swmr, encode_swmr, SwmrAction, SwmrPayloadError};
 
     fn hex_to_bytes(h: &str) -> Vec<u8> {
         (0..h.len())
@@ -54,5 +56,34 @@ mod codec_tests {
         assert_eq!(op.prev.as_ref().unwrap().len(), 32); // per-origin chain hash (GQ-9)
         assert_eq!(op.shape, Shape::Log);
         assert!(!op.refs.is_empty()); // causal refs
+    }
+
+    #[test]
+    fn swmr_shape_and_action_envelope_are_frozen() {
+        assert_eq!(Shape::Swmr.wire(), 3);
+        for (action, tag) in [
+            (SwmrAction::Snapshot, 0_u8),
+            (SwmrAction::Delta, 1_u8),
+            (SwmrAction::Reset, 2_u8),
+        ] {
+            let encoded = encode_swmr(action, b"body");
+            assert_eq!(&encoded[..2], &[1, tag]);
+            let decoded = decode_swmr(&encoded).unwrap();
+            assert_eq!(decoded.action, action);
+            assert_eq!(decoded.body, b"body");
+        }
+
+        let entry = VECTORS.iter().find(|(n, _, _)| *n == "edge/op-swmr").unwrap();
+        let op = Op::from_cbor(&cbor::decode(&hex_to_bytes(entry.2)));
+        assert_eq!(op.shape, Shape::Swmr);
+        assert_eq!(decode_swmr(&op.payload).unwrap().action, SwmrAction::Snapshot);
+    }
+
+    #[test]
+    fn malformed_swmr_action_envelopes_fail_closed() {
+        assert_eq!(decode_swmr(&[]), Err(SwmrPayloadError::TooShort));
+        assert_eq!(decode_swmr(&[1]), Err(SwmrPayloadError::TooShort));
+        assert_eq!(decode_swmr(&[2, 0]), Err(SwmrPayloadError::UnsupportedVersion(2)));
+        assert_eq!(decode_swmr(&[1, 3]), Err(SwmrPayloadError::UnsupportedAction(3)));
     }
 }

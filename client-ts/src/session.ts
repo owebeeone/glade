@@ -7,7 +7,8 @@ import { foldLog, foldValue, type FoldOp } from "./fold.ts";
 import { opHash } from "./hash.ts";
 import { Store, type Op } from "./store.ts";
 import type { SchemaIndex } from "./taut/schema.ts";
-import { requireFoldShape } from "./shapes.ts";
+import { requireFoldShape, requireOpShape } from "./shapes.ts";
+import { decodeSwmrAction } from "./swmr.ts";
 
 // Op is part of the Session API surface (append/applyRemote/dump) — re-export it.
 export type { Op } from "./store.ts";
@@ -28,7 +29,8 @@ export class Session {
    *  and return it. The zone `key` selects the chain — its own seq/prev. */
   append(share: string, gladeId: string, shape: string, payload: Uint8Array, key: Uint8Array = new Uint8Array()): Op {
     // Resolve capability before advancing lamport or touching the store.
-    const foldShape = requireFoldShape(shape, "append");
+    const opShape = requireOpShape(shape, "append");
+    if (opShape === "swmr") decodeSwmrAction(payload);
     const ownLog = this.store.scan(share, gladeId, key, this.origin, -Infinity);
     const last = ownLog[ownLog.length - 1];
     this.lamport += 1;
@@ -41,7 +43,7 @@ export class Session {
       prev: last ? opHash(this.schema, last as never) : null,
       lamport: this.lamport,
       refs: [],
-      shape: foldShape,
+      shape: opShape,
       payload,
     };
     this.store.append(op);
@@ -52,7 +54,10 @@ export class Session {
   applyRemote(ops: Op[]): void {
     // Preflight the whole batch so one unsupported op cannot leave a partially
     // mutated store before the error is reported.
-    for (const op of ops) requireFoldShape(op.shape, "applyRemote");
+    for (const op of ops) {
+      const shape = requireOpShape(op.shape, "applyRemote");
+      if (shape === "swmr") decodeSwmrAction(op.payload);
+    }
     for (const op of ops) {
       try {
         this.store.append(op);
@@ -91,7 +96,10 @@ export class Session {
     return this.store.dump();
   }
   static restore(schema: SchemaIndex, origin: string, ops: Op[]): Session {
-    for (const op of ops) requireFoldShape(op.shape, "restore");
+    for (const op of ops) {
+      const shape = requireOpShape(op.shape, "restore");
+      if (shape === "swmr") decodeSwmrAction(op.payload);
+    }
     return new Session(schema, origin, Store.load(schema, ops));
   }
 }

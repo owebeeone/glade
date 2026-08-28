@@ -16,7 +16,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use glade_wire::cbor;
-use glade_wire::generated::{Head, Op, StreamHeads};
+use glade_wire::generated::{Head, Op, Shape, StreamHeads};
+use glade_wire::swmr::{decode_swmr, SwmrPayloadError};
 
 use crate::chain::op_hash;
 
@@ -56,6 +57,12 @@ pub enum StoreError {
     Equivocation { origin: String, seq: i64 },
     /// A new op's `prev` does not match its predecessor's hash.
     ChainBreak { origin: String, seq: i64 },
+    /// The SWMR action envelope is not `glade.swmr.adapter/v1`.
+    InvalidSwmrPayload { error: SwmrPayloadError },
+    /// A SWMR surface already has a different authenticated writer origin.
+    SwmrWriterConflict { expected: String, got: String },
+    /// SWMR and a multi-writer fold MUST NOT share one zone-surface.
+    ShapeConflict { expected: Shape, got: Shape },
     Io(std::io::Error),
 }
 
@@ -127,6 +134,7 @@ impl Store {
     ///   unverified (M-LIMP lenient — honest clients always set it).
     /// - otherwise a forward **gap**.
     pub fn append(&mut self, op: Op) -> Result<Append, StoreError> {
+        self.validate_surface_contract(&op)?;
         let chain = chain_of(&op);
         // Classify against the current tail without holding a borrow of `logs`
         // across the proof write / push (equivocation records into `proofs`).
@@ -145,6 +153,30 @@ impl Store {
                 Ok(Append::Appended)
             }
         }
+    }
+
+    /// Validate exact shape capability before any journal or index mutation.
+    fn validate_surface_contract(&self, op: &Op) -> Result<(), StoreError> {
+        if op.shape == Shape::Swmr {
+            decode_swmr(&op.payload).map_err(|error| StoreError::InvalidSwmrPayload { error })?;
+        }
+
+        for ((share, glade_id, key, origin), log) in &self.logs {
+            if share != &op.share || glade_id != &op.glade_id || key != &op.key || log.is_empty() {
+                continue;
+            }
+            let existing_shape = log[0].shape;
+            if (op.shape == Shape::Swmr || existing_shape == Shape::Swmr) && existing_shape != op.shape {
+                return Err(StoreError::ShapeConflict { expected: existing_shape, got: op.shape });
+            }
+            if op.shape == Shape::Swmr && origin != &op.origin {
+                return Err(StoreError::SwmrWriterConflict {
+                    expected: origin.clone(),
+                    got: op.origin.clone(),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Persist an equivocation proof (both ops) under `<root>/proofs/` and keep
@@ -308,6 +340,7 @@ fn hex(s: &str) -> String {
 mod tests {
     use super::*;
     use glade_wire::generated::{Op, Shape};
+    use glade_wire::swmr::{encode_swmr, SwmrAction};
 
     fn op(share: &str, origin: &str, seq: i64, payload: &[u8]) -> Op {
         Op {
@@ -328,6 +361,14 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("glade-store-test-{name}"));
         let _ = fs::remove_dir_all(&dir);
         dir
+    }
+
+    fn swmr_op(origin: &str, seq: i64, action: SwmrAction, body: &[u8]) -> Op {
+        Op {
+            shape: Shape::Swmr,
+            payload: encode_swmr(action, body),
+            ..op("sh", origin, seq, b"")
+        }
     }
 
     #[test]
@@ -387,6 +428,54 @@ mod tests {
             }
             other => panic!("expected Gap, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn swmr_accepts_one_writer_snapshot_delta_and_empty_reset() {
+        let mut s = Store::open(fresh("swmr-one-writer")).unwrap();
+        assert_eq!(
+            s.append(swmr_op("writer-a", 0, SwmrAction::Snapshot, b"whole-0")).unwrap(),
+            Append::Appended,
+        );
+        assert_eq!(
+            s.append(swmr_op("writer-a", 1, SwmrAction::Delta, b"whole-1")).unwrap(),
+            Append::Appended,
+        );
+        assert_eq!(
+            s.append(swmr_op("writer-a", 2, SwmrAction::Reset, b"")).unwrap(),
+            Append::Appended,
+        );
+        assert_eq!(s.scan("sh", "g", &[], "writer-a", -1).len(), 3);
+    }
+
+    #[test]
+    fn swmr_rejects_malformed_action_before_store_mutation() {
+        let mut s = Store::open(fresh("swmr-malformed")).unwrap();
+        let malformed = Op { shape: Shape::Swmr, payload: vec![1, 99], ..op("sh", "writer-a", 0, b"") };
+
+        assert!(matches!(
+            s.append(malformed),
+            Err(StoreError::InvalidSwmrPayload { .. })
+        ));
+        assert!(s.heads("sh", "g", &[]).is_empty());
+    }
+
+    #[test]
+    fn swmr_rejects_second_writer_and_shape_mixing_before_mutation() {
+        let mut s = Store::open(fresh("swmr-conflicts")).unwrap();
+        s.append(swmr_op("writer-a", 0, SwmrAction::Snapshot, b"whole")).unwrap();
+
+        assert!(matches!(
+            s.append(swmr_op("writer-b", 0, SwmrAction::Snapshot, b"other")),
+            Err(StoreError::SwmrWriterConflict { expected, got })
+                if expected == "writer-a" && got == "writer-b"
+        ));
+        assert!(matches!(
+            s.append(op("sh", "writer-b", 0, b"value")),
+            Err(StoreError::ShapeConflict { expected: Shape::Swmr, got: Shape::Value })
+        ));
+        assert!(s.scan("sh", "g", &[], "writer-b", -1).is_empty());
+        assert_eq!(s.scan("sh", "g", &[], "writer-a", -1).len(), 1);
     }
 
     #[test]

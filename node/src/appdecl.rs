@@ -38,9 +38,10 @@ use crate::sysdata::{BindingDecl, CapabilityGrant, ServiceDefinition, WorkspaceE
 
 /// Legacy wire/declaration names remain recognizable so diagnostics can be
 /// precise and numeric wire values remain reserved. New binding declarations
-/// are capability-gated to the two fold adapters implemented by both clients.
-const KNOWN_SHAPES: [&str; 6] = ["value", "log", "message", "stream", "exchange", "window"];
-const BINDING_SHAPES: [&str; 2] = ["value", "log"];
+/// are capability-gated to the exact durable op adapters implemented by both
+/// clients. SWMR assembly is delegated to the canonical shape engine.
+const KNOWN_SHAPES: [&str; 7] = ["value", "log", "message", "stream", "exchange", "window", "swmr"];
+const BINDING_SHAPES: [&str; 3] = ["value", "log", "swmr"];
 /// The authority kinds (decl surface): the share is the source of record, or
 /// the share caches external truth.
 const AUTHORITIES: [&str; 2] = ["share", "external"];
@@ -301,6 +302,7 @@ mod tests {
         // key surface names ride as data — the workspace tree + the composed
         // gwz.output long-op stream + the chat group-keyed log:
         assert!(decl.bindings.iter().any(|b| b.glade_id == "ws.tree" && b.shape == "value"));
+        assert!(decl.bindings.iter().any(|b| b.glade_id == "ws.files" && b.shape == "swmr"));
         assert!(decl.bindings.iter().any(|b| b.glade_id == "gwz.output" && b.shape == "log"));
         assert!(decl.bindings.iter().any(|b| b.glade_id == "chat.msgs" && b.shape == "log"));
         assert!(decl.bindings.iter().any(|b| b.glade_id == "chat.groups" && b.shape == "value"));
@@ -342,6 +344,15 @@ mod tests {
         assert!(e.contains("line 3") && e.contains("workspace <share> <name>"), "{e}");
         let e = parse("glade-app v0\napp x\nworkspace ws-a a\nworkspace ws-a b\n").unwrap_err();
         assert!(e.contains("line 4") && e.contains("duplicate workspace share"), "{e}");
+    }
+
+    #[test]
+    fn swmr_is_an_exact_authorable_binding_shape() {
+        let decl = parse(
+            "glade-app v0\napp demo\nbinding ws.files swmr share commons from_cursor\n",
+        )
+        .unwrap();
+        assert_eq!(decl.bindings[0].shape, "swmr");
     }
 
     /// A declared workspace registers as an ordinary WorkspaceEntry whose

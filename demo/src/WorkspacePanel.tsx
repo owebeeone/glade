@@ -1,9 +1,14 @@
 import { useEffect, useState } from "react";
 import { useGrip } from "@owebeeone/grip-react";
-import { SELECTION, SELECTION_TAP, NOTES, NOTES_TAP, ACTIVITY, STATUS, STATUS_TAP } from "./grips";
+import {
+  SELECTION, SELECTION_TAP, NOTES, NOTES_TAP, ACTIVITY, STATUS, STATUS_TAP,
+  FILE_WINDOW, FILE_WINDOW_TAP,
+} from "./grips";
 import { doc, user, postActivity, onStatus, type GladeStatus } from "./glade";
+import { fromUtf8 } from "@owebeeone/glial-runtime";
+import { EMPTY_FILE_WINDOW } from "./files";
 
-const FILES = ["src/main.rs", "src/lib.rs", "Cargo.toml", "README.md"];
+const PATHS = ["src/main.rs", "src/lib.rs", "Cargo.toml", "README.md"];
 
 export function WorkspacePanel() {
   const selection = useGrip(SELECTION);
@@ -13,7 +18,10 @@ export function WorkspacePanel() {
   const activity = useGrip(ACTIVITY) ?? [];
   const status_ = useGrip(STATUS);
   const statusTap = useGrip(STATUS_TAP);
+  const fileWindow = useGrip(FILE_WINDOW) ?? EMPTY_FILE_WINDOW;
+  const fileTap = useGrip(FILE_WINDOW_TAP);
   const [msg, setMsg] = useState("");
+  const [fileError, setFileError] = useState("");
   const [conn, setConn] = useState<GladeStatus>("connecting");
   useEffect(() => onStatus(setConn), []);
 
@@ -39,7 +47,7 @@ export function WorkspacePanel() {
       <section>
         <h2>Selection · private zone</h2>
         <div className="files">
-          {FILES.map((f) => (
+          {PATHS.map((f) => (
             <button
               key={f}
               className={f === selection ? "file active" : "file"}
@@ -55,6 +63,35 @@ export function WorkspacePanel() {
         <div className="current zone-private">
           self:{user} · private — only you see this, even when the doc is shared: <b>{selection || "(none)"}</b>
         </div>
+      </section>
+
+      <section>
+        <h2>File window · canonical SWMR</h2>
+        <textarea
+          value={fromUtf8(fileWindow.bytes)}
+          rows={7}
+          placeholder="install the first ws.files snapshot…"
+          onChange={(e) => {
+            try {
+              const needsSnapshot = fileWindow.revision.endsWith(":empty") || fileWindow.revision.endsWith(":reset");
+              if (needsSnapshot) fileTap?.snapshot(e.target.value);
+              else fileTap?.delta(e.target.value);
+              setFileError("");
+            } catch (error) {
+              setFileError(error instanceof Error ? error.message : String(error));
+            }
+          }}
+        />
+        <div className="files">
+          <button onClick={() => fileTap?.snapshot("// demo.txt\ncanonical SWMR generation\n")}>
+            install snapshot
+          </button>
+          <button onClick={() => fileTap?.reset("workspace generation changed")}>reset generation</button>
+        </div>
+        <div className="current zone-commons">
+          ws.files · demo.txt (path routing pending) · revision <b>{fileWindow.revision}</b> · {fileWindow.length}/{fileWindow.total} bytes
+        </div>
+        {fileError && <div className="empty">{fileError}</div>}
       </section>
 
       <section>

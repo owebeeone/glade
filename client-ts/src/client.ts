@@ -7,7 +7,8 @@ import { Session } from "./session.ts";
 import * as codec from "./taut/codec.ts";
 import type { SchemaIndex } from "./taut/schema.ts";
 import type { Op } from "./store.ts";
-import { requireFoldShape } from "./shapes.ts";
+import { requireOpShape } from "./shapes.ts";
+import { decodeSwmrAction } from "./swmr.ts";
 
 const TAG = {
   Hello: 0, Welcome: 1, Subscribe: 2, Unsubscribe: 3, Ops: 4, Heads: 5,
@@ -99,7 +100,10 @@ export class GladeClient {
     if (tag === TAG.Ops) {
       const ops = value.ops as Op[];
       // Reject the whole batch before session storage or consumer callbacks.
-      for (const op of ops) requireFoldShape(op.shape, "receive");
+      for (const op of ops) {
+        const shape = requireOpShape(op.shape, "receive");
+        if (shape === "swmr") decodeSwmrAction(op.payload);
+      }
       // The `onOps` field keeps its exact contract (grip-share owns folding
       // when set; else the session folds). Op listeners are an additive
       // fan-out for suppliers serving shares — byte-for-byte for the field.
@@ -166,7 +170,10 @@ export class GladeClient {
 
   /** Ship already-built ops to the node (the binder appends; the client carries). */
   sendOps(ops: Op[]): void {
-    for (const op of ops) requireFoldShape(op.shape, "sendOps");
+    for (const op of ops) {
+      const shape = requireOpShape(op.shape, "sendOps");
+      if (shape === "swmr") decodeSwmrAction(op.payload);
+    }
     this.send(frame(this.schema, TAG.Ops, "Ops", { ops, pri: null }));
   }
 

@@ -10,6 +10,7 @@ import { dirname, join } from "node:path";
 import { loadSchema } from "../src/taut/schema.ts";
 import { Session } from "../src/session.ts";
 import { UnsupportedShapeError } from "../src/shapes.ts";
+import { encodeSwmrAction, SwmrActionError } from "../src/swmr.ts";
 import { hex, utf8 } from "../src/bytes.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -82,6 +83,7 @@ for (const shape of ["message", "stream", "exchange", "window"] as const) {
       assert.equal(error.code, "GLADE_UNSUPPORTED_SHAPE");
       assert.equal(error.shape, shape);
       assert.equal(error.operation, "append");
+      assert.match(error.message, /value, log, swmr/);
       return true;
     });
     assert.deepEqual(s.dump(), []);
@@ -109,4 +111,36 @@ test("an unsupported remote batch is rejected atomically", () => {
   assert.throws(() => target.applyRemote([good, bad]), UnsupportedShapeError);
   assert.deepEqual(target.dump(), []);
   assert.throws(() => Session.restore(schema, "target", [bad]), UnsupportedShapeError);
+});
+
+test("swmr actions append, replicate, and restore without becoming a generic fold", () => {
+  const source = new Session(schema, "writer-a");
+  source.append("sh", "ws.files", "swmr", encodeSwmrAction("snapshot", utf8("whole-0")));
+  source.append("sh", "ws.files", "swmr", encodeSwmrAction("delta", utf8("whole-1")));
+
+  const target = new Session(schema, "reader");
+  target.applyRemote(source.dump());
+  assert.equal(target.dump().length, 2);
+  assert.equal(Session.restore(schema, "reader", target.dump()).dump().length, 2);
+  assert.throws(() => target.fold("sh", "ws.files", "swmr"), UnsupportedShapeError);
+});
+
+test("malformed swmr actions fail before local or remote session mutation", () => {
+  const local = new Session(schema, "writer-a");
+  assert.throws(
+    () => local.append("sh", "ws.files", "swmr", new Uint8Array([1, 99])),
+    SwmrActionError,
+  );
+  assert.deepEqual(local.dump(), []);
+
+  const good = new Session(schema, "writer-a").append(
+    "sh",
+    "ws.files",
+    "swmr",
+    encodeSwmrAction("snapshot", utf8("whole")),
+  );
+  const bad = { ...good, origin: "legacy", payload: new Uint8Array([2, 0]) };
+  const target = new Session(schema, "reader");
+  assert.throws(() => target.applyRemote([good, bad]), SwmrActionError);
+  assert.deepEqual(target.dump(), []);
 });

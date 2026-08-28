@@ -45,6 +45,15 @@ pub fn error_frame(err: &StoreError, share: &str, glade_id: &str) -> Frame {
         StoreError::Gap { expected, got } => {
             (ErrorCode::Protocol, format!("gap: expected {expected}, got {got}"))
         }
+        StoreError::InvalidSwmrPayload { error } => {
+            (ErrorCode::Protocol, format!("invalid SWMR action envelope: {error:?}"))
+        }
+        StoreError::SwmrWriterConflict { expected, got } => {
+            (ErrorCode::Protocol, format!("SWMR writer conflict: expected {expected:?}, got {got:?}"))
+        }
+        StoreError::ShapeConflict { expected, got } => {
+            (ErrorCode::Protocol, format!("shape conflict: expected {expected:?}, got {got:?}"))
+        }
         StoreError::Io(e) => (ErrorCode::Internal, format!("io: {e}")),
     };
     Frame::Error(Error {

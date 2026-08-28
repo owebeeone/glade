@@ -23,7 +23,7 @@ use glade_wire::generated::{
 };
 use glade_wire::{cbor, generated};
 
-use crate::session::{require_fold_shape, shape_of, Session};
+use crate::session::{require_op, shape_of, Session};
 use crate::ws::{self, Msg, WsWriter};
 
 /// A provider's answer, as the requester sees it — the decoded `ExchangeRes`.
@@ -247,11 +247,12 @@ impl GladeClient {
         // Capability is resolved before connectivity checks, chain allocation,
         // or session mutation; unsupported names never become Value ops.
         let shape = shape_of(shape)?;
+        require_op(shape, &payload, "append")?;
         if self.inner.writer.lock().await.is_none() {
             return Err(io::Error::new(io::ErrorKind::NotConnected, "not connected"));
         }
         let k = key.map(|k| k.to_vec()).unwrap_or_default();
-        let op = self.inner.session.lock().await.append(share, glade_id, shape, payload, k);
+        let op = self.inner.session.lock().await.append(share, glade_id, shape, payload, k)?;
         self.inner.send(frame(FrameType::Ops, Ops { ops: vec![op.clone()], pri: None }.to_cbor())).await?;
         Ok(op)
     }
@@ -259,7 +260,7 @@ impl GladeClient {
     /// Ship already-built ops to the node (the caller owns the chain).
     pub async fn send_ops(&self, ops: Vec<generated::Op>) -> io::Result<()> {
         for op in &ops {
-            require_fold_shape(op.shape, "send_ops")?;
+            require_op(op.shape, &op.payload, "send_ops")?;
         }
         self.inner.send(frame(FrameType::Ops, Ops { ops, pri: None }.to_cbor())).await
     }

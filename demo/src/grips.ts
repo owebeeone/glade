@@ -1,5 +1,8 @@
 import { defineGrip } from "./runtime";
 import type { ChatLine } from "./glade";
+import type { FileWindow } from "@owebeeone/glial-runtime";
+import type { GlialTapController } from "@owebeeone/glial-runtime/grip";
+import { EMPTY_FILE_WINDOW } from "./files";
 
 // Shared workspace state, across two domains + two zones (GladeZones.md):
 //   SELECTION — doc domain, PRIVATE zone  (mine, this document)
@@ -18,6 +21,9 @@ export const ACTIVITY_TAP = defineGrip<any>("Activity.tap", undefined);
 
 export const STATUS = defineGrip<string>("Status", "");
 export const STATUS_TAP = defineGrip<any>("Status.tap", undefined);
+
+export const FILE_WINDOW = defineGrip<FileWindow>("FileWindow", EMPTY_FILE_WINDOW);
+export const FILE_WINDOW_TAP = defineGrip<GlialTapController<FileWindow>>("FileWindow.tap", undefined as any);
 
 // The selected tab — grip-style shared state (no React state hook). The default
 // is the first registered tab (tabs.tsx `TABS[0]`, "workspace"); the *_TAP
