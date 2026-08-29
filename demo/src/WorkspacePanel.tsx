@@ -3,10 +3,12 @@ import { useGrip } from "@owebeeone/grip-react";
 import {
   SELECTION, SELECTION_TAP, NOTES, NOTES_TAP, ACTIVITY, STATUS, STATUS_TAP,
   FILE_WINDOW, FILE_WINDOW_TAP,
+  COLLABORATIVE_NOTES, COLLABORATIVE_NOTES_TAP,
 } from "./grips";
 import { doc, user, postActivity, onStatus, type GladeStatus } from "./glade";
-import { fromUtf8 } from "@owebeeone/glial-runtime";
+import { emptyTextCrdtState, fromUtf8 } from "@owebeeone/glial-runtime";
 import { EMPTY_FILE_WINDOW } from "./files";
+import { CollaborativeTextEditor } from "./CollaborativeTextEditor";
 
 const PATHS = ["src/main.rs", "src/lib.rs", "Cargo.toml", "README.md"];
 
@@ -20,6 +22,8 @@ export function WorkspacePanel() {
   const statusTap = useGrip(STATUS_TAP);
   const fileWindow = useGrip(FILE_WINDOW) ?? EMPTY_FILE_WINDOW;
   const fileTap = useGrip(FILE_WINDOW_TAP);
+  const collaborativeNotes = useGrip(COLLABORATIVE_NOTES) ?? emptyTextCrdtState();
+  const collaborativeNotesTap = useGrip(COLLABORATIVE_NOTES_TAP);
   const [msg, setMsg] = useState("");
   const [fileError, setFileError] = useState("");
   const [conn, setConn] = useState<GladeStatus>("connecting");
@@ -95,6 +99,20 @@ export function WorkspacePanel() {
       </section>
 
       <section>
+        <h2>Collaborative notes · text CRDT</h2>
+        <CollaborativeTextEditor
+          state={collaborativeNotes}
+          onChange={(value) => collaborativeNotesTap?.replaceText(value)}
+        />
+        <div className="current zone-commons">
+          doc:{doc} · commons · {collaborativeNotes.visible.length} live elements · cursor anchored by element identity
+        </div>
+        {collaborativeNotes.diagnostics.length > 0 && (
+          <div className="empty">CRDT diagnostics: {collaborativeNotes.diagnostics.join(", ")}</div>
+        )}
+      </section>
+
+      <section>
         <h2>Notes · commons zone</h2>
         <textarea
           value={notes ?? ""}
@@ -102,7 +120,7 @@ export function WorkspacePanel() {
           placeholder="shared notes…"
           onChange={(e) => notesTap?.set(e.target.value)}
         />
-        <div className="current zone-commons">doc:{doc} · commons — everyone in this document</div>
+        <div className="current zone-commons">doc:{doc} · commons — whole-value LWW comparison</div>
       </section>
 
       <section>

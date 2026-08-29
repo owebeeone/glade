@@ -10,6 +10,11 @@ test("the demo's canonical ws.files surface is SWMR", () => {
   assert.equal(M.files.shape, "swmr");
 });
 
+test("the demo declares collaborative notes as a CRDT surface", () => {
+  assert.equal(M.collaborativeNotes.glade_id.id, "app:collaborative-notes");
+  assert.equal(M.collaborativeNotes.shape, "crdt");
+});
+
 test("the demo projects one bounded full-image file generation", () => {
   const swmr = assembleSwmr([
     { origin: "writer-a", seq: 1, lamport: 1, prev: null, payload: encodeSwmrAction("snapshot", utf8("abcdef")) },

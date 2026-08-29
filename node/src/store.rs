@@ -166,7 +166,12 @@ impl Store {
                 continue;
             }
             let existing_shape = log[0].shape;
-            if (op.shape == Shape::Swmr || existing_shape == Shape::Swmr) && existing_shape != op.shape {
+            if (op.shape == Shape::Swmr
+                || existing_shape == Shape::Swmr
+                || op.shape == Shape::Crdt
+                || existing_shape == Shape::Crdt)
+                && existing_shape != op.shape
+            {
                 return Err(StoreError::ShapeConflict { expected: existing_shape, got: op.shape });
             }
             if op.shape == Shape::Swmr && origin != &op.origin {
@@ -476,6 +481,23 @@ mod tests {
         ));
         assert!(s.scan("sh", "g", &[], "writer-b", -1).is_empty());
         assert_eq!(s.scan("sh", "g", &[], "writer-a", -1).len(), 1);
+    }
+
+    #[test]
+    fn crdt_accepts_multiple_writers_but_rejects_shape_mixing() {
+        let mut s = Store::open(fresh("crdt-multi-writer")).unwrap();
+        let alice = Op { shape: Shape::Crdt, ..op("sh", "alice", 0, b"A") };
+        let bob = Op { shape: Shape::Crdt, ..op("sh", "bob", 0, b"B") };
+        assert_eq!(s.append(alice).unwrap(), Append::Appended);
+        assert_eq!(s.append(bob).unwrap(), Append::Appended);
+
+        assert!(matches!(
+            s.append(op("sh", "legacy", 0, b"whole-value")),
+            Err(StoreError::ShapeConflict { expected: Shape::Crdt, got: Shape::Value })
+        ));
+        assert_eq!(s.scan("sh", "g", &[], "alice", -1).len(), 1);
+        assert_eq!(s.scan("sh", "g", &[], "bob", -1).len(), 1);
+        assert!(s.scan("sh", "g", &[], "legacy", -1).is_empty());
     }
 
     #[test]

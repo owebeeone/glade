@@ -96,6 +96,19 @@ export class Store {
     return out;
   }
 
+  /** Causal frontier for one zone-surface. CRDT appends copy this into refs so
+   *  the opaque payload rides the canonical version-vector dependency model. */
+  streamHeads(share: string, gladeId: string, key: Uint8Array): Head[] {
+    const latest = new Map<string, Op>();
+    for (const op of this.opsFor(share, gladeId, key)) {
+      const prior = latest.get(op.origin);
+      if (!prior || op.seq > prior.seq) latest.set(op.origin, op);
+    }
+    return [...latest.values()]
+      .sort((a, b) => a.origin.localeCompare(b.origin))
+      .map((op) => ({ origin: op.origin, seq: op.seq, hash: opHash(this.schema, op as never) }));
+  }
+
   /** Ops the peer holding `their` (chain-keyed) heads is missing — the gap to ship. */
   missingFor(share: string, their: Map<string, number>): Op[] {
     const out: Op[] = [];

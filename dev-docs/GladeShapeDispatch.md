@@ -1,6 +1,6 @@
 # Glade shape dispatch and declaration inventory
 
-Status: exact capability record; SWMR adapter built 2026-08-29
+Status: exact capability record; SWMR and CRDT/text adapters built 2026-08-29
 
 Decision source: `../../dev-docs/TautShapeCatalogDecision.md`
 
@@ -11,10 +11,10 @@ compatibility surface does not grant runtime capability.
 
 | Path | Accepted name | Behavior |
 | --- | --- | --- |
-| Binding declaration | `value`, `log`, `swmr` | Accepted and registered |
-| TypeScript/Rust durable op | `value`, `log`, `swmr` | Exact adapter dispatch; SWMR action envelope validated |
-| TypeScript/Rust fold | `value`, `log` | Exact local fold dispatch; SWMR is not reinterpreted |
-| Glial durable assembly | `value`, `log`, `swmr` | value/log folds; SWMR delegates to released `SwmrNode` |
+| Binding declaration | `value`, `log`, `swmr`, `crdt` | Accepted and registered |
+| TypeScript/Rust durable op | `value`, `log`, `swmr`, `crdt` | Exact adapter dispatch; SWMR action envelope validated; CRDT causal heads carried in `Op.refs` |
+| TypeScript/Rust fold | `value`, `log` | Exact local fold dispatch; SWMR and CRDT are not reinterpreted |
+| Glial durable assembly | `value`, `log`, `swmr`, `crdt` + explicit `text_crdt` profile | value/log folds; SWMR delegates to released `SwmrNode`; CRDT delegates to released `CrdtNode` and text projection |
 | Service declaration/provider | `exchange` | Dedicated correlated request/response path |
 | Binding declaration | `message`, `stream`, `exchange`, `window` | Rejected before registration |
 | Op/fold dispatch | every other name | Rejected before chain/store mutation |
@@ -22,7 +22,8 @@ compatibility surface does not grant runtime capability.
 `exchange` is intentionally absent from every fold registry. `message` and
 `window` remain reserved legacy decode values. `stream` is a canonical Taut
 engine name, but Glade must reject it until a versioned adapter capability and
-tests exist. SWMR is specified by `GladeSwmrAdapter.md`.
+tests exist. SWMR is specified by `GladeSwmrAdapter.md`; CRDT/text is specified
+by `GladeCrdtAdapter.md`.
 
 ## Checked-in application inventory
 

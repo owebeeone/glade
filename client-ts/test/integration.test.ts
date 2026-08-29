@@ -100,3 +100,33 @@ test("hello binds a principal and resolves on the node's Welcome; plain sessions
     child.kill();
   }
 });
+
+test("two CRDT writers exchange causal operations through the rust node", async () => {
+  const { port, child } = await startNode();
+  const url = `ws://127.0.0.1:${port}`;
+  try {
+    const alice = new GladeClient(schema, "alice");
+    const bob = new GladeClient(schema, "bob");
+    await alice.connect(url);
+    await bob.connect(url);
+    await alice.subscribe("sh", "collaborative-body");
+    await bob.subscribe("sh", "collaborative-body");
+
+    const first = alice.append("sh", "collaborative-body", "crdt", utf8("insert-a"));
+    assert.deepEqual(first.refs, []);
+    await until(() => bob.session.dump().some((op) => op.origin === "alice"));
+
+    const reply = bob.append("sh", "collaborative-body", "crdt", utf8("insert-b"));
+    assert.deepEqual(reply.refs.map(({ origin, seq }) => ({ origin, seq })), [{ origin: "alice", seq: 0 }]);
+    await until(() => alice.session.dump().some((op) => op.origin === "bob"));
+    assert.deepEqual(
+      alice.session.dump().map((op) => [op.origin, op.seq, op.shape]).sort(),
+      bob.session.dump().map((op) => [op.origin, op.seq, op.shape]).sort(),
+    );
+
+    alice.close();
+    bob.close();
+  } finally {
+    child.kill();
+  }
+});

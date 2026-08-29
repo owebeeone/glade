@@ -42,7 +42,7 @@ export class Session {
       seq: last ? last.seq + 1 : 0,
       prev: last ? opHash(this.schema, last as never) : null,
       lamport: this.lamport,
-      refs: [],
+      refs: opShape === "crdt" ? this.store.streamHeads(share, gladeId, key) : [],
       shape: opShape,
       payload,
     };

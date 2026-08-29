@@ -1,13 +1,13 @@
 # Gryth Workspace Demo
 
 A share-first demo over the gryth toolchain — **rust + glade + react**. Shared
-selection and notes (lww values) and an activity log (append log) converge
-across browser tabs through the local rust glade-node. No retrofit: every piece
-of state is a grip tap that declares a `share` (GQ-5); the grip-share binder
-wires them to a glade client over a websocket to the node.
+selection and comparison notes (LWW values), collaborative notes (text CRDT),
+and an activity log converge across browser tabs through the local Rust
+glade-node. No retrofit: every piece of state is a grip tap with a typed Glade
+declaration; Glial mounts it to a Glade client over WebSocket.
 
 ```
-useGrip components ─ grip-share binder ─ glade client ─ WS ─ rust glade-node ─ … other participants
+useGrip components ─ Glial binder/assembly ─ Glade client ─ WS ─ Rust glade-node ─ … other participants
 ```
 
 ## Run (one command)
@@ -18,11 +18,13 @@ python3 run_demo.py
 
 This rebuilds grip-core's `dist`, builds the rust `glade-node`, `npm install`s
 the demo (first run), starts the node on `:9099`, and runs vite on `:5175`.
-Ctrl-C stops everything. Open `http://localhost:5175` in **two tabs** — edit
-the selection / notes / activity in one and the others converge; reload a tab
-and the node resyncs it (the node is the backing store). The status dot is
-`live` when connected, `offline` otherwise (local edits still work and resync
-on reconnect).
+Ctrl-C stops everything. Open `http://localhost:5175` in **two tabs** and edit
+the **Collaborative notes · text CRDT** surface simultaneously. Put the caret
+in the middle in one tab while typing in the other: the remote identity delta
+converges without pushing the local caret to the end. The older LWW notes field
+remains directly below it as a whole-value comparison. Reloading a tab replays
+the operation set from the node. The status dot is `live` when connected and
+`offline` otherwise (local edits remain persisted for later resync).
 
 ## Run (manual)
 

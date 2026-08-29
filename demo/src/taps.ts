@@ -5,6 +5,7 @@ import {
   SELECTION, SELECTION_TAP, NOTES, NOTES_TAP, ACTIVITY, ACTIVITY_TAP,
   STATUS, STATUS_TAP, CURRENT_TAB, CURRENT_TAB_TAP,
   FILE_WINDOW, FILE_WINDOW_TAP,
+  COLLABORATIVE_NOTES, COLLABORATIVE_NOTES_TAP,
 } from "./grips";
 import { codecFor, destFor, fillFor, glial } from "./glial";
 import { M, type Surface } from "./manifest";
@@ -36,6 +37,18 @@ export function registerAllTaps(): void {
   grok.registerTap(glialSurface(M.selection, SELECTION, SELECTION_TAP) as never);
   // COMMONS: the document's shared notes — everyone in this document.
   grok.registerTap(glialSurface(M.notes, NOTES, NOTES_TAP) as never);
+  // COMMONS (CRDT engine + text_crdt profile): identity operations and
+  // element-anchored selections; simultaneous editors do not replace a whole
+  // controlled input value.
+  grok.registerTap(glialTap({
+    binder: glial,
+    decl: M.collaborativeNotes,
+    grip: COLLABORATIVE_NOTES,
+    fill: fillFor(M.collaborativeNotes),
+    crdtProfile: "text_crdt",
+    handleGrip: COLLABORATIVE_NOTES_TAP,
+    gladeFor: destFor(M.collaborativeNotes),
+  }) as never);
   // COMMONS (log): the document's activity feed. Entries append through the
   // glial controller (postActivity -> ACTIVITY_TAP.append), each its own op.
   grok.registerTap(glialSurface<ChatLine[]>(M.activity, ACTIVITY, ACTIVITY_TAP) as never);

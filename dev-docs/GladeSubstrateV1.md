@@ -78,6 +78,8 @@ not new substrate.
 | --- | --- | --- | --- |
 | `value` (SWMR/LWW or MV register) | replace; MV surfaces conflicts as data | latest | whole-value, no partials |
 | `log` | causal interleave, append-only | from-cursor / windowed | replay; trivially convergent |
+| `swmr` | canonical single-writer snapshot/delta/reset | from-cursor | generation-coherent assembly; see `GladeSwmrAdapter.md` |
+| `crdt` | canonical causal operation merge | from-cursor | multi-writer; payload profile selected explicitly; see `GladeCrdtAdapter.md` |
 | structured `message` | per-field merge annotations (taut `merge`) | latest | field-level lww / set-union / counter; lists/text later |
 | `stream` | none (ephemeral) | none | live channel; never replicated (read/write asymmetry per `GladeTerminalSliceProposal.md` §3) |
 | `exchange` | none (directed) | per diagnostics policy | request/response routed over the session |
@@ -119,7 +121,7 @@ drift surfaces as a diff (GQ-6).
 | --- | --- | --- |
 | Atom / MultiAtom | `value` | whole-value register |
 | FunctionTap | none by default | deterministic compute over shared inputs converges free; share output only when expensive/non-deterministic (origin-primary) |
-| AsyncTap | `value` / `log` (CRDT open — GQ-3) | keyed; authority split per §3 |
+| AsyncTap | `value` / `log` / `swmr` / `crdt` | keyed; authority split per §3 |
 | StreamTap | `log` or ephemeral `stream` | SWMR/CRDT structurally ruled out |
 
 Two levels of identity (resolved 2026-06-13):
@@ -270,7 +272,7 @@ suppression (recast per `(binding, key)`), and "capture as attachment"
 | # | Question | Lean |
 | --- | --- | --- |
 | GQ-1 | MV-register conflicts surfaced to UI as first-class grip state, or V1 declares only conflict-free folds (lww/log/sets)? | surface as data (Grip makes rendering conflicts cheap); decides tap API surface |
-| GQ-3 | CRDT shape on AsyncTap: any concrete case, or structurally permitted but unimplemented? | permit, don't implement |
+| GQ-3 | CRDT shape on AsyncTap: any concrete case, or structurally permitted but unimplemented? | resolved 2026-08-29: text editing profile implemented by `GladeCrdtAdapter.md` |
 | GQ-6 | Glade ID defaults: derivation recipe and pinning (checked-in manifest vs first-use pinning vs explicit-only for multi-party shares)? | derive from package id + grip key, pin in a manifest |
 | GQ-7 | Late-joiner cached folds with no authority session: designated folder origin per `(binding, key)` (reusing the role machinery)? | yes — reuse roles, no new mechanism |
 

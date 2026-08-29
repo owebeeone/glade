@@ -95,6 +95,29 @@ for (const shape of ["message", "stream", "exchange", "window"] as const) {
   });
 }
 
+test("crdt appends retain causal stream heads without becoming a value/log fold", () => {
+  const alice = new Session(schema, "alice");
+  const bob = new Session(schema, "bob");
+
+  const a0 = alice.append("sh", "doc.body", "crdt", utf8("A"));
+  assert.deepEqual(a0.refs, []);
+  bob.applyRemote([a0]);
+
+  const b0 = bob.append("sh", "doc.body", "crdt", utf8("B"));
+  assert.deepEqual(b0.refs.map(({ origin, seq }) => ({ origin, seq })), [
+    { origin: "alice", seq: 0 },
+  ]);
+  alice.applyRemote([b0]);
+
+  const a1 = alice.append("sh", "doc.body", "crdt", utf8("C"));
+  assert.deepEqual(a1.refs.map(({ origin, seq }) => ({ origin, seq })), [
+    { origin: "alice", seq: 0 },
+    { origin: "bob", seq: 0 },
+  ]);
+  assert.throws(() => alice.fold("sh", "doc.body", "crdt"), UnsupportedShapeError);
+  assert.equal(Session.restore(schema, "alice", alice.dump()).dump().length, 3);
+});
+
 test("unsupported fold does not fall through to value", () => {
   const s = new Session(schema, "a");
   s.append("sh", "g", "value", utf8("kept"));

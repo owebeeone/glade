@@ -80,6 +80,15 @@ mod codec_tests {
     }
 
     #[test]
+    fn crdt_shape_is_additive_and_payload_opaque() {
+        assert_eq!(Shape::Crdt.wire(), 4);
+        let entry = VECTORS.iter().find(|(n, _, _)| *n == "edge/op-crdt").unwrap();
+        let op = Op::from_cbor(&cbor::decode(&hex_to_bytes(entry.2)));
+        assert_eq!(op.shape, Shape::Crdt);
+        assert_eq!(op.payload, br#"{"kind":"insert"}"#);
+    }
+
+    #[test]
     fn malformed_swmr_action_envelopes_fail_closed() {
         assert_eq!(decode_swmr(&[]), Err(SwmrPayloadError::TooShort));
         assert_eq!(decode_swmr(&[1]), Err(SwmrPayloadError::TooShort));

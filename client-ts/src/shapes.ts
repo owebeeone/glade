@@ -1,7 +1,7 @@
 /** Exact op/fold shapes implemented by the TypeScript Glade session. */
 
 export type FoldShape = "value" | "log";
-export type OpShape = FoldShape | "swmr";
+export type OpShape = FoldShape | "swmr" | "crdt";
 
 export class UnsupportedShapeError extends Error {
   readonly code = "GLADE_UNSUPPORTED_SHAPE";
@@ -24,6 +24,6 @@ export function requireFoldShape(shape: string, operation: string): FoldShape {
 }
 
 export function requireOpShape(shape: string, operation: string): OpShape {
-  if (shape === "value" || shape === "log" || shape === "swmr") return shape;
-  throw new UnsupportedShapeError(shape, operation, ["value", "log", "swmr"]);
+  if (shape === "value" || shape === "log" || shape === "swmr" || shape === "crdt") return shape;
+  throw new UnsupportedShapeError(shape, operation, ["value", "log", "swmr", "crdt"]);
 }

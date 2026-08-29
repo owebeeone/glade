@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::io;
 
-use glade_wire::generated::{Op, Shape};
+use glade_wire::generated::{Head, Op, Shape};
 use glade_wire::swmr::decode_swmr;
 
 use crate::hash::op_hash;
@@ -21,6 +21,7 @@ pub fn shape_of(shape: &str) -> io::Result<Shape> {
         "value" => Ok(Shape::Value),
         "log" => Ok(Shape::Log),
         "swmr" => Ok(Shape::Swmr),
+        "crdt" => Ok(Shape::Crdt),
         other => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("unsupported Glade op shape {other:?}; supported: value, log, swmr"),
@@ -31,7 +32,7 @@ pub fn shape_of(shape: &str) -> io::Result<Shape> {
 /// Validate an exact durable op capability and its shape-specific envelope.
 pub fn require_op(shape: Shape, payload: &[u8], operation: &str) -> io::Result<Shape> {
     match shape {
-        Shape::Value | Shape::Log => Ok(shape),
+        Shape::Value | Shape::Log | Shape::Crdt => Ok(shape),
         Shape::Swmr => {
             decode_swmr(payload).map_err(|error| {
                 io::Error::new(
@@ -43,7 +44,7 @@ pub fn require_op(shape: Shape, payload: &[u8], operation: &str) -> io::Result<S
         }
         other => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("unsupported Glade op shape {other:?} for {operation}; supported: Value, Log, Swmr"),
+            format!("unsupported Glade op shape {other:?} for {operation}; supported: Value, Log, Swmr, Crdt"),
         )),
     }
 }
@@ -114,6 +115,22 @@ impl Store {
         }
         out
     }
+
+    fn stream_heads(&self, share: &str, glade_id: &str, key: &[u8]) -> Vec<Head> {
+        let mut latest: HashMap<String, &Op> = HashMap::new();
+        for op in self.ops_for(share, glade_id, key) {
+            if latest.get(&op.origin).map(|prior| prior.seq >= op.seq).unwrap_or(false) {
+                continue;
+            }
+            latest.insert(op.origin.clone(), op);
+        }
+        let mut heads: Vec<_> = latest
+            .into_values()
+            .map(|op| Head { origin: op.origin.clone(), seq: op.seq, hash: Some(op_hash(op).to_vec()) })
+            .collect();
+        heads.sort_by(|a, b| a.origin.cmp(&b.origin));
+        heads
+    }
 }
 
 /// One origin's session: append to its own chains, apply remote ops, fold.
@@ -140,6 +157,11 @@ impl Session {
             }
         };
         self.lamport += 1;
+        let refs = if shape == Shape::Crdt {
+            self.store.stream_heads(share, glade_id, &key)
+        } else {
+            vec![]
+        };
         let op = Op {
             share: share.into(),
             glade_id: glade_id.into(),
@@ -148,7 +170,7 @@ impl Session {
             seq,
             prev,
             lamport: self.lamport,
-            refs: vec![],
+            refs,
             shape,
             payload,
         };
@@ -258,6 +280,24 @@ mod tests {
         assert_eq!(shape_of("value").unwrap(), Shape::Value);
         assert_eq!(shape_of("log").unwrap(), Shape::Log);
         assert_eq!(shape_of("swmr").unwrap(), Shape::Swmr);
+        assert_eq!(shape_of("crdt").unwrap(), Shape::Crdt);
+    }
+
+    #[test]
+    fn crdt_appends_capture_causal_stream_heads() {
+        let mut alice = Session::new("alice");
+        let a0 = alice.append("s", "doc.body", Shape::Crdt, b"A".to_vec(), vec![]).unwrap();
+        assert!(a0.refs.is_empty());
+
+        let mut bob = Session::new("bob");
+        bob.apply_remote(&[a0.clone()]).unwrap();
+        let b0 = bob.append("s", "doc.body", Shape::Crdt, b"B".to_vec(), vec![]).unwrap();
+        assert_eq!(b0.refs.iter().map(|head| (head.origin.as_str(), head.seq)).collect::<Vec<_>>(), vec![("alice", 0)]);
+
+        alice.apply_remote(&[b0]).unwrap();
+        let a1 = alice.append("s", "doc.body", Shape::Crdt, b"C".to_vec(), vec![]).unwrap();
+        assert_eq!(a1.refs.len(), 2);
+        assert!(require_fold_shape(Shape::Crdt, "fold").is_err());
     }
 
     #[test]

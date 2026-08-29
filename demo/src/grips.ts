@@ -1,6 +1,6 @@
 import { defineGrip } from "./runtime";
 import type { ChatLine } from "./glade";
-import type { FileWindow } from "@owebeeone/glial-runtime";
+import { emptyTextCrdtState, type FileWindow, type TextCrdtState } from "@owebeeone/glial-runtime";
 import type { GlialTapController } from "@owebeeone/glial-runtime/grip";
 import { EMPTY_FILE_WINDOW } from "./files";
 
@@ -15,6 +15,12 @@ export const SELECTION_TAP = defineGrip<any>("Selection.tap", undefined);
 
 export const NOTES = defineGrip<string>("Notes", "");
 export const NOTES_TAP = defineGrip<any>("Notes.tap", undefined);
+
+export const COLLABORATIVE_NOTES = defineGrip<TextCrdtState>("CollaborativeNotes", emptyTextCrdtState());
+export const COLLABORATIVE_NOTES_TAP = defineGrip<GlialTapController<TextCrdtState>>(
+  "CollaborativeNotes.tap",
+  undefined as any,
+);
 
 export const ACTIVITY = defineGrip<ChatLine[]>("Activity", []);
 export const ACTIVITY_TAP = defineGrip<any>("Activity.tap", undefined);

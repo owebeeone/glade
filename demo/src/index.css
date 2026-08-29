@@ -122,6 +122,29 @@ input {
   padding: 0.5rem;
   font: inherit;
 }
+.collaborative-editor {
+  width: 100%;
+  min-height: 6.5rem;
+  box-sizing: border-box;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: #1a1e27;
+  border: 1px solid #365886;
+  color: #e6e6e6;
+  border-radius: 6px;
+  padding: 0.5rem;
+  font: inherit;
+  outline: none;
+}
+.collaborative-editor:focus {
+  border-color: #5b8bd4;
+  box-shadow: 0 0 0 2px rgb(91 139 212 / 20%);
+}
+.collaborative-editor:empty::before {
+  content: attr(data-placeholder);
+  color: #5a6172;
+  pointer-events: none;
+}
 .activity {
   background: #1a1e27;
   border: 1px solid #2a2f3a;

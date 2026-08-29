@@ -39,6 +39,12 @@ export const M = defineManifest({
     id: "app:notes", shape: "value", share: "doc:{doc}",
     domain: "document", zone: "commons", retention: { policy: "from_cursor", ttl_ms: null },
   },
+  // DOCUMENT domain, commons — simultaneous text edits through the canonical
+  // CRDT engine and text_crdt.profile/v1 (profile selected by the Glial mount).
+  collaborativeNotes: {
+    id: "app:collaborative-notes", shape: "crdt", share: "doc:{doc}",
+    domain: "document", zone: "commons", retention: { policy: "from_cursor", ttl_ms: null },
+  },
   // DOCUMENT domain, commons (a log) — the document's activity feed (ChatLine).
   activity: {
     id: "app:activity", shape: "log", share: "doc:{doc}",
