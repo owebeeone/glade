@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "packages": {
+    "glade-binding-api": {
+      "role": "contract",
+      "dependencies": ["normal:glade-decl"],
+      "traits": { "BindingResolver": ["resolve"] },
+      "conformance_tests": ["public_contract"]
+    },
+    "glade-invocation-api": {
+      "role": "contract",
+      "dependencies": [],
+      "traits": { "Invoker": ["invoke"] },
+      "conformance_tests": ["public_contract"]
+    },
+    "glade-subscription-api": {
+      "role": "contract",
+      "dependencies": [],
+      "traits": { "Subscriber": ["open"], "Subscription": ["next", "close"] },
+      "conformance_tests": ["public_contract"]
+    },
+    "glade-sync-api": {
+      "role": "contract",
+      "dependencies": [],
+      "traits": { "ReplicaSync": ["read", "ingest"] },
+      "conformance_tests": ["public_contract"]
+    },
+    "glade-lifecycle-api": {
+      "role": "contract",
+      "dependencies": [],
+      "traits": { "ManagedResource": ["phase", "shutdown"] },
+      "conformance_tests": ["public_contract"]
+    },
+    "glade-persistence-api": {
+      "role": "contract",
+      "dependencies": [],
+      "traits": { "SnapshotStore": ["load", "compare_exchange"] },
+      "conformance_tests": ["public_contract"]
+    }
+  }
+}
