@@ -1,0 +1,9 @@
+[package]
+name = "di-eval-ports"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata.architecture]
+role = "contract"
+purpose = "Dependency-free test interfaces; not proposed Glade API replacements"

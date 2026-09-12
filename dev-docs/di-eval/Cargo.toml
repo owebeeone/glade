@@ -1,0 +1,43 @@
+[package]
+name = "glade-di-eval"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+members = ["ports"]
+resolver = "3"
+
+[features]
+shaku = ["dep:shaku"]
+dill = ["dep:dill"]
+negative-shaku = ["shaku"]
+negative-dyn = []
+
+[dependencies]
+di-eval-ports = { path = "ports" }
+shaku = { version = "=0.6.3", optional = true }
+dill = { version = "=0.17.0", optional = true }
+
+[dev-dependencies]
+glade-lifecycle-api = { path = "../../contracts/lifecycle-api" }
+
+[[example]]
+name = "missing_shaku"
+required-features = ["negative-shaku"]
+
+[[example]]
+name = "native_dyn"
+required-features = ["negative-dyn"]
+
+[[example]]
+name = "cycle_shaku"
+required-features = ["negative-shaku"]
+
+[[example]]
+name = "foreign_port_shaku"
+required-features = ["negative-shaku"]
+
+[package.metadata.architecture]
+role = "harness/tool"
+purpose = "Isolated DI evaluation, not a production dependency or gate adoption"
