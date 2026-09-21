@@ -174,6 +174,7 @@ and keeps the two questions apart in the same way.
 | 3.3 | Shaku assembles over the **already-acquired** handle from inside an sdax step that `.needs` it, resolves the engine's own carrier, puts a frame across it, and constructs no provider of its own; the module step is ordered before every endpoint's release | `real/src/shaku_bridge.rs`, `real/tests/shaku_assembly.rs`, `real/tests/shaku_registration.rs` |
 | 3.4 | **The differential**: the same plan with and without the module step. Both runs are `is_clean()`, both free every port, and nothing observable diverges — in either running order, over three repeated pairs | `real/tests/differential.rs` |
 | 3.5 | **DI-E04**: the contract crate still has one dependency while the real iroh-backed provider fills its `CarrierPort`; the gate is seen to refuse an injected `shaku`, on a copy; no framework reaches it transitively or through a public signature | `arch002-fixture.sh`, `check.sh` |
+| 3.6 | **The two clocks**: the engine times a budget on a controllable clock of this crate's, the port reads `ClockPort::now_ms` from the contract crate's `FakeClock`, and one test shows they tell the same story while another advances them apart and shows they do not | `real/src/two_clocks.rs`, `real/tests/two_clocks.rs` |
 
 Reproduce from this directory:
 
@@ -183,6 +184,8 @@ cargo test --locked --offline -p async-witness-real --test peer_release -- --noc
 cargo test --locked --offline -p async-witness-real --test shaku_assembly
 cargo test --locked --offline -p async-witness-real --test shaku_registration
 cargo test --locked --offline -p async-witness-real --test differential -- --nocapture --test-threads 1
+cargo test --locked --offline -p async-witness-real --test two_clocks
+sh arch002-fixture.sh
 ```
 
 ### The plan shape, and why it is this shape
@@ -438,6 +441,58 @@ said out loud rather than counted as absences, and Phase 4 should say them:
 future **to a Glade contract**". No Glade contract was changed, so neither of
 these is that. They belong in the Phase 4 write-up as stated facts.
 
+### Step 3.6 — the two clocks
+
+Plan §4.4: "There are two clocks and the witness must not conflate them." sdax
+measures every backoff, `within` deadline and shutdown budget on its **own**
+injected `Clock`; Glade's clock port is a separate, Glade-owned thing, and
+"using sdax's `Clock` as Glade's clock port would put a framework type in a
+contract crate and fail DI-E04 by construction".
+
+**Which engine clock, and why.** Not `sdax_testkit::FakeClock` — the plan's own
+update, item 2, rules it out: its `sleep` answers `Pending` without registering
+a waker (`sdax-testkit/src/clock.rs:59-71`), so a sleeper on a multi-thread
+runtime never wakes, and every witness test is multi-thread because
+`TokioRuntime::new` panics on a current-thread handle. The update offers a
+scaled real clock or a clock that records wakers; this step takes the **second**
+and declares `WitnessClock` in `real/src/two_clocks.rs`. A scaled clock still
+measures wall time, so "advance both clocks and see whether they agree" would
+become "sleep and hope", and the agreement observed would be a fact about the
+machine's load. `WitnessClock` moves only when a test moves it, so the whole
+suite runs in 0.00 s and says nothing about the scheduler.
+
+It adds one thing `sdax_testkit::FakeClock` does not have, and the step turns on
+it: `advance` returns **how many registered deadlines that advance crossed**. A
+test can then say *where* the engine's budget expired, not merely that it
+eventually did.
+
+**The observable.** One step asks the engine for `cx.timeout(500 ms, pending)`
+— timed by the engine, on the engine's clock — and reads `ClockPort::now_ms`
+from the contract crate's `FakeClock` on either side of the wait. The run's
+export is the port's own measure of the engine's budget. The two clocks start at
+different origins on purpose, the engine at zero and the port at a
+wall-clock-shaped instant, so what they must agree about is an **interval**,
+which is the only thing two clocks can honestly agree about.
+
+| Test | What it shows |
+|---|---|
+| `the_engine_deadline_falls_where_the_port_clock_says_it_should` | both clocks advanced in ten equal ticks; the first nine cross **no** registered deadline and the tenth crosses exactly one, and the port's reading of the same wait is exactly 500 ms. `engine.asked_for() == [500 ms]` first, so the deadline advanced past is the body's and not some other wait the engine took out |
+| `advancing_the_two_clocks_apart_makes_them_disagree` | the same code path with the port clock frozen (the engine's budget expires in full, the port reports **0 ms**) and with the port clock at twice the rate (**1000 ms**), alongside the lockstep value the agreement test asserts. The agreement is therefore falsifiable, by construction, from the same `observe` |
+| `the_two_clocks_are_two_types_from_two_crates` | `WitnessClock` is `async_witness_real::…` implementing sdax's `Clock`; `FakeClock` is `async_witness_ports::…` implementing `ClockPort`. The load-bearing enforcement is the gate, not this test |
+
+**Two things worth passing on.** `Running::poll` is what launches the engine
+(`sdax-tokio/src/running.rs:339`, `me.launch()`), so a test that advances a
+clock must do it in a **second branch of the same await** — awaiting the run
+first and ticking afterwards hangs, because nothing has registered a deadline to
+advance past. And the wait for "the body is now waiting" is for the **clock's**
+registration, not for an announcement from the body: the deadline is fixed when
+`Clock::sleep` is called and the waker exists one poll later, so waiting for the
+waker is what removes the race with the first tick.
+
+**No socket.** The plan draws a fakes-or-real boundary and this step is on the
+fakes side: the two-clock plan holds no resource, binds nothing, and takes no
+wall time.
+
 ### Measured
 
 Toolchain `rustc 1.96.0 (ac68faa20 2026-05-25)`, macOS 26.6 on Apple silicon,
@@ -447,11 +502,12 @@ working figures.
 
 | Measurement | Result |
 |---|---|
-| `sh check.sh` (all three members, warm; 68 tests, `arch002-fixture.sh` included) | 4.9–5.9 s |
+| `sh check.sh` (all three members, warm; 71 tests, `arch002-fixture.sh` included) | 4.9–5.9 s |
 | `sh arch002-fixture.sh` alone, warm (a copy, two checker runs, offline) | 0.64–0.79 s |
 | Cold build of the whole workspace (`--lib --tests --no-run`, empty `CARGO_TARGET_DIR`) | 33.0 s, 1.6 GB of artefacts |
 | Warm incremental rebuild of the `real` lib after one touched file | 1.1 s |
-| `cargo test -p async-witness-real --lib --tests` (warm, 43 tests) | 2.87–2.96 s over five consecutive runs |
+| `cargo test -p async-witness-real --lib --tests` (warm, 46 tests) | 2.84–2.86 s over five consecutive runs |
+| `tests/two_clocks.rs` (3 tests, five simulated seconds of engine time) | 0.00 s, and 0.00 s over 40 consecutive runs — the engine clock consumes no wall time at all |
 | `tests/peer_carrier.rs` alone (4 tests, two real endpoints per run) | 0.04 s |
 | `tests/peer_release.rs` (5 tests) | 2.05 s, of which three deliberate 2 s bounds |
 | `tests/shaku_assembly.rs` (4 tests, two real endpoints per run) | 0.04 s |
@@ -460,7 +516,8 @@ working figures.
 | Port free after the escaped clone was dropped | 23–108 µs |
 | Port with an escaped clone still alive | still bound at 2.004–2.006 s, i.e. the whole bound |
 | Port with an escaped link `Connection` still alive | still bound at 2.004–2.005 s; free 41–66 µs after it was dropped, while the uncloned dialer side was free in 108–143 µs |
-| Under load: 4 parallel copies of every `real` test binary while a whole-workspace `cargo test` ran | all green, 40 binaries; `peer_carrier` went from 0.04 s to 1.12 s, and the suites with a 2 s bound in them stayed at 2.05–2.10 s |
+| Under load: 4 parallel copies of every `real` test binary while a whole-workspace `cargo test` ran | all green, 44 binaries and 184 tests; `peer_carrier` went from 0.04 s to 1.12 s, the suites with a 2 s bound stayed at 2.05–2.10 s, and `two_clocks` stayed at 0.01–0.07 s |
+| Under load: 4 parallel copies of `arch002-fixture.sh` beside the same load | all four refused the injection with the same diagnostic; no temp directory left behind |
 
 The clean-run figure is three orders of magnitude below the node's own 6–10 ms
 (`iroh_carrier.rs:218-221`), and the difference is not a faster machine: the
