@@ -9,5 +9,13 @@ publish.workspace = true
 role = "harness/tool"
 purpose = "DI-E01, DI-E02 and DI-E03 over Shaku alone; no runtime, no socket, no sdax"
 
+# No tokio, no iroh, no sdax, and it must stay that way: §4.4's hidden-I/O claim
+# is mechanical only while a provider that opens a socket cannot compile into
+# this target. Shaku is pinned EXACTLY at the evaluation's measured baseline —
+# a caret range would silently retest a different library.
+[dependencies]
+async-witness-ports = { path = "../ports" }
+shaku = "=0.6.3"
+
 [lints]
 workspace = true

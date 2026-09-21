@@ -9,5 +9,32 @@ publish.workspace = true
 role = "harness/tool"
 purpose = "AR-08 and DI-E04 against the real iroh endpoint, driven by sdax-rs; slow, run separately"
 
+# All three sdax crates come from Git at the SAME rev: a mismatch between them
+# is a failure case (sdax-rs/RELEASE.md:70). The rev is `origin/main` on a now
+# public repository, so a fresh clone resolves it without credentials.
+#
+# `tokio = "1"` is deliberately a range, not a pin: sdax-tokio pins `=1.53.1`
+# and iroh 1.2.0 wants `^1.44.1`, and the tracked Cargo.lock is where the
+# witness shows they UNIFY rather than asserting it. Features follow the node's
+# own list so `#[tokio::test(flavor = "multi_thread")]` works — sdax-tokio
+# disables tokio's `macros`, and `TokioRuntime::new` panics on a current_thread
+# handle, so every witness test needs the multi-thread flavour.
+[dependencies]
+async-witness-ports = { path = "../ports" }
+glade-node = { path = "../../../node" }
+glade-wire = { path = "../../../wire-rs" }
+iroh = "1.2"
+sdax = { git = "https://github.com/owebeeone/sdax-rs", package = "sdax", rev = "ccf06e76a90e22a454471a71f0cf6f5cb878baac" }
+sdax-tokio = { git = "https://github.com/owebeeone/sdax-rs", package = "sdax-tokio", rev = "ccf06e76a90e22a454471a71f0cf6f5cb878baac" }
+shaku = "=0.6.3"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+
+# sdax-testkit is `publish = false` upstream: it can only ever come from Git.
+# glade-lifecycle-api carries the LC-001..LC-006 conformance suite Step 2.3 runs
+# against the witness's ManagedResource adapter, unchanged.
+[dev-dependencies]
+glade-lifecycle-api = { path = "../../../contracts/lifecycle-api", features = ["conformance"] }
+sdax-testkit = { git = "https://github.com/owebeeone/sdax-rs", package = "sdax-testkit", rev = "ccf06e76a90e22a454471a71f0cf6f5cb878baac" }
+
 [lints]
 workspace = true

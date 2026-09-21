@@ -14,12 +14,23 @@
     "async-witness-fast": {
       "role": "harness",
       "reason": "DI-E01/E02/E03 over Shaku alone; a harness, never a production installation",
-      "dependencies": []
+      "dependencies": ["normal:async-witness-ports", "normal:shaku"]
     },
     "async-witness-real": {
       "role": "harness",
       "reason": "AR-08 and DI-E04 against the real iroh endpoint; a harness, never a production installation",
-      "dependencies": []
+      "dependencies": [
+        "normal:async-witness-ports",
+        "normal:glade-node",
+        "normal:glade-wire",
+        "normal:iroh",
+        "normal:sdax",
+        "normal:sdax-tokio",
+        "normal:shaku",
+        "normal:tokio",
+        "dev:glade-lifecycle-api",
+        "dev:sdax-testkit"
+      ]
     }
   }
 }

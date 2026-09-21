@@ -45,6 +45,23 @@ if [ "$wire_lines" != "1" ]; then
     exit 1
 fi
 
+# `--no-deps` also hides TRANSITIVE reachability from the checker: a contract
+# crate depending on a permitted pure crate that itself pulled in a framework
+# would pass. The second, equally cheap assertion (AsyncWitnessPlan.md §4.5):
+# inverting the tree from each framework must reach no contract-role package.
+# `contracts` MUST list every role: "contract" package in architecture-policy.json.
+contracts="async-witness-ports"
+for framework in shaku sdax sdax-tokio sdax-testkit tokio iroh; do
+    inverted=$(cargo tree --locked --offline --manifest-path "$manifest" --invert "$framework")
+    for contract in $contracts; do
+        if printf '%s\n' "$inverted" | grep -q -- "$contract"; then
+            echo "$contract is reachable from $framework: the DI-E04 wall is breached" >&2
+            printf '%s\n' "$inverted" >&2
+            exit 1
+        fi
+    done
+done
+
 # `--all-features --all-targets` is deliberately NOT used. From Phase 1 the fast
 # member carries examples that MUST fail to compile (di-eval/README.md records
 # the same rule); sweeping them in would invert their meaning. Run those by hand

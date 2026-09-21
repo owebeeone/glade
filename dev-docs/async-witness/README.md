@@ -23,10 +23,17 @@ The owner records the outcome on the decision graph; this workspace does not.
 |---|---|---|---|
 | `ports` (`async-witness-ports`) | contract | `glade-wire` only | `ClockPort`, `CarrierPort`, `StorePort` and deterministic fakes. **Zero framework dependencies — this crate is the DI-E04 wall.** |
 | `fast` (`async-witness-fast`) | harness | ports, `shaku =0.6.3` | DI-E01, DI-E02, DI-E03. No tokio, no iroh, no sdax. Milliseconds. |
-| `real` (`async-witness-real`) | harness | ports, shaku, `sdax`, `sdax-tokio`, `glade-node`, `glade-wire`, `iroh`, tokio | DI-E04 and AR-08 against the real iroh endpoint. Slow, run separately. |
+| `real` (`async-witness-real`) | harness | ports, shaku, `sdax`, `sdax-tokio`, `glade-node`, `glade-wire`, `iroh`, tokio; dev: `sdax-testkit`, `glade-lifecycle-api` | DI-E04 and AR-08 against the real iroh endpoint. Slow, run separately. |
 
 The three members exist from Phase 0; `fast` and `real` are filled in by Phases
 1–3. Phase 0 adds no witness logic.
+
+Every dependency and dev-dependency the later phases need is already declared
+and locked, so **no phase after this one has to touch a manifest or
+`Cargo.lock`** to resolve something. Adding an `[[example]]` target or a feature
+for Phase 1's compile-fail fixtures is a target-table edit and changes neither
+resolution nor the lockfile; adding a new *dependency* is a dependency-posture
+change and needs the plan's §5 read again first.
 
 ## Pins
 
