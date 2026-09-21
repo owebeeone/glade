@@ -18,4 +18,7 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "
 # node<->node QUIC carrier (Lane R step 2). Client-facing WS carrier (ws.rs) has
 # no new deps; iroh rides only the peer path. tls-ring gives the crypto provider
 # used by presets::Minimal (relay + discovery disabled — direct dial only).
-iroh = "1"
+# Floor at 1.2: 1.1.0 fixed a panic on a crafted EndpointAddr, a relay CPU pin and
+# NAT-probe misrouting (IrohReview §11). Cargo.lock is not tracked here, so this
+# line is the only place a minimum can be recorded.
+iroh = "1.2"
