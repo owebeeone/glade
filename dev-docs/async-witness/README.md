@@ -151,3 +151,71 @@ Three limits are named rather than hidden, the third measured above under
 
 Do not relax a classification or an allowlist to make a check pass
 (`glade-wz/AGENTS.md:31-32`). Record it and get it reviewed.
+
+## Phase 3 — the real async port
+
+Phase 2 decided AR-08 over fakes so that a lifecycle failure could never be
+mistaken for an injector failure (`AsyncWitnessPlan.md` §8.1). Phase 3 swaps the
+fakes for the node's own `glade_node::iroh_carrier::PeerEndpoint`, unmodified,
+and keeps the two questions apart in the same way.
+
+| Step | What it shows | Where |
+|---|---|---|
+| 3.1 | Two witness nodes bind localhost QUIC endpoints, one dials the other, both complete the node<->node HELLO seam, and one real glade `Frame` crosses the witness's `CarrierPort` — all driven by an sdax plan, with every external effect inside `cx.hold(...)` | `real/src/peer_carrier.rs`, `real/src/peer_plan.rs`, `real/tests/peer_carrier.rs` |
+
+Reproduce from this directory:
+
+```sh
+cargo test --locked --offline -p async-witness-real --test peer_carrier
+```
+
+### The plan shape, and why it is this shape
+
+```text
+Acceptor  <-- Served  <-- Exchange
+    ^                        |
+    +---- Dialed  <----------+
+           ^
+        Dialer
+```
+
+The arrows are `needs`; cleanup is their reverse, derived by sdax from the typed
+edges. `Dialed` needs **both** endpoints — its own to dial from and the
+acceptor's `addr()` to dial to — which makes every endpoint the parent of every
+link that can reach it. `release_order().before(...)` is asserted statically
+over that declaration, with no runtime and no socket, exactly as Step 2.1 did
+over the fakes.
+
+### Giving a handle back by value
+
+`PeerEndpoint::close(self)` consumes the handle, because iroh frees the UDP
+socket only once every clone is gone. An sdax release body receives an `Arc<T>`,
+and an **async** release leaves that `Arc` in the engine's slots rather than
+taking it out (`sdax/src/host/bodies.rs:404-421` takes the value only for a
+`by_drop` release). Closing a *clone* would therefore leave one live clone in
+the slots for as long as the run's storage lives.
+
+So `WitnessEndpoint` owns its `PeerEndpoint` as a `Mutex<Option<..>>` and the
+release body **takes** it out; the `Arc` the engine keeps afterwards is an empty
+shell. `WitnessCarrier` does the same for the link's `SendStream`, `RecvStream`
+and `Connection`, for a reason that is easy to miss: quinn's endpoint driver
+exits only when its handle count is zero **and** its connection map is empty
+(`quinn-0.11.12/src/endpoint.rs:384-385`), so a `Connection` left alive in a
+slot holds the endpoint's socket open just as surely as an endpoint clone does.
+
+Those `Mutex`es are interior mutability inside the **provider**, which is where
+`ports/src/lib.rs` already puts it ("an implementation owns its own interior
+mutability"). No Glade contract is touched, nothing is made `Sync` to please a
+container, and no public future is boxed that the port did not already box.
+
+### Measured
+
+Toolchain `rustc 1.96.0 (ac68faa20 2026-05-25)`, macOS 26.6 on Apple silicon,
+`dev` profile, warm `target/`.
+
+| Measurement | Result |
+|---|---|
+| `sh check.sh` (all three members, warm) | 7.2 s |
+| `cargo test -p async-witness-real --lib --tests` (warm, 27 tests) | 0.67–0.74 s over five consecutive runs |
+| `tests/peer_carrier.rs` alone (4 tests, two real endpoints per run) | 0.04 s |
+| Under load: 3 parallel copies of every `real` test binary while a whole-workspace `cargo test` ran | all green |

@@ -36,6 +36,16 @@
 //! is the `needs` edge, and nothing else. The field only lets the fake notice
 //! if that were ever untrue.
 
+//! # Phase 3 lives in its own modules
+//!
+//! [`peer_carrier`] is the witness's `CarrierPort` over the node's real
+//! `PeerEndpoint`, and [`peer_plan`] is the sdax plan that drives two witness
+//! nodes through it. The fakes below stay exactly as Phase 2 left them, so the
+//! AR-08 evidence decided without a socket is not re-decided by one.
+
+pub mod peer_carrier;
+pub mod peer_plan;
+
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
