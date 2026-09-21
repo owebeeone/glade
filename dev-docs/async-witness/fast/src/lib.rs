@@ -26,15 +26,16 @@
 //! construction and *panic* in every port method, which is the strongest form
 //! of "the real provider was never reached" this target can express.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Waker};
 
 use async_witness_ports::{
-    CarriedFrame, CarrierError, CarrierPort, ClockPort, FrameType, PortFuture, StoreError,
-    StorePort,
+    CarriedFrame, CarrierError, CarrierPort, ClockPort, FakeCarrier, FrameType, PortFuture,
+    StoreError, StorePort,
 };
-use shaku::{Component, Module, ModuleBuildContext, module};
+use shaku::{Component, Keyed, Module, ModuleBuildContext, module};
 
 /// Drive an already-complete port future to its value, with no runtime.
 ///
@@ -312,6 +313,148 @@ module! {
 module! {
     pub LazyComposition {
         components = [PeerSession, WallClock, EndpointCarrier, #[lazy] DirectoryStore],
+        providers = []
+    }
+}
+
+/// Which binding recipe a carrier occurrence was selected for.
+///
+/// `InjectionGraphRefinement.md:15-17` gives `CarrierPort` two recipes —
+/// `peer_carrier_binding` over the IrohAdapter and `client_carrier_binding`
+/// over the WebSocketAdapter — and says at `:23` that "the binding occurrence
+/// distinguishes a role; matching a port type alone does not". This is that
+/// distinction as a **type**: Shaku keys a multibinding by a value of a key
+/// type, so a role cannot be smuggled in as a string.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum CarrierRole {
+    Peer,
+    Client,
+    /// A role no recipe registers. Asking for it is an absent map entry rather
+    /// than a panic, which is the run-time half of DI-E03's ambiguity claim.
+    Unbound,
+}
+
+/// The stand-in for `peer_carrier_binding`'s IrohAdapter. It replays one frame
+/// naming its role, so a test can tell the two occurrences apart through the
+/// port alone, with no downcast and no access to the concrete type.
+pub struct PeerRoleCarrier(FakeCarrier);
+
+impl PeerRoleCarrier {
+    fn new() -> Self {
+        let carrier = FakeCarrier::new();
+        carrier.push_inbound(FrameType::NodeHello, b"peer");
+        Self(carrier)
+    }
+}
+
+impl CarrierPort for PeerRoleCarrier {
+    fn send<'a>(
+        &'a self,
+        frame: FrameType,
+        body: &'a [u8],
+    ) -> PortFuture<'a, Result<(), CarrierError>> {
+        self.0.send(frame, body)
+    }
+
+    fn recv(&self) -> PortFuture<'_, Result<Option<CarriedFrame>, CarrierError>> {
+        self.0.recv()
+    }
+}
+
+impl<M: Module> Component<M> for PeerRoleCarrier {
+    type Interface = dyn Carrier;
+    type Parameters = ();
+
+    fn build(_: &mut ModuleBuildContext<M>, _: ()) -> Box<dyn Carrier> {
+        Box::new(PeerRoleCarrier::new())
+    }
+}
+
+impl Keyed for PeerRoleCarrier {
+    type KeyType = CarrierRole;
+    const KEY: CarrierRole = CarrierRole::Peer;
+}
+
+/// The stand-in for `client_carrier_binding`'s WebSocketAdapter.
+pub struct ClientRoleCarrier(FakeCarrier);
+
+impl ClientRoleCarrier {
+    fn new() -> Self {
+        let carrier = FakeCarrier::new();
+        carrier.push_inbound(FrameType::Hello, b"client");
+        Self(carrier)
+    }
+}
+
+impl CarrierPort for ClientRoleCarrier {
+    fn send<'a>(
+        &'a self,
+        frame: FrameType,
+        body: &'a [u8],
+    ) -> PortFuture<'a, Result<(), CarrierError>> {
+        self.0.send(frame, body)
+    }
+
+    fn recv(&self) -> PortFuture<'_, Result<Option<CarriedFrame>, CarrierError>> {
+        self.0.recv()
+    }
+}
+
+impl<M: Module> Component<M> for ClientRoleCarrier {
+    type Interface = dyn Carrier;
+    type Parameters = ();
+
+    fn build(_: &mut ModuleBuildContext<M>, _: ()) -> Box<dyn Carrier> {
+        Box::new(ClientRoleCarrier::new())
+    }
+}
+
+impl Keyed for ClientRoleCarrier {
+    type KeyType = CarrierRole;
+    const KEY: CarrierRole = CarrierRole::Client;
+}
+
+/// `record_transport_binding`, which must "share their provider within the same
+/// node scope" with the peer carrier recipe. Its declared contract is
+/// `TransportPort`, which the witness does not declare, so what this models is
+/// the sharing requirement and not a second contract over one provider.
+pub trait RecordTransport: shaku::Interface {
+    /// The occurrence a role's recipe selected, handed back as the port.
+    fn shared_with(&self, role: CarrierRole) -> Option<Arc<dyn CarrierPort>>;
+
+    /// Every role this consumer was given, in declaration order.
+    fn roles(&self) -> Vec<CarrierRole>;
+}
+
+#[derive(Component)]
+#[shaku(interface = RecordTransport)]
+pub struct KeyedRecordTransport {
+    #[shaku(inject)]
+    carriers: HashMap<CarrierRole, Arc<dyn Carrier>>,
+}
+
+impl RecordTransport for KeyedRecordTransport {
+    fn shared_with(&self, role: CarrierRole) -> Option<Arc<dyn CarrierPort>> {
+        self.carriers.get(&role).map(|occurrence| {
+            let port: Arc<dyn CarrierPort> = occurrence.clone();
+            port
+        })
+    }
+
+    fn roles(&self) -> Vec<CarrierRole> {
+        let mut roles: Vec<CarrierRole> = self.carriers.keys().copied().collect();
+        roles.sort();
+        roles
+    }
+}
+
+module! {
+    pub KeyedComposition {
+        components = [
+            #[keyed(dyn Carrier, CarrierRole)] PeerRoleCarrier,
+            #[keyed(dyn Carrier, CarrierRole)] ClientRoleCarrier,
+            KeyedRecordTransport
+        ],
         providers = []
     }
 }
