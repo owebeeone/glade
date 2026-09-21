@@ -1,0 +1,13 @@
+[package]
+name = "async-witness-real"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[package.metadata.architecture]
+role = "harness/tool"
+purpose = "AR-08 and DI-E04 against the real iroh endpoint, driven by sdax-rs; slow, run separately"
+
+[lints]
+workspace = true

@@ -1,0 +1,13 @@
+[package]
+name = "async-witness-ports"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[package.metadata.architecture]
+role = "contract"
+purpose = "The DI-E04 wall: witness ports with zero framework dependencies, not proposed Glade API"
+
+[lints]
+workspace = true

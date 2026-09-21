@@ -1,0 +1,18 @@
+[workspace]
+members = ["ports", "fast", "real"]
+resolver = "3"
+
+# The effective MSRV is iroh 1.2.0's `rust-version = "1.91"`, not shaku's 1.88
+# (AsyncWitnessPlan.md §3.6). Recorded here so resolution, not a build failure,
+# reports a toolchain that is too old.
+[workspace.package]
+edition = "2024"
+rust-version = "1.91"
+version = "0.0.0"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
