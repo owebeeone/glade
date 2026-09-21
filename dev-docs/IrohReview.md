@@ -22,7 +22,7 @@ stale — see §11).
   fixes), **1.2.0 (09-09, current)**. n0's stated plan is maintenance releases
   every few weeks, not new features.
 - **Glade is on 1.0.2** (`iroh = "1"` in `node/Cargo.toml`; the lockfile resolves
-  1.0.2).
+  1.0.2). Superseded: see the 2026-09-21 update under §11 "Version gap".
 - **1.0 commits to wire compatibility** across all 1.x minors and across the
   official language bindings; wire changes only at a major.
 - **The QUIC stack is n0's own `noq`** (a diverged quinn fork carrying multipath,
@@ -582,6 +582,10 @@ several file-sharing GUIs (Sendme-egui, Dropwire, ringdrop, Strada).
   moot while `Minimal` stays; the `EndpointAddr` one matters as soon as
   addresses are parsed from untrusted input (tickets, directory records).
   `iroh = "1"` already admits 1.2.0; nothing was bumped in this review.
+  - Update 2026-09-21: `node/Cargo.lock` is not tracked (`node/.gitignore`), so
+    the 1.0.2 above was this checkout's stale resolution and not a pin. The
+    manifest now requires `iroh = "1.2"` (glade `74ffeb0`); the node's 61 tests
+    pass on iroh 1.2.0, iroh-dns 1.3.0 and noq 1.3.0.
 - **Unused capabilities that map onto open design items**: `EndpointHooks`
   (accept-time rejection before any glade frame is read); `RelayMode::Custom`
   with a self-hosted `iroh-relay` (the discovery model's "public iroh relay"
