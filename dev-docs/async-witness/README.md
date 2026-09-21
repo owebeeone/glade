@@ -525,3 +525,90 @@ node's test asks immediately after `close` resolves, whereas a run has a second
 endpoint to release and a report to assemble in between, so iroh's driver has
 already wound down by the time the check happens. The bound stays at two
 seconds regardless — it is there for the case where it has not.
+
+## Measured — Step 4.1
+
+This is the consolidated measurement the plan's Step 4.1 asks for, per
+`LibraryBoundaryAndTestingPolicy.md:66`: "Each adopting project MUST record its
+fast command, machine/toolchain context, and measured budget. Measure test
+execution, warm incremental build plus tests, and cold build separately. Do not
+describe an unmeasured target as an achieved performance guarantee."
+
+**Conditions**, one set, for every figure below.
+
+| | |
+|---|---|
+| Date | 2026-09-22 |
+| Tree | glade `5f2658f`, 71 tests: 7 `ports`, 18 `fast`, 46 `real` |
+| Toolchain | `rustc 1.96.0 (ac68faa20 2026-05-25)`, `cargo 1.96.0 (30a34c682 2026-05-25)`, host `aarch64-apple-darwin` |
+| Machine | Apple M3 Pro, 12 cores, 36 GiB memory, macOS 26.6.2 (build 25G83) |
+| Profile | `dev`; no `RUSTC_WRAPPER` and no compiler cache |
+| Fast command | `sh check.sh fast` for the fast member; `sh check.sh` for the whole gate |
+
+**The machine was not idle, and these are wall times on a loaded machine.** The
+owner's own application instance was running throughout on ports 5173, 8080 and
+9099 and was not touched, alongside a browser, an editor and Spotlight
+indexing; none of that load is the witness's. One-minute load averages are
+recorded beside every set and ranged from 13.9 to 89.4 across the measurement
+window on a 12-core machine. Read each figure as an upper bound under real
+desktop load, not as a best case and not as a guarantee.
+
+| Measurement | Repeats | min | median | max | 1-min load, before → after |
+|---|---|---|---|---|---|
+| `cargo test --locked --offline -p async-witness-ports --lib --tests`, warm (7 tests) | 5 | 0.09 s | 0.09 s | 0.21 s | 16.17 → 15.03 |
+| `cargo test --locked --offline -p async-witness-fast --lib --tests`, warm (18 tests) | 5 | 0.11 s | 0.11 s | 0.14 s | 15.03 → 15.03 |
+| `cargo test --locked --offline -p async-witness-real --lib --tests`, warm (46 tests) | 5 | 2.95 s | 3.04 s | 3.39 s | 15.03 → 13.92 |
+| `sh check.sh`, warm — all three members, 71 tests, `arch002-fixture.sh` included | 5 | 4.92 s | 7.47 s | 8.05 s | 13.92 → 52.61 |
+| Warm incremental: `touch fast/src/lib.rs`, then rebuild and run (18 tests) | 5 | 2.99 s | 3.05 s | 3.35 s | 67.90 → 49.42 |
+| Warm incremental: `touch real/src/lib.rs`, then rebuild and run (46 tests) | 5 | 11.12 s | 11.25 s | 11.72 s | 49.42 → 24.76 |
+| Cold build of `fast` alone, `--lib --tests --no-run`, empty `CARGO_TARGET_DIR` | 1 | — | 7.10 s | — | 53.89 → 53.18 |
+| Cold build of `real` alone, same command | 1 | — | 42.88 s | — | 53.18 → 89.38 |
+
+Cold artefacts: `fast` 71 MiB (72,764 KiB), `real` 1.6 GiB (1,665,924 KiB). Both
+cold builds used a scratch `CARGO_TARGET_DIR` outside the workspace, which was
+deleted afterwards; this workspace's own `target/` was not used for them and not
+disturbed by them. Free space was checked before and after and never fell below
+50 GiB.
+
+The three things the policy line asks to be kept apart are kept apart above:
+**test execution** is the first four rows, where nothing recompiles; **warm
+incremental build plus tests** is the two `touch` rows, which rebuild the
+library and every test binary and then run the tests; **cold build** is the last
+two rows.
+
+**None of this is a budget.** The plan sets no seconds threshold for the witness
+and the policy "deliberately does not impose a universal seconds threshold"
+(`LibraryBoundaryAndTestingPolicy.md:68`). These are measurements, not achieved
+performance guarantees. The plan's §9.2 stop trigger "The real target's build
+cost makes Phase 3 impractical" did not fire: Phase 3 completed on the real
+target and the WebSocket runner-up was never needed.
+
+### Where this disagrees with Phase 3's working figures above
+
+The Phase 3 table stays where it is; it is that phase's own record. **This
+section is the current one.** The test count is identical in both (71), so every
+difference is load, with one exception that is a different measurement
+altogether:
+
+- `sh check.sh`. Phase 3 recorded 4.9–5.9 s; this set measured 4.92–8.05 s over
+  five runs. The minimum agrees almost exactly. The median and maximum are
+  higher because the one-minute load rose from 13.9 to 52.6 while the five runs
+  were going, from work that is not the witness's.
+- Cold build. Phase 3 recorded 33.0 s and 1.6 GB for the **whole workspace**;
+  this set built `real` **alone** in 42.9 s for the same 1.6 GiB, at a load of
+  53 rising to 89. The artefact size matches because `real` is what dominates
+  it — it pulls iroh, `glade-node` and the two sdax crates — and adding `ports`
+  and `fast` costs little on top. The wall time is higher for load, not for a
+  larger build.
+- `cargo test -p async-witness-real`. Phase 3 recorded 2.84–2.86 s over five
+  consecutive runs; this set measured 2.95–3.39 s over five. The `peer_release`
+  binary's three deliberate two-second bounds dominate the figure in both, which
+  is why load moves it so little.
+- `sh arch002-fixture.sh` alone. Phase 3 recorded 0.64–0.79 s warm; measured
+  once here at 1.06 s, at a load above 50. Same cause.
+- Warm incremental. Phase 3's 1.1 s is **not** the same measurement as the row
+  above: it timed `cargo build` of the `real` library after one touched file.
+  The row above rebuilds that library and all ten of its test binaries and then
+  runs 46 tests, which is what the policy line means by "warm incremental build
+  plus tests". The two numbers are not comparable and neither supersedes the
+  other.
