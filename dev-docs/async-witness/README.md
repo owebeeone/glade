@@ -164,6 +164,7 @@ and keeps the two questions apart in the same way.
 | 3.1 | Two witness nodes bind localhost QUIC endpoints, one dials the other, both complete the node<->node HELLO seam, and one real glade `Frame` crosses the witness's `CarrierPort` — all driven by an sdax plan, with every external effect inside `cx.hold(...)` | `real/src/peer_carrier.rs`, `real/src/peer_plan.rs`, `real/tests/peer_carrier.rs` |
 | 3.2 | **AR-08 for real**: after `report.is_clean()`, every recorded UDP port re-binds within the bound — and a variant in which one endpoint clone deliberately escapes keeps its port bound for the whole bound, then frees it when the clone is dropped | `real/tests/peer_release.rs` |
 | 3.3 | Shaku assembles over the **already-acquired** handle from inside an sdax step that `.needs` it, resolves the engine's own carrier, puts a frame across it, and constructs no provider of its own; the module step is ordered before every endpoint's release | `real/src/shaku_bridge.rs`, `real/tests/shaku_assembly.rs`, `real/tests/shaku_registration.rs` |
+| 3.4 | **The differential**: the same plan with and without the module step. Both runs are `is_clean()`, both free every port, and nothing observable diverges — in either running order, over three repeated pairs | `real/tests/differential.rs` |
 
 Reproduce from this directory:
 
@@ -172,6 +173,7 @@ cargo test --locked --offline -p async-witness-real --test peer_carrier
 cargo test --locked --offline -p async-witness-real --test peer_release -- --nocapture
 cargo test --locked --offline -p async-witness-real --test shaku_assembly
 cargo test --locked --offline -p async-witness-real --test shaku_registration
+cargo test --locked --offline -p async-witness-real --test differential -- --nocapture --test-threads 1
 ```
 
 ### The plan shape, and why it is this shape
@@ -269,6 +271,36 @@ microseconds. The reason is the by-value release above — a module that outlive
 the step holds a carrier that owns nothing. Contrast the endpoint clone of Step
 3.2, a handle the engine never owned, which does hold the port.
 
+### The differential, and what it may not compare
+
+`observe(with_module: bool)` is one function and the `bool` reaches exactly one
+place, `PeerHarness::with_shaku_module`. Everything else — plan, bodies,
+budgets, runtime, the order of the observations — is shared, so a difference in
+the result can only have come from the module step.
+
+**The first version of it compared too much, and that is worth recording.** It
+compared the *sequence* in which releases completed, and the two sides
+"diverged": `["Served", "Dialed", "Acceptor", "Dialer"]` against `["Dialed",
+"Served", "Dialer", "Acceptor"]`. The sequence also varied between runs of the
+**same** configuration, which is what gave it away. Nothing was wrong: `Served`
+and `Dialed` share no `needs` path, and neither do `Acceptor` and `Dialer`, so
+`release_order()` reports both pairs `unordered` and the engine is free to
+finish them in either order. That is AR-08's third clause — "concurrent
+independent cleanup can progress" — observed live rather than derived from
+`unordered_pairs()`, and three distinct total orders showed up across six runs.
+
+So the differential compares the **partial** order the plan declares: which
+releases completed, and `released_before(child, parent)` for each of the three
+pairs that are genuinely ordered.
+`the_uncompared_pairs_are_the_ones_the_plan_declares_unordered` asserts
+statically that the pairs left out are exactly the ones `release_order()` calls
+unordered, so the exclusion is reading the plan rather than excusing a
+difference.
+
+The general lesson for anyone writing the next differential here: **a total
+order is not an observable of this system.** Compare what the declaration
+constrains.
+
 ### Measured
 
 Toolchain `rustc 1.96.0 (ac68faa20 2026-05-25)`, macOS 26.6 on Apple silicon,
@@ -276,15 +308,16 @@ Toolchain `rustc 1.96.0 (ac68faa20 2026-05-25)`, macOS 26.6 on Apple silicon,
 
 | Measurement | Result |
 |---|---|
-| `sh check.sh` (all three members, warm; 62 tests) | 7.2 s |
-| `cargo test -p async-witness-real --lib --tests` (warm, 37 tests) | 2.73–2.88 s over five consecutive runs |
+| `sh check.sh` (all three members, warm; 67 tests) | 7.2 s |
+| `cargo test -p async-witness-real --lib --tests` (warm, 42 tests) | 2.88–2.94 s over five consecutive runs |
 | `tests/peer_carrier.rs` alone (4 tests, two real endpoints per run) | 0.04 s |
 | `tests/peer_release.rs` (4 tests) | 2.04 s, of which two deliberate 2 s bounds |
 | `tests/shaku_assembly.rs` (4 tests, two real endpoints per run) | 0.04 s |
+| `tests/differential.rs` (5 tests, 22 real endpoints) | 0.09 s in parallel, 0.21 s single-threaded |
 | Port free after a clean run | 4.7–15.2 µs, over three runs of both endpoints — already free at the first poll |
 | Port free after the escaped clone was dropped | 23–108 µs |
 | Port with an escaped clone still alive | still bound at 2.004–2.006 s, i.e. the whole bound |
-| Under load: 3 parallel copies of every `real` test binary while a whole-workspace `cargo test` ran | all green |
+| Under load: 4 parallel copies of every `real` test binary while a whole-workspace `cargo test` ran | all green; the slowest suite went from 0.04 s to 2.2 s and stayed green |
 
 The clean-run figure is three orders of magnitude below the node's own 6–10 ms
 (`iroh_carrier.rs:218-221`), and the difference is not a faster machine: the
