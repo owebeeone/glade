@@ -57,6 +57,17 @@ sh check.sh --list all # the packages a selector names, without running them
 `di-eval/README.md` records; sweeping them into the gate would invert their
 meaning. Run those by hand and inspect the diagnostics, not just the exit codes.
 
+Two commands to avoid from this workspace, both because they reach outside it:
+
+- **`cargo fmt --all`** formats a package's local **path dependencies** too,
+  which from here means `glade-wire`, `glade-node` and the contracts. They are
+  not rustfmt-clean and are not ours to reformat. Select packages by name, as
+  `check.sh` does.
+- **`cargo build`, `cargo test` or `cargo check` with `glade/node` as the
+  working directory.** The owner's desk runs `glade/node/target/debug/glade-node`.
+  Building the witness is safe and leaves every artefact, `glade-node` included,
+  in this workspace's own `target/`.
+
 ## What the gate checks, and what it cannot
 
 `check.sh` runs the `syn`-based lint at

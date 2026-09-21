@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "packages": {
+    "async-witness-ports": {
+      "role": "contract",
+      "dependencies": ["normal:glade-wire"],
+      "traits": {
+        "ClockPort": ["now_ms"],
+        "CarrierPort": ["send", "recv"],
+        "StorePort": ["append", "scan"]
+      },
+      "conformance_tests": ["ports_contract"]
+    },
+    "async-witness-fast": {
+      "role": "harness",
+      "reason": "DI-E01/E02/E03 over Shaku alone; a harness, never a production installation",
+      "dependencies": []
+    },
+    "async-witness-real": {
+      "role": "harness",
+      "reason": "AR-08 and DI-E04 against the real iroh endpoint; a harness, never a production installation",
+      "dependencies": []
+    }
+  }
+}
