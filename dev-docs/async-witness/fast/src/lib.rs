@@ -296,3 +296,22 @@ module! {
         providers = []
     }
 }
+
+// The pair below exists only to produce the evidence for caveat 2 of
+// AsyncWitnessPlan.md §8.4, which must be recorded with its evidence or it
+// counts as a failure. Neither registers the journal, so NOTHING in either
+// injects `dyn Store`: the store is an unreferenced registration, and the only
+// difference between the two modules is `#[lazy]`.
+module! {
+    pub EagerComposition {
+        components = [PeerSession, WallClock, EndpointCarrier, DirectoryStore],
+        providers = []
+    }
+}
+
+module! {
+    pub LazyComposition {
+        components = [PeerSession, WallClock, EndpointCarrier, #[lazy] DirectoryStore],
+        providers = []
+    }
+}
