@@ -9,5 +9,11 @@ publish.workspace = true
 role = "contract"
 purpose = "The DI-E04 wall: witness ports with zero framework dependencies, not proposed Glade API"
 
+# The ONE edge, and it must stay the only one. `glade-wire` is itself
+# zero-dependency, which is the point: the carrier port is expressible in real
+# Glade types without importing anything framework-shaped.
+[dependencies]
+glade-wire = { path = "../../../wire-rs" }
+
 [lints]
 workspace = true

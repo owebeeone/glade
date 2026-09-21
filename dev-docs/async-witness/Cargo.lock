@@ -9,7 +9,14 @@ version = "0.0.0"
 [[package]]
 name = "async-witness-ports"
 version = "0.0.0"
+dependencies = [
+ "glade-wire",
+]
 
 [[package]]
 name = "async-witness-real"
+version = "0.0.0"
+
+[[package]]
+name = "glade-wire"
 version = "0.0.0"
