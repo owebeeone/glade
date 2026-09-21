@@ -162,11 +162,13 @@ and keeps the two questions apart in the same way.
 | Step | What it shows | Where |
 |---|---|---|
 | 3.1 | Two witness nodes bind localhost QUIC endpoints, one dials the other, both complete the node<->node HELLO seam, and one real glade `Frame` crosses the witness's `CarrierPort` — all driven by an sdax plan, with every external effect inside `cx.hold(...)` | `real/src/peer_carrier.rs`, `real/src/peer_plan.rs`, `real/tests/peer_carrier.rs` |
+| 3.2 | **AR-08 for real**: after `report.is_clean()`, every recorded UDP port re-binds within the bound — and a variant in which one endpoint clone deliberately escapes keeps its port bound for the whole bound, then frees it when the clone is dropped | `real/tests/peer_release.rs` |
 
 Reproduce from this directory:
 
 ```sh
 cargo test --locked --offline -p async-witness-real --test peer_carrier
+cargo test --locked --offline -p async-witness-real --test peer_release -- --nocapture
 ```
 
 ### The plan shape, and why it is this shape
@@ -208,6 +210,20 @@ Those `Mutex`es are interior mutability inside the **provider**, which is where
 mutability"). No Glade contract is touched, nothing is made `Sync` to please a
 container, and no public future is boxed that the port did not already box.
 
+### The socket is the only honest witness
+
+A leaked handle is **invisible to the report**. The escaped-clone variant is
+`report.is_clean()`, `report.incomplete` is empty and `TokioRuntime::tracked()`
+is 0 — and the acceptor's UDP port is still bound two seconds later. Nothing
+sdax can see is wrong, because nothing sdax can see *is* wrong: the release ran,
+the obligation was discharged, and a clone the engine never knew about outlived
+it. That is why the plan chose a port whose leak is observable from outside the
+process, and it is what makes §8.4 caveat 3 decidable rather than rhetorical.
+
+The release check is itself falsifiable: `the_release_check_can_answer_still_bound`
+holds a port of its own and requires the helper to spend the whole bound saying
+so, so a `Some(..)` elsewhere cannot mean the check was vacuous.
+
 ### Measured
 
 Toolchain `rustc 1.96.0 (ac68faa20 2026-05-25)`, macOS 26.6 on Apple silicon,
@@ -216,6 +232,17 @@ Toolchain `rustc 1.96.0 (ac68faa20 2026-05-25)`, macOS 26.6 on Apple silicon,
 | Measurement | Result |
 |---|---|
 | `sh check.sh` (all three members, warm) | 7.2 s |
-| `cargo test -p async-witness-real --lib --tests` (warm, 27 tests) | 0.67–0.74 s over five consecutive runs |
+| `cargo test -p async-witness-real --lib --tests` (warm, 35 tests) | 2.70–2.77 s over five consecutive runs |
 | `tests/peer_carrier.rs` alone (4 tests, two real endpoints per run) | 0.04 s |
+| `tests/peer_release.rs` (4 tests) | 2.04 s, of which two deliberate 2 s bounds |
+| Port free after a clean run | 4.7–15.2 µs, over three runs of both endpoints — already free at the first poll |
+| Port free after the escaped clone was dropped | 23–108 µs |
+| Port with an escaped clone still alive | still bound at 2.004–2.006 s, i.e. the whole bound |
 | Under load: 3 parallel copies of every `real` test binary while a whole-workspace `cargo test` ran | all green |
+
+The clean-run figure is three orders of magnitude below the node's own 6–10 ms
+(`iroh_carrier.rs:218-221`), and the difference is not a faster machine: the
+node's test asks immediately after `close` resolves, whereas a run has a second
+endpoint to release and a report to assemble in between, so iroh's driver has
+already wound down by the time the check happens. The bound stays at two
+seconds regardless — it is there for the case where it has not.
