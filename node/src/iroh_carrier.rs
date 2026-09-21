@@ -122,6 +122,22 @@ impl PeerEndpoint {
         let peer = hello_accept(&mut recv, &mut send, &self.identity).await?;
         Ok(Some(PeerLink { peer, conn, send, recv }))
     }
+
+    /// Close the endpoint gracefully and give up this handle.
+    ///
+    /// Dropping the last handle also closes the endpoint, but abruptly: a peer
+    /// sees its connection time out even when every byte arrived. `close` AWAITS
+    /// iroh's own drain (about three seconds on a bad link, usually far less), so
+    /// each open connection is told it is over. It consumes the handle because
+    /// iroh frees the UDP socket only when EVERY clone is gone: once `close`
+    /// resolves, `accept` on a remaining clone answers `Ok(None)`, the accept
+    /// loop ends and drops its clone, and iroh's driver task then releases the
+    /// port a few milliseconds later. iroh gives no signal for that moment, so a
+    /// caller that must bind the same port again has to wait for it. A clone that
+    /// never goes away keeps the port bound, which is how a leaked handle shows up.
+    pub async fn close(self) {
+        self.endpoint.close().await;
+    }
 }
 
 #[cfg(test)]
@@ -197,5 +213,58 @@ mod tests {
         assert_eq!(out.applied, 4);
         assert!(out.rejected.is_empty());
         assert_eq!(client.scan("sh", "g", &[], "a", -1).len(), 4);
+    }
+
+    /// iroh gives no signal for "the socket is released": its driver task ends a
+    /// few milliseconds AFTER `close` resolves and the last handle drops (measured
+    /// at 6 to 10 ms with the whole suite running in parallel), and only then is
+    /// the port free. So these tests wait for the release, bounded at two seconds.
+    async fn port_is_freed(port: u16) -> bool {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).is_ok() {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// `close` awaits iroh's drain and gives up the handle, so with no clone left
+    /// the UDP socket is released: the recorded port binds again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn close_frees_the_bound_port() {
+        let endpoint = PeerEndpoint::bind().await.unwrap();
+        let port = endpoint.addr().unwrap().socket.port();
+        assert!(
+            std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).is_err(),
+            "the port is held while the endpoint lives"
+        );
+
+        endpoint.close().await;
+
+        assert!(port_is_freed(port).await, "the port is free once the last handle has closed");
+    }
+
+    /// After `close` a clone's `accept` answers `Ok(None)`, which is what ends an
+    /// accept loop; until that clone is dropped it keeps the port, so a handle
+    /// that never goes away shows up as a port that never frees.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn close_ends_an_accept_loop_and_a_kept_clone_keeps_the_port() {
+        let endpoint = PeerEndpoint::bind().await.unwrap();
+        let kept = endpoint.clone();
+        let port = endpoint.addr().unwrap().socket.port();
+
+        endpoint.close().await;
+
+        assert!(kept.accept().await.unwrap().is_none(), "a closed endpoint accepts nothing");
+        assert!(
+            std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).is_err(),
+            "a clone that is still alive still holds the port"
+        );
+        drop(kept);
+        assert!(port_is_freed(port).await, "the port is free once every clone is gone");
     }
 }
