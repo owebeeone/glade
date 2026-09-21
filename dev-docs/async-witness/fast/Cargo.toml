@@ -17,5 +17,30 @@ purpose = "DI-E01, DI-E02 and DI-E03 over Shaku alone; no runtime, no socket, no
 async-witness-ports = { path = "../ports" }
 shaku = "=0.6.3"
 
+# Phase 1's negative fixtures. Three of them MUST FAIL to compile and one MUST
+# compile; either way, sweeping them into the gate would invert their meaning,
+# so they are examples behind a feature and `check.sh` runs `--lib --tests` and
+# never `--all-features --all-targets`, exactly as `di-eval/README.md` records.
+# A feature and a target table change no dependency resolution and leave
+# `Cargo.lock` untouched.
+[features]
+negative = []
+
+[[example]]
+name = "missing_binding"
+required-features = ["negative"]
+
+[[example]]
+name = "construction_cycle"
+required-features = ["negative"]
+
+[[example]]
+name = "ambiguous_role"
+required-features = ["negative"]
+
+[[example]]
+name = "cfg_scanner_gap"
+required-features = ["negative"]
+
 [lints]
 workspace = true

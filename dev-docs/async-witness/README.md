@@ -75,6 +75,54 @@ Two commands to avoid from this workspace, both because they reach outside it:
   Building the witness is safe and leaves every artefact, `glade-node` included,
   in this workspace's own `target/`.
 
+## Negative fixtures
+
+Phase 1 files four of them, as `fast` examples behind the `negative` feature so
+nothing sweeps them into the gate. **Three MUST fail to compile and one MUST
+compile.** Inspect the diagnostics, not the exit codes; these are manual
+reproduction commands, not newly installed CI gates. Run them from this
+directory, each prefixed with `cargo check --locked --offline --features
+negative --example`:
+
+| Fixture | Expected result | What it decides |
+|---|---|---|
+| `missing_binding` | **E0277** — "the trait bound `MissingPorts: HasComponent<(dyn Clock + 'static)>` is not satisfied", the same for `dyn Carrier`, and a third E0277 falling out of those two ("`MissingPorts` cannot be shared between threads safely") | DI-E03: a port no one bound is refused at the composition, not at the first request |
+| `construction_cycle` | **E0275** — "overflow evaluating the requirement `Cyclic: HasComponent<(dyn Admission + 'static)>`" | DI-E03: a constructor cycle is refused before startup. The diagnostic names a bound, not the loop — caveat 1 of the plan's §8.4 |
+| `ambiguous_role` | **E0599** at the natural call site — "no method named `resolve` found for struct `Ambiguous`", because a multibound interface gets no `HasComponent` impl at all — then **E0277** where the bound is named explicitly | DI-E03: selecting one of two occurrences requires its key. The plan predicted only the E0277 |
+| `cfg_scanner_gap` | **compiles, and prints** `compiled: seen, unseen and an entire module the scanner skipped` | The §4.5 gap below, demonstrated rather than described. `cargo run` it |
+
+`missing_binding` and `ambiguous_role` report the same *kind* of failure for
+opposite causes — nothing bound and two things bound. Shaku's diagnostics do not
+distinguish absence from ambiguity.
+
+### The `#[cfg]` scanner gap, measured
+
+`architecture-check`'s `fn conditional` (`src/lib.rs:97-102`) tests whether an
+attribute's path is `cfg` or `cfg_attr` and never evaluates the condition, so an
+always-true `#[cfg(all())]` is skipped exactly like a never-true `#[cfg(any())]`.
+Pointing the real checker at `cfg_scanner_gap.rs` as a scratch contract package
+gives both directions:
+
+- **Fails closed.** With `"traits": {"PartlyScannedPort": ["seen", "unseen"]}` it
+  reports `ARCH-003 cfg-gap-fixture: PartlyScannedPort must expose required
+  methods {"seen", "unseen"} unconditionally` — the conditional method is
+  invisible, so a *required* item is reported missing.
+- **Silent.** With `"traits": {"PartlyScannedPort": ["seen"]}` it reports
+  `PASS`, although the file also contains a whole module — a public trait, a
+  public type and an impl — that the scanner never examined, because an
+  ordinary `allow(dead_code)` wrapped in `cfg_attr` was enough to skip it.
+- **The guard it defeats.** `#[path = "hidden.rs"] mod hidden;` is refused with
+  `ARCH-003 … #[path] modules need explicit checker support; cannot silently
+  skip them`. Wrapping the same attribute as `#[cfg_attr(all(), path =
+  "hidden.rs")]` compiles the identical code and the checker reports `PASS`:
+  the `!conditional(&m.attrs)` guard sits in front of that refusal
+  (`src/lib.rs:211-214`).
+
+This does not touch the dependency half of the gate, which is read from `cargo
+metadata` and cannot be reached by any `#[cfg]`; DI-E01's and DI-E04's manifest
+claims are unaffected. It is why the owner's standing rule puts conditional
+compilation inside an explicit boundary instead of on a single declaration.
+
 ## What the gate checks, and what it cannot
 
 `check.sh` runs the `syn`-based lint at
@@ -85,7 +133,8 @@ library's **declared** dependencies against the allowlist in
 forbid it; it sees inactive optional, target, build and dev dependencies, whose
 kind is part of the key; and it is manifest-level, so no `#[cfg]` can bypass it.
 
-Two limits are named rather than hidden:
+Three limits are named rather than hidden, the third measured above under
+[the `#[cfg]` scanner gap](#the-cfg-scanner-gap-measured):
 
 - The checker shells `cargo metadata --no-deps`, so it classifies **workspace
   members only**. `glade-wire` and `glade-decl` cannot be listed in this policy
