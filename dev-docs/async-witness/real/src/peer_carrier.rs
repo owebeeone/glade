@@ -23,11 +23,24 @@
 //! where the plan puts it — `ports/src/lib.rs` already says "an implementation
 //! owns its own interior mutability", and no Glade contract is touched.
 //!
-//! The same argument applies to the link, for a reason that is easy to miss:
-//! quinn's endpoint driver exits only when its handle count is zero **and** its
-//! connection map is empty (`quinn-0.11.12/src/endpoint.rs:384-385`), so a
-//! `Connection` value left alive in a slot would hold the endpoint's socket
-//! open just as surely as an endpoint clone would.
+//! The same argument applies to the link, and it rests on a **measurement**,
+//! not on a derivation. iroh 1.2.0 does not run on quinn: `cargo tree -p iroh
+//! --depth 1` lists `noq`, `noq-proto` and `noq-udp`, and `cargo tree --invert
+//! quinn` matches no package in this workspace at all. noq's own endpoint
+//! driver stops when the connection map is empty **and** either the handle
+//! count is zero **or** `close` has been called
+//! (`noq-1.3.0/src/endpoint.rs:471-476`), so after a close a remaining handle
+//! does not keep the *driver* alive — which means the driver's exit condition
+//! cannot settle the question in either direction. What a surviving handle does
+//! to the *socket* is therefore measured: with one clone of the served link's
+//! `Connection` escaping the composition, the acceptor's UDP port stays bound
+//! for the whole two-second bound and comes back tens of microseconds after
+//! that `Connection` is dropped
+//! (`tests/peer_release.rs`,
+//! `an_escaped_connection_holds_the_port_as_an_endpoint_clone_does`). A
+//! `Connection` left alive in a slot does hold the endpoint's socket open, just
+//! as an endpoint clone does, so taking the link's handles by value is
+//! load-bearing rather than tidy.
 
 use std::io;
 use std::sync::Arc;
@@ -48,10 +61,14 @@ fn transport(e: io::Error) -> CarrierError {
 /// Write one length-prefixed record, byte for byte as
 /// `glade_node::peer::write_frame` writes one (`peer.rs:36-42`).
 ///
-/// Generic on purpose. iroh's `SendStream` carries quinn's *inherent*
-/// `write_all`, which shadows the `AsyncWriteExt` method and answers a
-/// `WriteError`; a generic bound selects tokio's trait method, so the bytes and
-/// the error type are the node's own rather than a second convention.
+/// Generic on purpose. `iroh::endpoint::SendStream` **is** `noq::SendStream`,
+/// re-exported (`iroh-1.2.0/src/endpoint/quic.rs:15-44`), and it carries noq's
+/// *inherent* `write_all` (`noq-1.3.0/src/send_stream.rs:74`), which shadows
+/// the `AsyncWriteExt` method and answers a `WriteError`; a generic bound
+/// selects tokio's trait method, so the bytes and the error type are the node's
+/// own rather than a second convention. `RecvStream` shadows `read_exact` the
+/// same way (`noq-1.3.0/src/recv_stream.rs:89`, answering a `ReadExactError`),
+/// which is why [`read_framed`] is generic too.
 async fn write_framed<W: AsyncWrite + Unpin>(w: &mut W, bytes: &[u8]) -> io::Result<()> {
     let len = u32::try_from(bytes.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "frame longer than u32"))?;
@@ -184,6 +201,14 @@ impl WitnessCarrier {
     /// The peer identity the HELLO seam vouched for.
     pub fn peer(&self) -> PeerHello {
         self.peer
+    }
+
+    /// A clone of the live `Connection`, for the **measurement** fixture of the
+    /// module docs only: whether a `Connection` value outliving the run holds
+    /// the endpoint's UDP port is a fact to measure, not to derive. Nothing in
+    /// the ordinary composition calls this.
+    pub async fn escaping_connection(&self) -> Option<Connection> {
+        self.conn.lock().await.clone()
     }
 
     /// Finish the stream, close the connection and **drop every handle**, so

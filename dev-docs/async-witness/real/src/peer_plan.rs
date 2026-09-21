@@ -34,6 +34,7 @@ use glade_node::frame::Frame;
 use glade_node::iroh_carrier::PeerEndpoint;
 use glade_node::peer::NodeIdentity;
 use glade_wire::generated::{Op, Ops, Shape};
+use iroh::endpoint::Connection;
 use sdax::prelude::*;
 
 use crate::peer_carrier::{WitnessCarrier, WitnessEndpoint};
@@ -171,8 +172,10 @@ pub struct PeerHarness {
     received: Arc<Mutex<Vec<CarriedFrame>>>,
     module_received: Arc<Mutex<Vec<CarriedFrame>>>,
     escaped: Arc<Mutex<Option<PeerEndpoint>>>,
+    escaped_conn: Arc<Mutex<Option<Connection>>>,
     kept_module: Arc<Mutex<Option<RealComposition>>>,
     escape_a_clone: bool,
+    escape_a_connection: bool,
     with_module: bool,
     keep_the_module: bool,
 }
@@ -193,8 +196,10 @@ impl PeerHarness {
             received: Arc::new(Mutex::new(Vec::new())),
             module_received: Arc::new(Mutex::new(Vec::new())),
             escaped: Arc::new(Mutex::new(None)),
+            escaped_conn: Arc::new(Mutex::new(None)),
             kept_module: Arc::new(Mutex::new(None)),
             escape_a_clone: false,
+            escape_a_connection: false,
             with_module: false,
             keep_the_module: false,
         }
@@ -257,6 +262,40 @@ impl PeerHarness {
     pub fn let_a_clone_escape(mut self) -> PeerHarness {
         self.escape_a_clone = true;
         self
+    }
+
+    /// Let one clone of the **served** link's iroh `Connection` escape the
+    /// composition, from inside the acquire body that established it.
+    ///
+    /// The served link belongs to the acceptor, so the port this fixture asks
+    /// about is the acceptor's — the same port [`let_a_clone_escape`] makes
+    /// stay bound. The release still takes and closes the carrier's own
+    /// handles; the only difference is one `Connection` value that outlives the
+    /// run, which is exactly what a `Connection` left in an engine slot would
+    /// be.
+    ///
+    /// [`let_a_clone_escape`]: Self::let_a_clone_escape
+    #[must_use]
+    pub fn let_a_connection_escape(mut self) -> PeerHarness {
+        self.escape_a_connection = true;
+        self
+    }
+
+    /// Whether the escaped `Connection` is still held.
+    pub fn holds_an_escaped_connection(&self) -> bool {
+        self.escaped_conn
+            .lock()
+            .expect("connection escape cell lock")
+            .is_some()
+    }
+
+    /// Drop the escaped `Connection`. Returns whether there was one to drop.
+    pub fn drop_escaped_connection(&self) -> bool {
+        self.escaped_conn
+            .lock()
+            .expect("connection escape cell lock")
+            .take()
+            .is_some()
     }
 
     /// Whether the escaped clone is still held.
@@ -355,6 +394,13 @@ impl PeerHarness {
         *self.escaped.lock().expect("escape cell lock") = Some(endpoint);
     }
 
+    fn escape_connection(&self, conn: Connection) {
+        *self
+            .escaped_conn
+            .lock()
+            .expect("connection escape cell lock") = Some(conn);
+    }
+
     fn keep(&self, module: RealComposition) {
         *self.kept_module.lock().expect("module cell lock") = Some(module);
     }
@@ -427,6 +473,15 @@ fn served_link(
                         io::Error::new(io::ErrorKind::NotConnected, "the endpoint is closed")
                     })?;
                     let carrier = WitnessCarrier::over(link);
+                    if harness.escape_a_connection {
+                        // The measurement fixture of `peer_carrier`'s module
+                        // docs, and the only `Connection` clone the
+                        // composition ever takes.
+                        let escaping = carrier.escaping_connection().await;
+                        if let Some(conn) = escaping {
+                            harness.escape_connection(conn);
+                        }
+                    }
                     harness.record_peer(node::SERVED, carrier.peer().peer_id);
                     harness.record(PeerEvent::Acquired(node::SERVED));
                     Ok::<_, io::Error>(carrier)

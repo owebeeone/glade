@@ -147,6 +147,77 @@ async fn the_endpoints_are_the_last_things_released() {
     );
 }
 
+/// **The measurement that replaced a derivation.** Step 3.1's module doc used
+/// to say that a `Connection` value left alive in a slot would hold the
+/// endpoint's socket open "just as surely as an endpoint clone would", and
+/// rested that on quinn's endpoint driver. Two things were wrong with it: iroh
+/// 1.2.0 does not use quinn at all — `cargo tree --invert quinn` matches no
+/// package in this workspace, and `cargo tree -p iroh --depth 1` shows `noq`,
+/// `noq-proto` and `noq-udp` — and the driver's real exit condition
+/// (`noq-1.3.0/src/endpoint.rs:471-476`) is that the connection map is empty
+/// **and** (the handle count is zero **or** `close` has been called), so
+/// remaining handles do not keep the driver alive after a close.
+///
+/// **The direction was not known in advance.** Whether a live `Connection`
+/// holds the UDP port is a fact about noq's internal ownership, and the witness
+/// does not derive facts about a dependency it can measure. This test runs the
+/// ordinary plan with one clone of the **served** link's `Connection` escaping
+/// the composition, and asks the acceptor's port the same question Step 3.2
+/// asks: free within the bound, or not. The measured answer is that it holds
+/// the port, which is why `WitnessCarrier` takes its handles by value; had the
+/// answer been the other way, the by-value release would have been tidy rather
+/// than load-bearing and the module docs would say so.
+///
+/// The escaped `Connection` is a clone of one the release then **closes** —
+/// `Connection::close` takes `&self` and the clones share one inner connection
+/// — so what this measures is exactly the counterfactual: a *closed*
+/// `Connection` value left alive in a slot, which is what the engine would hold
+/// if the release borrowed instead of taking.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_escaped_connection_holds_the_port_as_an_endpoint_clone_does() {
+    let harness = PeerHarness::new().let_a_connection_escape();
+    let rt = runtime();
+    let report = peer_plan(&harness).start(rt.clone(), ()).await;
+
+    assert!(report.is_clean(), "{}", shown(&report));
+    assert_eq!(rt.shutdown(WAIT).await, Ok(()));
+    assert_eq!(rt.tracked(), 0);
+    assert!(
+        harness.holds_an_escaped_connection(),
+        "the fixture must actually be holding one"
+    );
+
+    let acceptor_port = harness
+        .port(node::ACCEPTOR)
+        .expect("a recorded acceptor port");
+
+    let started = Instant::now();
+    assert_eq!(
+        wait_until_free(acceptor_port).await,
+        None,
+        "measured: a surviving Connection keeps port {acceptor_port} bound for the whole bound"
+    );
+    println!(
+        "escaped Connection held port {acceptor_port} for {:?}",
+        started.elapsed()
+    );
+
+    // The leak is exactly as wide as the escaped handle: the dialer's side of
+    // the same QUIC connection was not cloned, and its port comes back.
+    let dialer_port = harness.port(node::DIALER).expect("a recorded dialer port");
+    let freed = wait_until_free(dialer_port)
+        .await
+        .expect("the dialer's port is not the one that leaked");
+    println!("dialer port {dialer_port} was free after {freed:?}");
+
+    // And it is the Connection, not something else about the variant.
+    assert!(harness.drop_escaped_connection());
+    let freed = wait_until_free(acceptor_port)
+        .await
+        .expect("the port is free once the escaped Connection is gone");
+    println!("port {acceptor_port} was free {freed:?} after the Connection was dropped");
+}
+
 /// **The falsification.** One clone of the acceptor's endpoint escapes the
 /// composition from inside the acquire body that bound it. Everything else is
 /// identical, and the difference is visible only in the socket.

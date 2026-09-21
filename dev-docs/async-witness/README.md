@@ -162,7 +162,7 @@ and keeps the two questions apart in the same way.
 | Step | What it shows | Where |
 |---|---|---|
 | 3.1 | Two witness nodes bind localhost QUIC endpoints, one dials the other, both complete the node<->node HELLO seam, and one real glade `Frame` crosses the witness's `CarrierPort` — all driven by an sdax plan, with every external effect inside `cx.hold(...)` | `real/src/peer_carrier.rs`, `real/src/peer_plan.rs`, `real/tests/peer_carrier.rs` |
-| 3.2 | **AR-08 for real**: after `report.is_clean()`, every recorded UDP port re-binds within the bound — and a variant in which one endpoint clone deliberately escapes keeps its port bound for the whole bound, then frees it when the clone is dropped | `real/tests/peer_release.rs` |
+| 3.2 | **AR-08 for real**: after `report.is_clean()`, every recorded UDP port re-binds within the bound — and two variants in which one endpoint clone, or one link `Connection`, deliberately escapes keep that port bound for the whole bound, then free it when the escapee is dropped | `real/tests/peer_release.rs` |
 | 3.3 | Shaku assembles over the **already-acquired** handle from inside an sdax step that `.needs` it, resolves the engine's own carrier, puts a frame across it, and constructs no provider of its own; the module step is ordered before every endpoint's release | `real/src/shaku_bridge.rs`, `real/tests/shaku_assembly.rs`, `real/tests/shaku_registration.rs` |
 | 3.4 | **The differential**: the same plan with and without the module step. Both runs are `is_clean()`, both free every port, and nothing observable diverges — in either running order, over three repeated pairs | `real/tests/differential.rs` |
 
@@ -205,10 +205,33 @@ the slots for as long as the run's storage lives.
 So `WitnessEndpoint` owns its `PeerEndpoint` as a `Mutex<Option<..>>` and the
 release body **takes** it out; the `Arc` the engine keeps afterwards is an empty
 shell. `WitnessCarrier` does the same for the link's `SendStream`, `RecvStream`
-and `Connection`, for a reason that is easy to miss: quinn's endpoint driver
-exits only when its handle count is zero **and** its connection map is empty
-(`quinn-0.11.12/src/endpoint.rs:384-385`), so a `Connection` left alive in a
-slot holds the endpoint's socket open just as surely as an endpoint clone does.
+and `Connection`, and that half is settled by measurement rather than by
+reading a driver.
+
+**A correction, and what replaced it.** This passage used to derive the link's
+by-value release from quinn's endpoint driver. **iroh 1.2.0 does not use
+quinn**: `cargo tree -p iroh --depth 1` lists `noq`, `noq-proto` and `noq-udp`,
+and `cargo tree --invert quinn` answers "package ID specification `quinn` did
+not match any packages" — it is not in this workspace's graph at all. The crate
+that is there stops its endpoint driver when the connection map is empty **and**
+either the handle count is zero **or** `close` has been called
+(`noq-1.3.0/src/endpoint.rs:471-476`), so after a close a remaining handle does
+not keep the *driver* alive, and the driver's exit condition settles nothing
+about the socket in either direction.
+
+So the witness measured the socket instead, with the direction unknown in
+advance:
+`tests/peer_release.rs::an_escaped_connection_holds_the_port_as_an_endpoint_clone_does`
+runs the ordinary plan with one clone of the **served** link's `Connection`
+escaping the composition. The acceptor's port stays bound for the whole two
+second bound, the dialer's port — the side nothing cloned — comes back in about
+a hundred microseconds, and the acceptor's comes back in tens of microseconds
+the moment the escaped `Connection` is dropped. The escapee is a clone of the
+handle the release then closes, so what is measured is precisely the
+counterfactual: a **closed** `Connection` value left alive in a slot. Taking the
+link's handles by value is therefore load-bearing, not tidiness — the claim
+stands, but it now rests on the socket rather than on a crate this workspace
+does not compile.
 
 Those `Mutex`es are interior mutability inside the **provider**, which is where
 `ports/src/lib.rs` already puts it ("an implementation owns its own interior
@@ -321,6 +344,7 @@ working figures.
 | Port free after a clean run | 4.7–15.2 µs, over three runs of both endpoints — already free at the first poll |
 | Port free after the escaped clone was dropped | 23–108 µs |
 | Port with an escaped clone still alive | still bound at 2.004–2.006 s, i.e. the whole bound |
+| Port with an escaped link `Connection` still alive | still bound at 2.004–2.005 s; free 41–66 µs after it was dropped, while the uncloned dialer side was free in 108–143 µs |
 | Under load: 4 parallel copies of every `real` test binary while a whole-workspace `cargo test` ran | all green; the slowest suite went from 0.04 s to 2.2 s and stayed green |
 
 The clean-run figure is three orders of magnitude below the node's own 6–10 ms
