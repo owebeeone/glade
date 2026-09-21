@@ -77,7 +77,14 @@ Two commands to avoid from this workspace, both because they reach outside it:
 
 ## Negative fixtures
 
-Phase 1 files four of them, as `fast` examples behind the `negative` feature so
+Phase 3 files one that the gate itself runs: `arch002-fixture.sh` injects
+`shaku` into the contract crate's manifest **on a copy** and requires the gate
+to refuse it with one exact `ARCH-002`. It is described under
+[Step 3.5](#step-35--the-wall-with-a-real-provider-standing-behind-it), it fails
+closed rather than on any non-zero exit, and `check.sh` calls it. Run it alone
+with `sh arch002-fixture.sh`.
+
+Phase 1 files four more, as `fast` examples behind the `negative` feature so
 nothing sweeps them into the gate. **Three MUST fail to compile and one MUST
 compile.** Inspect the diagnostics, not the exit codes; these are manual
 reproduction commands, not newly installed CI gates. Run them from this
@@ -146,8 +153,9 @@ Three limits are named rather than hidden, the third measured above under
   workspace at all.
 - `--no-deps` also means **transitive** framework reachability is invisible to
   the checker. `check.sh` adds the second, equally cheap assertion the plan asks
-  for: `cargo tree --invert` over `shaku`, `sdax` and `tokio` must list no
-  contract-role package.
+  for: `cargo tree --invert` over `shaku`, `sdax`, `sdax-tokio`, `sdax-testkit`,
+  `tokio` and `iroh` must list no contract-role package. Step 3.5 below records
+  what those inversions answer now that a real provider is behind the port.
 
 Do not relax a classification or an allowlist to make a check pass
 (`glade-wz/AGENTS.md:31-32`). Record it and get it reviewed.
@@ -165,6 +173,7 @@ and keeps the two questions apart in the same way.
 | 3.2 | **AR-08 for real**: after `report.is_clean()`, every recorded UDP port re-binds within the bound — and two variants in which one endpoint clone, or one link `Connection`, deliberately escapes keep that port bound for the whole bound, then free it when the escapee is dropped | `real/tests/peer_release.rs` |
 | 3.3 | Shaku assembles over the **already-acquired** handle from inside an sdax step that `.needs` it, resolves the engine's own carrier, puts a frame across it, and constructs no provider of its own; the module step is ordered before every endpoint's release | `real/src/shaku_bridge.rs`, `real/tests/shaku_assembly.rs`, `real/tests/shaku_registration.rs` |
 | 3.4 | **The differential**: the same plan with and without the module step. Both runs are `is_clean()`, both free every port, and nothing observable diverges — in either running order, over three repeated pairs | `real/tests/differential.rs` |
+| 3.5 | **DI-E04**: the contract crate still has one dependency while the real iroh-backed provider fills its `CarrierPort`; the gate is seen to refuse an injected `shaku`, on a copy; no framework reaches it transitively or through a public signature | `arch002-fixture.sh`, `check.sh` |
 
 Reproduce from this directory:
 
@@ -324,6 +333,111 @@ The general lesson for anyone writing the next differential here: **a total
 order is not an observable of this system.** Compare what the declaration
 constrains.
 
+### Step 3.5 — the wall, with a real provider standing behind it
+
+DI-E04 asks whether "the selected real async Glade port remains usable without
+framework imports in its contract/pure libraries". Phase 0 could only answer it
+about an empty crate. It is answered here against the state that now exists:
+`WitnessCarrier`, over the node's own `PeerEndpoint`, is a live `CarrierPort`
+implementation that binds real UDP sockets and drives real QUIC — and the port
+it implements still has one dependency.
+
+**The declaration.** `cargo tree -p async-witness-ports` is two lines:
+
+```text
+async-witness-ports v0.0.0 (…/dev-docs/async-witness/ports)
+└── glade-wire v0.0.0 (…/glade/wire-rs)
+```
+
+**The inversion**, which is what the manifest check cannot see. From each of
+the six frameworks, the workspace members reached are:
+
+| `cargo tree --invert` | reaches |
+|---|---|
+| `shaku` | `async-witness-fast`, `async-witness-real` |
+| `sdax` | `async-witness-real` (directly, and through `sdax-tokio` and the dev-dependency `sdax-testkit`) |
+| `sdax-tokio` | `async-witness-real` |
+| `sdax-testkit` | `async-witness-real`, as `[dev-dependencies]` |
+| `tokio` | `async-witness-real` and `glade-node`; everything else on the path is iroh's own transitive graph |
+| `iroh` | `async-witness-real` and `glade-node` |
+
+`async-witness-ports` appears in none of them. `check.sh` asserts that, and
+separately asserts that `glade-wire` — the pure crate the port's types come from
+— is still a one-line tree of its own.
+
+**The gate is seen to refuse.** `arch002-fixture.sh` injects `shaku` into the
+contract crate's manifest and requires this exact diagnostic:
+
+```text
+ARCH-002 async-witness-ports: undeclared dependency normal:shaku
+```
+
+It **fails closed**, and each branch was exercised rather than assumed:
+
+| If | the fixture says |
+|---|---|
+| the untouched copy does not report `PASS` first | "the untouched copy does not pass the gate, so nothing below decides anything" |
+| `cargo metadata` could not run | "the checker could not run, so its non-zero exit decides nothing" |
+| the gate accepts the injected entry | "the gate ACCEPTED a framework dependency in the contract crate" |
+| the gate refuses with some other `ARCH-002` | "the gate refused, but not with the diagnostic this fixture is about", printing expected and actual |
+
+The last three were each produced on purpose from a scratch copy of the script —
+with the injection removed, with the sibling symlinks removed, and with `tokio`
+injected in place of `shaku` (`actual: ARCH-002 async-witness-ports: undeclared
+dependency normal:tokio`). A non-zero exit on its own never passes this fixture.
+
+**It runs on a copy, never on the live tree.** The manifests, `Cargo.lock` and
+`architecture-policy.json` here are never edited, not even for the length of one
+command, so an interrupted run cannot leave the workspace changed. The copy sits
+at the same depth below a `glade` root that the real tree has, so the members'
+`../../../` path dependencies resolve, and the three siblings they name
+(`wire-rs`, `node`, `contracts`) are symlinks the fixture only reads through. It
+costs 0.6–0.8 s warm, is entirely offline, and `check.sh` runs it.
+
+**What the fixture does and does not prove**, in the terms of the plan's §4.5.
+It proves the *manifest* half fails closed: an allowlist violation in the
+contract crate is an error without anyone having thought to forbid that
+particular crate, and dependency kind is part of the key, so `dev:shaku` would
+be caught as surely as `normal:shaku`. It does not prove anything about
+transitive reachability, because the checker shells `cargo metadata --no-deps`
+and therefore sees workspace members only — that is what the inversion table
+above is for. And it says nothing about the trait half of the gate, which the
+`#[cfg]` scanner gap above measures and which is why that gap is recorded rather
+than described.
+
+**The public signatures, by inspection.** §8.2's DI-E04 row has a second clause:
+no framework type may appear in a contract crate's public signature either.
+`ports/src/lib.rs` names `shaku`, `sdax` and `tokio` exactly three times, all in
+doc comments saying the crate must not name them. Every type in a public
+signature is `std` or `glade-wire`: `FrameType`, `i64`, `String`, `Vec<u8>`,
+`Pin<Box<dyn Future + Send>>`, `Result`, and the crate's own `CarrierError` and
+`StoreError`. The `std::sync::Mutex` inside `FakeCarrier` and `FakeStore` is a
+private field, not a signature.
+
+**And nothing was added to please a container.** `git log -- ports/` is **two
+commits**, both Phase 0: `b2b6779` (the skeleton) and `8a7ed44` (the ports and
+fakes). Nothing has touched the crate since, so no `Sync`, no lock and no boxed
+public future was added to it for Phase 1's bridge, Phase 2's lifecycle or Phase
+3's real provider. Two things that were there from the start should still be
+said out loud rather than counted as absences, and Phase 4 should say them:
+
+- `ClockPort`, `CarrierPort` and `StorePort` all require `Any + Send + Sync`,
+  and the crate's own doc says the `Sync` is what lets Phase 1's facade
+  (`trait Carrier: CarrierPort + shaku::Interface`) compile. The bound is not
+  *only* Shaku's: an injected port is shared as `Arc<dyn CarrierPort>` across
+  tasks on a multi-thread runtime, which needs `Sync` whatever assembles it, and
+  `Any` is a `'static` bound any `'static` type already satisfies. All three are
+  `std`. But the coincidence is a coincidence, and it is honest to record that
+  the port was written knowing what `shaku::Interface` demands.
+- `PortFuture` is a boxed public future. It is boxed to stay dyn-compatible —
+  `impl Future` in return position is not (E0038) — and it is the **witness's
+  own** port, not a Glade contract. `glade-lifecycle-api`'s `ManagedResource`
+  still returns `impl Future` and was not touched.
+
+§8.2 records `selection_reopened` for "adding `Sync`, a lock or a boxed public
+future **to a Glade contract**". No Glade contract was changed, so neither of
+these is that. They belong in the Phase 4 write-up as stated facts.
+
 ### Measured
 
 Toolchain `rustc 1.96.0 (ac68faa20 2026-05-25)`, macOS 26.6 on Apple silicon,
@@ -333,19 +447,20 @@ working figures.
 
 | Measurement | Result |
 |---|---|
-| `sh check.sh` (all three members, warm; 67 tests) | 4.3–4.5 s |
+| `sh check.sh` (all three members, warm; 68 tests, `arch002-fixture.sh` included) | 4.9–5.9 s |
+| `sh arch002-fixture.sh` alone, warm (a copy, two checker runs, offline) | 0.64–0.79 s |
 | Cold build of the whole workspace (`--lib --tests --no-run`, empty `CARGO_TARGET_DIR`) | 33.0 s, 1.6 GB of artefacts |
 | Warm incremental rebuild of the `real` lib after one touched file | 1.1 s |
-| `cargo test -p async-witness-real --lib --tests` (warm, 42 tests) | 2.88–2.94 s over five consecutive runs |
+| `cargo test -p async-witness-real --lib --tests` (warm, 43 tests) | 2.87–2.96 s over five consecutive runs |
 | `tests/peer_carrier.rs` alone (4 tests, two real endpoints per run) | 0.04 s |
-| `tests/peer_release.rs` (4 tests) | 2.04 s, of which two deliberate 2 s bounds |
+| `tests/peer_release.rs` (5 tests) | 2.05 s, of which three deliberate 2 s bounds |
 | `tests/shaku_assembly.rs` (4 tests, two real endpoints per run) | 0.04 s |
 | `tests/differential.rs` (5 tests, 22 real endpoints) | 0.09 s in parallel, 0.21 s single-threaded |
 | Port free after a clean run | 4.7–15.2 µs, over three runs of both endpoints — already free at the first poll |
 | Port free after the escaped clone was dropped | 23–108 µs |
 | Port with an escaped clone still alive | still bound at 2.004–2.006 s, i.e. the whole bound |
 | Port with an escaped link `Connection` still alive | still bound at 2.004–2.005 s; free 41–66 µs after it was dropped, while the uncloned dialer side was free in 108–143 µs |
-| Under load: 4 parallel copies of every `real` test binary while a whole-workspace `cargo test` ran | all green; the slowest suite went from 0.04 s to 2.2 s and stayed green |
+| Under load: 4 parallel copies of every `real` test binary while a whole-workspace `cargo test` ran | all green, 40 binaries; `peer_carrier` went from 0.04 s to 1.12 s, and the suites with a 2 s bound in them stayed at 2.05–2.10 s |
 
 The clean-run figure is three orders of magnitude below the node's own 6–10 ms
 (`iroh_carrier.rs:218-221`), and the difference is not a faster machine: the

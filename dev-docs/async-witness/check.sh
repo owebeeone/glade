@@ -30,6 +30,13 @@ if [ ! -f "$checker" ]; then
 fi
 cargo run --quiet --locked --offline --manifest-path "$checker" -- "$witness_root"
 
+# Step 3.5: a gate that has never been seen to refuse anything is not evidence
+# that it would. The fixture injects `shaku` into the contract crate's manifest
+# ON A COPY — the live manifests and lockfile are never edited — and requires
+# the exact ARCH-002 naming `async-witness-ports`, refusing to pass on any other
+# non-zero exit. It is offline and costs well under a second warm.
+sh "$witness_root/arch002-fixture.sh"
+
 # The checker shells `cargo metadata --no-deps`, so it classifies WORKSPACE
 # MEMBERS only. `glade-wire` is a path dependency outside this workspace and can
 # never appear there: Cargo refuses a member that is not hierarchically below
