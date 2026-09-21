@@ -37,6 +37,7 @@ use glade_wire::generated::{Op, Ops, Shape};
 use sdax::prelude::*;
 
 use crate::peer_carrier::{WitnessCarrier, WitnessEndpoint};
+use crate::shaku_bridge::{RealComposition, assemble, resolve_carrier};
 
 /// The node names, in one place, so a test and a plan cannot disagree about a
 /// spelling. `ReleaseOrder::before` matches a node by its path, and a typo
@@ -52,6 +53,10 @@ pub mod node {
     pub const DIALED: &str = "Dialed";
     /// One real glade `Frame` across the port.
     pub const EXCHANGE: &str = "Exchange";
+    /// Step 3.3's Shaku assembly over the already-acquired carrier. Present
+    /// only when the harness asks for it — it is the whole of Step 3.4's
+    /// differential.
+    pub const MODULE: &str = "Module";
 }
 
 /// The acceptor's glade node key. Fixed, so a test can name the `node_id` the
@@ -113,6 +118,26 @@ pub fn split(frame: &Frame) -> CarriedFrame {
     (FrameType::from_wire(i64::from(tag)), body.to_vec())
 }
 
+/// The frame the **Shaku-assembled** port sends, distinct from the exchange's
+/// so a test can tell which port put which frame on the wire.
+pub fn module_frame() -> Frame {
+    Frame::Ops(Ops {
+        ops: vec![Op {
+            share: "witness".into(),
+            glade_id: "g".into(),
+            key: vec![],
+            origin: "a".into(),
+            seq: 2,
+            prev: None,
+            lamport: 2,
+            refs: vec![],
+            shape: Shape::Value,
+            payload: b"one frame through an assembled module".to_vec(),
+        }],
+        pri: None,
+    })
+}
+
 /// Put a carried frame back together and decode it, so a test can say "the
 /// frame that arrived is the frame that was sent" about a `Frame` rather than
 /// about a byte vector.
@@ -144,8 +169,12 @@ pub struct PeerHarness {
     ports: Arc<Mutex<BTreeMap<&'static str, u16>>>,
     peers: Arc<Mutex<BTreeMap<&'static str, [u8; 32]>>>,
     received: Arc<Mutex<Vec<CarriedFrame>>>,
+    module_received: Arc<Mutex<Vec<CarriedFrame>>>,
     escaped: Arc<Mutex<Option<PeerEndpoint>>>,
+    kept_module: Arc<Mutex<Option<RealComposition>>>,
     escape_a_clone: bool,
+    with_module: bool,
+    keep_the_module: bool,
 }
 
 impl Default for PeerHarness {
@@ -162,9 +191,60 @@ impl PeerHarness {
             ports: Arc::new(Mutex::new(BTreeMap::new())),
             peers: Arc::new(Mutex::new(BTreeMap::new())),
             received: Arc::new(Mutex::new(Vec::new())),
+            module_received: Arc::new(Mutex::new(Vec::new())),
             escaped: Arc::new(Mutex::new(None)),
+            kept_module: Arc::new(Mutex::new(None)),
             escape_a_clone: false,
+            with_module: false,
+            keep_the_module: false,
         }
+    }
+
+    /// Add the Step 3.3 node: a step that `.needs` the acquired carrier and
+    /// assembles a Shaku module over it.
+    ///
+    /// This switch **is** Step 3.4's differential. Nothing else about the plan
+    /// changes with it, which is what lets the two runs be compared at all.
+    #[must_use]
+    pub fn with_shaku_module(mut self) -> PeerHarness {
+        self.with_module = true;
+        self
+    }
+
+    /// Let the assembled module outlive the step that built it, by stashing it
+    /// here instead of dropping it at the end of the body.
+    ///
+    /// The plan's §4.2 names this as the sharp risk at the seam: "The Shaku
+    /// module holds `Arc` clones of things derived from the endpoint, and an
+    /// escaped clone keeps the UDP socket bound." Whether it does is a fact to
+    /// measure, not to assume.
+    #[must_use]
+    pub fn keep_the_module(mut self) -> PeerHarness {
+        self.keep_the_module = true;
+        self
+    }
+
+    /// Whether the assembled module is still held.
+    pub fn holds_the_module(&self) -> bool {
+        self.kept_module.lock().expect("module cell lock").is_some()
+    }
+
+    /// Resolve the port out of the kept module, if there is one — proof that a
+    /// module asserted to be "still alive" really is.
+    pub fn resolve_kept_module(&self) -> Option<Arc<dyn CarrierPort>> {
+        self.kept_module
+            .lock()
+            .expect("module cell lock")
+            .as_ref()
+            .map(resolve_carrier)
+    }
+
+    /// Every frame the served carrier read that the **assembled** port sent.
+    pub fn module_received(&self) -> Vec<CarriedFrame> {
+        self.module_received
+            .lock()
+            .expect("witness module inbox lock")
+            .clone()
     }
 
     /// Let one clone of the **acceptor's** endpoint escape the composition,
@@ -264,8 +344,19 @@ impl PeerHarness {
             .push(frame);
     }
 
+    fn record_module_received(&self, frame: CarriedFrame) {
+        self.module_received
+            .lock()
+            .expect("witness module inbox lock")
+            .push(frame);
+    }
+
     fn escape(&self, endpoint: PeerEndpoint) {
         *self.escaped.lock().expect("escape cell lock") = Some(endpoint);
+    }
+
+    fn keep(&self, module: RealComposition) {
+        *self.kept_module.lock().expect("module cell lock") = Some(module);
     }
 }
 
@@ -427,6 +518,10 @@ pub fn peer_plan(harness: &PeerHarness) -> Plan<usize> {
             )
     };
 
+    if harness.with_module {
+        module_step(&mut p, harness, exchange, served, dialed);
+    }
+
     p.export(exchange)
         .build(
             Policy::FailFast,
@@ -434,4 +529,57 @@ pub fn peer_plan(harness: &PeerHarness) -> Plan<usize> {
             Mode::Finite,
         )
         .expect("the witness peer plan is valid by construction")
+}
+
+/// Step 3.3's node: Shaku assembles over the handle the engine already holds.
+///
+/// It needs the exchange as well as the two carriers, for a reason that is
+/// about determinism rather than about dependency: without that edge the two
+/// steps would be `unordered` and would contend for the same stream, and a
+/// witness whose result depends on which body reached the lock first would be
+/// evidence of nothing.
+fn module_step(
+    p: &mut PlanBuilder<(), ()>,
+    harness: &PeerHarness,
+    exchange: Key<usize>,
+    served: Key<WitnessCarrier>,
+    dialed: Key<WitnessCarrier>,
+) {
+    let harness = harness.clone();
+    p.step(node::MODULE)
+        .needs((exchange, served, dialed))
+        .within(LINK_BUDGET)
+        .run(
+            move |_cx: Cx<Run>,
+                  (_frames, served, dialed): (
+                Arc<usize>,
+                Arc<WitnessCarrier>,
+                Arc<WitnessCarrier>,
+            )| {
+                let harness = harness.clone();
+                async move {
+                    // Assembly, over a handle acquired by the engine three
+                    // nodes ago. Shaku never learns that a lifecycle exists.
+                    let module = assemble(dialed);
+                    let port = resolve_carrier(&module);
+
+                    let (tag, body) = split(&module_frame());
+                    port.send(tag, &body).await?;
+                    let Some(got) = served.recv().await? else {
+                        return Err(Error::from("the served carrier reached end of stream"));
+                    };
+                    harness.record_module_received(got);
+                    harness.record(PeerEvent::Ran(node::MODULE));
+
+                    // The module is a plain value produced by a step, so its
+                    // ordinary fate is to be dropped here. The harness switch
+                    // exists to measure what happens when it is not.
+                    drop(port);
+                    if harness.keep_the_module {
+                        harness.keep(module);
+                    }
+                    Ok(())
+                }
+            },
+        );
 }

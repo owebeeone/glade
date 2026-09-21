@@ -163,12 +163,15 @@ and keeps the two questions apart in the same way.
 |---|---|---|
 | 3.1 | Two witness nodes bind localhost QUIC endpoints, one dials the other, both complete the node<->node HELLO seam, and one real glade `Frame` crosses the witness's `CarrierPort` — all driven by an sdax plan, with every external effect inside `cx.hold(...)` | `real/src/peer_carrier.rs`, `real/src/peer_plan.rs`, `real/tests/peer_carrier.rs` |
 | 3.2 | **AR-08 for real**: after `report.is_clean()`, every recorded UDP port re-binds within the bound — and a variant in which one endpoint clone deliberately escapes keeps its port bound for the whole bound, then frees it when the clone is dropped | `real/tests/peer_release.rs` |
+| 3.3 | Shaku assembles over the **already-acquired** handle from inside an sdax step that `.needs` it, resolves the engine's own carrier, puts a frame across it, and constructs no provider of its own; the module step is ordered before every endpoint's release | `real/src/shaku_bridge.rs`, `real/tests/shaku_assembly.rs`, `real/tests/shaku_registration.rs` |
 
 Reproduce from this directory:
 
 ```sh
 cargo test --locked --offline -p async-witness-real --test peer_carrier
 cargo test --locked --offline -p async-witness-real --test peer_release -- --nocapture
+cargo test --locked --offline -p async-witness-real --test shaku_assembly
+cargo test --locked --offline -p async-witness-real --test shaku_registration
 ```
 
 ### The plan shape, and why it is this shape
@@ -224,6 +227,48 @@ The release check is itself falsifiable: `the_release_check_can_answer_still_bou
 holds a port of its own and requires the helper to spend the whole bound saying
 so, so a `Some(..)` elsewhere cannot mean the check was vacuous.
 
+### Where Shaku meets the lifecycle
+
+```text
+sdax-rs acquires  ->  Shaku assembles over the acquired handles  ->  sdax-rs releases, in reverse
+```
+
+The order is forced, not chosen: `build()` is synchronous and
+`with_component_override` takes an already-constructed value, so Shaku cannot
+acquire a socket. The `Module` step therefore `.needs` the carrier the engine
+acquired three nodes earlier, and hands it to the builder as an override.
+
+- **The facade traits are declared in `real`**, not imported from `fast`.
+  `architecture-policy.json` does not let `async-witness-real` depend on
+  `async-witness-fast`, and widening an allowlist to make a check pass is
+  forbidden. "Depends on 1.1" means the pattern; a facade is local to one
+  assembly anyway.
+- **A plain `with_component_override` is enough.** The override is consulted
+  before the registered build function, which Phase 1 measured, so
+  `BindingCarrier::build` never runs and the counter reads 0.
+  `with_component_override_fn` on a `#[lazy]` registration would also work and
+  is not needed — there is nothing to defer when the value already exists.
+- **`AcquiredCarrier` is what makes the plain override possible.**
+  `with_component_override` takes `Box<I>` and the engine's value is an `Arc`,
+  so the box is a delegating handle rather than a copy of anything.
+- **The counter is paid for.** `tests/shaku_registration.rs` is a separate test
+  binary that builds the same module with nothing overridden and watches the
+  registration construct itself, so the zero read in `tests/shaku_assembly.rs`
+  is not the zero of a registration that does not exist.
+- **The `Module` step `.needs` the `Exchange` step.** Without that edge the two
+  would be `unordered` and would contend for the same stream; a witness whose
+  result depended on which body reached the lock first would be evidence of
+  nothing.
+
+**The sharp risk at the seam, measured.** Plan §4.2 warns that "the Shaku module
+holds `Arc` clones of things derived from the endpoint, and an escaped clone
+keeps the UDP socket bound". It does not here:
+`a_module_that_outlives_the_step_holds_no_socket` stashes the built module in
+the harness so it survives the whole run, and both ports still free in
+microseconds. The reason is the by-value release above — a module that outlives
+the step holds a carrier that owns nothing. Contrast the endpoint clone of Step
+3.2, a handle the engine never owned, which does hold the port.
+
 ### Measured
 
 Toolchain `rustc 1.96.0 (ac68faa20 2026-05-25)`, macOS 26.6 on Apple silicon,
@@ -231,10 +276,11 @@ Toolchain `rustc 1.96.0 (ac68faa20 2026-05-25)`, macOS 26.6 on Apple silicon,
 
 | Measurement | Result |
 |---|---|
-| `sh check.sh` (all three members, warm) | 7.2 s |
-| `cargo test -p async-witness-real --lib --tests` (warm, 35 tests) | 2.70–2.77 s over five consecutive runs |
+| `sh check.sh` (all three members, warm; 62 tests) | 7.2 s |
+| `cargo test -p async-witness-real --lib --tests` (warm, 37 tests) | 2.73–2.88 s over five consecutive runs |
 | `tests/peer_carrier.rs` alone (4 tests, two real endpoints per run) | 0.04 s |
 | `tests/peer_release.rs` (4 tests) | 2.04 s, of which two deliberate 2 s bounds |
+| `tests/shaku_assembly.rs` (4 tests, two real endpoints per run) | 0.04 s |
 | Port free after a clean run | 4.7–15.2 µs, over three runs of both endpoints — already free at the first poll |
 | Port free after the escaped clone was dropped | 23–108 µs |
 | Port with an escaped clone still alive | still bound at 2.004–2.006 s, i.e. the whole bound |

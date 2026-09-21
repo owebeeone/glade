@@ -45,6 +45,7 @@
 
 pub mod peer_carrier;
 pub mod peer_plan;
+pub mod shaku_bridge;
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
