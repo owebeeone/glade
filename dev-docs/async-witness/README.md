@@ -304,11 +304,15 @@ constrains.
 ### Measured
 
 Toolchain `rustc 1.96.0 (ac68faa20 2026-05-25)`, macOS 26.6 on Apple silicon,
-`dev` profile, warm `target/`.
+12 cores, no `RUSTC_WRAPPER` and no compiler cache, `dev` profile. Phase 4's
+Step 4.1 owns the measured table for the result document; these are Phase 3's
+working figures.
 
 | Measurement | Result |
 |---|---|
-| `sh check.sh` (all three members, warm; 67 tests) | 7.2 s |
+| `sh check.sh` (all three members, warm; 67 tests) | 4.3–4.5 s |
+| Cold build of the whole workspace (`--lib --tests --no-run`, empty `CARGO_TARGET_DIR`) | 33.0 s, 1.6 GB of artefacts |
+| Warm incremental rebuild of the `real` lib after one touched file | 1.1 s |
 | `cargo test -p async-witness-real --lib --tests` (warm, 42 tests) | 2.88–2.94 s over five consecutive runs |
 | `tests/peer_carrier.rs` alone (4 tests, two real endpoints per run) | 0.04 s |
 | `tests/peer_release.rs` (4 tests) | 2.04 s, of which two deliberate 2 s bounds |
