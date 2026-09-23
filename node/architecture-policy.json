@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "packages": {
+    "glade-node": {
+      "role": "integration",
+      "reason": "PROVISIONAL, owner review pending (plan Step 3.5, 2026-09-23). Classifies the node as it exists today, not a target shape: its composition root, WS and iroh carriers, store, registry and sessions share one crate, which implements no contract port yet. Adding shaku (Step 3.2) or sdax (Step 3.3), or moving a port or carrier into a crate of its own, is a policy change that re-reviews this entry. binding_census and shipped_app_files are integration tests, not a shared conformance suite (LBT-009 is not yet met).",
+      "dependencies": ["normal:glade-wire", "normal:iroh", "normal:sha2", "normal:tokio"],
+      "conformance_tests": ["binding_census", "shipped_app_files"]
+    }
+  }
+}
