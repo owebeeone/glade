@@ -77,7 +77,7 @@ not new substrate.
 | Shape | Fold | Retention | Notes |
 | --- | --- | --- | --- |
 | `value` (SWMR/LWW or MV register) | replace; MV surfaces conflicts as data | latest | whole-value, no partials |
-| `log` | causal interleave, append-only | from-cursor / windowed | replay; trivially convergent |
+| `log` | causal interleave, append-only | from-cursor (`windowed` dropped 2026-09-23, R2(a)) | replay; trivially convergent |
 | `swmr` | canonical single-writer snapshot/delta/reset | from-cursor | generation-coherent assembly; see `GladeSwmrAdapter.md` |
 | `crdt` | canonical causal operation merge | from-cursor | multi-writer; payload profile selected explicitly; see `GladeCrdtAdapter.md` |
 | structured `message` | per-field merge annotations (taut `merge`) | latest | field-level lww / set-union / counter; lists/text later |

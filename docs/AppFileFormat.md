@@ -1,0 +1,243 @@
+# The `<app>.glade` file format
+
+An `<app>.glade` file declares what an application puts on glade: the surfaces
+it shares, the services it answers, the access it starts with and the workspace
+share it serves from. A glade node loads the file when it starts and registers
+each declaration as an ordinary record. The file is data: nothing in it runs.
+
+This page is about the line-oriented `glade-app` app-declaration file, the
+`.glade` file a glade node loads; the brace-nested `.glade` files under
+`dev-docs/examples/` in the glade-wz workspace are a different declaration
+language, a design sketch that nothing implements.
+
+The page describes the format as today's node accepts it. Where the node's next
+change (Step 2.5 of the glade-wz plan, `dev-docs/GladeFirstSlicePlan.md`)
+alters what an edit does, the page says so.
+
+## Words used here
+
+- **share**: a replicated space, named by a token such as `ws-razel`.
+- **surface**: one typed thing shared on a share, named by its **glade id**,
+  such as `term.log`.
+- **principal**: an identity that can be granted access, such as `owner`.
+
+## An example
+
+```text
+# A small notes app.
+glade-app v0
+app notes
+
+binding notes.list    value share commons latest
+binding notes.edits   log   share commons from-cursor
+binding notes.cursor  value share private latest
+
+service notes notes.ops
+
+seed owner ws-notes read.*,notes.*
+
+workspace ws-notes notes
+```
+
+A node loads the files named by its `--app` flags when it starts with a profile,
+for example `glade-node --profile local --app notes.glade`; the flag may repeat.
+The shipped [`apps/grazel-app.glade`](../apps/grazel-app.glade) is a longer
+example, with comments.
+
+## Grammar
+
+```text
+glade-app v0                # the header
+app <name>                  # exactly once, before any other declaration
+binding <glade_id> <shape> <authority> <zone> <retention>
+service <name> <exchange-glade-id>
+seed <principal> <share> <verb[,verb...]>
+workspace <share> <name>
+# a comment runs from `#` to the end of the line
+```
+
+- One declaration per line. Tokens are separated by spaces or tabs, and extra
+  spaces are ignored, so columns may be aligned.
+- `#` starts a comment wherever it appears, including after a declaration, and
+  the comment runs to the end of the line. A token therefore cannot contain
+  `#`. Blank lines are ignored.
+- The first line that is not blank or a comment is the header: write
+  `glade-app v0`.
+- `app <name>` comes next, exactly once. Every `binding` and `service` record
+  the file registers carries this name.
+- Every directive takes exactly the tokens shown. None is optional and none has
+  a default, so a line with a token missing or extra is refused.
+- A glade id may appear once per file, across `binding` and `service` lines. A
+  share may appear in one `workspace` line per file.
+- A file that breaks a rule stops the node from starting; the message names the
+  file and, where a line is at fault, its line number. A file that loads can
+  still carry warnings, which the node prints as `<file>: warning: line N: …`
+  before it goes on.
+
+**Spelling.** Multi-word tokens use the hyphen: `glade-app`, `from-cursor`.
+Every multi-word token in the shipped app files does (`ws-razel`, `glade-gyld`),
+and none uses an underscore.
+
+### `binding`: a surface
+
+`binding <glade_id> <shape> <authority> <zone> <retention>` declares a surface.
+It has exactly five tokens after `binding`.
+
+| Token | What to write |
+| --- | --- |
+| `<glade_id>` | The surface's id: any single token. Dotted names such as `term.log` are a convention, not a rule. |
+| `<shape>` | `value`: one value; concurrent writes resolve last-writer-wins. `log`: an append-only log, read from a cursor. `swmr`: one writer, many readers, as snapshots plus deltas. The node refuses every other shape: `message`, `stream` and `window` are recognised but cannot be bound, and an exchange is declared with `service`, not `binding`. |
+| `<authority>` | `share`: the share is the source of record. `external`: the share caches truth from an outside source. `external` is accepted, but the file cannot name the source yet. |
+| `<zone>` | `commons` or `private`. See [The zone](#the-zone). |
+| `<retention>` | `latest`, `from-cursor` or `ttl`. See [The retention](#the-retention). |
+
+### `service`: an exchange
+
+`service <name> <exchange-glade-id>` declares an exchange: a directed
+request/response surface, `<exchange-glade-id>`, answered by the service
+`<name>`. Each request is answered by a single provider, the one attached on
+the node that serves the request's share: an exchange never fans out.
+
+### `seed`: a starting grant
+
+`seed <principal> <share> <verb[,verb...]>` grants `<principal>` the listed
+verbs on `<share>`. Verbs are separated by commas with no spaces, and a verb may
+be a pattern such as `read.*`. At registration a seed becomes an ordinary grant
+record, and a revocation always wins over it, even when the file is loaded
+again. The node records grants but does not enforce them yet.
+
+### `workspace`: the share this app serves from
+
+`workspace <share> <name>` names the workspace share this app serves from and
+gives it a display name. The node that loads the file registers itself as the
+share's host and claims the share while it runs: this is the line that makes a
+declared surface routable.
+
+## The zone
+
+The zone, token 4 of a binding line, says who converges on a surface: everyone
+together, or each person on their own.
+
+| Zone | Meaning |
+| --- | --- |
+| `commons` | Everyone who reaches the surface on its share converges on one copy. |
+| `private` | Keyed to the principal: each person has a copy of their own. |
+
+**Choosing.** Ask whether everyone should see the same data. If so, as for a
+document body, a chat, a workspace tree or a build's output, write `commons`;
+nearly every surface is `commons`. If each person should have their own, as for
+a selection, a cursor or a draft, write `private`.
+
+**Do not rely on `private` for confidentiality yet.** Only the grip-share binder
+honours it. glial mounts do not produce the per-person key, so a surface
+declared `private` and mounted through glial converges in the commons partition,
+where everyone shares it.
+
+**There is no default.** A binding line has exactly five tokens after
+`binding`. Leaving the zone out leaves four, and the node refuses the line with
+its line number and the template
+`binding <glade_id> <shape> <authority> <zone> <retention>`. No zone is
+assumed.
+
+**A mount does not override the zone you write.** The grip-share binder uses the
+declared zone, and falls back to its manifest's zone only for a declaration that
+has none. On the glial path the mount's zone fill never reaches the wire.
+
+**Checking.** Today's node stores the zone exactly as written and checks it
+against nothing, so a misspelled zone is stored without a word. Write `commons`
+or `private`.
+
+## The retention
+
+The retention, token 5 of a binding line, says how much of a surface's history
+is kept.
+
+| Retention | Meaning |
+| --- | --- |
+| `latest` | The surface keeps one value, and the last write wins. |
+| `from-cursor` | The surface keeps its history, and a subscriber resumes from a position (a cursor) rather than from the newest value. |
+| `ttl` | The surface's records expire after a duration. |
+
+**Which to write** follows from the shape you wrote on the same line:
+
+| Shape | Write | Because |
+| --- | --- | --- |
+| `value` | `latest` | A setting or a status, read at its current value. |
+| `log` | `from-cursor` | An append log or an output stream: a reader resumes where it left off. |
+| `swmr` | `from-cursor` | Single-writer state such as a workspace file tree is resumed, not last-write-wins. |
+| `crdt` | Whatever matches how the surface is read | `from-cursor` if a subscriber resumes a history; `ttl` if its entries expire. Never `latest` by reflex: `latest` does not mean "the merged value". It keeps one value and lets the last write win, which is the opposite of a merge. |
+
+`crdt` cannot be bound yet (today's node refuses the shape). Its row is here so
+the choice is made on purpose when it can be.
+
+**`latest` is the one to be careful with.** It is legal on every shape, so
+nothing warns you: on a `log` it declares that only the newest entry matters,
+which turns an append log into a single value.
+
+**`ttl` cannot say how long yet.** It is the answer for a surface whose entries
+should expire, such as a cache, on any shape. But the file has no way to state
+the duration: a bare `ttl` is accepted and names none.
+
+**`windowed` is not a retention.** A window, such as the last screenful of a
+terminal, is a projection the application makes over a base shape, not
+something the surface keeps. Where a file said `windowed`, write `from-cursor`
+for the history and keep the window in the app.
+
+**Spelling.** Write `from-cursor`, with a hyphen. `from_cursor`, with an
+underscore, is how the contract (`glade-decl`) and the stored record spell it;
+do not write it in a file.
+
+**Retention is declarative.** Nothing enforces it yet: no node or client trims
+or expires a surface by its retention today. Write the value that says how the
+surface is read.
+
+**Checking.** Today's node stores the retention exactly as written and checks it
+against nothing, so a misspelled value, or `windowed`, is stored without a word.
+Write one of the three values above.
+
+## Changing or deleting a line
+
+A node reads its app files only when it starts, so an edit takes effect at the
+next start. Registration is by difference: a declaration whose record the node
+already holds is skipped, so loading an unchanged file registers nothing new.
+
+### `binding` lines
+
+With the node's next change (plan Step 2.5):
+
+- **The newest declaration wins.** Binding records are folded by glade id and
+  the newest is the live one, so a changed line replaces the surface's
+  declaration.
+- **A deleted line retracts its surface, for its own app only.** When a
+  `binding` line is deleted from a file, the surface is retracted, but only the
+  declaration registered under the app that file names in its `app` line. A
+  surface declared by another app file is never touched.
+- **A file that is not loaded retracts nothing.** A surface stays declared on a
+  boot that leaves its file out, so a surface that a supplier will serve later
+  stays declared. grazel, for instance, loads `gyld-app.glade` only when its
+  gyld leg is on, and gyld's surfaces stay declared while the leg is off.
+- **The node stores the retention in the contract's spelling.** Whichever
+  spelling the file uses, the stored record says `from_cursor`. So on a node
+  that registered the file before, each binding that says `from-cursor` is
+  registered once more on the first start, now stored as `from_cursor`, and the
+  fold makes that new record the live one.
+
+Until then, on today's node, a changed binding line appends a second record for
+the same glade id beside the first, and nothing yet chooses between them; a
+deleted line retracts nothing; and the retention is stored exactly as written.
+
+### Other lines
+
+Deleting a `service` or a `workspace` line retracts nothing: a retired exchange
+stays declared and so stays routable, and the workspace's registered entry
+stays. Deleting a `seed` line does not withdraw the grant it made; revoking the
+grant does, and a revocation always wins over a seed.
+
+## See also
+
+- [`dev-docs/GladeGrazelAttachNotes.md`](../dev-docs/GladeGrazelAttachNotes.md):
+  engineering notes on the parser and on registration.
+- `dev-docs/glade/GladeDeclSurface.md` in the glade-wz workspace: the
+  declaration vocabulary these tokens come from, including its `Domain` /
+  `Zone` and `Retention` rows.
+- [`node/src/appdecl.rs`](../node/src/appdecl.rs): the parser.

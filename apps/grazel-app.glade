@@ -17,12 +17,12 @@ glade-app v0
 app grazel
 
 # binding <glade_id> <shape> <authority> <zone> <retention>
-# App-static surfaces: no share/key here — the ServeClaim selects the node,
-# the mount fills domain/zone/key (GladeDeclSurface.md).
+# App-static surfaces: no share/key here — the ServeClaim selects the node.
+# You write the zone; a mount does not override it (glade/docs/AppFileFormat.md).
 binding ws.tree   value share commons latest
 binding ws.files  swmr  share commons from-cursor
 binding ws.diff   log   share private from-cursor
-binding term.log  log   share commons windowed
+binding term.log  log   share commons from-cursor
 
 # Supplier surfaces grazel composes (P1.S3): glade-gwz's long-op output stream,
 # and glade-chat's group-keyed message log + group-list value. Pre-declared so

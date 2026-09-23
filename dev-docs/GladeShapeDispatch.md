@@ -35,7 +35,7 @@ repository.
 | `ws.tree` | `value` | `latest` | Compatible materialized-winner policy |
 | `ws.files` | `swmr` | `from-cursor` | Canonical single-writer generation; file window is an application projection |
 | `ws.diff` | `log` | `from-cursor` | Compatible replay/cursor policy |
-| `term.log` | `log` | `windowed` | Ambiguous legacy token; owner decision required |
+| `term.log` | `log` | `from-cursor` | Was `windowed`; decided 2026-09-23 (R2(a)): the window is an application projection, the history is `from-cursor` |
 | `gwz.output` | `log` | `from-cursor` | Compatible replay/cursor policy |
 | `chat.msgs` | `log` | `from-cursor` | Compatible replay/cursor policy |
 | `chat.groups` | `value` | `latest` | Compatible materialized-winner policy |
@@ -52,3 +52,8 @@ narrow it. The terminal owner must choose an explicit record/byte/age bound and
 cursor-expiry behavior before the declaration can migrate. All other current
 tokens can remain while retention is separated from shape identity in a later
 declaration revision.
+
+*Decided 2026-09-23 (`GladeDeclReconciliation.md` R2(a)): `windowed` is not a
+retention; `term.log` is `from-cursor`, with the window kept in the app. A
+storage bound for the history (records, bytes or age) and cursor expiry are
+still open: retention is declarative and unenforced until GC-4.*

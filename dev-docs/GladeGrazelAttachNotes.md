@@ -24,7 +24,9 @@ glade-sys.glade (base glade's own app file — nothing needs it yet).
 
 ## The `<app>.glade` format (the serialization call)
 
-Line-oriented text, hand-parsed, zero new deps:
+Line-oriented text, hand-parsed, zero new deps. The user-facing page for the
+format is [`glade/docs/AppFileFormat.md`](../docs/AppFileFormat.md), which
+carries the same grammar and what each token means:
 
 ```text
 glade-app v0                                        # header, first decl line
@@ -32,8 +34,15 @@ app grazel                                          # exactly once, first
 binding <glade_id> <shape> <authority> <zone> <retention>
 service <name> <exchange-glade-id>
 seed <principal> <share> <verb[,verb...]>
+workspace <share> <name>                            # makes declared surfaces routable
 # comments + blank lines anywhere; `#` starts a comment
 ```
+
+The in-file grammar comment is carried by the three authored app files
+(`grazel/apps/grazel-app.glade`, its byte-identical twin
+`glade/apps/grazel-app.glade`, and `grazel/apps/gyld-app.glade`) and not by the
+two test fixtures (`glade-gyld/tests/fixtures/gyld-test-app.glade`,
+`glade-gwz/tests/fixtures/gwz-test-app.glade`).
 
 Why this over JSON/CBOR-of-a-taut-message: the file is the LEGIBLE app
 surface (GDL-037's surviving de-noising value) and is hand-edited, so
@@ -47,8 +56,13 @@ authority / directive, duplicate glade id (frozen-once-shared, GQ-6), and
 missing header/app are refused with line numbers.
 
 `BindingDecl` is app-static: no share/key in the record — the ServeClaim
-selects the node, the mount fills domain/zone/key (GladeDeclSurface). shape /
-authority / zone / retention ride as STRINGS so the record evolves additively.
+selects the node. The author writes the zone (the binding line's `<zone>` token,
+which has no default), and a mount does not override it: on the grip-share path
+`manifestScope` reads `decl.zone ?? spec?.zone ?? ""`, so the declared zone wins
+and the manifest's surface spec is only a fallback; on the glial path the
+mount's zone fill enters only a local instance key and never reaches the wire
+(GladeDeclSurface, `Domain` / `Zone`). shape / authority / zone / retention ride
+as STRINGS so the record evolves additively.
 
 ## Registration (s-app-register RL/RC)
 
@@ -61,6 +75,25 @@ so re-loading appends nothing and can never clobber a later runtime revocation
 (`reregistration_cannot_clobber_a_runtime_revocation` is the regression).
 Nothing in base glade names grazel; the loader registers any app
 (`registration_appends_ordinary_attributed_records` uses a non-grazel app).
+
+**Changed and deleted lines (R9, ruled 2026-09-23; lands with plan Step 2.5).**
+The diff is the whole of today's rule, and it does not say which record is live:
+a changed binding line appends a second `BindingDecl` for the same glade id
+beside the first, nothing folds `dir.bindings` (its one production reader,
+`declared_exchange` in `node/src/exchange.rs`, asks only whether any record
+matches), and a deleted line retracts nothing. R9 (b2) + (a) replaces that in
+one node change: `parse()` normalises `from-cursor` to `from_cursor` on the way
+into the record, so the store holds the contract's spelling whichever spelling
+the file uses; `dir.bindings` is folded by `glade_id`, newest wins; and
+`register` diffs the parsed file against the fold per `(app, glade_id)`,
+appending a `BindingRetraction` for each binding the file's `app` registered
+before and no longer declares. So a file not loaded on a boot retracts nothing
+(gyld's surfaces stay declared while grazel's gyld leg is off), and a
+declaration made by a different app file is never in scope. R9 governs
+`dir.bindings` only: deleting a `service` or `workspace` line retracts nothing,
+so a retired exchange stays routable, and `seed`'s remove half is a runtime
+revocation (item 4 below). `glade/docs/AppFileFormat.md` states the same rule
+for authors.
 
 ## Resolved ambiguities (smallest reasonable call)
 
@@ -94,11 +127,13 @@ No wire change: `ExchangeReq`/`ExchangeRes` frames existed frozen since P1
 exchange locally.
 
 **Provider attach.** An authority session SUBSCRIBEs to a `(share, glade_id)`
-whose glade id is DECLARED an exchange surface (a `dir.services` record, or a
-`dir.bindings` record with shape `exchange`, folded from the served store).
-The node registers the session in `Shared::providers` and acks with an empty
-`Heads` — "the keyed entry map IS the routing table" applied to the directed
-leg; no new frame. On disconnect the provider entry drops with the session.
+whose glade id is DECLARED an exchange surface: a `dir.services` record, folded
+from the served store, whose authored form is a `service` line. (A
+`dir.bindings` record with shape `exchange` would also count — the fold honours
+one if it exists — but it is not authorable: the parser refuses
+`binding … exchange …` and names `service` instead.) The node registers the
+session in `Shared::providers` and acks with an empty `Heads` — "the keyed
+entry map IS the routing table" applied to the directed leg; no new frame. On disconnect the provider entry drops with the session.
 
 **Request routing** (`ExchangeReq`), in order:
 
@@ -142,7 +177,11 @@ session stays usable, mirroring R3's `Error/UnknownShare` call for subscribes
    the day enforcement lands.
 
 7. **Exchange timeout is a node constant (10s).** Not declared per-binding
-   yet; retention/timeout policy per declaration is a decl-surface question.
+   yet; a per-declaration timeout is still a decl-surface question. Retention
+   per declaration no longer is: it is the binding line's `<retention>` token
+   (`latest` / `from-cursor` / `ttl`), glossed in `glade/docs/AppFileFormat.md`
+   and in the `Retention` row of `dev-docs/glade/GladeDeclSurface.md`, and
+   declarative — nothing enforces it yet (GC-4).
 
 8. **`who_serves == self` requires a booted mesh.** On a mesh-less (legacy)
    node every declared exchange routes Local — the provider map alone decides.
