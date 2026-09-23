@@ -5,7 +5,7 @@ One command brings up the whole rust + glade + react toolchain:
   1. rebuild grip-core's dist so the share feature reaches the demo
      (grip-react -> grip-core is a symlink; dist is gitignored)
   2. build the rust glade-node
-  3. npm install the demo (first run only)
+  3. pnpm install the demo (first run only)
   4. start the glade-node (background, port 9099)
   5. run the vite dev server (foreground)
 
@@ -59,15 +59,15 @@ def main() -> int:
 
     # 1. grip-core dist (carries the GQ-5 share feature; gitignored)
     if not (GRIP_CORE / "node_modules").exists():
-        run(["npm", "install"], GRIP_CORE)
-    run(["npm", "run", "build"], GRIP_CORE)
+        run(["pnpm", "install"], GRIP_CORE)
+    run(["pnpm", "run", "build"], GRIP_CORE)
 
     # 2. the rust glade-node
     run(["cargo", "build", "--offline", "--bin", "glade-node"], NODE_DIR)
 
     # 3. demo deps (first run)
     if not (HERE / "node_modules").exists():
-        run(["npm", "install"], HERE)
+        run(["pnpm", "install"], HERE)
 
     # 4. glade-node in the background
     print(f"\n\033[32m+ starting glade-node on :{NODE_PORT} (store {STORE})\033[0m")
@@ -77,7 +77,9 @@ def main() -> int:
     # 5. vite dev (foreground). Note: the demo connects to ws://127.0.0.1:9099.
     print(f"\n\033[32m+ vite dev on :{VITE_PORT} — open it in two tabs\033[0m")
     try:
-        run(["npm", "run", "dev", "--", "--port", VITE_PORT, "--strictPort"], HERE)
+        # No `--` before the flags: pnpm passes a `--` on to the script, and vite
+        # ignores every flag after one, so it would fall back to its default port.
+        run(["pnpm", "run", "dev", "--port", VITE_PORT, "--strictPort"], HERE)
     except KeyboardInterrupt:
         pass
     except subprocess.CalledProcessError:

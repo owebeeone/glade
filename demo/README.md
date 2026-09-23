@@ -16,8 +16,9 @@ useGrip components ─ Glial binder/assembly ─ Glade client ─ WS ─ Rust gl
 python3 run_demo.py
 ```
 
-This rebuilds grip-core's `dist`, builds the rust `glade-node`, `npm install`s
-the demo (first run), starts the node on `:9099`, and runs vite on `:5175`.
+This rebuilds grip-core's `dist`, builds the rust `glade-node`, runs
+`pnpm install` for the demo (first run), starts the node on `:9099`, and
+runs vite on `:5175`.
 Ctrl-C stops everything. Open `http://localhost:5175` in **two tabs** and edit
 the **Collaborative notes · text CRDT** surface simultaneously. Put the caret
 in the middle in one tab while typing in the other: the remote identity delta
@@ -30,11 +31,11 @@ the operation set from the node. The status dot is `live` when connected and
 
 1. **Build grip-core** so its `dist` carries the share feature (gitignored; the
    demo resolves grip-react → grip-core via symlink):
-   `(cd ../../grip-core && npm run build)`
+   `(cd ../../grip-core && pnpm build)`
 2. **Build + run the node** on 9099:
    `(cd ../node && cargo build --bin glade-node)` then
    `../node/target/debug/glade-node 9099 ../node/target/demo-store`
-3. **Install + run the demo**: `npm install && npm run dev`
+3. **Install + run the demo**: `pnpm install && pnpm dev`
 
 The wire protocol, folds, and op-hash are the frozen glade contract
 (`taut/corpus/glade.*`); the client reproduces them byte-for-byte.
