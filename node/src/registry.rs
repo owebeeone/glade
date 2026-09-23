@@ -18,6 +18,7 @@
 //! disk" — the SAME per-origin chain checks the wire store runs (`store.rs`),
 //! so hardening s-sync hardens boot for free.
 
+use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
@@ -28,8 +29,8 @@ use glade_wire::generated::{Head, Op, Shape, StreamHeads};
 
 use crate::chain::op_hash;
 use crate::sysdata::{
-    BindingDecl, CapabilityGrant, CapabilityRevocation, NodeRecord, PrincipalRecord, ServeClaim,
-    ServiceDefinition, SystemSnapshot, WorkspaceEntry,
+    BindingDecl, BindingRetraction, CapabilityGrant, CapabilityRevocation, NodeRecord, PrincipalRecord,
+    ServeClaim, ServiceDefinition, SystemSnapshot, WorkspaceEntry,
 };
 
 /// The home share — the user-scale system declaration space (WD §2). All
@@ -47,6 +48,9 @@ pub const G_REVOCATIONS: &str = "dir.revocations";
 // App declaration records (GDL-037): what an <app>.glade file registers.
 pub const G_BINDINGS: &str = "dir.bindings";
 pub const G_SERVICES: &str = "dir.services";
+// Binding retractions (R9(a)): a binding line an app file no longer declares.
+// Folded with dir.bindings — together, the binding family.
+pub const G_BINDING_RETRACTIONS: &str = "dir.binding-retractions";
 // Principals minimal (GLP-0006 P0.S7; the stream GDL-038 names): identity as
 // data — session Hellos auto-append unknown principals; nothing enforced.
 pub const G_PRINCIPALS: &str = "dir.principals";
@@ -62,6 +66,7 @@ pub enum Record {
     Grant(CapabilityGrant),
     Revoke(CapabilityRevocation),
     Binding(BindingDecl),
+    Retract(BindingRetraction),
     Service(ServiceDefinition),
     Principal(PrincipalRecord),
 }
@@ -76,6 +81,7 @@ impl Record {
             Record::Grant(_) => G_GRANTS,
             Record::Revoke(_) => G_REVOCATIONS,
             Record::Binding(_) => G_BINDINGS,
+            Record::Retract(_) => G_BINDING_RETRACTIONS,
             Record::Service(_) => G_SERVICES,
             Record::Principal(_) => G_PRINCIPALS,
         }
@@ -87,6 +93,12 @@ impl Record {
         matches!(glade_id, G_GRANTS | G_REVOCATIONS)
     }
 
+    /// Is `glade_id` a stream of the binding family, folded as one
+    /// (`dir.bindings` + `dir.binding-retractions`)?
+    fn is_binding_family(glade_id: &str) -> bool {
+        matches!(glade_id, G_BINDINGS | G_BINDING_RETRACTIONS)
+    }
+
     pub(crate) fn encode(&self) -> Vec<u8> {
         let c = match self {
             Record::Node(r) => r.to_cbor(),
@@ -95,6 +107,7 @@ impl Record {
             Record::Grant(r) => r.to_cbor(),
             Record::Revoke(r) => r.to_cbor(),
             Record::Binding(r) => r.to_cbor(),
+            Record::Retract(r) => r.to_cbor(),
             Record::Service(r) => r.to_cbor(),
             Record::Principal(r) => r.to_cbor(),
         };
@@ -204,6 +217,11 @@ pub trait RegistryApi {
     /// Verbs granted to `principal` on `share` — set-union, revocation wins.
     fn grants_for(&self, principal: &str, share: &str) -> Vec<String>;
 
+    /// The live binding declarations (R9(a)) — the [`BindingFold`] of
+    /// `dir.bindings` and `dir.binding-retractions`: per glade id the newest
+    /// live declaration, in glade-id order.
+    fn bindings_of(&self) -> Vec<BindingDecl>;
+
     /// Nodes operated by `operator` (NodeRecord set-union).
     fn nodes_of(&self, operator: &str) -> Vec<String>;
 
@@ -311,6 +329,10 @@ impl Registry {
             Some(&(last_seq, last_hash)) => (last_seq + 1, Some(last_hash.to_vec())),
             None => (0, None),
         };
+        // The binding family folds newest-wins ACROSS its two streams, so its
+        // lamport is one clock over both (see `next_binding_lamport`); every
+        // other kind keeps its chain seq.
+        let lamport = if Record::is_binding_family(glade_id) { self.next_binding_lamport() } else { seq };
         let op = Op {
             share: HOME.into(),
             glade_id: glade_id.into(),
@@ -318,13 +340,28 @@ impl Registry {
             origin: origin.into(),
             seq,
             prev,
-            lamport: seq,
+            lamport,
             refs: vec![],
             shape: Shape::Log,
             payload: rec.encode(),
         };
         self.ingest(op.clone())?;
         Ok(op)
+    }
+
+    /// The next lamport on the binding family: one past the highest either
+    /// of its streams holds, from any origin, so an append is newer than
+    /// every binding record already here — whichever stream it is on. With
+    /// one origin and no retraction this is the record's own seq, which is
+    /// what every binding record written before R9 carries, so no envelope
+    /// that existed before moves.
+    fn next_binding_lamport(&self) -> i64 {
+        self.ops
+            .iter()
+            .filter(|o| Record::is_binding_family(&o.glade_id))
+            .map(|o| o.lamport + 1)
+            .max()
+            .unwrap_or(0)
     }
 
     /// Is a byte-identical record already in the fold? The diff basis for
@@ -386,6 +423,10 @@ impl RegistryApi for Registry {
         verbs
     }
 
+    fn bindings_of(&self) -> Vec<BindingDecl> {
+        BindingFold::over(&self.ops).live()
+    }
+
     fn nodes_of(&self, operator: &str) -> Vec<String> {
         let mut nodes: Vec<String> = self
             .fold_iter(G_NODES)
@@ -421,6 +462,110 @@ impl RegistryApi for Registry {
             })
             .collect();
         SystemSnapshot { records, heads }
+    }
+}
+
+// ============================================================================
+// The binding fold (R9(a)) — dir.bindings and its retractions, as one.
+// ============================================================================
+
+/// Where a binding-family record stands in the fold's order: the documented
+/// `value` rule, highest `(lamport, origin)` wins (glade-gyld README), made
+/// total by the stream — a retraction outranks a declaration it ties — and
+/// then the chain seq.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Stamp {
+    lamport: i64,
+    origin: String,
+    retraction: bool,
+    seq: i64,
+}
+
+/// The newest record for one `(app, glade_id)`: a declaration, with its
+/// stored payload bytes, or `None` for a retraction.
+#[derive(Clone, Debug)]
+struct Newest {
+    stamp: Stamp,
+    decl: Option<(BindingDecl, Vec<u8>)>,
+}
+
+/// The `dir.bindings` fold (R9(a)), a pure function of an op-set, never of
+/// arrival order. Per `(app, glade_id)` the newest binding-family record
+/// wins, and a retraction that is newest takes that app's declaration down;
+/// per glade id, the newest declaration still live across apps is the
+/// surface. A retraction therefore retracts only its own app's declaration.
+/// The same fold serves the registry, `register`'s diff, and the served
+/// store (`exchange::declared_exchange`).
+#[derive(Clone, Debug, Default)]
+pub struct BindingFold {
+    newest: BTreeMap<(String, String), Newest>,
+}
+
+impl BindingFold {
+    /// Fold the binding family out of `ops`; ops on any other stream are
+    /// ignored.
+    pub fn over<'a>(ops: impl IntoIterator<Item = &'a Op>) -> BindingFold {
+        let mut newest: BTreeMap<(String, String), Newest> = BTreeMap::new();
+        for op in ops {
+            let (app, glade_id, decl) = match op.glade_id.as_str() {
+                G_BINDINGS => {
+                    let b = BindingDecl::from_cbor(&cbor::decode(&op.payload));
+                    (b.app.clone(), b.glade_id.clone(), Some((b, op.payload.clone())))
+                }
+                G_BINDING_RETRACTIONS => {
+                    let r = BindingRetraction::from_cbor(&cbor::decode(&op.payload));
+                    (r.app, r.glade_id, None)
+                }
+                _ => continue,
+            };
+            let stamp =
+                Stamp { lamport: op.lamport, origin: op.origin.clone(), retraction: decl.is_none(), seq: op.seq };
+            let candidate = Newest { stamp, decl };
+            match newest.entry((app, glade_id)) {
+                Entry::Vacant(slot) => {
+                    slot.insert(candidate);
+                }
+                Entry::Occupied(mut slot) => {
+                    if candidate.stamp > slot.get().stamp {
+                        slot.insert(candidate);
+                    }
+                }
+            }
+        }
+        BindingFold { newest }
+    }
+
+    /// The live bindings: per glade id, the newest live declaration across
+    /// apps, in glade-id order.
+    pub fn live(&self) -> Vec<BindingDecl> {
+        let mut by_id: BTreeMap<&str, (&Stamp, &BindingDecl)> = BTreeMap::new();
+        for ((_, glade_id), newest) in &self.newest {
+            let Some((decl, _)) = &newest.decl else {
+                continue;
+            };
+            let newer = by_id.get(glade_id.as_str()).map_or(true, |(stamp, _)| newest.stamp > **stamp);
+            if newer {
+                by_id.insert(glade_id.as_str(), (&newest.stamp, decl));
+            }
+        }
+        by_id.into_values().map(|(_, decl)| decl.clone()).collect()
+    }
+
+    /// The declarations live for `app`, by glade id, with the payload bytes
+    /// stored for each: what `register` diffs that app's file against.
+    pub fn declared_by(&self, app: &str) -> BTreeMap<String, Vec<u8>> {
+        self.newest
+            .iter()
+            .filter(|((a, _), _)| a == app)
+            .filter_map(|((_, glade_id), newest)| {
+                newest.decl.as_ref().map(|(_, bytes)| (glade_id.clone(), bytes.clone()))
+            })
+            .collect()
+    }
+
+    /// The `(app, glade_id)` pairs whose newest record is a retraction.
+    pub fn retracted(&self) -> Vec<(String, String)> {
+        self.newest.iter().filter(|(_, newest)| newest.decl.is_none()).map(|(key, _)| key.clone()).collect()
     }
 }
 
@@ -541,6 +686,149 @@ mod tests {
         assert!(rejected >= 1, "the tampered op (and its suffix) is quarantined");
         // the honest records still fold.
         assert_eq!(reg.nodes_of("gianni"), vec!["glade-local", "peer1"]);
+    }
+
+    fn decl(app: &str, glade_id: &str, shape: &str) -> Record {
+        Record::Binding(BindingDecl {
+            app: app.into(),
+            glade_id: glade_id.into(),
+            shape: shape.into(),
+            authority: "share".into(),
+            zone: "commons".into(),
+            retention: "latest".into(),
+        })
+    }
+    fn retract(app: &str, glade_id: &str) -> Record {
+        Record::Retract(BindingRetraction { app: app.into(), glade_id: glade_id.into() })
+    }
+    /// The live bindings as (app, glade_id, shape).
+    fn live(r: &Registry) -> Vec<(String, String, String)> {
+        r.bindings_of().into_iter().map(|b| (b.app, b.glade_id, b.shape)).collect()
+    }
+    fn row(app: &str, glade_id: &str, shape: &str) -> (String, String, String) {
+        (app.into(), glade_id.into(), shape.into())
+    }
+    fn ops_of(r: &Registry) -> Vec<Op> {
+        r.snapshot().records.iter().map(|b| Op::from_cbor(&cbor::decode(b))).collect()
+    }
+
+    /// R9(a): `dir.bindings` folds by glade id and the newest declaration is
+    /// the live one — a changed line replaces the surface's declaration.
+    #[test]
+    fn the_binding_fold_takes_the_newest_declaration_per_glade_id() {
+        let mut r = Registry::new();
+        assert_eq!(live(&r), vec![]);
+        r.append(decl("a", "g", "value"), "n1").unwrap();
+        r.append(decl("a", "h", "log"), "n1").unwrap();
+        r.append(decl("a", "g", "log"), "n1").unwrap();
+        assert_eq!(live(&r), vec![row("a", "g", "log"), row("a", "h", "log")]);
+    }
+
+    /// A retraction that is newest takes the surface down; a declaration
+    /// newer than the retraction brings it back. The two ride different
+    /// streams, so "newer" needs one clock across both (the lamport rule).
+    #[test]
+    fn a_newest_retraction_takes_a_surface_down_and_a_newer_declaration_revives_it() {
+        let mut r = Registry::new();
+        for id in ["g", "h", "k"] {
+            r.append(decl("a", id, "value"), "n1").unwrap();
+        }
+        r.append(retract("a", "g"), "n1").unwrap();
+        assert_eq!(live(&r), vec![row("a", "h", "value"), row("a", "k", "value")]);
+        assert_eq!(BindingFold::over(&ops_of(&r)).retracted(), vec![("a".to_string(), "g".to_string())]);
+        r.append(decl("a", "g", "log"), "n1").unwrap();
+        assert_eq!(live(&r), vec![row("a", "g", "log"), row("a", "h", "value"), row("a", "k", "value")]);
+        assert_eq!(BindingFold::over(&ops_of(&r)).retracted(), Vec::<(String, String)>::new());
+    }
+
+    /// R9(a)'s scope: a retraction retracts its own app's declaration and no
+    /// other. Two apps declaring one glade id: the newest live declaration is
+    /// the surface, and retracting one app's leaves the other's live.
+    #[test]
+    fn a_retraction_retracts_only_its_own_apps_declaration() {
+        let mut r = Registry::new();
+        r.append(decl("a", "g", "value"), "n1").unwrap();
+        r.append(decl("b", "g", "log"), "n1").unwrap();
+        assert_eq!(live(&r), vec![row("b", "g", "log")]);
+        r.append(retract("b", "g"), "n1").unwrap();
+        assert_eq!(live(&r), vec![row("a", "g", "value")], "a's declaration was never in scope");
+        r.append(retract("a", "g"), "n1").unwrap();
+        assert_eq!(live(&r), vec![]);
+    }
+
+    /// The binding family's lamport is one clock across its two streams: one
+    /// past the highest either holds, from any origin. With one origin and no
+    /// retraction that is the record's own seq, which is what every record
+    /// written before R9 carries; every other record kind keeps lamport = seq.
+    #[test]
+    fn the_binding_family_lamport_is_one_clock_across_both_streams() {
+        let mut r = Registry::new();
+        let mut at = |rec: Record, origin: &str| {
+            let op = r.append_returning(rec, origin).unwrap();
+            (op.glade_id, op.seq, op.lamport)
+        };
+        assert_eq!(at(decl("a", "g", "value"), "n1"), (G_BINDINGS.into(), 0, 0));
+        assert_eq!(at(decl("a", "h", "value"), "n1"), (G_BINDINGS.into(), 1, 1));
+        assert_eq!(at(claim("n1", "ws", 1, 1), "n1"), (G_CLAIMS.into(), 0, 0));
+        assert_eq!(at(retract("a", "g"), "n1"), (G_BINDING_RETRACTIONS.into(), 0, 2));
+        assert_eq!(at(decl("a", "g", "log"), "n1"), (G_BINDINGS.into(), 2, 3));
+        assert_eq!(at(retract("a", "h"), "n1"), (G_BINDING_RETRACTIONS.into(), 1, 4));
+        // a second origin's first record is still the newest
+        assert_eq!(at(decl("a", "k", "value"), "n2"), (G_BINDINGS.into(), 0, 5));
+        assert_eq!(at(claim("n1", "ws", 1, 2), "n1"), (G_CLAIMS.into(), 1, 1));
+    }
+
+    /// The fold is a pure function of the op-set: any arrival order, and a
+    /// reload through verify-as-ingest, give the same live set.
+    #[test]
+    fn the_binding_fold_is_a_pure_function_of_the_op_set() {
+        let mut r = Registry::new();
+        r.append(decl("a", "g", "value"), "n1").unwrap();
+        r.append(decl("a", "h", "value"), "n1").unwrap();
+        r.append(decl("b", "g", "log"), "n2").unwrap();
+        r.append(retract("a", "h"), "n1").unwrap();
+        r.append(decl("a", "h", "log"), "n1").unwrap();
+        r.append(retract("b", "g"), "n2").unwrap();
+        let ops = ops_of(&r);
+        let forward = BindingFold::over(&ops).live();
+        assert_eq!(live(&r), vec![row("a", "g", "value"), row("a", "h", "log")]);
+        let mut reversed = ops.clone();
+        reversed.reverse();
+        assert_eq!(BindingFold::over(&reversed).live(), forward);
+        let (again, rejected) = Registry::from_snapshot(&r.snapshot());
+        assert_eq!(rejected, 0);
+        assert_eq!(again.bindings_of(), forward);
+    }
+
+    /// No existing record kind's bytes move (the amendment ADDS a kind). A
+    /// `BindingDecl` payload as the pre-amendment codec wrote it — pinned here
+    /// by hand from the canonical encoding, not produced by the code under
+    /// test — decodes and re-encodes to the same bytes, alone and inside its
+    /// stored op through a snapshot reload; a first binding record's envelope
+    /// still says seq 0, lamport 0.
+    #[test]
+    fn a_stored_binding_decl_round_trips_byte_identically() {
+        let pinned = "a601666772617a656c02687465726d2e6c6f6703636c6f67046573686172650567636f6d6d6f6e73066b66726f6d5f637572736f72";
+        let payload: Vec<u8> =
+            (0..pinned.len()).step_by(2).map(|i| u8::from_str_radix(&pinned[i..i + 2], 16).unwrap()).collect();
+        let b = BindingDecl {
+            app: "grazel".into(),
+            glade_id: "term.log".into(),
+            shape: "log".into(),
+            authority: "share".into(),
+            zone: "commons".into(),
+            retention: "from_cursor".into(),
+        };
+        assert_eq!(BindingDecl::from_cbor(&cbor::decode(&payload)), b);
+        assert_eq!(Record::Binding(b.clone()).encode(), payload);
+        let mut r = Registry::new();
+        r.append(Record::Binding(b), "n1").unwrap();
+        let snap = r.snapshot();
+        let op = Op::from_cbor(&cbor::decode(&snap.records[0]));
+        assert_eq!((op.payload.as_slice(), op.seq, op.lamport), (payload.as_slice(), 0, 0));
+        let (back, rejected) = Registry::from_snapshot(&snap);
+        assert_eq!(rejected, 0);
+        assert_eq!(back.snapshot(), snap);
     }
 
     #[test]

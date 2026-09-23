@@ -31,12 +31,21 @@ carries the same grammar and what each token means:
 ```text
 glade-app v0                                        # header, first decl line
 app grazel                                          # exactly once, first
-binding <glade_id> <shape> <authority> <zone> <retention>
+binding <glade_id> <shape> <authority> <zone> <retention> [ttl=<duration>] [shape-profile=<profile>]
 service <name> <exchange-glade-id>
 seed <principal> <share> <verb[,verb...]>
 workspace <share> <name>                            # makes declared surfaces routable
 # comments + blank lines anywhere; `#` starts a comment
 ```
+
+A binding line's tail (R11(a)) is optional `key=value` entries after its five
+tokens, in any order: `ttl=<duration>` (a whole number above zero and one unit
+of `ms`, `s`, `m`, `h` or `d`, such as `ttl=10m`, on a line whose retention is
+`ttl`) and `shape-profile=<profile>` (`text_crdt`, required on `crdt`;
+`snapshot_delta`, optional on `swmr`). An author learns the tail exists only
+from a grammar like this one: a valid five-token line is never refused, so the
+node's template, which shows the tail, never reaches an author whose line is
+right.
 
 The in-file grammar comment is carried by the three authored app files
 (`grazel/apps/grazel-app.glade`, its byte-identical twin
@@ -52,8 +61,11 @@ what registers is taut records (`BindingDecl`/`ServiceDefinition` in
 `node/ir/sysdata.taut.py`), so the cross-language contract lives in taut, not
 in this text form. A structured rendering can replace it later without
 touching anything downstream of `parse()`. Validation: unknown shape /
-authority / directive, duplicate glade id (frozen-once-shared, GQ-6), and
-missing header/app are refused with line numbers.
+authority / directive, duplicate glade id (frozen-once-shared, GQ-6),
+missing header/app, and a malformed tail (an entry that is not `key=value` or
+stands where a positional token goes, an unknown or repeated key, a bad
+duration or profile, `ttl=` without the retention `ttl`, a profile that does
+not fit the shape, `crdt` without one) are refused with line numbers.
 
 `BindingDecl` is app-static: no share/key in the record — the ServeClaim
 selects the node. The author writes the zone (the binding line's `<zone>` token,
@@ -62,7 +74,10 @@ which has no default), and a mount does not override it: on the grip-share path
 and the manifest's surface spec is only a fallback; on the glial path the
 mount's zone fill enters only a local instance key and never reaches the wire
 (GladeDeclSurface, `Domain` / `Zone`). shape / authority / zone / retention ride
-as STRINGS so the record evolves additively.
+as STRINGS so the record evolves additively. The tail is parse data and rides
+no record: a new `BindingDecl` field would change the bytes of every stored
+binding record, so a key that must reach a consumer takes a record kind of its
+own, keyed by glade id (the contract's `ShapeProfileDecl`).
 
 ## Registration (s-app-register RL/RC)
 
@@ -70,30 +85,33 @@ as STRINGS so the record evolves additively.
 ordinary home-share record on `dir.bindings` / `dir.services`, and COMPILES
 each seed to a `CapabilityGrant` on `dir.grants` — the same record kind
 s-grant appends by hand, under the REGISTRANT's chain. Idempotence is by DIFF:
-a record whose (glade_id, payload bytes) already exist in the fold is skipped,
+a record whose (glade_id, payload bytes) already exist in the fold is skipped
+(a binding: against the live fold, per `(app, glade_id)`, below),
 so re-loading appends nothing and can never clobber a later runtime revocation
 (`reregistration_cannot_clobber_a_runtime_revocation` is the regression).
 Nothing in base glade names grazel; the loader registers any app
 (`registration_appends_ordinary_attributed_records` uses a non-grazel app).
 
-**Changed and deleted lines (R9, ruled 2026-09-23; lands with plan Step 2.5).**
-The diff is the whole of today's rule, and it does not say which record is live:
-a changed binding line appends a second `BindingDecl` for the same glade id
-beside the first, nothing folds `dir.bindings` (its one production reader,
-`declared_exchange` in `node/src/exchange.rs`, asks only whether any record
-matches), and a deleted line retracts nothing. R9 (b2) + (a) replaces that in
-one node change: `parse()` normalises `from-cursor` to `from_cursor` on the way
-into the record, so the store holds the contract's spelling whichever spelling
-the file uses; `dir.bindings` is folded by `glade_id`, newest wins; and
-`register` diffs the parsed file against the fold per `(app, glade_id)`,
-appending a `BindingRetraction` for each binding the file's `app` registered
-before and no longer declares. So a file not loaded on a boot retracts nothing
-(gyld's surfaces stay declared while grazel's gyld leg is off), and a
-declaration made by a different app file is never in scope. R9 governs
-`dir.bindings` only: deleting a `service` or `workspace` line retracts nothing,
-so a retired exchange stays routable, and `seed`'s remove half is a runtime
-revocation (item 4 below). `glade/docs/AppFileFormat.md` states the same rule
-for authors.
+**Changed and deleted lines (R9 (b2) + (a), ruled 2026-09-23).** `parse()`
+normalises `from-cursor` to `from_cursor` on the way into the record, so the
+store holds the contract's spelling whichever spelling the file uses.
+`dir.bindings` is folded by `glade_id`, newest wins (`BindingFold` in
+`node/src/registry.rs`, read by `RegistryApi::bindings_of` and by
+`declared_exchange` in `node/src/exchange.rs`), and `register` diffs the
+parsed file's bindings against that fold per `(app, glade_id)`: a changed line
+appends its new `BindingDecl`, and each binding the file's `app` registered
+before and no longer declares gets a `BindingRetraction` on
+`dir.binding-retractions`. "Newest" is the highest `(lamport, origin)` across
+both streams, which the registry keeps as one lamport clock over the two, so a
+line put back after a retraction declares its surface again; and a retraction
+takes down only its own app's declaration. So a file not loaded on a boot
+retracts nothing (gyld's surfaces stay declared while grazel's gyld leg is
+off), and a declaration made by a different app file is never in scope. R9
+governs `dir.bindings` only: deleting a `service` or `workspace` line retracts
+nothing, so a retired exchange stays routable, and `seed`'s remove half is a
+runtime revocation (item 4 below). A client that folds `dir.bindings` itself
+must fold `dir.binding-retractions` with it the same way; none does yet.
+`glade/docs/AppFileFormat.md` states the same rule for authors.
 
 ## Resolved ambiguities (smallest reasonable call)
 

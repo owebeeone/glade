@@ -16,7 +16,11 @@
 glade-app v0
 app grazel
 
-# binding <glade_id> <shape> <authority> <zone> <retention>
+# binding <glade_id> <shape> <authority> <zone> <retention> [ttl=<duration>] [shape-profile=<profile>]
+# The key=value tail after the five tokens is optional: `ttl=10m` goes with the
+# retention `ttl`, and a `crdt` line needs `shape-profile=text_crdt`. A valid
+# five-token line is never refused, so no error will show you the tail: it is
+# written down here and in glade/docs/AppFileFormat.md.
 # App-static surfaces: no share/key here — the ServeClaim selects the node.
 # You write the zone; a mount does not override it (glade/docs/AppFileFormat.md).
 binding ws.tree   value share commons latest

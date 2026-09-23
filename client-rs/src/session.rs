@@ -24,7 +24,7 @@ pub fn shape_of(shape: &str) -> io::Result<Shape> {
         "crdt" => Ok(Shape::Crdt),
         other => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("unsupported Glade op shape {other:?}; supported: value, log, swmr"),
+            format!("unsupported Glade op shape {other:?}; supported: value, log, swmr, crdt"),
         )),
     }
 }
@@ -276,6 +276,8 @@ mod tests {
             let err = shape_of(shape).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
             assert!(err.to_string().contains(shape));
+            // the supported list names every shape `shape_of` accepts (A7).
+            assert!(err.to_string().ends_with("supported: value, log, swmr, crdt"), "{err}");
         }
         assert_eq!(shape_of("value").unwrap(), Shape::Value);
         assert_eq!(shape_of("log").unwrap(), Shape::Log);

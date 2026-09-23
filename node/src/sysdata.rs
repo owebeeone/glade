@@ -148,6 +148,26 @@ impl BindingDecl {
 }
 
 #[derive(Clone, Debug, PartialEq, Default)]
+pub struct BindingRetraction {
+    pub app: String,
+    pub glade_id: String,
+}
+impl BindingRetraction {
+    pub fn to_cbor(&self) -> Cbor {
+        Cbor::Map(vec![
+            (1, Cbor::Text(self.app.clone())),
+            (2, Cbor::Text(self.glade_id.clone())),
+        ])
+    }
+    pub fn from_cbor(c: &Cbor) -> Self {
+        Self {
+            app: c.get(1).text(),
+            glade_id: c.get(2).text(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Default)]
 pub struct ServiceDefinition {
     pub app: String,
     pub name: String,

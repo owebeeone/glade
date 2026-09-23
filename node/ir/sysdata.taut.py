@@ -72,9 +72,18 @@ SCHEMA = schema(
     # knowing any app; grazel is just the first contributor.
     #
     # A declared binding surface (glade-decl vocabulary, GladeDeclSurface.md):
-    # app-static — no share/key here; the ServeClaim selects the node and the
-    # mount fills domain/zone/key. shape/authority/zone/retention ride as
-    # strings (data, not enums) so the record evolves additively.
+    # app-static — no share/key here; the ServeClaim selects the node. The
+    # author writes the zone (the binding line's token 4, which has no
+    # default), and a mount does not override it (glade/docs/AppFileFormat.md).
+    # shape/authority/zone/retention ride as strings (data, not enums) so the
+    # record evolves additively; the retention is stored in the contract's
+    # spelling (a file's `from-cursor` is stored `from_cursor`, R9(b2)).
+    #
+    # `app` (field 1) is the owning app, from the file's `app` line:
+    # BindingDecl.app ≡ the contract's former AdvertisementRecord.package,
+    # held out of contract v1 until GDL-029 (row 33). This record is
+    # structurally that AdvertisementRecord minus grip_key, not glade-decl's
+    # BindingDecl.
     Msg("BindingDecl",
         F("app", 1, STR),
         F("glade_id", 2, STR),
@@ -82,6 +91,18 @@ SCHEMA = schema(
         F("authority", 4, STR),
         F("zone", 5, STR),
         F("retention", 6, STR)),
+
+    # A binding retraction (R9(a)): the app file naming `app` declared a
+    # binding for `glade_id` and no longer does. Registration appends one per
+    # such surface, diffing a file against the dir.bindings fold per
+    # (app, glade_id) and only for the app that file names: a file not loaded
+    # retracts nothing, and another app's declaration is never in scope. It
+    # rides its own stream (dir.binding-retractions) and folds with
+    # dir.bindings, newest by (lamport, origin) winning, so a later
+    # declaration of the surface revives it.
+    Msg("BindingRetraction",
+        F("app", 1, STR),
+        F("glade_id", 2, STR)),
 
     # A declared service: the authority provider an app attaches, named with
     # the EXCHANGE glade id it answers (directed frames route to it — never a

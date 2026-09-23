@@ -1,3 +1,8 @@
+# SUPERSEDED: this sketch is superseded by the `glade-decl` contract repository
+# (a glade-wz member; its schema is glade-decl/ir/glade_decl.taut.py, rendered
+# by glade-decl-rs, -ts and -py). Kept for history only: nothing builds from it,
+# and where the two differ, the contract is the answer.
+#
 # glade-decl: the declaration surface as a taut schema (SKELETON).
 # Design: glial-dev/dev-docs/glade/GladeDeclSurface.md (GDL-035).
 # Rule: declaration ONLY — if a field needs a network or a store to mean

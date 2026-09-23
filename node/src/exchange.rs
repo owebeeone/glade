@@ -3,9 +3,10 @@
 //! an EXCHANGE must reach the claim-holding authority. The replica answers
 //! "what is"; only the authority answers "do".
 //!
-//! An exchange surface is DECLARED data: a `dir.services` record, or a
-//! `dir.bindings` record with shape `exchange` (both registered from an
-//! `<app>.glade` file — `appdecl.rs`). An authority provider session attaches
+//! An exchange surface is DECLARED data: a `dir.services` record, or a live
+//! `dir.bindings` declaration with shape `exchange` — live by the binding fold
+//! (R9(a): newest wins, a retraction takes it down) — both registered from an
+//! `<app>.glade` file (`appdecl.rs`). An authority provider session attaches
 //! by SUBSCRIBE-ing to the declared `(share, glade_id)`; the node routes each
 //! `ExchangeReq` by the same C2 decision a subscribe gets (local provider /
 //! forward to the claim holder / absent), 1:1 by correlation id, never folded,
@@ -26,11 +27,11 @@ use crate::echo::Echo;
 use crate::frame::Frame;
 use crate::mesh::{route_subscribe, Route};
 use crate::peer::{read_frame, write_frame};
-use crate::registry::{G_BINDINGS, G_SERVICES, HOME};
+use crate::registry::{BindingFold, G_BINDINGS, G_BINDING_RETRACTIONS, G_SERVICES, HOME};
 use crate::router::SessionId;
 use crate::server::{send, Shared};
 use crate::store::Store;
-use crate::sysdata::{BindingDecl, ServiceDefinition, WorkspaceCreateReq};
+use crate::sysdata::{ServiceDefinition, WorkspaceCreateReq};
 
 /// The reserved built-in create surface (s-create D1–D3, audit F2): a system
 /// glade id the NODE answers itself, never a supplier — creation precedes
@@ -59,6 +60,8 @@ fn res_err(corr: &str, error: &str) -> Frame {
 
 /// Is `glade_id` a DECLARED exchange surface? A fold over the registered app
 /// declarations in the local replica — base glade reads records, not apps.
+/// `dir.bindings` is read through the binding fold, so only a LIVE
+/// declaration counts: a superseded or retracted one keeps nothing routable.
 pub fn declared_exchange(store: &Store, glade_id: &str) -> bool {
     for (origin, _) in store.heads(HOME, G_SERVICES, &[]) {
         for op in store.scan(HOME, G_SERVICES, &[], &origin, i64::MIN) {
@@ -67,15 +70,13 @@ pub fn declared_exchange(store: &Store, glade_id: &str) -> bool {
             }
         }
     }
-    for (origin, _) in store.heads(HOME, G_BINDINGS, &[]) {
-        for op in store.scan(HOME, G_BINDINGS, &[], &origin, i64::MIN) {
-            let b = BindingDecl::from_cbor(&glade_wire::cbor::decode(&op.payload));
-            if b.glade_id == glade_id && b.shape == "exchange" {
-                return true;
-            }
+    let mut family = Vec::new();
+    for stream in [G_BINDINGS, G_BINDING_RETRACTIONS] {
+        for (origin, _) in store.heads(HOME, stream, &[]) {
+            family.extend(store.scan(HOME, stream, &[], &origin, i64::MIN));
         }
     }
-    false
+    BindingFold::over(&family).live().iter().any(|b| b.glade_id == glade_id && b.shape == "exchange")
 }
 
 /// An authority provider attaches: a SUBSCRIBE to a declared exchange surface
@@ -270,7 +271,7 @@ mod tests {
     use crate::iroh_carrier::PeerEndpoint;
     use crate::registry::{Record, Registry, RegistryApi, G_BINDINGS, G_GRANTS};
     use crate::server::Server;
-    use crate::sysdata::{CapabilityGrant, ServeClaim};
+    use crate::sysdata::{BindingDecl, BindingRetraction, CapabilityGrant, ServeClaim};
     use crate::sysdir::{boot_at, now_ms};
     use crate::ws;
     use glade_wire::generated::{Op, Ops, Shape, Subscribe};
@@ -391,6 +392,44 @@ mod tests {
             }
             other => panic!("expected echoed ExchangeRes, got {other:?}"),
         }
+    }
+
+    /// The served store holding a registry's records, as `seed_registry` lands them.
+    fn store_of(reg: &Registry, name: &str) -> Store {
+        let mut st = Store::open(fresh(name)).unwrap();
+        for bytes in &reg.snapshot().records {
+            st.append(Op::from_cbor(&glade_wire::cbor::decode(bytes))).unwrap();
+        }
+        st
+    }
+
+    fn binding(app: &str, glade_id: &str, shape: &str) -> Record {
+        Record::Binding(BindingDecl {
+            app: app.into(),
+            glade_id: glade_id.into(),
+            shape: shape.into(),
+            authority: "share".into(),
+            zone: "commons".into(),
+            retention: "latest".into(),
+        })
+    }
+
+    /// R9(a): `declared_exchange` reads `dir.bindings` through the fold, not
+    /// through `any()`. A stale `exchange` declaration superseded by a newer
+    /// one for the same surface no longer keeps a retired exchange routable,
+    /// and a newer `exchange` declaration makes it routable again.
+    #[test]
+    fn a_declared_exchange_binding_is_read_through_the_fold() {
+        let mut reg = Registry::new();
+        reg.append(binding("demo", "d.x", "exchange"), "n1").unwrap();
+        assert!(declared_exchange(&store_of(&reg, "fold-1"), "d.x"));
+        reg.append(binding("demo", "d.x", "value"), "n1").unwrap();
+        assert!(!declared_exchange(&store_of(&reg, "fold-2"), "d.x"), "the newest declaration is not an exchange");
+        reg.append(binding("demo", "d.x", "exchange"), "n1").unwrap();
+        assert!(declared_exchange(&store_of(&reg, "fold-3"), "d.x"));
+        let retract = BindingRetraction { app: "demo".into(), glade_id: "d.x".into() };
+        reg.append(Record::Retract(retract), "n1").unwrap();
+        assert!(!declared_exchange(&store_of(&reg, "fold-4"), "d.x"), "a newest retraction takes it down");
     }
 
     fn tree_op(seq: i64, prev: Option<Vec<u8>>, payload: &[u8]) -> Op {
