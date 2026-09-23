@@ -10,7 +10,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "glade-carrier-api"
+version = "0.0.0"
+
+[[package]]
+name = "glade-clock-api"
+version = "0.0.0"
+
+[[package]]
 name = "glade-decl"
+version = "0.0.0"
+
+[[package]]
+name = "glade-grant-api"
 version = "0.0.0"
 
 [[package]]
@@ -23,6 +35,10 @@ version = "0.0.0"
 
 [[package]]
 name = "glade-persistence-api"
+version = "0.0.0"
+
+[[package]]
+name = "glade-signer-api"
 version = "0.0.0"
 
 [[package]]

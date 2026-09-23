@@ -7,12 +7,12 @@ if [ "${1:-}" = "--list" ]; then
     shift
 fi
 if [ "$#" -gt 1 ]; then
-    echo "usage: check.sh [--list] [all|binding|invocation|subscription|sync|lifecycle|persistence]" >&2
+    echo "usage: check.sh [--list] [all|binding|invocation|subscription|sync|lifecycle|persistence|carrier|clock|grant|signer]" >&2
     exit 2
 fi
 case "${1:-all}" in
-    all) packages="glade-binding-api glade-invocation-api glade-subscription-api glade-sync-api glade-lifecycle-api glade-persistence-api" ;;
-    binding|invocation|subscription|sync|lifecycle|persistence) packages="glade-$1-api" ;;
+    all) packages="glade-binding-api glade-invocation-api glade-subscription-api glade-sync-api glade-lifecycle-api glade-persistence-api glade-carrier-api glade-clock-api glade-grant-api glade-signer-api" ;;
+    binding|invocation|subscription|sync|lifecycle|persistence|carrier|clock|grant|signer) packages="glade-$1-api" ;;
     *) echo "Unknown contract selector: $1" >&2; exit 2 ;;
 esac
 if [ "$list_only" = true ]; then

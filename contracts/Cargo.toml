@@ -1,5 +1,5 @@
 [workspace]
-members = ["persistence-api", "binding-api", "invocation-api", "subscription-api", "sync-api", "lifecycle-api"]
+members = ["persistence-api", "binding-api", "invocation-api", "subscription-api", "sync-api", "lifecycle-api", "carrier-api", "clock-api", "grant-api", "signer-api"]
 resolver = "3"
 
 [workspace.package]

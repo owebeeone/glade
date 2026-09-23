@@ -36,6 +36,30 @@
       "dependencies": [],
       "traits": { "SnapshotStore": ["load", "compare_exchange"] },
       "conformance_tests": ["public_contract"]
+    },
+    "glade-carrier-api": {
+      "role": "contract",
+      "dependencies": [],
+      "traits": { "CarrierPort": ["bind", "dial", "accept", "close"], "CarrierLink": ["send", "recv", "close"] },
+      "conformance_tests": ["public_contract"]
+    },
+    "glade-clock-api": {
+      "role": "contract",
+      "dependencies": [],
+      "traits": { "ClockPort": ["now_ms"] },
+      "conformance_tests": ["public_contract"]
+    },
+    "glade-grant-api": {
+      "role": "contract",
+      "dependencies": [],
+      "traits": { "GrantPort": ["check"] },
+      "conformance_tests": ["public_contract"]
+    },
+    "glade-signer-api": {
+      "role": "contract",
+      "dependencies": [],
+      "traits": { "SignerPort": ["node_id", "sign", "verify"] },
+      "conformance_tests": ["public_contract"]
     }
   }
 }

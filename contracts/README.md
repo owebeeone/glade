@@ -2,9 +2,10 @@
 
 This independent Cargo workspace adds contracts alongside the working node/client,
 not inside discovery. It does not replace or link into the demo. It now contains
-six draft contracts: binding, invocation, subscription, replica synchronization,
-resource lifecycle and persistence. These are a first reviewable boundary layer,
-not a complete stable Glade SDK or working implementation.
+ten draft contracts: binding, invocation, subscription, replica synchronization,
+resource lifecycle and persistence, plus the four assembly ports below (carrier,
+clock, grant, signer). These are a first reviewable boundary layer, not a complete
+stable Glade SDK or working implementation.
 
 The five new contracts, test IDs, review disposition, dependency rationale and
 remaining adapter obligations are recorded in
@@ -39,12 +40,44 @@ MUST also test concurrent handles, interrupted writes, pending-future cancellati
 capacity limits and recovery after known failure. Caller schema/authenticity checks
 remain outside the storage port. There are no current production consumers.
 
+## Assembly ports (first-slice plan Step 3.1)
+
+Four zero-dependency ports the node's assembly needs and did not have
+(`dev-docs/GladeFirstSlicePlan.md` Step 3.1). Each is `Send + Sync`, names no `Any`,
+and bridges onto an injector with `impl<T: Port + 'static> Facade for T {}`: each
+trait's doctests compile that bridge against a local copy of `shaku::Interface` and
+show the witness's form failing (E0310; rustdoc checks the code only on nightly).
+
+- `glade-carrier-api`: `CarrierPort` (bind, dial, accept, close) and `CarrierLink`
+  (send, recv, close), from the async witness. CA-001 framing and order, CA-002 the
+  frame limit both ways, CA-003 lazy futures and a cancel-safe `recv`, CA-004 close
+  by value: the address re-binds while a clone of the port and a link survive.
+- `glade-clock-api`: `ClockPort::now_ms`, wall-clock epoch milliseconds. CL-001 one
+  instant behind every handle, CL-002 unit and epoch.
+- `glade-grant-api`: `GrantPort::check`, the `grants_for` question as one decision.
+  GR-001 exact match, GR-002 revocation wins in either fold order, GR-003 an
+  unreadable fold is `Unavailable`.
+- `glade-signer-api`: `SignerPort` (node_id, sign, verify) for the HELLO, origin-op
+  and local-overlay seams. SI-001 round trip, SI-002 bytes, purpose and signer
+  binding with an unknown key `Unavailable`, SI-003 unavailable key material. It
+  follows the discovery `Signer`/`Verifier` outcomes without depending on them.
+
+Each suite passes on a volatile fixture and fails, naming its requirement, on
+deliberately wrong ones. The fixtures (a fake network, an atomic clock, an in-memory
+fold, a keyed checksum) are not transports, time sources, registries or cryptography.
+Real adapters MUST add I/O, partial-frame, backpressure, fault, algorithm-vector and
+key-resolution tests.
+
 ## Fast checks and gate scope
 
-From the GWZ root: `sh glade/contracts/check.sh` runs all six contract packages.
-Pass `binding`, `invocation`, `subscription`, `sync`, `lifecycle`, or `persistence`
-for one package. `sh glade/contracts/test-selection.sh` verifies those selections.
+From the GWZ root: `sh glade/contracts/check.sh` runs all ten contract packages.
+Pass `binding`, `invocation`, `subscription`, `sync`, `lifecycle`, `persistence`,
+`carrier`, `clock`, `grant` or `signer` for one package.
+`sh glade/contracts/test-selection.sh` verifies those selections.
 All selections include the local architecture gate and enable conformance tests.
+`sh glade/contracts/arch002-fixture.sh` injects `shaku` into each contract crate in
+turn, on a temporary copy, and requires the gate to refuse each with ARCH-002; it
+is a separate command, not part of `check.sh`.
 There are no concrete consumers yet; future contract changes MUST also test their
 affected consumers, not just the selected interface package.
 
