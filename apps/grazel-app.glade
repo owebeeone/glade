@@ -13,7 +13,7 @@
 # single shared source is factored out (future dedup item).
 #
 # Executable spec: ggg-viz s-app-register.
-glade-app v0
+glade-app v1
 app grazel
 
 # binding <glade_id> <shape> <authority> <zone> <retention> [ttl=<duration>] [shape-profile=<profile>]

@@ -13,7 +13,7 @@
 //! `dev-docs/GladeGrazelAttachNotes.md` for the choice):
 //!
 //! ```text
-//! glade-app v0                 # version header, first declaration line
+//! glade-app v1                 # version header, first declaration line (v0: the old language, warned)
 //! app <name>                   # exactly once, before any declaration
 //! binding <glade_id> <shape> <authority> <zone> <retention> [ttl=<duration>] [shape-profile=<profile>]
 //! service <name> <exchange-glade-id>
@@ -798,20 +798,23 @@ mod tests {
         assert_eq!(reg.snapshot(), snap, "no record moved");
     }
 
-    /// The shipped file, headed `glade-app v0` until Step 2.7, loads with one
-    /// warning: its header's, on line 16, naming the header to write. Headed
-    /// `v1`, it loads with none, because every zone and retention in it is
-    /// one `v1` accepts. (Step 2.3 asserted no warning under either header;
-    /// Step 2.6 adds the `v0` header's, deliberately.)
+    /// The shipped file, headed `glade-app v1` since Step 2.7, loads with no
+    /// warning, because every zone and retention in it is one `v1` accepts.
+    /// Headed `glade-app v0`, as it was until Step 2.7, it loads with one
+    /// warning: its header's, on line 16, naming the header to write. (Step
+    /// 2.3 asserted no warning under either header; Step 2.6 added the `v0`
+    /// header's, deliberately; Step 2.7 moved the file to `v1`.)
     #[test]
-    fn the_shipped_file_warns_only_of_its_v0_header() {
+    fn the_shipped_file_loads_with_no_warning() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../apps/grazel-app.glade");
+        let decl = load(path).unwrap();
+        assert_eq!(decl.version, AppFileVersion::V1);
+        assert_eq!(decl.warnings, Vec::<String>::new());
+        let v0 = parse(&grazel_file_headed("glade-app v0")).unwrap();
         assert_eq!(
-            load(path).unwrap().warnings,
+            v0.warnings,
             ["line 16: header `glade-app v0` names the old language; write `glade-app v1`"]
         );
-        let v1 = parse(&grazel_file_headed("glade-app v1")).unwrap();
-        assert_eq!(v1.warnings, Vec::<String>::new());
     }
 
     /// The boundary prints each warning prefixed with the file's path, as

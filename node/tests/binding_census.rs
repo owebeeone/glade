@@ -14,7 +14,7 @@
 
 use std::path::PathBuf;
 
-use glade_node::appdecl::{parse, register, AppDecl, Registered};
+use glade_node::appdecl::{parse, register, AppDecl, AppFileVersion, Registered};
 use glade_node::registry::{BindingFold, Registry, RegistryApi, G_BINDING_RETRACTIONS};
 use glade_node::sysdata::BindingDecl;
 use glade_wire::cbor;
@@ -68,6 +68,8 @@ fn records(decl: &AppDecl) -> usize {
 /// Undo plan Step 2.4's one token edit (grazel 05553b4, glade 7bd5f9d):
 /// `term.log`'s retention back from `from-cursor` to `windowed`. Returns the
 /// text and the number of lines changed; no other census line moved in 2.4.
+/// It also puts back `glade-app v0`, the header the text had then, which Step
+/// 2.7 moved to `v1`; that line is not counted, being no census line.
 fn before_step_2_4(text: &str) -> (String, usize) {
     let mut changed = 0;
     let lines: Vec<String> = text
@@ -77,6 +79,8 @@ fn before_step_2_4(text: &str) -> (String, usize) {
             if toks == ["binding", "term.log", "log", "share", "commons", "from-cursor"] {
                 changed += 1;
                 line.replacen("from-cursor", "windowed", 1)
+            } else if toks == ["glade-app", "v1"] {
+                "glade-app v0".to_string()
             } else {
                 line.to_string()
             }
@@ -92,9 +96,13 @@ fn before_step_2_4(text: &str) -> (String, usize) {
 /// first four raw and rewrites only the retention (R9(b2)), so the text is
 /// parsed with it and each binding's retention reset to its own line's raw
 /// token; all five fields are then checked against the raw tokens, so the
-/// rebuild cannot drift unnoticed.
+/// rebuild cannot drift unnoticed. The text is headed `glade-app v0`, as it
+/// was before Step 2.4: today's parser never refuses a `v0` file for a
+/// retention, so this parse of `windowed` holds on both sides of the next
+/// release's flip, which refuses it in a `v1` file.
 fn pre_amendment(text: &str) -> AppDecl {
     let mut decl = parse(text).unwrap();
+    assert_eq!(decl.version, AppFileVersion::V0, "the text as it was before Step 2.4");
     let lines: Vec<Vec<&str>> = text
         .lines()
         .map(|line| line.split('#').next().unwrap_or("").split_whitespace().collect::<Vec<&str>>())

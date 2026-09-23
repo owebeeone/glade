@@ -1,10 +1,10 @@
-//! Plan Step 2.6's done-when (`dev-docs/GladeFirstSlicePlan.md` at the
+//! Plan Step 2.7's done-when (`dev-docs/GladeFirstSlicePlan.md` at the
 //! glade-wz root), over the five app files of the reconciliation document's
 //! census (`dev-docs/glade/GladeDeclReconciliation.md`, §4.4 bullet 6): every
-//! shipped file loads with no warning except its `glade-app v0` header's,
-//! which names the header to write. Headed `glade-app v1`, as plan Step 2.7
-//! will head it, each loads with none, because every zone and retention in it
-//! is one `v1` accepts.
+//! shipped file is headed `glade-app v1` and loads with no warning, because
+//! every zone and retention in it is one `v1` accepts. Headed `glade-app v0`,
+//! as each was until Step 2.7, the same declarations load with one warning,
+//! the header's, which names the header to write (Step 2.6's done-when).
 //!
 //! Where the files are, as in `binding_census.rs`: one census file lives in
 //! this repository and four in sibling repositories of the glade-wz
@@ -40,8 +40,8 @@ fn header_at(text: &str) -> usize {
     at.expect("a header line") + 1
 }
 
-/// `text` with its header line replaced by `header`: the edit plan Step 2.7
-/// makes to each file.
+/// `text` with its header line replaced by `header`: with `glade-app v0`, the
+/// edit plan Step 2.7 made to each file, undone.
 fn headed(text: &str, header: &str) -> String {
     let at = header_at(text);
     let lines: Vec<&str> = text
@@ -59,7 +59,7 @@ fn headed(text: &str, header: &str) -> String {
 }
 
 #[test]
-fn every_shipped_file_loads_with_only_its_v0_header_warning() {
+fn every_shipped_file_loads_with_no_warning() {
     let missing: Vec<String> =
         SHIPPED.iter().map(|rel| path(rel)).filter(|p| !p.is_file()).map(|p| p.display().to_string()).collect();
     assert!(
@@ -73,18 +73,19 @@ fn every_shipped_file_loads_with_only_its_v0_header_warning() {
         let text = std::fs::read_to_string(&file).unwrap();
         let at = header_at(&text);
 
-        // As the node loads it: the one warning is the header's, on its line.
+        // As the node loads it: headed `glade-app v1`, with no warning,
         let decl = load(&file).unwrap();
-        assert_eq!(decl.version, AppFileVersion::V0, "{rel}");
-        let warning = format!("line {at}: header `glade-app v0` names the old language; write `glade-app v1`");
-        assert_eq!(decl.warnings, [warning.clone()], "{rel}");
-        // and as the node prints it to stderr (grazel forwards it as `[node] …`)
-        assert_eq!(decl.warning_lines(&file), [format!("{}: warning: {warning}", file.display())], "{rel}");
+        assert_eq!(decl.version, AppFileVersion::V1, "{rel}");
+        assert_eq!(decl.warnings, Vec::<String>::new(), "{rel}");
+        // so the node prints none to stderr (grazel forwards it as `[node] …`).
+        assert_eq!(decl.warning_lines(&file), Vec::<String>::new(), "{rel}");
 
-        // Headed `glade-app v1`, the same declarations load with no warning.
-        let v1 = parse(&headed(&text, "glade-app v1")).unwrap();
-        assert_eq!(v1.version, AppFileVersion::V1, "{rel}");
-        assert_eq!(v1.warnings, Vec::<String>::new(), "{rel}");
-        assert_eq!(v1.bindings, decl.bindings, "{rel}: the header moves no declaration");
+        // Headed `glade-app v0`, the same declarations load with one warning:
+        // the header's, on its line.
+        let v0 = parse(&headed(&text, "glade-app v0")).unwrap();
+        assert_eq!(v0.version, AppFileVersion::V0, "{rel}");
+        let warning = format!("line {at}: header `glade-app v0` names the old language; write `glade-app v1`");
+        assert_eq!(v0.warnings, [warning], "{rel}");
+        assert_eq!(v0.bindings, decl.bindings, "{rel}: the header moves no declaration");
     }
 }

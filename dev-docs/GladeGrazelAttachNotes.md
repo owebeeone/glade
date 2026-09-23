@@ -29,7 +29,7 @@ format is [`glade/docs/AppFileFormat.md`](../docs/AppFileFormat.md), which
 carries the same grammar and what each token means:
 
 ```text
-glade-app v0                                        # header, first decl line
+glade-app v1                                        # header, first decl line
 app grazel                                          # exactly once, first
 binding <glade_id> <shape> <authority> <zone> <retention> [ttl=<duration>] [shape-profile=<profile>]
 service <name> <exchange-glade-id>

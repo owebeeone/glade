@@ -23,7 +23,7 @@ The page describes the format as today's node accepts it.
 
 ```text
 # A small notes app.
-glade-app v0
+glade-app v1
 app notes
 
 binding notes.list    value share commons latest
@@ -47,7 +47,7 @@ example, with comments.
 ## Grammar
 
 ```text
-glade-app v0                # the header
+glade-app v1                # the header
 app <name>                  # exactly once, before any other declaration
 binding <glade_id> <shape> <authority> <zone> <retention> [ttl=<duration>] [shape-profile=<profile>]
 service <name> <exchange-glade-id>
@@ -62,7 +62,8 @@ workspace <share> <name>
   the comment runs to the end of the line. A token therefore cannot contain
   `#`. Blank lines are ignored.
 - The first line that is not blank or a comment is the header: write
-  `glade-app v0`.
+  `glade-app v1`. `glade-app v0` names the old language: a file headed with it
+  still loads, with a warning that names the header to write.
 - `app <name>` comes next, exactly once. Every `binding` and `service` record
   the file registers carries this name.
 - Every directive takes exactly the tokens shown, and none has a default, so a
@@ -184,14 +185,15 @@ token goes. No zone is assumed.
 declared zone, and falls back to its manifest's zone only for a declaration that
 has none. On the glial path the mount's zone fill never reaches the wire.
 
-**Checking.** In a file headed `glade-app v1`, the node checks the zone: any
-value other than `commons` or `private` is reported with its line number and
-the two values. In this release the report is a warning, and the node stores
-the zone as written and starts. From the next release it refuses the file. A
-file headed `glade-app v0` loads as it always did, with a warning that its
-header names the old language and that you should write `glade-app v1`, plus a
-warning for each zone `glade-app v1` does not accept. A `glade-app v0` file is
-never refused for its zone.
+**Checking.** The node checks the zone in a file headed `glade-app v1`, the
+header to write: any value other than `commons` or `private` is reported with
+its line number and the two values. In this release the report is a warning,
+and the node stores the zone as written and starts. From the next release it
+refuses the file. A file headed `glade-app v0`, the old language, still loads
+as it always did, with a warning that its header names the old language and
+that you should write `glade-app v1`, plus a warning for each zone
+`glade-app v1` does not accept. A `glade-app v0` file is never refused for its
+zone.
 
 ## The retention
 
@@ -241,14 +243,15 @@ underscore in a file.
 or expires a surface by its retention today, whatever duration `ttl=` names.
 Write the value that says how the surface is read.
 
-**Checking.** In a file headed `glade-app v1`, the node checks the retention
-against the three values above, spelled as they are here. Any other value is
-reported with its line number: `windowed` and `from_cursor` are each told to
-write `from-cursor`, and any other value is told the three. In this release the
-report is a warning, and the node stores the retention as before (`from-cursor`
-as `from_cursor`, anything else as written) and starts. From the next release
-it refuses the file. A file headed `glade-app v0` loads as it always did, with
-the header's warning and, for each retention `glade-app v1` does not accept, a
+**Checking.** The node checks the retention in a file headed `glade-app v1`,
+the header to write: it must be one of the three values above, spelled as they
+are here. Any other value is reported with its line number: `windowed` and
+`from_cursor` are each told to write `from-cursor`, and any other value is told
+the three. In this release the report is a warning, and the node stores the
+retention as before (`from-cursor` as `from_cursor`, anything else as written)
+and starts. From the next release it refuses the file. A file headed
+`glade-app v0`, the old language, still loads as it always did, with the
+header's warning and, for each retention `glade-app v1` does not accept, a
 warning naming what to write and `glade-app v1`, the version it changed in. A
 `glade-app v0` file is never refused for its retention.
 
