@@ -47,9 +47,10 @@ pub(super) fn parse(
     retention: &str,
     toks: &[&str],
 ) -> Result<Option<BindingTail>, String> {
-    // Shape and authority are checked against their vocabularies already; the
-    // zone and the retention are not (Step 2.6), so a tail entry that slid
-    // into either slot would otherwise pass as that token.
+    // Shape and authority are refused outside their vocabularies already; the
+    // zone and the retention are checked after the tail, and a `v0` file is
+    // never refused for them (Step 2.6), so a tail entry that slid into either
+    // slot would otherwise load as that token.
     for (slot, tok) in [("zone", zone), ("retention", retention)] {
         if tok.contains('=') {
             return Err(format!(

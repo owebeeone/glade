@@ -184,9 +184,14 @@ token goes. No zone is assumed.
 declared zone, and falls back to its manifest's zone only for a declaration that
 has none. On the glial path the mount's zone fill never reaches the wire.
 
-**Checking.** The node stores the zone exactly as written and checks it against
-no list of values, so a misspelled zone is stored without a word. Write
-`commons` or `private`.
+**Checking.** In a file headed `glade-app v1`, the node checks the zone: any
+value other than `commons` or `private` is reported with its line number and
+the two values. In this release the report is a warning, and the node stores
+the zone as written and starts. From the next release it refuses the file. A
+file headed `glade-app v0` loads as it always did, with a warning that its
+header names the old language and that you should write `glade-app v1`, plus a
+warning for each zone `glade-app v1` does not accept. A `glade-app v0` file is
+never refused for its zone.
 
 ## The retention
 
@@ -236,10 +241,16 @@ underscore in a file.
 or expires a surface by its retention today, whatever duration `ttl=` names.
 Write the value that says how the surface is read.
 
-**Checking.** The node stores `from-cursor` as `from_cursor` and every other
-retention exactly as written, and checks it against no list of values, so a
-misspelled value, or `windowed`, is stored without a word. Write one of the
-three values above.
+**Checking.** In a file headed `glade-app v1`, the node checks the retention
+against the three values above, spelled as they are here. Any other value is
+reported with its line number: `windowed` and `from_cursor` are each told to
+write `from-cursor`, and any other value is told the three. In this release the
+report is a warning, and the node stores the retention as before (`from-cursor`
+as `from_cursor`, anything else as written) and starts. From the next release
+it refuses the file. A file headed `glade-app v0` loads as it always did, with
+the header's warning and, for each retention `glade-app v1` does not accept, a
+warning naming what to write and `glade-app v1`, the version it changed in. A
+`glade-app v0` file is never refused for its retention.
 
 ## Changing or deleting a line
 

@@ -29,9 +29,15 @@
 //!
 //! The header names the file's language (R10(a)): `glade-app v0` or
 //! `glade-app v1`, recorded as [`AppDecl::version`]; any other first
-//! declaration line is refused with its line number. Nothing validates by
-//! version yet, so the two parse identically. A file that loads can still
-//! carry messages through [`AppDecl::warnings`], the non-fatal channel.
+//! declaration line is refused with its line number. `v1` is the validated
+//! grammar: a binding's zone must be `commons` or `private`, and its retention
+//! `latest`, `from-cursor` or `ttl` in the file's spelling; any other token is
+//! a line-numbered warning for one release and refuses the file from the next
+//! (the flip is `V1_TOKEN_CHECKS_REFUSE`). A `v0` file loads as it always
+//! did, warned that its header names the old language and told, for each
+//! token `v1` changes or refuses, the replacement and the version; it is never
+//! refused for them. Warnings go through [`AppDecl::warnings`], the non-fatal
+//! channel.
 //!
 //! Registration is idempotent by DIFF (the GQ-6 pinning discipline): a record
 //! whose bytes already exist in the fold is skipped, so re-loading the file
@@ -75,15 +81,48 @@ const RESERVED_SHAPES: [&str; 3] = ["message", "window", "atom"];
 /// then the optional keyword tail (R11(a)).
 const BINDING_TEMPLATE: &str =
     "binding <glade_id> <shape> <authority> <zone> <retention> [ttl=<duration>] [shape-profile=<profile>]";
-/// The retention tokens a file may not write, each with the message naming
-/// the spelling it writes instead (§4.4 bullet 7; the hyphen-only ruling of
-/// 2026-09-23). Defined here and switched on by plan Step 2.6, which reports
-/// them through [`AppDecl::warnings`]; until then a file holding either parses
-/// as before, and a file's `from_cursor` stores what `from-cursor` does.
-const REFUSED_RETENTIONS: [(&str, &str); 2] = [
-    ("windowed", "unknown retention `windowed` (removed; use `from-cursor`)"),
-    ("from_cursor", "retention `from_cursor` is the contract's spelling (use `from-cursor` in a file)"),
+/// The zones a `glade-app v1` file may write (R1(a); row 31b (ii)).
+const ZONES: [&str; 2] = ["commons", "private"];
+/// The retentions a `glade-app v1` file may write, in the file's spelling
+/// (R2(a); row 18b (ii); the hyphen-only ruling). The record stores the
+/// second as `from_cursor`.
+const RETENTIONS: [&str; 3] = ["latest", "from-cursor", "ttl"];
+/// The retention tokens a file may not write, each with what a file that
+/// writes one is told (§4.4 bullet 7; the hyphen-only ruling of 2026-09-23):
+/// in a `glade-app v1` file, Step 2.5's message naming the spelling to write
+/// instead; in a `glade-app v0` file, that replacement and the version the
+/// token changed in (R10(a)). A file's `from_cursor` still stores what
+/// `from-cursor` does.
+const REFUSED_RETENTIONS: [(&str, &str, &str); 2] = [
+    (
+        "windowed",
+        "unknown retention `windowed` (removed; use `from-cursor`)",
+        "retention `windowed` was removed in `glade-app v1` (use `from-cursor`)",
+    ),
+    (
+        "from_cursor",
+        "retention `from_cursor` is the contract's spelling (use `from-cursor` in a file)",
+        "retention `from_cursor` is written `from-cursor` in `glade-app v1` (`from_cursor` is the contract's spelling)",
+    ),
 ];
+/// What a `glade-app v0` header is told (R10(a)): the file loads as it always
+/// did, and learns the header that names the validated grammar.
+const V0_HEADER_WARNING: &str = "header `glade-app v0` names the old language; write `glade-app v1`";
+/// THE NEXT-RELEASE FLIP, for R1's row 31b (ii) and R2's row 18b (ii): "a
+/// warning for one release, a hard error at the next". `false`, this release:
+/// a `glade-app v1` file holding a zone or retention that `v1` does not accept
+/// is told so through [`AppDecl::warnings`] and loads. `true`, the next
+/// release: the first such token refuses the file, with the same line-numbered
+/// text. The flip is this one line: nothing else changes, and the tests read
+/// this constant, so they hold on both sides of it.
+///
+/// A release, here, is a new `version` in `node/Cargo.toml`. glade-node has
+/// not had one: its version is `0.0.0`, and no tag names a node release. So
+/// these warnings ship in the first release that carries this code (the first
+/// version above `0.0.0`), and the release after that one sets this to `true`.
+/// A `glade-app v0` file is never refused for its zone or retention, whatever
+/// this says (R10(a)).
+const V1_TOKEN_CHECKS_REFUSE: bool = false;
 /// The authority kinds (decl surface): the share is the source of record, or
 /// the share caches external truth.
 const AUTHORITIES: [&str; 2] = ["share", "external"];
@@ -109,9 +148,9 @@ pub struct AppDecl {
     pub seeds: Vec<CapabilityGrant>,
     pub workspaces: Vec<WorkspaceDecl>,
     /// The non-fatal channel (R10(a)): line-numbered messages about a file
-    /// that still loads. `parse` fills it; whoever loaded the file prints it
-    /// (see [`AppDecl::warning_lines`]). Nothing produces one yet: the `v0`
-    /// header's warning and the token checks arrive with validation.
+    /// that still loads. `parse` fills it in file order — a `v0` header's
+    /// warning, then each binding line's zone and retention checks — and
+    /// whoever loaded the file prints it (see [`AppDecl::warning_lines`]).
     pub warnings: Vec<String>,
 }
 
@@ -128,16 +167,20 @@ impl AppDecl {
     }
 }
 
-/// The app-file language a header names (R10(a)). Both load; validation's
-/// binding arm branches on this once `v1` is the validated grammar, and until
-/// then the two parse identically.
+/// The app-file language a header names (R10(a)). Both load and parse to the
+/// same declarations; the binding arm's zone and retention checks branch on
+/// it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AppFileVersion {
-    /// `glade-app v0`: the language as first shipped, and the default.
+    /// `glade-app v0`: the language as first shipped, and the default. It
+    /// loads as it always did, with warnings: its header names the old
+    /// language, and each zone or retention `v1` changes or refuses is told
+    /// its replacement and the version. It is never refused for them.
     #[default]
     V0,
-    /// `glade-app v1`: the validated grammar, parsed as `v0` until
-    /// validation lands.
+    /// `glade-app v1`: the validated grammar. A zone other than `commons` or
+    /// `private`, or a retention other than `latest`, `from-cursor` or `ttl`,
+    /// is a warning for one release and refuses the file from the next.
     V1,
 }
 
@@ -196,6 +239,9 @@ pub fn parse(text: &str) -> Result<AppDecl, String> {
                 ));
             };
             decl.version = version;
+            if version == AppFileVersion::V0 {
+                decl.warnings.push(format!("line {n}: {V0_HEADER_WARNING}"));
+            }
             versioned = true;
             continue;
         }
@@ -233,6 +279,22 @@ pub fn parse(text: &str) -> Result<AppDecl, String> {
                 }
                 let tail = tail::parse(n, glade_id, shape, toks[4], retention, &toks[6..])?;
                 push_glade_id(&mut glade_ids, glade_id, n)?;
+                // The zone and the retention (Step 2.6), after every refusal
+                // above, so each of those keeps its message; branched by the
+                // header (R10(a)).
+                for told in unaccepted(toks[4], retention) {
+                    match decl.version {
+                        AppFileVersion::V1 => {
+                            if V1_TOKEN_CHECKS_REFUSE {
+                                return Err(format!("line {n}: {}", told.v1));
+                            }
+                            decl.warnings.push(format!("line {n}: {}", told.v1));
+                        }
+                        AppFileVersion::V0 => {
+                            decl.warnings.push(format!("line {n}: {}", told.v0));
+                        }
+                    }
+                }
                 decl.bindings.push(BindingDecl {
                     app: decl.app.clone(),
                     glade_id: glade_id.into(),
@@ -324,10 +386,45 @@ fn stored_retention(token: &str) -> &str {
     }
 }
 
-/// The message [`REFUSED_RETENTIONS`] holds for `token`, if it is one of the
-/// tokens a file may not write. Nothing reports it until plan Step 2.6.
+/// The message a `glade-app v1` file is told for `token`, if it is one of the
+/// retention tokens a file may not write ([`REFUSED_RETENTIONS`]).
 pub fn refused_retention(token: &str) -> Option<&'static str> {
-    REFUSED_RETENTIONS.iter().find(|(t, _)| *t == token).map(|(_, message)| *message)
+    REFUSED_RETENTIONS.iter().find(|(t, _, _)| *t == token).map(|(_, v1, _)| *v1)
+}
+
+/// A zone or retention that `glade-app v1` does not accept, as a file in each
+/// language is told it.
+struct Unaccepted {
+    /// Told a `glade-app v1` file: a warning for one release, then the
+    /// refusal ([`V1_TOKEN_CHECKS_REFUSE`]).
+    v1: String,
+    /// Told a `glade-app v0` file, always as a warning: the replacement and
+    /// the version the token changed in.
+    v0: String,
+}
+
+/// The tokens of a binding line's `zone` and `retention` that `glade-app v1`
+/// does not accept, zone first; none for a line it accepts, so the file's
+/// `from-cursor` is never reported. A zone outside [`ZONES`] and a retention
+/// outside [`RETENTIONS`] are named with the legal values; `windowed` and a
+/// file's `from_cursor` take [`REFUSED_RETENTIONS`]' messages.
+fn unaccepted(zone: &str, retention: &str) -> Vec<Unaccepted> {
+    let mut out = Vec::new();
+    if !ZONES.contains(&zone) {
+        out.push(Unaccepted {
+            v1: format!("unknown zone `{zone}` (one of {ZONES:?})"),
+            v0: format!("zone `{zone}` is not in `glade-app v1` (one of {ZONES:?})"),
+        });
+    }
+    if let Some(&(_, v1, v0)) = REFUSED_RETENTIONS.iter().find(|(t, _, _)| *t == retention) {
+        out.push(Unaccepted { v1: v1.into(), v0: v0.into() });
+    } else if !RETENTIONS.contains(&retention) {
+        out.push(Unaccepted {
+            v1: format!("unknown retention `{retention}` (one of {RETENTIONS:?})"),
+            v0: format!("retention `{retention}` is not in `glade-app v1` (one of {RETENTIONS:?})"),
+        });
+    }
+    out
 }
 
 /// The headers a node reads, as a diagnostic names them.
@@ -701,19 +798,25 @@ mod tests {
         assert_eq!(reg.snapshot(), snap, "no record moved");
     }
 
-    /// The non-fatal channel exists and is empty for the shipped file under
-    /// either header: nothing produces a warning until validation (Step 2.6).
+    /// The shipped file, headed `glade-app v0` until Step 2.7, loads with one
+    /// warning: its header's, on line 16, naming the header to write. Headed
+    /// `v1`, it loads with none, because every zone and retention in it is
+    /// one `v1` accepts. (Step 2.3 asserted no warning under either header;
+    /// Step 2.6 adds the `v0` header's, deliberately.)
     #[test]
-    fn the_shipped_file_loads_with_no_warning() {
+    fn the_shipped_file_warns_only_of_its_v0_header() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../apps/grazel-app.glade");
-        assert_eq!(load(path).unwrap().warnings, Vec::<String>::new());
+        assert_eq!(
+            load(path).unwrap().warnings,
+            ["line 16: header `glade-app v0` names the old language; write `glade-app v1`"]
+        );
         let v1 = parse(&grazel_file_headed("glade-app v1")).unwrap();
         assert_eq!(v1.warnings, Vec::<String>::new());
     }
 
     /// The boundary prints each warning prefixed with the file's path, as
-    /// `load` prefixes its errors. Nothing produces a warning yet, so this one
-    /// is pushed by hand.
+    /// `load` prefixes its errors. The warning is pushed by hand, so this
+    /// does not depend on what the checks say.
     #[test]
     fn warnings_print_prefixed_with_the_file_path() {
         let mut decl = parse("glade-app v1\napp x\n").unwrap();
@@ -779,10 +882,10 @@ mod tests {
 
     /// §4.4 bullet 7 under the hyphen-only ruling: the recognised-but-refused
     /// retention tokens, each with a message naming the spelling a file
-    /// writes. DEFINED here and switched on by nothing yet — Step 2.6 reports
-    /// them — so a file holding either still parses, with no warning.
+    /// writes. Defined in Step 2.5 and switched on by Step 2.6: a `v1` file
+    /// is told exactly these messages, on the token's line.
     #[test]
-    fn refused_retentions_are_defined_but_not_switched_on() {
+    fn refused_retentions_are_defined_and_switched_on() {
         assert_eq!(
             refused_retention("windowed"),
             Some("unknown retention `windowed` (removed; use `from-cursor`)")
@@ -795,8 +898,8 @@ mod tests {
             assert_eq!(refused_retention(token), None, "{token}");
         }
         for token in ["windowed", "from_cursor"] {
-            let decl = binding_line(&format!("binding g log share commons {token}")).unwrap();
-            assert_eq!(decl.warnings, Vec::<String>::new(), "{token} is not warned yet");
+            let told = v1_reports(&v1_file(&format!("binding g log share commons {token}")));
+            assert_eq!(told, [format!("line 3: {}", refused_retention(token).unwrap())], "{token}");
         }
     }
 
@@ -926,8 +1029,9 @@ mod tests {
 
     /// R9(b2): the file writes `from-cursor` and the stored record holds the
     /// contract's `from_cursor`; a file's `from_cursor` stores the same value.
-    /// Every other token is stored as written — `windowed` included — and
-    /// nothing is validated or warned in this step (Step 2.6 does that).
+    /// Every other token is stored as written — `windowed` included. Step
+    /// 2.6's checks warn about this `v0` file (its header, `from_cursor` and
+    /// `windowed`) and change nothing that is stored.
     #[test]
     fn the_retention_is_stored_in_the_contracts_spelling() {
         let decl = parse(
@@ -941,11 +1045,230 @@ mod tests {
         .unwrap();
         let stored: Vec<&str> = decl.bindings.iter().map(|b| b.retention.as_str()).collect();
         assert_eq!(stored, ["from_cursor", "from_cursor", "latest", "ttl", "windowed"]);
-        assert_eq!(decl.warnings, Vec::<String>::new());
+        assert_eq!(decl.warnings.len(), 3, "the header, `from_cursor` and `windowed`: {:?}", decl.warnings);
         // The shipped file's five `from-cursor` lines all store the contract's spelling.
         let shipped = parse(&grazel_file()).unwrap();
         let cursor = shipped.bindings.iter().filter(|b| b.retention == "from_cursor").count();
         assert_eq!(cursor, 5);
         assert!(shipped.bindings.iter().all(|b| b.retention != "from-cursor"));
+    }
+
+    // ---- Step 2.6: the zone and retention checks (§4.7 row 7) -------------
+
+    /// The `v0` header's warning, for a header on line 1.
+    const V0_HEADER_AT_1: &str = "line 1: header `glade-app v0` names the old language; write `glade-app v1`";
+
+    /// A `v1` file holding `lines` after its `app` line; the first is line 3.
+    fn v1_file(lines: &str) -> String {
+        format!("glade-app v1\napp x\n{lines}\n")
+    }
+
+    /// What a `v1` file's zone and retention checks report for `text`, in
+    /// this build's channel: the file's warnings while
+    /// [`V1_TOKEN_CHECKS_REFUSE`] is off (this release), or the refusal they
+    /// become once it is on (the next release), which names the first
+    /// violation. A test that asserts through this holds on both sides of
+    /// the flip, so the flip stays one line.
+    fn v1_reports(text: &str) -> Vec<String> {
+        if V1_TOKEN_CHECKS_REFUSE {
+            vec![parse(text).unwrap_err()]
+        } else {
+            parse(text).unwrap().warnings
+        }
+    }
+
+    /// The warnings a `v0` file holding one binding `line`, as line 3, loads
+    /// with. A `v0` file is never refused for a zone or a retention.
+    fn v0_warnings(line: &str) -> Vec<String> {
+        binding_line(line).unwrap().warnings
+    }
+
+    /// R10(a): a `v0` header loads as before and is warned once, on its own
+    /// line, with the header to write instead. A `v1` header is not warned.
+    #[test]
+    fn a_v0_header_is_warned_naming_the_header_to_write() {
+        assert_eq!(parse("glade-app v0\napp x\n").unwrap().warnings, [V0_HEADER_AT_1]);
+        assert_eq!(
+            parse("# c\n\n  glade-app   v0  # the header\napp x\n").unwrap().warnings,
+            ["line 3: header `glade-app v0` names the old language; write `glade-app v1`"]
+        );
+        assert_eq!(parse("glade-app v1\napp x\n").unwrap().warnings, Vec::<String>::new());
+    }
+
+    /// §4.7 row 7, an unknown zone (R1, row 31b (ii)): told on its line with
+    /// the two zones. A `v0` file is also told the version the zone is not
+    /// accepted in.
+    #[test]
+    fn row7_an_unknown_zone_is_told_the_two_zones() {
+        for zone in ["shared", "Commons", "account"] {
+            let line = format!("binding g value share {zone} latest");
+            assert_eq!(
+                v1_reports(&v1_file(&line)),
+                [format!(r#"line 3: unknown zone `{zone}` (one of ["commons", "private"])"#)]
+            );
+            assert_eq!(
+                v0_warnings(&line),
+                [
+                    V0_HEADER_AT_1.to_string(),
+                    format!(r#"line 3: zone `{zone}` is not in `glade-app v1` (one of ["commons", "private"])"#)
+                ]
+            );
+        }
+    }
+
+    /// §4.7 row 7, `windowed` (R2, row 18b (ii)): told Step 2.5's message,
+    /// which names `from-cursor`. A `v0` file is told the version it was
+    /// removed in.
+    #[test]
+    fn row7_windowed_is_told_to_write_from_cursor() {
+        let line = "binding term.log log share commons windowed";
+        assert_eq!(
+            v1_reports(&v1_file(line)),
+            ["line 3: unknown retention `windowed` (removed; use `from-cursor`)"]
+        );
+        assert_eq!(
+            v0_warnings(line),
+            [V0_HEADER_AT_1, "line 3: retention `windowed` was removed in `glade-app v1` (use `from-cursor`)"]
+        );
+    }
+
+    /// §4.7 row 7, `from_cursor` written in a file (the hyphen-only ruling):
+    /// told Step 2.5's message, which names `from-cursor`. A `v0` file is
+    /// told the version whose spelling is the hyphen.
+    #[test]
+    fn row7_a_files_from_cursor_is_told_to_write_the_hyphen() {
+        let line = "binding g log share commons from_cursor";
+        assert_eq!(
+            v1_reports(&v1_file(line)),
+            ["line 3: retention `from_cursor` is the contract's spelling (use `from-cursor` in a file)"]
+        );
+        assert_eq!(
+            v0_warnings(line),
+            [
+                V0_HEADER_AT_1,
+                "line 3: retention `from_cursor` is written `from-cursor` in `glade-app v1` (`from_cursor` is the contract's spelling)"
+            ]
+        );
+    }
+
+    /// Any other retention outside `v1`'s three is told the three, in the
+    /// file's spelling.
+    #[test]
+    fn row7_an_unknown_retention_is_told_the_three() {
+        for retention in ["hourly", "Latest", "cursor"] {
+            let line = format!("binding g value share commons {retention}");
+            assert_eq!(
+                v1_reports(&v1_file(&line)),
+                [format!(r#"line 3: unknown retention `{retention}` (one of ["latest", "from-cursor", "ttl"])"#)]
+            );
+            assert_eq!(
+                v0_warnings(&line),
+                [
+                    V0_HEADER_AT_1.to_string(),
+                    format!(
+                        r#"line 3: retention `{retention}` is not in `glade-app v1` (one of ["latest", "from-cursor", "ttl"])"#
+                    )
+                ]
+            );
+        }
+    }
+
+    /// §4.7 row 7: no diagnostic for a token `v1` accepts, and above all none
+    /// for `from-cursor`, the file's spelling (R9(b2)). A `v1` file using
+    /// every legal zone and retention loads with no warning; its `v0` twin
+    /// with the header's only.
+    #[test]
+    fn row7_no_diagnostic_for_a_token_v1_accepts() {
+        let lines = "binding a value share commons latest\n\
+                     binding b log   share private from-cursor\n\
+                     binding c swmr  share commons from-cursor shape-profile=snapshot_delta\n\
+                     binding d value share private ttl ttl=10m\n\
+                     binding e value share commons ttl\n\
+                     binding f crdt  share commons from-cursor shape-profile=text_crdt";
+        assert_eq!(parse(&v1_file(lines)).unwrap().warnings, Vec::<String>::new());
+        assert_eq!(parse(&format!("glade-app v0\napp x\n{lines}\n")).unwrap().warnings, [V0_HEADER_AT_1]);
+    }
+
+    /// In this release a `v1` file's violations are warnings: the file loads,
+    /// every token is stored as before, and a line with a bad zone and a bad
+    /// retention is told both, zone first, each with its line. From the next
+    /// release the first violation refuses the file, with the same text.
+    #[test]
+    fn a_v1_file_is_warned_this_release_and_refused_from_the_next() {
+        let text = v1_file(
+            "binding a value share commons latest\n\
+             binding b log share shared windowed\n\
+             binding c log share commons from_cursor",
+        );
+        let told = [
+            r#"line 4: unknown zone `shared` (one of ["commons", "private"])"#,
+            "line 4: unknown retention `windowed` (removed; use `from-cursor`)",
+            "line 5: retention `from_cursor` is the contract's spelling (use `from-cursor` in a file)",
+        ];
+        if V1_TOKEN_CHECKS_REFUSE {
+            assert_eq!(parse(&text).unwrap_err(), told[0]);
+        } else {
+            let decl = parse(&text).unwrap();
+            assert_eq!(decl.warnings, told);
+            let stored: Vec<(&str, &str)> =
+                decl.bindings.iter().map(|b| (b.zone.as_str(), b.retention.as_str())).collect();
+            assert_eq!(stored, [("commons", "latest"), ("shared", "windowed"), ("commons", "from_cursor")]);
+        }
+    }
+
+    /// A `v0` file is never refused for its zone or retention, whichever way
+    /// [`V1_TOKEN_CHECKS_REFUSE`] is set (R10(a)): it loads as it does today,
+    /// every token stored as before, with the header's warning and then one
+    /// per token `v1` changes or refuses, in file order.
+    #[test]
+    fn a_v0_file_loads_as_before_told_what_v1_changes() {
+        let decl = parse(
+            "glade-app v0\napp x\n\
+             binding a value share commons latest\n\
+             binding b log share shared windowed\n\
+             binding c log share commons from_cursor\n\
+             binding d value share private hourly\n",
+        )
+        .unwrap();
+        assert_eq!(
+            decl.warnings,
+            [
+                V0_HEADER_AT_1,
+                r#"line 4: zone `shared` is not in `glade-app v1` (one of ["commons", "private"])"#,
+                "line 4: retention `windowed` was removed in `glade-app v1` (use `from-cursor`)",
+                "line 5: retention `from_cursor` is written `from-cursor` in `glade-app v1` (`from_cursor` is the contract's spelling)",
+                r#"line 6: retention `hourly` is not in `glade-app v1` (one of ["latest", "from-cursor", "ttl"])"#,
+            ]
+        );
+        let stored: Vec<(&str, &str)> = decl.bindings.iter().map(|b| (b.zone.as_str(), b.retention.as_str())).collect();
+        assert_eq!(
+            stored,
+            [("commons", "latest"), ("shared", "windowed"), ("commons", "from_cursor"), ("private", "hourly")]
+        );
+    }
+
+    /// Every refusal a line met before Step 2.6 still comes first, with its
+    /// own message, in a `v1` file too: the tail's checks (a `key=value`
+    /// entry where the zone or the retention goes; `ttl=` on a `windowed`
+    /// line) and a duplicate glade id are refused as before, not reported as
+    /// an unknown token — on both sides of the flip.
+    #[test]
+    fn earlier_refusals_come_before_the_token_checks() {
+        assert_eq!(
+            parse(&v1_file("binding g value share commons ttl=10m")).unwrap_err(),
+            "line 3: `ttl=10m` is a key=value entry where <retention> goes (the tail follows all five tokens)"
+        );
+        assert_eq!(
+            parse(&v1_file("binding g swmr share shape-profile=snapshot_delta from-cursor")).unwrap_err(),
+            "line 3: `shape-profile=snapshot_delta` is a key=value entry where <zone> goes (the tail follows all five tokens)"
+        );
+        assert_eq!(
+            parse(&v1_file("binding g log share commons windowed ttl=10m")).unwrap_err(),
+            "line 3: `ttl=` needs the retention `ttl` (this line's is `windowed`)"
+        );
+        assert_eq!(
+            parse(&v1_file("binding g value share commons latest\nbinding g log share shared windowed")).unwrap_err(),
+            "line 4: duplicate glade id `g`"
+        );
     }
 }
