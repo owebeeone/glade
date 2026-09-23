@@ -26,6 +26,8 @@
 //! Each `--app FILE.glade` is LOADED as data and REGISTERED (GDL-037): its
 //! declarations append as ordinary records, its ACL seeds compile to grant
 //! records — under this node's chain, diffed against the fold (idempotent).
+//! A file that fails to parse stops the node; a file that parses with
+//! warnings prints each to stderr as `<FILE>: warning: line N: ...` and boots.
 //!
 //! Either form binds 127.0.0.1:<port> (0 = OS-assigned) and prints
 //! `listening <port>` so a parent process can read the actual port.
@@ -86,6 +88,11 @@ async fn main() -> std::io::Result<()> {
         let mut workspaces: Vec<(String, String)> = Vec::new();
         for path in &apps {
             let decl = glade_node::appdecl::load(path)?;
+            // The non-fatal channel (R10(a)): the file loaded, so boot goes on;
+            // each warning goes to stderr, path-prefixed as `load`'s errors are.
+            for line in decl.warning_lines(path) {
+                eprintln!("{line}");
+            }
             let reg = glade_node::appdecl::register(&decl, &mut node.registry, &registrant)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}")))?;
             node.store.save(&node.registry.snapshot())?;

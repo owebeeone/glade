@@ -21,6 +21,12 @@
 //! workspace <share> <name>     # a workspace share this app serves from
 //! ```
 //!
+//! The header names the file's language (R10(a)): `glade-app v0` or
+//! `glade-app v1`, recorded as [`AppDecl::version`]; any other first
+//! declaration line is refused with its line number. Nothing validates by
+//! version yet, so the two parse identically. A file that loads can still
+//! carry messages through [`AppDecl::warnings`], the non-fatal channel.
+//!
 //! Registration is idempotent by DIFF (the GQ-6 pinning discipline): a record
 //! whose bytes already exist in the fold is skipped, so re-loading the file
 //! appends nothing — and can never clobber a later runtime ACL update, because
@@ -45,15 +51,55 @@ const BINDING_SHAPES: [&str; 3] = ["value", "log", "swmr"];
 /// The authority kinds (decl surface): the share is the source of record, or
 /// the share caches external truth.
 const AUTHORITIES: [&str; 2] = ["share", "external"];
+/// The headers a node reads, each with the language it names (R10(a)). The
+/// first declaration line must be one of them; anything else is refused.
+const HEADERS: [(&str, AppFileVersion); 2] = [
+    ("glade-app v0", AppFileVersion::V0),
+    ("glade-app v1", AppFileVersion::V1),
+];
 
 /// A parsed `<app>.glade` file — pure data, inert until registered.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct AppDecl {
+    /// The language the file's header names. Parse data only: `register`
+    /// never writes it, so no record carries it.
+    pub version: AppFileVersion,
     pub app: String,
     pub bindings: Vec<BindingDecl>,
     pub services: Vec<ServiceDefinition>,
     pub seeds: Vec<CapabilityGrant>,
     pub workspaces: Vec<WorkspaceDecl>,
+    /// The non-fatal channel (R10(a)): line-numbered messages about a file
+    /// that still loads. `parse` fills it; whoever loaded the file prints it
+    /// (see [`AppDecl::warning_lines`]). Nothing produces one yet: the `v0`
+    /// header's warning and the token checks arrive with validation.
+    pub warnings: Vec<String>,
+}
+
+impl AppDecl {
+    /// The non-fatal channel as the loading boundary prints it: one line per
+    /// warning, prefixed with the file's path the way `load` prefixes its
+    /// errors, and marked as a warning because the node keeps booting.
+    pub fn warning_lines(&self, path: impl AsRef<Path>) -> Vec<String> {
+        let path = path.as_ref().display();
+        self.warnings
+            .iter()
+            .map(|w| format!("{path}: warning: {w}"))
+            .collect()
+    }
+}
+
+/// The app-file language a header names (R10(a)). Both load; validation's
+/// binding arm branches on this once `v1` is the validated grammar, and until
+/// then the two parse identically.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AppFileVersion {
+    /// `glade-app v0`: the language as first shipped, and the default.
+    #[default]
+    V0,
+    /// `glade-app v1`: the validated grammar, parsed as `v0` until
+    /// validation lands.
+    V1,
 }
 
 /// A declared workspace↔share association (GLP-0006 P0.S2 / audit F1): the
@@ -87,9 +133,14 @@ pub fn parse(text: &str) -> Result<AppDecl, String> {
 
         // The version header must be the FIRST declaration line.
         if !versioned {
-            if toks != ["glade-app", "v0"] {
-                return Err(format!("line {n}: expected `glade-app v0` header, got `{line}`"));
-            }
+            let header = toks.join(" ");
+            let Some(&(_, version)) = HEADERS.iter().find(|(h, _)| *h == header) else {
+                let expected = expected_headers();
+                return Err(format!(
+                    "line {n}: expected {expected} header, got `{line}`"
+                ));
+            };
+            decl.version = version;
             versioned = true;
             continue;
         }
@@ -182,12 +233,19 @@ pub fn parse(text: &str) -> Result<AppDecl, String> {
     }
 
     if !versioned {
-        return Err("empty file: expected `glade-app v0` header".into());
+        let expected = expected_headers();
+        return Err(format!("empty file: expected {expected} header"));
     }
     if decl.app.is_empty() {
         return Err("missing `app <name>` declaration".into());
     }
     Ok(decl)
+}
+
+/// The headers a node reads, as a diagnostic names them.
+fn expected_headers() -> String {
+    let quoted: Vec<String> = HEADERS.iter().map(|(h, _)| format!("`{h}`")).collect();
+    quoted.join(" or ")
 }
 
 /// A glade id is frozen once shared (GQ-6) — a duplicate within one file is a
@@ -280,6 +338,19 @@ mod tests {
     fn grazel_file() -> String {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../apps/grazel-app.glade");
         std::fs::read_to_string(path).unwrap()
+    }
+
+    /// The shipped file with only its header line replaced by `header` — the
+    /// edit plan Step 2.7 makes, whichever header the file carries now.
+    fn grazel_file_headed(header: &str) -> String {
+        let text = grazel_file();
+        let mut lines: Vec<&str> = text.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| l.starts_with("glade-app "))
+            .expect("a header line");
+        lines[at] = header;
+        lines.join("\n") + "\n"
     }
 
     /// The checked-in grazel-app.glade parses to the app-register shape grazel
@@ -431,5 +502,110 @@ mod tests {
         let again = register(&decl, &mut reg, "node-1").unwrap();
         assert_eq!(again.appended, 0, "identical seeds diff away on re-load");
         assert_eq!(reg.grants_for("owner", "grazel"), Vec::<String>::new(), "revocation stays");
+    }
+
+    /// §4.7 row 17 (R10(a)): the regression that pins plan Step 2.3 ahead of
+    /// Step 2.7. Before this step (glade 559cb2c, `appdecl.rs:89-95`) `parse`
+    /// compared the header for exact equality with `glade-app v0` and refused
+    /// this very text, the shipped file with only its header moved to v1, with:
+    ///
+    /// ```text
+    /// line 16: expected `glade-app v0` header, got `glade-app v1`
+    /// ```
+    ///
+    /// `load` propagates that out of the node's `main`, so a pre-2.3 node exits
+    /// at boot on any file whose header has moved. That is why this step must
+    /// land, and its node be deployed, before any file's header moves
+    /// (Step 2.7). The header names the language, not the content: a `v1` file
+    /// declares what its `v0` twin declares — the same app, bindings,
+    /// services, seeds and workspaces.
+    #[test]
+    fn a_v1_header_loads_as_its_v0_twin() {
+        let v0 = parse(&grazel_file_headed("glade-app v0")).unwrap();
+        let v1 = parse(&grazel_file_headed("glade-app v1")).unwrap();
+        assert_eq!(v0.version, AppFileVersion::V0);
+        assert_eq!(v1.version, AppFileVersion::V1);
+        assert_eq!(v1.app, v0.app);
+        assert_eq!(v1.bindings, v0.bindings);
+        assert_eq!(v1.services, v0.services);
+        assert_eq!(v1.seeds, v0.seeds);
+        assert_eq!(v1.workspaces, v0.workspaces);
+    }
+
+    /// R10(a): both headers load, tokenized as before, and the parse records
+    /// which language the file names, for validation to branch on (Step 2.6).
+    #[test]
+    fn both_headers_load_and_record_their_version() {
+        let v0 = parse("glade-app v0\napp x\n").unwrap();
+        assert_eq!(v0.version, AppFileVersion::V0);
+        let v1 = parse("glade-app v1\napp x\n").unwrap();
+        assert_eq!(v1.version, AppFileVersion::V1);
+        let v1 = parse("# c\n\n  glade-app   v1  # the header\napp x\n").unwrap();
+        assert_eq!(v1.version, AppFileVersion::V1);
+    }
+
+    /// Any other header is still refused, with its line number, the text it
+    /// found, and both headers a node reads.
+    #[test]
+    fn any_other_header_is_refused_with_its_line_naming_both() {
+        let cases = [
+            ("glade-app v2\napp x\n", 1, "glade-app v2"),
+            ("glade-app\napp x\n", 1, "glade-app"),
+            ("app x\nglade-app v1\n", 1, "app x"),
+            ("glade-app v1 extra\napp x\n", 1, "glade-app v1 extra"),
+            ("# c\n\nglade-app V1\napp x\n", 3, "glade-app V1"),
+        ];
+        for (text, line, found) in cases {
+            assert_eq!(
+                parse(text).unwrap_err(),
+                format!(
+                    "line {line}: expected `glade-app v0` or `glade-app v1` header, got `{found}`"
+                )
+            );
+        }
+        for text in ["", "# only a comment\n\n"] {
+            assert_eq!(
+                parse(text).unwrap_err(),
+                "empty file: expected `glade-app v0` or `glade-app v1` header"
+            );
+        }
+    }
+
+    /// The header is parse data, never part of a record: registering the
+    /// shipped file headed `v1` after its `v0` twin appends nothing, so moving
+    /// the headers (Step 2.7) moves no stored byte.
+    #[test]
+    fn moving_the_header_to_v1_appends_no_record() {
+        let mut reg = Registry::new();
+        let v0 = parse(&grazel_file_headed("glade-app v0")).unwrap();
+        let first = register(&v0, &mut reg, "node-1").unwrap();
+        assert!(first.appended > 0);
+        let snap = reg.snapshot();
+        let v1 = parse(&grazel_file_headed("glade-app v1")).unwrap();
+        let moved = register(&v1, &mut reg, "node-1").unwrap();
+        assert_eq!((moved.appended, moved.unchanged), (0, first.appended));
+        assert_eq!(reg.snapshot(), snap, "no record moved");
+    }
+
+    /// The non-fatal channel exists and is empty for the shipped file under
+    /// either header: nothing produces a warning until validation (Step 2.6).
+    #[test]
+    fn the_shipped_file_loads_with_no_warning() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../apps/grazel-app.glade");
+        assert_eq!(load(path).unwrap().warnings, Vec::<String>::new());
+        let v1 = parse(&grazel_file_headed("glade-app v1")).unwrap();
+        assert_eq!(v1.warnings, Vec::<String>::new());
+    }
+
+    /// The boundary prints each warning prefixed with the file's path, as
+    /// `load` prefixes its errors. Nothing produces a warning yet, so this one
+    /// is pushed by hand.
+    #[test]
+    fn warnings_print_prefixed_with_the_file_path() {
+        let mut decl = parse("glade-app v1\napp x\n").unwrap();
+        assert_eq!(decl.warning_lines("apps/x.glade"), Vec::<String>::new());
+        decl.warnings.push("line 1: a note".into());
+        let printed = decl.warning_lines("apps/x.glade");
+        assert_eq!(printed, vec!["apps/x.glade: warning: line 1: a note"]);
     }
 }
