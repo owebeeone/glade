@@ -20,7 +20,7 @@
 # cannot leave the tree changed. The copy keeps the tree's depth below a
 # `glade` root, and `wire-rs`, which the manifest names by path, is a symlink
 # this script only reads through. The checker needs no lockfile (it shells
-# `cargo metadata --no-deps`), so the untracked Cargo.lock is not copied.
+# `cargo metadata --no-deps`), so Cargo.lock is not copied.
 #
 # When a reviewed step allows `normal:shaku` for glade-node (the plan's Step 3.2
 # puts the Shaku assembly in this crate), this fixture fails closed -- the

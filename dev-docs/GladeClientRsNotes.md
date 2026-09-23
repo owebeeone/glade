@@ -71,6 +71,8 @@ internals. `ws.rs` is the client half of the node's `ws.rs`, behavior-ported.
 
 7. **`Cargo.lock` untracked; `/target` + `/Cargo.lock` gitignored** — the
    sibling convention (node, wire-rs, grip-share do not commit `Cargo.lock`).
+   Update 2026-09-24: node and wire-rs now track theirs (the owner's ruling at
+   Step 3.5 of the glade-wz first-slice plan); client-rs is unchanged.
 
 8. **No `node/src` changes.** No `pub(crate)`→`pub` widening was needed: the
    client talks to the node purely over the wire.

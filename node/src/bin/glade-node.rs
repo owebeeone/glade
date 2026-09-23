@@ -27,14 +27,20 @@
 //! declarations append as ordinary records, its ACL seeds compile to grant
 //! records — under this node's chain, diffed against the fold (idempotent).
 //! An app is declared by one file. Every file is loaded before the instance
-//! is opened, so a file that fails to parse, or two files naming one app,
-//! stop the node before it writes anything; a file that parses with warnings
-//! prints each to stderr as `<FILE>: warning: line N: ...` and boots.
+//! is opened, so a file that cannot be read or fails to parse, or two files
+//! naming one app, stop the node before it writes anything; a file that
+//! parses with warnings prints each to stderr as `<FILE>: warning: line N:
+//! ...` and boots.
+//!
+//! A start that fails, a refused `--app` file included, prints its message
+//! to stderr as the author reads it, `<FILE>: line N: ...` for a file that
+//! breaks a rule, and exits 1.
 //!
 //! Either form binds 127.0.0.1:<port> (0 = OS-assigned) and prints
 //! `listening <port>` so a parent process can read the actual port.
 
 use std::io::Write;
+use std::process::ExitCode;
 
 use glade_node::iroh_carrier::{PeerAddr, PeerEndpoint};
 use glade_node::registry::{RegistryApi, StoreApi, HOME};
@@ -49,8 +55,22 @@ fn parse_peer(s: &str) -> Option<PeerAddr> {
     Some(PeerAddr { endpoint_id: id.parse().ok()?, socket: sock.parse().ok()? })
 }
 
+/// Runs the node, and prints a failure with `Display`, its message as written
+/// (SUR-P3-11): returning the error from `main` would print its `Debug` form,
+/// `Error: Custom { kind: InvalidData, error: "..." }`, with the message's
+/// quotes escaped. A failure exits 1 (`ExitCode::FAILURE`), as it did.
 #[tokio::main]
-async fn main() -> std::io::Result<()> {
+async fn main() -> ExitCode {
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> std::io::Result<()> {
     let mut profile: Option<Profile> = None;
     let mut name: Option<String> = None;
     let mut operator: Option<String> = None;

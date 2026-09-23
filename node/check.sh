@@ -16,12 +16,14 @@
 #   arch002-contracts  glade/contracts/arch002-fixture.sh, plan Step 3.1's
 #                      fixture for the port side; absent means red
 #   confinement        cargo tree --invert: each framework is seen only by the
-#                      crates the allowlist below names
+#                      crates the allowlist below names, on every target
+#                      platform for the node
 #   node-tests         cargo test for this workspace
 #   contracts-gate     glade/contracts/check.sh (its checker, tests, fmt, clippy)
 #   fmt, clippy        by package: a held package must pass; a package whose
 #                      debt predates this gate is counted and printed as a
-#                      named gap, never fixed here and never hidden
+#                      named gap, never fixed here and never hidden, and is
+#                      ratcheted: a count above its recorded baseline fails
 #
 # Cargo reads CARGO_TARGET_DIR from the environment and nothing here sets or
 # overrides it, so a caller can keep every build out of the repositories. Every
@@ -71,15 +73,26 @@ contracts  sdax-testkit  -
 # A real edge confinement must SEE: glade-node's peer carrier depends on iroh.
 # If this is not seen, the check is blind, not passing.
 confinement_witness='node iroh glade-node'
+# The workspaces whose confinement must cover every target platform (owner,
+# 2026-09-24, plan Step 3.5): `cargo tree --target all` must resolve them from
+# the offline cache, or the component fails. One online `cargo fetch --locked`
+# filled the cache with the node's platform crates; a dependency change that
+# needs new ones needs that fetch again. A workspace not named here falls back
+# to the host target, and the narrowing is printed as a named gap.
+confinement_all_targets='node'
 
 # fmt and clippy dispositions, by package: name, fmt, clippy. `held`: the
-# check must pass. `gap`: debt that predates this gate -- counted and printed on
-# every run as a named gap, never fixed here. A package in scope that this table
-# does not name is held, so a new crate starts clean. A name here that is no
-# longer in scope fails the component, as a stale entry.
+# check must pass. `gap:N`: debt that predates this gate -- counted and printed
+# on every run as a named gap, never fixed here -- and ratcheted (owner,
+# 2026-09-24, plan Step 3.5) at the baseline N: rustfmt hunks for fmt, clippy
+# warnings for clippy. A count above N fails the component. A count below N
+# passes, and the gate says N can be lowered to it, an edit to this table. A
+# package in scope that this table does not name is held, so a new crate
+# starts clean. A name here that is no longer in scope fails the component, as
+# a stale entry.
 style_dispositions='
-glade-node  gap  gap
-glade-wire  gap  gap
+glade-node  gap:339  gap:11
+glade-wire  gap:43   gap:7
 '
 
 results=$(mktemp -d "${TMPDIR:-/tmp}/glade-node-gate.XXXXXX") || exit 1
@@ -191,8 +204,9 @@ c_arch002_contracts() {
     return 1
 }
 
-# select_targets LABEL MANIFEST: inspect every target platform when Cargo can
-# resolve them offline, else the host target, with the narrowing named as a gap.
+# select_targets LABEL MANIFEST: inspect every target platform, resolved
+# offline. A workspace named in confinement_all_targets fails when Cargo cannot;
+# any other falls back to the host target, with the narrowing named as a gap.
 select_targets() {
     if out=$(tree_of "$2" --target all 2>&1); then
         printf '%s\n' "$out" > "$results/tree.$1"
@@ -202,6 +216,13 @@ select_targets() {
     case "$out" in
         *"--offline was specified"* | *"failed to download"*)
             first=$(printf '%s\n' "$out" | sed -n 's/^error: failed to download `\(.*\)`$/\1/p' | head -n 1)
+            case " $confinement_all_targets " in
+                *" $1 "*)
+                    printf '%s\n' "$out" >&2
+                    echo "  $1: every target platform is required, and --target all needs crates absent from the offline cache (first: ${first:-unknown}); \`cargo fetch --locked --manifest-path $(rel "$2")\`, once and online, fetches them" >&2
+                    return 1
+                    ;;
+            esac
             if ! out=$(tree_of "$2" 2>&1); then
                 printf '%s\n' "$out" >&2
                 return 1
@@ -219,13 +240,14 @@ select_targets() {
 c_confinement() {
     echo "allowlist (workspace, framework, local crates allowed to see it):"
     printf '%s\n' "$confinement_allowlist" | sed -n 's/^\(..*\)$/  \1/p'
+    echo "every target platform required for: $confinement_all_targets"
     for workspace in node contracts; do
         case "$workspace" in
             node) manifest=$node_manifest ;;
             *) manifest=$contracts_manifest ;;
         esac
         if ! select_targets "$workspace" "$manifest"; then
-            why "cargo tree could not resolve the $workspace workspace, locked and offline"
+            why "cargo tree could not resolve the $workspace workspace, locked and offline, for the targets it must cover"
             return 1
         fi
     done
@@ -386,6 +408,28 @@ stale_dispositions() {
     return "$stale"
 }
 
+# baseline_of MODE: N, from a `gap:N` disposition; fails when N is not a count.
+baseline_of() {
+    n=${1#gap:}
+    case "$n" in
+        '' | *[!0-9]*)
+            return 1
+            ;;
+    esac
+    printf '%s\n' "$n"
+}
+
+# against COUNT BASELINE: where a counted gap stands against its ratchet.
+against() {
+    if [ "$1" -gt "$2" ]; then
+        printf 'ABOVE its baseline of %s: the gap grew' "$2"
+    elif [ "$1" -lt "$2" ]; then
+        printf 'below its baseline of %s: the baseline can be lowered to %s' "$2" "$1"
+    else
+        printf 'at its baseline of %s' "$2"
+    fi
+}
+
 c_fmt() {
     if ! scope=$(style_scope); then
         why "could not list the packages in scope"
@@ -419,13 +463,28 @@ c_fmt() {
                     held="$held $name"
                 fi
                 ;;
-            gap)
+            gap:*)
+                if ! baseline=$(baseline_of "$mode"); then
+                    echo "  $name: fmt disposition '$mode' does not end in a count"
+                    bad=1
+                    continue
+                fi
                 files=$(printf '%s\n' "$out" | sed -n 's/^Diff in \(.*\):[0-9]*:$/\1/p' | sort -u | grep -c .)
-                echo "  $name: $hunks rustfmt hunks in $files files (a named gap, not held)"
+                fix="cargo fmt --manifest-path $(rel "$dir")/Cargo.toml -p $name -- --check"
+                standing=$(against "$hunks" "$baseline")
+                echo "  $name: $hunks rustfmt hunks in $files files, $standing (a named gap, not held)"
+                if [ "$hunks" -gt "$baseline" ]; then
+                    echo "  $name: rustfmt hunks by file ($fix prints them):"
+                    printf '%s\n' "$out" | sed -n 's/^Diff in \(.*\):[0-9]*:$/\1/p' | sort | uniq -c |
+                        while read -r count file; do
+                            printf '    %4s  %s\n' "$count" "$(rel "$file")"
+                        done
+                    bad=1
+                fi
                 if [ "$hunks" -eq 0 ]; then
                     gap "fmt          $name: 0 hunks -- the gap is closed; set its fmt disposition to held"
                 else
-                    gap "fmt          $name: $hunks rustfmt hunks in $files files; not fixed by this gate (cargo fmt --manifest-path $(rel "$dir")/Cargo.toml -p $name -- --check)"
+                    gap "fmt          $name: $hunks rustfmt hunks in $files files, $standing; not fixed by this gate ($fix)"
                 fi
                 ;;
             *)
@@ -437,10 +496,10 @@ c_fmt() {
 $scope
 EOF
     if [ "$bad" -ne 0 ]; then
-        why "a held package is not rustfmt-clean, rustfmt could not run, or a disposition is stale"
+        why "a held package is not rustfmt-clean, a counted gap rose above its baseline, rustfmt could not run, or a disposition is stale"
         return 1
     fi
-    why "held:${held:- none}; every other package in scope is a counted gap"
+    why "held:${held:- none}; every other package in scope is a counted gap at or below its baseline"
     return 0
 }
 
@@ -489,10 +548,15 @@ c_clippy() {
                     bad=1
                 fi
                 ;;
-            gap)
+            gap:*)
+                if ! baseline=$(baseline_of "$mode"); then
+                    echo "  $name: clippy disposition '$mode' does not end in a count"
+                    bad=1
+                    continue
+                fi
                 # Without -D warnings, so every target is linted and counted;
                 # an error is a failure, never a counted gap.
-                echo "  $name: linting (a gap: counted, not held)"
+                echo "  $name: linting (a gap: counted and ratcheted, not held)"
                 if ! cargo clippy --locked --offline --manifest-path "$dir/Cargo.toml" -p "$name" --all-targets --all-features > "$results/clippy.log" 2>&1 < /dev/null; then
                     cat "$results/clippy.log" >&2
                     echo "  $name: clippy could not check the package"
@@ -500,11 +564,19 @@ c_clippy() {
                     continue
                 fi
                 count=$(clippy_warnings "$name" "$results/clippy.log")
-                echo "  $name: $count clippy warnings (a named gap, not held)"
+                fix="cargo clippy --manifest-path $(rel "$dir")/Cargo.toml -p $name --all-targets --all-features"
+                standing=$(against "$count" "$baseline")
+                echo "  $name: $count clippy warnings, $standing (a named gap, not held)"
+                if [ "$count" -gt "$baseline" ]; then
+                    echo "  $name: the warnings, each once ($fix prints them in full):"
+                    awk '/^warning: / && !/ generated [0-9]+ warning/ { w = $0; next }
+                         w != "" && /^ *--> / { print "    " $2 "  " w; w = "" }' "$results/clippy.log" | sort -u
+                    bad=1
+                fi
                 if [ "$count" -eq 0 ]; then
                     gap "clippy       $name: 0 warnings -- the gap is closed; set its clippy disposition to held"
                 else
-                    gap "clippy       $name: $count warnings; not fixed by this gate (cargo clippy --manifest-path $(rel "$dir")/Cargo.toml -p $name --all-targets --all-features)"
+                    gap "clippy       $name: $count warnings, $standing; not fixed by this gate ($fix)"
                 fi
                 ;;
             *)
@@ -516,10 +588,10 @@ c_clippy() {
 $scope
 EOF
     if [ "$bad" -ne 0 ]; then
-        why "a held package is not clippy-clean, clippy could not run, or a disposition is stale"
+        why "a held package is not clippy-clean, a counted gap rose above its baseline, clippy could not run, or a disposition is stale"
         return 1
     fi
-    why "held:${held:- none}; every other package in scope is a counted gap"
+    why "held:${held:- none}; every other package in scope is a counted gap at or below its baseline"
     return 0
 }
 
@@ -585,9 +657,11 @@ review only); test determinism (LBT-008) -- the node suite starts real iroh
 endpoints on loopback and is the whole suite, not a measured fast loop
 (LBT-010); disabled platform branches -- tests and clippy build the host target
 only, so code under another platform's #[cfg] is neither compiled nor linted;
-the standing rule that #[cfg] sits inside cfg_if! or a platform module; the
-witness workspace (glade/dev-docs/async-witness, its own check.sh); the
-checker's own tests (glade-discover); branch protection.
+the standing rule that #[cfg] sits inside cfg_if! or a platform module; a new
+rustfmt deviation a few lines from an existing one -- the fmt ratchet counts
+hunks, and rustfmt merges nearby deviations into one hunk, so such a line need
+not raise the count; the witness workspace (glade/dev-docs/async-witness, its
+own check.sh); the checker's own tests (glade-discover); branch protection.
 EOF
 if [ -s "$results/outside" ]; then
     awk '!seen[$0]++ { print "Also not checked: " $0 }' "$results/outside"

@@ -45,6 +45,8 @@ service grazel gwz.ops
 # seed <principal> <share> <verb[,verb...]>
 # Bootstrap shortcuts, not a parallel ACL system: compiled to CapabilityGrant
 # records at registration; ordinary fold rules (revocation wins) from then on.
+# A seed names the workspace share (ws-razel), not the app: these two lines are
+# corrected together with the revocation route at plan Step 4.3.
 seed owner grazel read.*
 seed owner grazel gwz.*
 

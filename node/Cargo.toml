@@ -19,6 +19,6 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "
 # no new deps; iroh rides only the peer path. tls-ring gives the crypto provider
 # used by presets::Minimal (relay + discovery disabled — direct dial only).
 # Floor at 1.2: 1.1.0 fixed a panic on a crafted EndpointAddr, a relay CPU pin and
-# NAT-probe misrouting (IrohReview §11). Cargo.lock is not tracked here, so this
-# line is the only place a minimum can be recorded.
+# NAT-probe misrouting (IrohReview §11). This line records the minimum; the
+# tracked Cargo.lock records the version a checkout builds.
 iroh = "1.2"

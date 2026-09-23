@@ -83,11 +83,18 @@ workspace <share> <name>
   [The keyword tail](#the-keyword-tail)).
 - A glade id may appear once per file, across `binding` and `service` lines. A
   share may appear in one `workspace` line per file.
-- A file that breaks a rule stops the node from starting; the message names the
-  file and, where a line is at fault, its line number. The node reads every
-  file before it writes anything, so a refused start leaves its store as it
-  was. A file that loads can still carry warnings, which the node prints as
-  `<file>: warning: line N: …` before it goes on.
+- A file that breaks a rule stops the node from starting, and so does an
+  `--app` path the node cannot read. The node prints the refusal to stderr as
+  `<file>: line N: …`, or as `<file>: …` where no single line is at fault, and
+  exits with status 1:
+
+  ```text
+  notes.glade: line 5: unknown authority `shared` (one of ["share", "external"])
+  ```
+
+  The node reads every file before it writes anything, so a refused start
+  leaves its store as it was. A file that loads can still carry warnings,
+  which the node prints as `<file>: warning: line N: …` before it goes on.
 
 **Spelling.** Multi-word tokens use the hyphen: `glade-app`, `from-cursor`,
 `shape-profile`. Every multi-word token in the shipped app files does
@@ -169,6 +176,14 @@ verbs on `<share>`. Verbs are separated by commas with no spaces, and a verb may
 be a pattern such as `read.*`. At registration a seed becomes an ordinary grant
 record, and a revocation always wins over it, even when the file is loaded
 again. The node records grants but does not enforce them yet.
+
+`<share>` is the workspace share the app's surfaces live on, the share a
+`workspace` line declares (`ws-notes` in the example above), not a share named
+after the app. The shipped `grazel-app.glade` does not follow this yet: its
+`seed owner grazel …` lines name the app. They are corrected together with the
+route that revokes a seeded grant, so that the grants they already made can be
+withdrawn (Step 4.3 of `dev-docs/GladeFirstSlicePlan.md` in the glade-wz
+workspace).
 
 ### `workspace`: the share this app serves from
 
@@ -317,11 +332,14 @@ before it writes anything, and the message names both files.
   file the node loads names that app any more. So a line deleted later, under
   the new name, can bring back the old app's declaration of the same surface,
   as it was before the rename.
-- **Retiring an app.** To withdraw every surface an app declared, start the
-  node once with a file that names the app and has no `binding` lines: each of
-  the app's declarations is retracted, and the file can then be left out.
+- **Retiring an app.** To withdraw every `binding` surface an app declared,
+  start the node once with a file that names the app and has no `binding`
+  lines: each of the app's `binding` declarations is retracted, and the file
+  can then be left out. Nothing else is withdrawn: the exchange each of the
+  app's `service` lines declared stays declared and routable, and the app's
+  workspace entry and seed grants stay (see [Other lines](#other-lines)).
   Retiring the old name this way is how to rename an app without leaving its
-  declarations live.
+  `binding` declarations live; the old name's `service` declarations stay.
 - **The node stores the retention in the contract's spelling.** Whichever
   spelling the file uses, the stored record says `from_cursor`. So on a node
   whose records were written before it did this, each binding that says

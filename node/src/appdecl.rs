@@ -130,13 +130,15 @@ const HEADER_TO_WRITE: &str = "write `glade-app v1` (`glade-app v0` is accepted 
 /// version above `0.0.0`), which [`V1_WARNING_RELEASE`] names once it is cut,
 /// and the release after that one sets this to `true`. A test holds the two
 /// constants to `CARGO_PKG_VERSION`, so a version bump that has not decided
-/// the flip fails it. A `glade-app v0` file is never refused for its zone or
-/// retention, whatever this says (R10(a)).
+/// the flip fails it, and so does a flip made before that later release. A
+/// `glade-app v0` file is never refused for its zone or retention, whatever
+/// this says (R10(a)).
 const V1_TOKEN_CHECKS_REFUSE: bool = false;
 /// The node release that ships the `v1` warnings: `None` until the first
 /// release (the first version above `0.0.0`) is cut, then its version. At any
-/// version but `0.0.0` it must name a release, and once the version is past
-/// it [`V1_TOKEN_CHECKS_REFUSE`] must be `true` (`a_node_release_decides_the_flip`).
+/// version but `0.0.0` it must name a release. Up to and including it
+/// [`V1_TOKEN_CHECKS_REFUSE`] must be `false`, and once the version is past
+/// it `true` (`a_node_release_decides_the_flip`).
 #[allow(dead_code)] // read by that test only
 const V1_WARNING_RELEASE: Option<&str> = None;
 /// How a `v1` zone or retention warning ends: what happens to the line once
@@ -490,13 +492,17 @@ fn push_glade_id(seen: &mut Vec<String>, id: &str, line: usize) -> Result<(), St
     Ok(())
 }
 
-/// Parse an `<app>.glade` file from disk.
+/// Parse an `<app>.glade` file from disk. Every error names the file, as
+/// `<path>: <message>`: a file that cannot be read keeps its read error's
+/// kind (SUR-P3-10), and a file that breaks a rule is `InvalidData`.
 pub fn load(path: impl AsRef<Path>) -> io::Result<AppDecl> {
-    let text = fs::read_to_string(&path)?;
+    let path = path.as_ref();
+    let text = fs::read_to_string(path)
+        .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
     parse(&text).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("{}: {e}", path.as_ref().display()),
+            format!("{}: {e}", path.display()),
         )
     })
 }
@@ -1459,12 +1465,16 @@ mod tests {
     }
 
     /// STA-P3-2: an app is retired by loading, once, a file that names it
-    /// and has no binding lines. It retracts every declaration of that app,
-    /// and only that app's; loaded again, it appends nothing.
+    /// and has no binding lines. It retracts every `binding` declaration of
+    /// that app, and only that app's; loaded again, it appends nothing. It
+    /// retracts nothing else: the app's `service` record stays, so its
+    /// exchange stays declared (SUR-P3-9 = STA-P3-4), as the format page says.
     #[test]
     fn a_file_naming_an_app_with_no_binding_lines_retires_it() {
         let mut reg = Registry::new();
-        register(&parse(NOTES).unwrap(), &mut reg, "node-1").unwrap();
+        let text = format!("{NOTES}service notes notes.ops\n");
+        let notes_app = parse(&text).unwrap();
+        register(&notes_app, &mut reg, "node-1").unwrap();
         register(&parse(NOTES2).unwrap(), &mut reg, "node-1").unwrap();
         let retire = parse("glade-app v1\napp notes\n").unwrap();
         assert_eq!(counts(&retire, &mut reg), (2, 0));
@@ -1472,23 +1482,34 @@ mod tests {
         let retracted = BindingFold::over(&ops_of(&reg)).retracted();
         let notes = |id: &str| ("notes".to_string(), id.to_string());
         assert_eq!(retracted, [notes("n.list"), notes("n.old")]);
+        let service = Record::Service(notes_app.services[0].clone()).encode();
+        assert!(reg.contains(G_SERVICES, &service), "the service stays");
         assert_eq!(counts(&retire, &mut reg), (0, 0));
     }
 
-    /// What a node version requires of the flip's two constants (COD-P3-2):
-    /// `0.0.0`, no release yet, requires nothing; any other version must name
-    /// the release that ships the `v1` warnings; a version past that release
-    /// must refuse.
+    /// What a node version requires of the flip's two constants (COD-P3-2,
+    /// COD-P3-7): `0.0.0`, no release yet, must not refuse; any other version
+    /// must name the release that ships the `v1` warnings; a version at or
+    /// below that release must not refuse, so the warnings do ship; and a
+    /// version past it must refuse.
     fn flip_decided(version: &str, release: Option<&str>, refuse: bool) -> Result<(), String> {
+        let early = "V1_TOKEN_CHECKS_REFUSE must be false";
         if version == "0.0.0" {
+            if refuse {
+                return Err(format!("{version} is no release: {early}"));
+            }
             return Ok(());
         }
         let Some(release) = release else {
             return Err(format!("{version} is a release: set V1_WARNING_RELEASE"));
         };
-        if numbered(version) > numbered(release) && !refuse {
+        let past = numbered(version) > numbered(release);
+        if past && !refuse {
             let flip = "V1_TOKEN_CHECKS_REFUSE must be true";
             return Err(format!("{version} is past {release}: {flip}"));
+        }
+        if !past && refuse {
+            return Err(format!("{version} is not past {release}: {early}"));
         }
         Ok(())
     }
@@ -1501,8 +1522,10 @@ mod tests {
     }
 
     /// COD-P3-2's mechanical check: a version bump that has not decided the
-    /// flip fails here. The rule is checked on versions this build is not,
-    /// then held to this build's `CARGO_PKG_VERSION`.
+    /// flip fails here, and so does a flip made before the release after the
+    /// one that ships the warnings (COD-P3-7). The rule is checked on
+    /// versions this build is not, then held to this build's
+    /// `CARGO_PKG_VERSION`.
     #[test]
     fn a_node_release_decides_the_flip() {
         assert_eq!(flip_decided("0.0.0", None, false), Ok(()));
@@ -1510,6 +1533,10 @@ mod tests {
         assert_eq!(flip_decided("0.1.0", Some("0.1.0"), false), Ok(()));
         assert!(flip_decided("0.1.1", Some("0.1.0"), false).is_err());
         assert!(flip_decided("0.10.0", Some("0.9.0"), false).is_err());
+        // COD-P3-7: an early flip fails, at no release and at the warnings'
+        // release; the release after that one refuses.
+        assert!(flip_decided("0.0.0", None, true).is_err());
+        assert!(flip_decided("0.1.0", Some("0.1.0"), true).is_err());
         assert_eq!(flip_decided("0.2.0", Some("0.1.0"), true), Ok(()));
         let version = env!("CARGO_PKG_VERSION");
         let this_build = flip_decided(version, V1_WARNING_RELEASE, V1_TOKEN_CHECKS_REFUSE);

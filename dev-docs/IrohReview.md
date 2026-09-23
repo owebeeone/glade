@@ -586,6 +586,9 @@ several file-sharing GUIs (Sendme-egui, Dropwire, ringdrop, Strada).
     the 1.0.2 above was this checkout's stale resolution and not a pin. The
     manifest now requires `iroh = "1.2"` (glade `74ffeb0`); the node's 61 tests
     pass on iroh 1.2.0, iroh-dns 1.3.0 and noq 1.3.0.
+  - Update 2026-09-24: `node/Cargo.lock` is tracked now (the owner's ruling at
+    Step 3.5 of the glade-wz first-slice plan), so a checkout builds the
+    versions it records: iroh 1.2.0, iroh-dns 1.3.0 and noq 1.3.0.
 - **Unused capabilities that map onto open design items**: `EndpointHooks`
   (accept-time rejection before any glade frame is read); `RelayMode::Custom`
   with a self-hosted `iroh-relay` (the discovery model's "public iroh relay"
