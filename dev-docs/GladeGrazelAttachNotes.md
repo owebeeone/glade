@@ -62,10 +62,13 @@ what registers is taut records (`BindingDecl`/`ServiceDefinition` in
 in this text form. A structured rendering can replace it later without
 touching anything downstream of `parse()`. Validation: unknown shape /
 authority / directive, duplicate glade id (frozen-once-shared, GQ-6),
-missing header/app, and a malformed tail (an entry that is not `key=value` or
-stands where a positional token goes, an unknown or repeated key, a bad
-duration or profile, `ttl=` without the retention `ttl`, a profile that does
-not fit the shape, `crdt` without one) are refused with line numbers.
+missing header/app, and a malformed tail (an entry that is not `key=value` or,
+in a `glade-app v1` file, stands where a positional token goes, an unknown or
+repeated key, a bad duration or profile, `ttl=` without the retention `ttl`, a
+profile that does not fit the shape, `crdt` without one) are refused with line
+numbers; a `v0` file keeps an entry that stands where a token goes as that
+token, with a warning. Two `--app` files naming one app are refused before
+the node writes anything (below).
 
 `BindingDecl` is app-static: no share/key in the record — the ServeClaim
 selects the node. The author writes the zone (the binding line's `<zone>` token,
@@ -95,23 +98,45 @@ Nothing in base glade names grazel; the loader registers any app
 **Changed and deleted lines (R9 (b2) + (a), ruled 2026-09-23).** `parse()`
 normalises `from-cursor` to `from_cursor` on the way into the record, so the
 store holds the contract's spelling whichever spelling the file uses.
-`dir.bindings` is folded by `glade_id`, newest wins (`BindingFold` in
-`node/src/registry.rs`, read by `RegistryApi::bindings_of` and by
-`declared_exchange` in `node/src/exchange.rs`), and `register` diffs the
-parsed file's bindings against that fold per `(app, glade_id)`: a changed line
-appends its new `BindingDecl`, and each binding the file's `app` registered
-before and no longer declares gets a `BindingRetraction` on
-`dir.binding-retractions`. "Newest" is the highest `(lamport, origin)` across
-both streams, which the registry keeps as one lamport clock over the two, so a
-line put back after a retraction declares its surface again; and a retraction
-takes down only its own app's declaration. So a file not loaded on a boot
-retracts nothing (gyld's surfaces stay declared while grazel's gyld leg is
-off), and a declaration made by a different app file is never in scope. R9
-governs `dir.bindings` only: deleting a `service` or `workspace` line retracts
-nothing, so a retired exchange stays routable, and `seed`'s remove half is a
-runtime revocation (item 4 below). A client that folds `dir.bindings` itself
-must fold `dir.binding-retractions` with it the same way; none does yet.
-`glade/docs/AppFileFormat.md` states the same rule for authors.
+`dir.bindings` and `dir.binding-retractions` are folded per `(app, glade_id)`,
+newest wins, and per glade id the newest declaration still live across apps is
+the surface (`BindingFold` in `node/src/registry.rs`, read by
+`RegistryApi::bindings_of` and by `declared_exchange` in
+`node/src/exchange.rs`). `register` diffs the parsed file's bindings against
+that fold for the file's `app` only: a changed line appends its new
+`BindingDecl`, and each binding the app has live that the file no longer
+declares gets a `BindingRetraction` on `dir.binding-retractions`. So a file not
+loaded on a boot retracts nothing (gyld's surfaces stay declared while
+grazel's gyld leg is off), and a retraction takes down only its own app's
+declaration: one declared under another app is never in scope, and one glade
+id declared by two apps is allowed, unwarned, the newer live declaration
+standing. R9 governs `dir.bindings` only (its option (s), a retract half for
+the other lines, was not taken): deleting a `service` or `workspace` line
+retracts nothing, so a retired exchange stays routable, and `seed`'s remove
+half is a runtime revocation (item 4 below). `glade/docs/AppFileFormat.md`
+states the same rules for authors.
+
+An app is declared by one file. `register` takes a file as its app's whole
+binding set, so two files naming one app would retract each other's bindings
+on every boot; `appdecl::load_all` loads every `--app` file before `boot()`
+opens the instance and refuses, naming the app and both paths, when two name
+one app, so a refused start writes nothing. Renaming a file's `app` line
+starts another app and leaves the old name's declarations live, so a line
+deleted later can bring back the old app's declaration of that surface. An app
+is retired by loading, once, a file that names it and has no binding lines.
+
+"Newest" is the highest `(lamport, origin)` across both streams. Within one
+registry that is the order of appends, because the registry keeps one lamport
+clock over the two, so a line put back after a retraction declares its surface
+again. The claim holds for one registry only: a registry never ingests a
+peer's records, so each node's binding lamport is its own clock, and a
+retraction is keyed `(app, glade_id)` with no origin. In a store holding
+several nodes' records, such as the served store, one node's retraction can
+outrank another's later declaration and takes down every node's declaration
+of its surface; what such a store should do is open at plan Step 4.6
+(`dev-docs/GladeFirstSlicePlan.md` in the glade-wz workspace). A client that
+folds `dir.bindings` itself must fold `dir.binding-retractions` with it the
+same way, with the same caveat; none does yet.
 
 ## Resolved ambiguities (smallest reasonable call)
 

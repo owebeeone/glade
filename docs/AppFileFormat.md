@@ -40,9 +40,11 @@ workspace ws-notes notes
 ```
 
 A node loads the files named by its `--app` flags when it starts with a profile,
-for example `glade-node --profile local --app notes.glade`; the flag may repeat.
-The shipped [`apps/grazel-app.glade`](../apps/grazel-app.glade) is a longer
-example, with comments.
+for example `glade-node --profile local --app notes.glade`. The flag may
+repeat, once per app: an app is declared by one file, and a node given two
+files that name the same app refuses to start, naming both files. The shipped
+[`apps/grazel-app.glade`](../apps/grazel-app.glade) is a longer example, with
+comments.
 
 ## Grammar
 
@@ -63,9 +65,18 @@ workspace <share> <name>
   `#`. Blank lines are ignored.
 - The first line that is not blank or a comment is the header: write
   `glade-app v1`. `glade-app v0` names the old language: a file headed with it
-  still loads, with a warning that names the header to write.
+  still loads, with a warning that names the header to write, and no release is
+  scheduled to stop loading it. The node reads both headers with one grammar,
+  so a `glade-app v0` file may use every directive, token and key on this page,
+  the keyword tail and `crdt` included. The header decides only how a zone or a
+  retention that `glade-app v1` does not accept is treated (see
+  [The zone](#the-zone) and [The retention](#the-retention)), and whether a
+  `key=value` entry standing where either goes is refused (`v1`) or kept as
+  written with a warning (`v0`).
 - `app <name>` comes next, exactly once. Every `binding` and `service` record
-  the file registers carries this name.
+  the file registers carries this name. An app is declared by one file: the
+  node takes the file's `binding` lines as the app's whole set, so two files
+  loaded at one start may not name the same app.
 - Every directive takes exactly the tokens shown, and none has a default, so a
   line with a token missing or extra is refused. The one optional part of any
   line is a binding's keyword tail, the entries in brackets above (see
@@ -73,9 +84,10 @@ workspace <share> <name>
 - A glade id may appear once per file, across `binding` and `service` lines. A
   share may appear in one `workspace` line per file.
 - A file that breaks a rule stops the node from starting; the message names the
-  file and, where a line is at fault, its line number. A file that loads can
-  still carry warnings, which the node prints as `<file>: warning: line N: …`
-  before it goes on.
+  file and, where a line is at fault, its line number. The node reads every
+  file before it writes anything, so a refused start leaves its store as it
+  was. A file that loads can still carry warnings, which the node prints as
+  `<file>: warning: line N: …` before it goes on.
 
 **Spelling.** Multi-word tokens use the hyphen: `glade-app`, `from-cursor`,
 `shape-profile`. Every multi-word token in the shipped app files does
@@ -93,7 +105,7 @@ tail.
 | --- | --- |
 | `<glade_id>` | The surface's id: any single token. Dotted names such as `term.log` are a convention, not a rule. |
 | `<shape>` | `value`: one value; concurrent writes resolve last-writer-wins. `log`: an append-only log, read from a cursor. `swmr`: one writer, many readers, as snapshots plus deltas. `crdt`: many writers whose concurrent edits merge rather than one overwriting another; the line must name its profile, `shape-profile=text_crdt`. The node refuses every other shape: `message`, `window` and `atom` are recognised and reserved, `stream` is recognised, and none of them can be bound; an exchange is declared with `service`, not `binding`. |
-| `<authority>` | `share`: the share is the source of record. `external`: the share caches truth from an outside source. `external` is accepted, but the file cannot name the source yet. |
+| `<authority>` | `share`: the share is the source of record. `external`: the share caches truth from an outside source. `external` is accepted with a warning: the file cannot name the source yet, so the binding registers and nothing acts on it. |
 | `<zone>` | `commons` or `private`. See [The zone](#the-zone). |
 | `<retention>` | `latest`, `from-cursor` or `ttl`. See [The retention](#the-retention). |
 
@@ -119,8 +131,11 @@ The node refuses, with the line number: an entry that is not `key=value`; a
 key other than these two, which the message names; a key written twice; a
 duration or a profile it does not know; `ttl=` on a line whose retention is not
 `ttl`; a profile on a shape it does not fit; a `crdt` line without its profile;
-and a `key=value` entry standing where the zone or the retention goes, which
-means one of the five tokens is missing.
+and, in a file headed `glade-app v1`, a `key=value` entry standing where the
+zone or the retention goes, which means one of the five tokens is missing. A
+file headed `glade-app v0` keeps such an entry as the zone or the retention,
+as it always did, with a warning that it belongs in the tail, after all five
+tokens.
 
 **You learn the tail here, not from the node.** A valid five-token line is
 never refused, so the one message that shows the tail, the template the node
@@ -128,9 +143,17 @@ prints for a line with a token missing, never reaches an author whose line is
 right. The tail is in the grammar above, in this section, and in the grammar
 comment of the shipped app files.
 
-**The node checks the tail and does not record it yet.** The registered record
-holds the five tokens only, so nothing downstream learns a duration or a
-profile from the node today.
+**The node validates the tail keys `ttl=<duration>` and `shape-profile=<profile>`
+and records neither: no record carries a duration or a profile yet.** The
+registered record holds the five tokens only.
+
+**Where a `crdt` mount gets its profile today.** A glial mount of a `crdt`
+surface reads the profile declared for its glade id, a `ShapeProfileDecl`
+record, ahead of the mount's own `MountConfig.crdtProfile`. No node registers a
+`ShapeProfileDecl` yet, so today the profile comes from
+`MountConfig.crdtProfile`: the application mounting the surface sets it to
+`text_crdt`, or glial refuses the mount. The `shape-profile=text_crdt` a `crdt`
+line must carry is checked by the node and reaches no mount.
 
 ### `service`: an exchange
 
@@ -187,8 +210,10 @@ has none. On the glial path the mount's zone fill never reaches the wire.
 
 **Checking.** The node checks the zone in a file headed `glade-app v1`, the
 header to write: any value other than `commons` or `private` is reported with
-its line number and the two values. In this release the report is a warning,
-and the node stores the zone as written and starts. From the next release it
+its line number and the two values. For now the report is a warning that says
+a later node release refuses the line, and the node stores the zone as written
+and starts. glade-node has had no release yet (its version is `0.0.0`): its
+first release reports such a zone as a warning, and the release after that
 refuses the file. A file headed `glade-app v0`, the old language, still loads
 as it always did, with a warning that its header names the old language and
 that you should write `glade-app v1`, plus a warning for each zone
@@ -226,8 +251,8 @@ which turns an append log into a single value.
 **`ttl` says how long in the tail.** It is the answer for a surface whose
 entries should expire, such as a cache, on any shape. Write the duration as the
 tail's `ttl=` key, for example
-`binding notes.preview value share commons ttl ttl=10m`. A bare `ttl` is still
-accepted, and names no duration.
+`binding notes.preview value share commons ttl ttl=10m`. A bare `ttl`, with no
+`ttl=` entry, stays legal under either header and names no duration.
 
 **`windowed` is not a retention.** A window, such as the last screenful of a
 terminal, is a projection the application makes over a base shape, not
@@ -247,13 +272,15 @@ Write the value that says how the surface is read.
 the header to write: it must be one of the three values above, spelled as they
 are here. Any other value is reported with its line number: `windowed` and
 `from_cursor` are each told to write `from-cursor`, and any other value is told
-the three. In this release the report is a warning, and the node stores the
-retention as before (`from-cursor` as `from_cursor`, anything else as written)
-and starts. From the next release it refuses the file. A file headed
-`glade-app v0`, the old language, still loads as it always did, with the
-header's warning and, for each retention `glade-app v1` does not accept, a
-warning naming what to write and `glade-app v1`, the version it changed in. A
-`glade-app v0` file is never refused for its retention.
+the three. For now the report is a warning that says a later node release
+refuses the line, and the node stores the retention as before (`from-cursor`
+as `from_cursor`, anything else as written) and starts. As for the zone, the
+first glade-node release reports such a retention as a warning and the release
+after that refuses the file. A file headed `glade-app v0`, the old language,
+still loads as it always did, with the header's warning and, for each
+retention `glade-app v1` does not accept, a warning naming what to write and
+`glade-app v1`, the version it changed in. A `glade-app v0` file is never
+refused for its retention.
 
 ## Changing or deleting a line
 
@@ -261,21 +288,40 @@ A node reads its app files only when it starts, so an edit takes effect at the
 next start. Registration is by difference: a declaration whose record the node
 already holds is skipped, so loading an unchanged file registers nothing new.
 
+An app is declared by one file. The node takes a file's `binding` lines as the
+whole set its app declares, so two files naming one app would withdraw each
+other's surfaces at every start. A node given two such files refuses to start,
+before it writes anything, and the message names both files.
+
 ### `binding` lines
 
-- **The newest declaration wins.** Binding records are folded by glade id and
-  the newest is the live one, so a changed line replaces the surface's
-  declaration. The records it replaces stay in the store, and the node no
-  longer treats them as declared.
+- **The newest declaration wins.** Binding records are folded per app and
+  glade id, and the newest is that app's declaration of the surface; per glade
+  id, the newest declaration still live across apps is the live one. So a
+  changed line replaces the surface's declaration. The records it replaces stay
+  in the store, and the node no longer treats them as declared. Two apps may
+  declare one glade id: the node does not warn, and the newer live declaration
+  stands.
 - **A deleted line retracts its surface, for its own app only.** When a
   `binding` line is deleted from a file, the node records a retraction of the
   surface at its next start, but only of the declaration registered under the
-  app that file names in its `app` line. A surface declared by another app file
-  is never touched. Putting the line back declares the surface again.
+  app that file names in its `app` line. A declaration made under another app
+  is never touched, and if one is still live it becomes the surface's live
+  declaration. Putting the line back declares the surface again.
 - **A file that is not loaded retracts nothing.** A surface stays declared on a
   boot that leaves its file out, so a surface that a supplier will serve later
   stays declared. grazel, for instance, loads `gyld-app.glade` only when its
   gyld leg is on, and gyld's surfaces stay declared while the leg is off.
+- **Renaming the `app` line starts another app.** The file's lines register
+  under the new name, and the old name's declarations stay live, because no
+  file the node loads names that app any more. So a line deleted later, under
+  the new name, can bring back the old app's declaration of the same surface,
+  as it was before the rename.
+- **Retiring an app.** To withdraw every surface an app declared, start the
+  node once with a file that names the app and has no `binding` lines: each of
+  the app's declarations is retracted, and the file can then be left out.
+  Retiring the old name this way is how to rename an app without leaving its
+  declarations live.
 - **The node stores the retention in the contract's spelling.** Whichever
   spelling the file uses, the stored record says `from_cursor`. So on a node
   whose records were written before it did this, each binding that says
@@ -284,10 +330,19 @@ already holds is skipped, so loading an unchanged file registers nothing new.
 
 ### Other lines
 
-Deleting a `service` or a `workspace` line retracts nothing: a retired exchange
-stays declared and so stays routable, and the workspace's registered entry
-stays. Deleting a `seed` line does not withdraw the grant it made; revoking the
-grant does, and a revocation always wins over a seed.
+`glade-app v1` gives `service` and `workspace` lines no retraction. That was
+decided, not missed: the format's rule for deleted lines covers `binding` lines
+only (ruling R9 of `dev-docs/glade/GladeDeclReconciliation.md` in the glade-wz
+workspace), and whether a later format adds one is an open question.
+
+- Deleting a `service` line retracts nothing: the exchange stays declared, and
+  so stays routable.
+- Deleting a `workspace` line: from its next start the node no longer serves
+  the share, because at start it serves the shares its loaded files declare,
+  so it stops claiming it. The registered entry that names the node as an
+  eligible host of the share stays.
+- Deleting a `seed` line does not withdraw the grant it made; revoking the
+  grant does, and a revocation always wins over a seed.
 
 ## See also
 

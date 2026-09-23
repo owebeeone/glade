@@ -14,7 +14,9 @@ and future G* applications:
 - provider claims and leases
 - routing and diagnostics
 
-This repository is new and currently contains scaffolding only.
+Status: pre-release (glade-node `0.0.0`). The node in `node/` boots, loads the
+app files described in [`docs/AppFileFormat.md`](docs/AppFileFormat.md) and
+serves shares to clients and peers.
 
 ## Layout
 
@@ -26,14 +28,11 @@ This repository is new and currently contains scaffolding only.
 
 ## Current Focus
 
-The immediate planning focus is Phase 1:
-
-```text
-browser js-libp2p peer
-  -> Rust libp2p provider peer
-  -> local PTY process
-  -> append-log-shaped output buffer
-```
+The current plan is the first slice (`dev-docs/GladeFirstSlicePlan.md` at the
+glade-wz workspace root): the declaration contract v1 and its app-file header
+`glade-app v1`, then a node assembled from the contract ports in `contracts/`
+behind one gate (`node/check.sh`), then real adapters and a fixed-peer route over
+iroh.
 
 Stable design from the root `glial-dev` plan documents will be promoted here
 when it becomes module-owned Glade design.

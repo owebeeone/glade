@@ -98,8 +98,12 @@ SCHEMA = schema(
     # (app, glade_id) and only for the app that file names: a file not loaded
     # retracts nothing, and another app's declaration is never in scope. It
     # rides its own stream (dir.binding-retractions) and folds with
-    # dir.bindings, newest by (lamport, origin) winning, so a later
-    # declaration of the surface revives it.
+    # dir.bindings, the highest (lamport, origin) winning. Within one
+    # registry, whose one clock numbers both streams, that is the newest, so
+    # a later declaration of the surface brings it back. Across nodes the
+    # lamports are separate clocks, and this retraction carries no origin: in
+    # a store holding several nodes' records it takes down every node's
+    # declaration of the surface (open at plan Step 4.6).
     Msg("BindingRetraction",
         F("app", 1, STR),
         F("glade_id", 2, STR)),

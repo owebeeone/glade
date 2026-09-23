@@ -113,10 +113,23 @@ pub mod conformance {
         let mut r = request();
         r.definition_version = "other".into();
         assert_eq!(resolver.resolve(r).await, Err(BindError::VersionMismatch));
-        for shape in [Shape::Message, Shape::Window, Shape::Stream, Shape::Crdt] {
+        for shape in [
+            Shape::Message,
+            Shape::Window,
+            Shape::Stream,
+            Shape::Crdt,
+            Shape::Atom,
+            Shape::Exchange,
+            Shape::Swmr,
+            Shape::Log,
+        ] {
             let mut r = request();
             r.declaration.shape = shape;
-            assert_eq!(resolver.resolve(r).await, Err(BindError::Unsupported));
+            assert_eq!(
+                resolver.resolve(r).await,
+                Err(BindError::Unsupported),
+                "BI-002 {shape:?} must not fall back to value"
+            );
         }
         let mut r = request();
         r.declaration.glade_id.id = "missing".into();

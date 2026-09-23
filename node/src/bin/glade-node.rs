@@ -11,7 +11,7 @@
 //! **Booted profile form** (opt-in): `glade-node --profile local|peer|server
 //! [--name NAME] [--operator OP] [--app FILE.glade]... [--peer ID@IP:PORT]...
 //! [PORT] [STORE_DIR]` —
-//! FIRST boots the system-data instance (GDL-036): acquires
+//! reads every `--app` file, then boots the system-data instance (GDL-036): acquires
 //! `~/.glade/sys/<name>/` (the profile picks the default name; `--name`
 //! overrides; `GLADE_HOME` overrides `$HOME/.glade`), runs the load-validation
 //! ladder, materialises the RegistryApi fold, and writes its own presence —
@@ -26,8 +26,10 @@
 //! Each `--app FILE.glade` is LOADED as data and REGISTERED (GDL-037): its
 //! declarations append as ordinary records, its ACL seeds compile to grant
 //! records — under this node's chain, diffed against the fold (idempotent).
-//! A file that fails to parse stops the node; a file that parses with
-//! warnings prints each to stderr as `<FILE>: warning: line N: ...` and boots.
+//! An app is declared by one file. Every file is loaded before the instance
+//! is opened, so a file that fails to parse, or two files naming one app,
+//! stop the node before it writes anything; a file that parses with warnings
+//! prints each to stderr as `<FILE>: warning: line N: ...` and boots.
 //!
 //! Either form binds 127.0.0.1:<port> (0 = OS-assigned) and prints
 //! `listening <port>` so a parent process can read the actual port.
@@ -73,6 +75,10 @@ async fn main() -> std::io::Result<()> {
     // Only an explicit --profile/--name boots the system-data instance; the
     // legacy positional form keeps its pre-seam contract exactly.
     let booted = if profile.is_some() || name.is_some() {
+        // Every `--app` file is loaded, and two naming one app are refused,
+        // before `boot` opens the instance (L1-14): a refused start writes
+        // nothing.
+        let decls = glade_node::appdecl::load_all(&apps)?;
         let mut node = boot(profile.unwrap_or(Profile::Local), name.as_deref(), operator.as_deref())?;
         println!("instance {}", node.dir.display());
         println!("node {}", node.node_id);
@@ -86,8 +92,7 @@ async fn main() -> std::io::Result<()> {
         // the fold (idempotent), then persisted like any other record write.
         let registrant = node.node_id.clone();
         let mut workspaces: Vec<(String, String)> = Vec::new();
-        for path in &apps {
-            let decl = glade_node::appdecl::load(path)?;
+        for (path, decl) in apps.iter().zip(decls) {
             // The non-fatal channel (R10(a)): the file loaded, so boot goes on;
             // each warning goes to stderr, path-prefixed as `load`'s errors are.
             for line in decl.warning_lines(path) {

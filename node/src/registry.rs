@@ -472,7 +472,11 @@ impl RegistryApi for Registry {
 /// Where a binding-family record stands in the fold's order: the documented
 /// `value` rule, highest `(lamport, origin)` wins (glade-gyld README), made
 /// total by the stream — a retraction outranks a declaration it ties — and
-/// then the chain seq.
+/// then the chain seq. Within one registry this order is "newest", because
+/// one clock numbers the family there (`next_binding_lamport`). Records from
+/// several nodes carry several clocks, so across them it is an order and not
+/// a newest: which one a store holding several nodes' records should use is
+/// open at plan Step 4.6.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Stamp {
     lamport: i64,
@@ -495,7 +499,11 @@ struct Newest {
 /// per glade id, the newest declaration still live across apps is the
 /// surface. A retraction therefore retracts only its own app's declaration.
 /// The same fold serves the registry, `register`'s diff, and the served
-/// store (`exchange::declared_exchange`).
+/// store (`exchange::declared_exchange`), but the rules above hold as stated
+/// within one registry, which holds one node's records only. The served
+/// store also holds peers' records, each numbered on its own node's clock,
+/// and a retraction, keyed `(app, glade_id)` with no origin, takes down every
+/// node's declaration of its surface: open at plan Step 4.6.
 #[derive(Clone, Debug, Default)]
 pub struct BindingFold {
     newest: BTreeMap<(String, String), Newest>,
@@ -776,6 +784,49 @@ mod tests {
         // a second origin's first record is still the newest
         assert_eq!(at(decl("a", "k", "value"), "n2"), (G_BINDINGS.into(), 0, 5));
         assert_eq!(at(claim("n1", "ws", 1, 2), "n1"), (G_CLAIMS.into(), 1, 1));
+    }
+
+    /// The glade ids `app` has live in one fold of every record `regs` hold.
+    fn live_together(regs: &[&Registry], app: &str) -> Vec<String> {
+        let ops: Vec<Op> = regs.iter().copied().flat_map(ops_of).collect();
+        let live = BindingFold::over(&ops).declared_by(app);
+        live.into_keys().collect()
+    }
+
+    /// Today's outcome across two origins (STA-P3-1), pinned, not endorsed.
+    /// Each registry numbers the binding family on its own clock and never
+    /// ingests another node's records. So where two nodes' records are folded
+    /// together, as the served store does, they rank by lamport, not by when
+    /// each was appended; and a retraction, keyed `(app, glade_id)` with no
+    /// origin, takes both nodes' declarations of its surface down. What such
+    /// a store should do is open at plan Step 4.6.
+    #[test]
+    fn across_two_origins_one_nodes_retraction_outranks_the_others_later_declaration() {
+        let (mut a, mut b) = (Registry::new(), Registry::new());
+        // A's clock runs ahead of B's: six binding records of another app.
+        for i in 0..6 {
+            let other = decl("other", &format!("o{i}"), "value");
+            a.append(other, "A").unwrap();
+        }
+        for (reg, origin) in [(&mut a, "A"), (&mut b, "B")] {
+            reg.append(decl("grazel", "g", "value"), origin).unwrap();
+            reg.append(decl("grazel", "h", "value"), origin).unwrap();
+        }
+        let retraction = a.append_returning(retract("grazel", "g"), "A").unwrap();
+        assert_eq!(retraction.lamport, 8);
+        // Folded together, A's retraction takes B's `g` down as well, while
+        // B's own registry has it live.
+        assert_eq!(live_together(&[&a, &b], "grazel"), ["h"]);
+        assert_eq!(live_together(&[&b], "grazel"), ["g", "h"]);
+        // B changes `g` after A's retraction. On B's clock that declaration
+        // is lamport 2, below the retraction's 8, so it stays down together.
+        let later = b.append_returning(decl("grazel", "g", "log"), "B").unwrap();
+        assert_eq!(later.lamport, 2);
+        assert_eq!(live_together(&[&a, &b], "grazel"), ["h"]);
+        // B's registry, the basis of its next `register` diff, has the
+        // change live, so nothing on B declares `g` again.
+        let want = vec![row("grazel", "g", "log"), row("grazel", "h", "value")];
+        assert_eq!(live(&b), want);
     }
 
     /// The fold is a pure function of the op-set: any arrival order, and a

@@ -13,13 +13,16 @@
 //!   boot profile (R11's naming note).
 //!
 //! The tail starts after the fifth token, so a `key=value` entry standing
-//! where the zone or the retention goes means a token is missing, and it is
-//! refused rather than stored as that token. Each rule is enforced at parse
-//! with the line number, as every binding check is. This is the tail's own
-//! grammar, not the zone and retention validation plan Step 2.6 switches on.
-//! What the tail yields is parse data ([`BindingTail`]); no record carries it.
+//! where the zone or the retention goes means a token is missing. A
+//! `glade-app v1` file is refused for it rather than having it stored as that
+//! token; a `glade-app v0` file stores it as written, as it always did, and
+//! the zone and retention checks warn where the entry belongs (R10(a)). Each
+//! rule is enforced at parse with the line number, as every binding check is.
+//! This is the tail's own grammar, not the zone and retention validation plan
+//! Step 2.6 switches on. What the tail yields is parse data ([`BindingTail`]);
+//! no record carries it.
 
-use super::BindingTail;
+use super::{AppFileVersion, BindingTail};
 
 /// The keys a tail may carry.
 const KEYS: [&str; 2] = ["ttl", "shape-profile"];
@@ -37,10 +40,11 @@ const UNITS: [(&str, i64); 5] =
     [("ms", 1), ("s", 1_000), ("m", 60_000), ("h", 3_600_000), ("d", 86_400_000)];
 
 /// Parse binding line `n`'s tail — `toks`, the tokens after the five
-/// positional ones — against the line's shape, zone and retention. `Ok(None)`
-/// for a line with no tail that needs none.
+/// positional ones — against the line's shape, zone and retention, in a file
+/// of language `version`. `Ok(None)` for a line with no tail that needs none.
 pub(super) fn parse(
     n: usize,
+    version: AppFileVersion,
     glade_id: &str,
     shape: &str,
     zone: &str,
@@ -48,14 +52,16 @@ pub(super) fn parse(
     toks: &[&str],
 ) -> Result<Option<BindingTail>, String> {
     // Shape and authority are refused outside their vocabularies already; the
-    // zone and the retention are checked after the tail, and a `v0` file is
-    // never refused for them (Step 2.6), so a tail entry that slid into either
-    // slot would otherwise load as that token.
-    for (slot, tok) in [("zone", zone), ("retention", retention)] {
-        if tok.contains('=') {
-            return Err(format!(
-                "line {n}: `{tok}` is a key=value entry where <{slot}> goes (the tail follows all five tokens)"
-            ));
+    // zone and the retention are checked after the tail. A `v1` file is
+    // refused here, whatever `V1_TOKEN_CHECKS_REFUSE` says, for a tail entry
+    // that slid into either slot, which would otherwise load as that token. A
+    // `v0` file is never refused for its zone or retention (R10(a)): it keeps
+    // the token, as it always did, and the zone and retention checks warn.
+    if version == AppFileVersion::V1 {
+        for (slot, tok) in [("zone", zone), ("retention", retention)] {
+            if tok.contains('=') {
+                return Err(format!("line {n}: {}", misplaced(slot, tok)));
+            }
         }
     }
     let mut tail = BindingTail { glade_id: glade_id.into(), ..BindingTail::default() };
@@ -86,6 +92,12 @@ pub(super) fn parse(
     } else {
         Ok(Some(tail))
     }
+}
+
+/// A `key=value` entry standing where `slot`, the zone or the retention, goes,
+/// as a `glade-app v1` file is refused for it.
+pub(super) fn misplaced(slot: &str, tok: &str) -> String {
+    format!("`{tok}` is a key=value entry where <{slot}> goes (the tail follows all five tokens)")
 }
 
 /// The tail's keys, as a diagnostic lists them.
@@ -152,7 +164,7 @@ fn fits_shape(n: usize, shape: &str, profile: Option<&str>) -> Result<(), String
             if PROFILE_REQUIRED.contains(&shape) {
                 let needs: Vec<String> = over_shape.iter().map(|p| format!("`shape-profile={p}`")).collect();
                 return Err(format!(
-                    "line {n}: shape `{shape}` needs {} (glial cannot mount a {shape} surface without its profile)",
+                    "line {n}: shape `{shape}` needs {} (a `{shape}` line must name its profile)",
                     needs.join(" or ")
                 ));
             }
@@ -247,23 +259,62 @@ mod tests {
         }
     }
 
-    /// A missing positional token cannot hide behind the tail: a `key=value`
-    /// entry standing where the zone or the retention goes is refused, naming
-    /// the slot, so "there is no default" stays true on a line with a tail.
+    /// A missing positional token cannot hide behind the tail in a
+    /// `glade-app v1` file: a `key=value` entry standing where the zone or the
+    /// retention goes is refused, naming the slot, so "there is no default"
+    /// stays true on a line with a tail. It is not a zone or retention check,
+    /// so the refusal holds on both sides of `V1_TOKEN_CHECKS_REFUSE`.
     #[test]
     fn a_tail_entry_where_a_token_goes_is_refused() {
+        let v1_line = |binding: &str| parse(&format!("glade-app v1\napp x\n{binding}\n"));
         assert_eq!(
-            line("binding g value share commons ttl=10m").unwrap_err(),
+            v1_line("binding g value share commons ttl=10m").unwrap_err(),
             "line 3: `ttl=10m` is a key=value entry where <retention> goes (the tail follows all five tokens)"
         );
         assert_eq!(
-            line("binding g value share latest ttl=10m").unwrap_err(),
+            v1_line("binding g value share latest ttl=10m").unwrap_err(),
             "line 3: `ttl=10m` is a key=value entry where <retention> goes (the tail follows all five tokens)"
         );
         assert_eq!(
-            line("binding g swmr share shape-profile=snapshot_delta from-cursor").unwrap_err(),
+            v1_line("binding g swmr share shape-profile=snapshot_delta from-cursor").unwrap_err(),
             "line 3: `shape-profile=snapshot_delta` is a key=value entry where <zone> goes (the tail follows all five tokens)"
         );
+    }
+
+    /// The first binding's stored zone and retention.
+    fn stored(decl: &AppDecl) -> [&str; 2] {
+        let b = &decl.bindings[0];
+        [&b.zone, &b.retention]
+    }
+
+    /// The `glade-app v0` twin: the file loads as it did before the tail
+    /// (glade 559cb2c), each token stored as written, and each entry where a
+    /// token goes is warned on its line with where it belongs (R10(a)).
+    #[test]
+    fn a_tail_entry_where_a_token_goes_is_warned_in_a_v0_file() {
+        let header = "line 1: header `glade-app v0` names the old language; write `glade-app v1`";
+        let belongs = "it belongs in the tail, after all five tokens (`glade-app v1` refuses it)";
+        let retention =
+            format!("line 3: `ttl=10m` is a key=value entry where <retention> goes; {belongs}");
+        let zone = format!(
+            "line 3: `shape-profile=snapshot_delta` is a key=value entry where <zone> goes; {belongs}"
+        );
+
+        let decl = line("binding g value share commons ttl=10m").unwrap();
+        assert_eq!(stored(&decl), ["commons", "ttl=10m"]);
+        assert_eq!(decl.warnings, [header, retention.as_str()]);
+
+        let decl = line("binding g value share latest ttl=10m").unwrap();
+        assert_eq!(stored(&decl), ["latest", "ttl=10m"]);
+        let latest =
+            r#"line 3: zone `latest` is not in `glade-app v1` (one of ["commons", "private"])"#;
+        assert_eq!(decl.warnings, [header, latest, retention.as_str()]);
+
+        let decl = line("binding g swmr share shape-profile=snapshot_delta from-cursor").unwrap();
+        let profile = "shape-profile=snapshot_delta";
+        assert_eq!(stored(&decl), [profile, "from_cursor"]);
+        assert_eq!(decl.warnings, [header, zone.as_str()]);
+        assert!(decl.tails.is_empty(), "a token here, not a tail");
     }
 
     /// A key may appear once per line, even with the same value.
@@ -348,16 +399,17 @@ mod tests {
 
     /// `crdt` without its profile is refused at parse: glial throws at mount
     /// without one, and a file that loads into an unmountable surface is the
-    /// defect (§4.4 bullet 4).
+    /// defect (§4.4 bullet 4). The message says only what is true of the
+    /// file: the line must name its profile, which no record carries yet.
     #[test]
     fn crdt_without_a_profile_is_refused() {
         assert_eq!(
             line("binding doc.body crdt share commons from-cursor").unwrap_err(),
-            "line 3: shape `crdt` needs `shape-profile=text_crdt` (glial cannot mount a crdt surface without its profile)"
+            "line 3: shape `crdt` needs `shape-profile=text_crdt` (a `crdt` line must name its profile)"
         );
         assert_eq!(
             line("binding doc.body crdt share commons ttl ttl=1d").unwrap_err(),
-            "line 3: shape `crdt` needs `shape-profile=text_crdt` (glial cannot mount a crdt surface without its profile)"
+            "line 3: shape `crdt` needs `shape-profile=text_crdt` (a `crdt` line must name its profile)"
         );
     }
 }

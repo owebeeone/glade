@@ -33,22 +33,26 @@
 //! grammar: a binding's zone must be `commons` or `private`, and its retention
 //! `latest`, `from-cursor` or `ttl` in the file's spelling; any other token is
 //! a line-numbered warning for one release and refuses the file from the next
-//! (the flip is `V1_TOKEN_CHECKS_REFUSE`). A `v0` file loads as it always
-//! did, warned that its header names the old language and told, for each
-//! token `v1` changes or refuses, the replacement and the version; it is never
-//! refused for them. Warnings go through [`AppDecl::warnings`], the non-fatal
-//! channel.
+//! (the flip is `V1_TOKEN_CHECKS_REFUSE`); a `key=value` entry standing where
+//! either goes is refused on both sides of the flip. A `v0` file loads as it
+//! always did, warned that its header names the old language and told, for
+//! each token `v1` changes or refuses, the replacement and the version; it is
+//! never refused for them. Warnings go through [`AppDecl::warnings`], the
+//! non-fatal channel.
 //!
-//! Registration is idempotent by DIFF (the GQ-6 pinning discipline): a record
-//! whose bytes already exist in the fold is skipped, so re-loading the file
-//! appends nothing — and can never clobber a later runtime ACL update, because
-//! the fold (revocation-wins) stays the only authority. Bindings diff against
-//! the `dir.bindings` fold (R9(a)), per `(app, glade_id)` and only for the app
-//! the file names: a changed line appends its new declaration, and a line the
-//! file no longer has appends a `BindingRetraction`. So a file not loaded
-//! retracts nothing, and another app's declarations are never in scope.
-//! `service`, `seed` and `workspace` lines keep the plain diff: deleting one
-//! retracts nothing.
+//! An app is declared by one file. Registration is idempotent by DIFF (the
+//! GQ-6 pinning discipline): a record whose bytes already exist in the fold is
+//! skipped, so re-loading the file appends nothing — and can never clobber a
+//! later runtime ACL update, because the fold (revocation-wins) stays the only
+//! authority. Bindings diff against the `dir.bindings` fold (R9(a)), per
+//! `(app, glade_id)` and only for the app the file names: a changed line
+//! appends its new declaration, and a line the file no longer has appends a
+//! `BindingRetraction`. So a file not loaded retracts nothing, and another
+//! app's declarations are never in scope; but a second file naming the same
+//! app would retract the first's bindings on every start, which is why
+//! [`load_all`] refuses a start whose files name one app twice. `service`,
+//! `seed` and `workspace` lines keep the plain diff: deleting one retracts
+//! nothing.
 
 use std::fs;
 use std::io;
@@ -108,21 +112,44 @@ const REFUSED_RETENTIONS: [(&str, &str, &str); 2] = [
 /// What a `glade-app v0` header is told (R10(a)): the file loads as it always
 /// did, and learns the header that names the validated grammar.
 const V0_HEADER_WARNING: &str = "header `glade-app v0` names the old language; write `glade-app v1`";
+/// What a file whose first declaration line is not a header is told: the
+/// header to write, and the one an old file may still carry.
+const HEADER_TO_WRITE: &str = "write `glade-app v1` (`glade-app v0` is accepted for old files)";
 /// THE NEXT-RELEASE FLIP, for R1's row 31b (ii) and R2's row 18b (ii): "a
 /// warning for one release, a hard error at the next". `false`, this release:
 /// a `glade-app v1` file holding a zone or retention that `v1` does not accept
-/// is told so through [`AppDecl::warnings`] and loads. `true`, the next
-/// release: the first such token refuses the file, with the same line-numbered
-/// text. The flip is this one line: nothing else changes, and the tests read
-/// this constant, so they hold on both sides of it.
+/// is told so through [`AppDecl::warnings`], ending with [`V1_REFUSED_LATER`],
+/// and loads. `true`, the next release: the first such token refuses the file,
+/// with the same line-numbered text less that ending. The flip is this one
+/// line: nothing else changes, and the tests read this constant, so they hold
+/// on both sides of it.
 ///
 /// A release, here, is a new `version` in `node/Cargo.toml`. glade-node has
 /// not had one: its version is `0.0.0`, and no tag names a node release. So
 /// these warnings ship in the first release that carries this code (the first
-/// version above `0.0.0`), and the release after that one sets this to `true`.
-/// A `glade-app v0` file is never refused for its zone or retention, whatever
-/// this says (R10(a)).
+/// version above `0.0.0`), which [`V1_WARNING_RELEASE`] names once it is cut,
+/// and the release after that one sets this to `true`. A test holds the two
+/// constants to `CARGO_PKG_VERSION`, so a version bump that has not decided
+/// the flip fails it. A `glade-app v0` file is never refused for its zone or
+/// retention, whatever this says (R10(a)).
 const V1_TOKEN_CHECKS_REFUSE: bool = false;
+/// The node release that ships the `v1` warnings: `None` until the first
+/// release (the first version above `0.0.0`) is cut, then its version. At any
+/// version but `0.0.0` it must name a release, and once the version is past
+/// it [`V1_TOKEN_CHECKS_REFUSE`] must be `true` (`a_node_release_decides_the_flip`).
+#[allow(dead_code)] // read by that test only
+const V1_WARNING_RELEASE: Option<&str> = None;
+/// How a `v1` zone or retention warning ends: what happens to the line once
+/// [`V1_TOKEN_CHECKS_REFUSE`] is flipped.
+const V1_REFUSED_LATER: &str = "a later node release refuses the line";
+/// What a `v0` file is told after a `key=value` entry that stands where the
+/// zone or the retention goes ([`misplaced`]).
+const MISPLACED_V0: &str =
+    "it belongs in the tail, after all five tokens (`glade-app v1` refuses it)";
+/// What a binding line whose authority is `external` is told, under either
+/// header: the file cannot name the source yet.
+const EXTERNAL_WARNING: &str =
+    "authority `external` names no source yet: the binding registers, and nothing acts on it";
 /// The authority kinds (decl surface): the share is the source of record, or
 /// the share caches external truth.
 const AUTHORITIES: [&str; 2] = ["share", "external"];
@@ -233,9 +260,8 @@ pub fn parse(text: &str) -> Result<AppDecl, String> {
         if !versioned {
             let header = toks.join(" ");
             let Some(&(_, version)) = HEADERS.iter().find(|(h, _)| *h == header) else {
-                let expected = expected_headers();
                 return Err(format!(
-                    "line {n}: expected {expected} header, got `{line}`"
+                    "line {n}: expected a header, got `{line}`: {HEADER_TO_WRITE}"
                 ));
             };
             decl.version = version;
@@ -277,8 +303,19 @@ pub fn parse(text: &str) -> Result<AppDecl, String> {
                         toks[3]
                     ));
                 }
-                let tail = tail::parse(n, glade_id, shape, toks[4], retention, &toks[6..])?;
+                let tail = tail::parse(
+                    n,
+                    decl.version,
+                    glade_id,
+                    shape,
+                    toks[4],
+                    retention,
+                    &toks[6..],
+                )?;
                 push_glade_id(&mut glade_ids, glade_id, n)?;
+                if toks[3] == "external" {
+                    decl.warnings.push(format!("line {n}: {EXTERNAL_WARNING}"));
+                }
                 // The zone and the retention (Step 2.6), after every refusal
                 // above, so each of those keeps its message; branched by the
                 // header (R10(a)).
@@ -288,7 +325,8 @@ pub fn parse(text: &str) -> Result<AppDecl, String> {
                             if V1_TOKEN_CHECKS_REFUSE {
                                 return Err(format!("line {n}: {}", told.v1));
                             }
-                            decl.warnings.push(format!("line {n}: {}", told.v1));
+                            let warning = format!("line {n}: {}; {V1_REFUSED_LATER}", told.v1);
+                            decl.warnings.push(warning);
                         }
                         AppFileVersion::V0 => {
                             decl.warnings.push(format!("line {n}: {}", told.v0));
@@ -351,8 +389,7 @@ pub fn parse(text: &str) -> Result<AppDecl, String> {
     }
 
     if !versioned {
-        let expected = expected_headers();
-        return Err(format!("empty file: expected {expected} header"));
+        return Err(format!("empty file: expected a header: {HEADER_TO_WRITE}"));
     }
     if decl.app.is_empty() {
         return Err("missing `app <name>` declaration".into());
@@ -407,16 +444,21 @@ struct Unaccepted {
 /// does not accept, zone first; none for a line it accepts, so the file's
 /// `from-cursor` is never reported. A zone outside [`ZONES`] and a retention
 /// outside [`RETENTIONS`] are named with the legal values; `windowed` and a
-/// file's `from_cursor` take [`REFUSED_RETENTIONS`]' messages.
+/// file's `from_cursor` take [`REFUSED_RETENTIONS`]' messages; a `key=value`
+/// entry in either slot takes [`misplaced`]'s.
 fn unaccepted(zone: &str, retention: &str) -> Vec<Unaccepted> {
     let mut out = Vec::new();
-    if !ZONES.contains(&zone) {
+    if zone.contains('=') {
+        out.push(misplaced("zone", zone));
+    } else if !ZONES.contains(&zone) {
         out.push(Unaccepted {
             v1: format!("unknown zone `{zone}` (one of {ZONES:?})"),
             v0: format!("zone `{zone}` is not in `glade-app v1` (one of {ZONES:?})"),
         });
     }
-    if let Some(&(_, v1, v0)) = REFUSED_RETENTIONS.iter().find(|(t, _, _)| *t == retention) {
+    if retention.contains('=') {
+        out.push(misplaced("retention", retention));
+    } else if let Some(&(_, v1, v0)) = REFUSED_RETENTIONS.iter().find(|(t, _, _)| *t == retention) {
         out.push(Unaccepted { v1: v1.into(), v0: v0.into() });
     } else if !RETENTIONS.contains(&retention) {
         out.push(Unaccepted {
@@ -427,10 +469,15 @@ fn unaccepted(zone: &str, retention: &str) -> Vec<Unaccepted> {
     out
 }
 
-/// The headers a node reads, as a diagnostic names them.
-fn expected_headers() -> String {
-    let quoted: Vec<String> = HEADERS.iter().map(|(h, _)| format!("`{h}`")).collect();
-    quoted.join(" or ")
+/// A `key=value` entry standing where `slot` goes, which means a token is
+/// missing. A `glade-app v1` file is refused for it by the tail's own check,
+/// before this one and on both sides of the flip, so only a `v0` file meets
+/// this: the token is stored as written, as it always was, and the file is
+/// told where the entry belongs (R10(a)).
+fn misplaced(slot: &str, tok: &str) -> Unaccepted {
+    let v1 = tail::misplaced(slot, tok);
+    let v0 = format!("`{tok}` is a key=value entry where <{slot}> goes; {MISPLACED_V0}");
+    Unaccepted { v1, v0 }
 }
 
 /// A glade id is frozen once shared (GQ-6) — a duplicate within one file is a
@@ -454,6 +501,31 @@ pub fn load(path: impl AsRef<Path>) -> io::Result<AppDecl> {
     })
 }
 
+/// Load every app file of one start, in order, before any is registered
+/// (L1-14's preflight): each with [`load`], then refused when two name one
+/// app. An app is declared by one file, because [`register`] takes a file as
+/// its app's whole binding set: a second file naming the app would retract
+/// the first's bindings, and the first the second's, on every start. The
+/// refusal is one line, prefixed with the later file's path as `load`
+/// prefixes its errors, naming the app and the earlier file's path.
+pub fn load_all<P: AsRef<Path>>(paths: &[P]) -> io::Result<Vec<AppDecl>> {
+    let decls: Vec<AppDecl> = paths.iter().map(load).collect::<io::Result<_>>()?;
+    for (later, decl) in decls.iter().enumerate() {
+        if let Some(earlier) = decls[..later].iter().position(|d| d.app == decl.app) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{}: app `{}` is already declared by {} (an app is declared by one file)",
+                    paths[later].as_ref().display(),
+                    decl.app,
+                    paths[earlier].as_ref().display()
+                ),
+            ));
+        }
+    }
+    Ok(decls)
+}
+
 /// What one registration did — load evidence, and the idempotence observable.
 #[derive(Debug, Default, PartialEq)]
 pub struct Registered {
@@ -475,7 +547,11 @@ pub struct Registered {
 /// with the same bytes is unchanged; any other line appends its declaration
 /// (new, changed, or declared again after a retraction); and each glade id
 /// this app has live that the file no longer declares appends a
-/// [`BindingRetraction`]. Retractions count in `appended`.
+/// [`BindingRetraction`]. Retractions count in `appended`. So `decl` is its
+/// app's whole binding set, and an app is declared by one file: a caller
+/// registering several files loads them with [`load_all`], which refuses two
+/// naming one app. A file naming an app with no binding lines retracts every
+/// binding that app has live.
 pub fn register(
     decl: &AppDecl,
     reg: &mut dyn RegistryApi,
@@ -756,9 +832,11 @@ mod tests {
     }
 
     /// Any other header is still refused, with its line number, the text it
-    /// found, and both headers a node reads.
+    /// found, and both headers a node reads: `glade-app v1` as the one to
+    /// write, `glade-app v0` as accepted for old files (SUR-P3-2).
     #[test]
     fn any_other_header_is_refused_with_its_line_naming_both() {
+        let to_write = "write `glade-app v1` (`glade-app v0` is accepted for old files)";
         let cases = [
             ("glade-app v2\napp x\n", 1, "glade-app v2"),
             ("glade-app\napp x\n", 1, "glade-app"),
@@ -769,16 +847,12 @@ mod tests {
         for (text, line, found) in cases {
             assert_eq!(
                 parse(text).unwrap_err(),
-                format!(
-                    "line {line}: expected `glade-app v0` or `glade-app v1` header, got `{found}`"
-                )
+                format!("line {line}: expected a header, got `{found}`: {to_write}")
             );
         }
+        let empty = format!("empty file: expected a header: {to_write}");
         for text in ["", "# only a comment\n\n"] {
-            assert_eq!(
-                parse(text).unwrap_err(),
-                "empty file: expected `glade-app v0` or `glade-app v1` header"
-            );
+            assert_eq!(parse(text).unwrap_err(), empty);
         }
     }
 
@@ -1070,13 +1144,21 @@ mod tests {
     /// this build's channel: the file's warnings while
     /// [`V1_TOKEN_CHECKS_REFUSE`] is off (this release), or the refusal they
     /// become once it is on (the next release), which names the first
-    /// violation. A test that asserts through this holds on both sides of
-    /// the flip, so the flip stays one line.
+    /// violation. Each warning must end with [`V1_REFUSED_LATER`], which the
+    /// refusal does not print, so it is checked and dropped here. A test that
+    /// asserts through this holds on both sides of the flip, so the flip
+    /// stays one line.
     fn v1_reports(text: &str) -> Vec<String> {
         if V1_TOKEN_CHECKS_REFUSE {
             vec![parse(text).unwrap_err()]
         } else {
-            parse(text).unwrap().warnings
+            let ending = format!("; {V1_REFUSED_LATER}");
+            let warnings = parse(text).unwrap().warnings;
+            for w in &warnings {
+                assert!(w.ends_with(&ending), "{w}: no refusal notice");
+            }
+            let cut = |w: &String| w[..w.len() - ending.len()].to_string();
+            warnings.iter().map(cut).collect()
         }
     }
 
@@ -1194,8 +1276,10 @@ mod tests {
 
     /// In this release a `v1` file's violations are warnings: the file loads,
     /// every token is stored as before, and a line with a bad zone and a bad
-    /// retention is told both, zone first, each with its line. From the next
-    /// release the first violation refuses the file, with the same text.
+    /// retention is told both, zone first, each with its line and each saying
+    /// a later node release refuses the line (SUR-P3-2). From the next
+    /// release the first violation refuses the file, with the same text less
+    /// that ending.
     #[test]
     fn a_v1_file_is_warned_this_release_and_refused_from_the_next() {
         let text = v1_file(
@@ -1212,7 +1296,8 @@ mod tests {
             assert_eq!(parse(&text).unwrap_err(), told[0]);
         } else {
             let decl = parse(&text).unwrap();
-            assert_eq!(decl.warnings, told);
+            let warned = told.map(|t| format!("{t}; a later node release refuses the line"));
+            assert_eq!(decl.warnings, warned);
             let stored: Vec<(&str, &str)> =
                 decl.bindings.iter().map(|b| (b.zone.as_str(), b.retention.as_str())).collect();
             assert_eq!(stored, [("commons", "latest"), ("shared", "windowed"), ("commons", "from_cursor")]);
@@ -1273,5 +1358,161 @@ mod tests {
             parse(&v1_file("binding g value share commons latest\nbinding g log share shared windowed")).unwrap_err(),
             "line 4: duplicate glade id `g`"
         );
+    }
+
+    // ---- The amendment review's remediation, round 1 ----------------------
+
+    /// Register `decl` under node-1: (appended, unchanged).
+    fn counts(decl: &AppDecl, reg: &mut Registry) -> (usize, usize) {
+        let out = register(decl, reg, "node-1").unwrap();
+        (out.appended, out.unchanged)
+    }
+
+    /// STA-P2-2: a `key=value` entry where the zone or the retention goes, in
+    /// a `glade-app v0` file. The token is stored as written, as before the
+    /// tail (glade 559cb2c), and warned on its line with where the entry
+    /// belongs; a `v0` file is never refused for it (R10(a)).
+    #[test]
+    fn a_v0_file_keeps_a_key_value_zone_or_retention_and_is_warned() {
+        let decl = binding_line("binding g value share commons ttl=10m").unwrap();
+        assert_eq!(decl.bindings[0].retention, "ttl=10m");
+        let told = format!(
+            "line 3: `ttl=10m` is a key=value entry where <retention> goes; {MISPLACED_V0}"
+        );
+        assert_eq!(decl.warnings, [V0_HEADER_AT_1.to_string(), told]);
+
+        let decl = binding_line("binding g value share a=b latest").unwrap();
+        assert_eq!(decl.bindings[0].zone, "a=b");
+        let told = format!("line 3: `a=b` is a key=value entry where <zone> goes; {MISPLACED_V0}");
+        assert_eq!(decl.warnings, [V0_HEADER_AT_1.to_string(), told]);
+
+        assert_eq!(
+            MISPLACED_V0,
+            "it belongs in the tail, after all five tokens (`glade-app v1` refuses it)"
+        );
+    }
+
+    /// STA-P2-2's `v1` twins, refused with Step 2.5's message naming the slot
+    /// on both sides of the flip: the refusal is the tail's check, which
+    /// [`V1_TOKEN_CHECKS_REFUSE`] does not reach.
+    #[test]
+    fn a_v1_file_is_refused_for_a_key_value_zone_or_retention() {
+        assert_eq!(
+            parse(&v1_file("binding g value share commons ttl=10m")).unwrap_err(),
+            "line 3: `ttl=10m` is a key=value entry where <retention> goes (the tail follows all five tokens)"
+        );
+        assert_eq!(
+            parse(&v1_file("binding g value share a=b latest")).unwrap_err(),
+            "line 3: `a=b` is a key=value entry where <zone> goes (the tail follows all five tokens)"
+        );
+    }
+
+    /// SUR-P3-7: `external` loads and registers, and is warned under either
+    /// header, on both sides of the flip: the binding names no source yet, so
+    /// nothing acts on it.
+    #[test]
+    fn external_is_warned_that_it_names_no_source() {
+        let line = "binding feed.cache value external commons latest";
+        let told = format!("line 3: {EXTERNAL_WARNING}");
+        let decl = parse(&v1_file(line)).unwrap();
+        assert_eq!(decl.warnings, [told.as_str()]);
+        let mut reg = Registry::new();
+        assert_eq!(counts(&decl, &mut reg), (1, 0));
+        assert_eq!(reg.bindings_of()[0].authority, "external");
+        assert_eq!(v0_warnings(line), [V0_HEADER_AT_1.to_string(), told]);
+        assert_eq!(
+            EXTERNAL_WARNING,
+            "authority `external` names no source yet: the binding registers, and nothing acts on it"
+        );
+    }
+
+    /// The live bindings, each as `app/glade_id shape`.
+    fn live_apps(reg: &Registry) -> Vec<String> {
+        let row = |b: BindingDecl| format!("{}/{} {}", b.app, b.glade_id, b.shape);
+        reg.bindings_of().into_iter().map(row).collect()
+    }
+    /// The `notes` app of STA-P3-2's sequence, before its `app` line is renamed.
+    const NOTES: &str = "glade-app v1\napp notes\n\
+                         binding n.list value share commons latest\n\
+                         binding n.old  log   share commons from-cursor\n";
+    /// The same file with its `app` line renamed, `n.old` deleted, and
+    /// `n.list` changed to a log.
+    const NOTES2: &str = "glade-app v1\napp notes2\nbinding n.list log share commons from-cursor\n";
+
+    /// SUR-P3-1 case 1, STA-P3-2: the fold is per `(app, glade_id)`, and per
+    /// glade id the newest live declaration across apps stands. Renaming the
+    /// `app` line starts another app and leaves the old name's declarations
+    /// live, so a line deleted later brings back the old app's declaration of
+    /// that surface: the outcome the format page states.
+    #[test]
+    fn renaming_the_app_line_leaves_the_old_names_declarations_live() {
+        let mut reg = Registry::new();
+        assert_eq!(counts(&parse(NOTES).unwrap(), &mut reg), (2, 0));
+        // Renamed: `n.old` is not retracted, because `notes` is out of scope.
+        assert_eq!(counts(&parse(NOTES2).unwrap(), &mut reg), (1, 0));
+        assert_eq!(live_apps(&reg), ["notes2/n.list log", "notes/n.old log"]);
+        // `n.list` deleted from the renamed file: `notes2`'s declaration is
+        // retracted, and `notes`'s older one stands again, as a value.
+        let deleted = parse("glade-app v1\napp notes2\n").unwrap();
+        assert_eq!(counts(&deleted, &mut reg), (1, 0));
+        assert_eq!(live_apps(&reg), ["notes/n.list value", "notes/n.old log"]);
+    }
+
+    /// STA-P3-2: an app is retired by loading, once, a file that names it
+    /// and has no binding lines. It retracts every declaration of that app,
+    /// and only that app's; loaded again, it appends nothing.
+    #[test]
+    fn a_file_naming_an_app_with_no_binding_lines_retires_it() {
+        let mut reg = Registry::new();
+        register(&parse(NOTES).unwrap(), &mut reg, "node-1").unwrap();
+        register(&parse(NOTES2).unwrap(), &mut reg, "node-1").unwrap();
+        let retire = parse("glade-app v1\napp notes\n").unwrap();
+        assert_eq!(counts(&retire, &mut reg), (2, 0));
+        assert_eq!(live_apps(&reg), ["notes2/n.list log"]);
+        let retracted = BindingFold::over(&ops_of(&reg)).retracted();
+        let notes = |id: &str| ("notes".to_string(), id.to_string());
+        assert_eq!(retracted, [notes("n.list"), notes("n.old")]);
+        assert_eq!(counts(&retire, &mut reg), (0, 0));
+    }
+
+    /// What a node version requires of the flip's two constants (COD-P3-2):
+    /// `0.0.0`, no release yet, requires nothing; any other version must name
+    /// the release that ships the `v1` warnings; a version past that release
+    /// must refuse.
+    fn flip_decided(version: &str, release: Option<&str>, refuse: bool) -> Result<(), String> {
+        if version == "0.0.0" {
+            return Ok(());
+        }
+        let Some(release) = release else {
+            return Err(format!("{version} is a release: set V1_WARNING_RELEASE"));
+        };
+        if numbered(version) > numbered(release) && !refuse {
+            let flip = "V1_TOKEN_CHECKS_REFUSE must be true";
+            return Err(format!("{version} is past {release}: {flip}"));
+        }
+        Ok(())
+    }
+
+    /// A `major.minor.patch` version as numbers, so versions order as releases.
+    fn numbered(version: &str) -> Vec<u64> {
+        let number = |n: &str| n.parse::<u64>().ok();
+        let numbers: Option<Vec<u64>> = version.split('.').map(number).collect();
+        numbers.unwrap_or_else(|| panic!("`{version}` is not major.minor.patch"))
+    }
+
+    /// COD-P3-2's mechanical check: a version bump that has not decided the
+    /// flip fails here. The rule is checked on versions this build is not,
+    /// then held to this build's `CARGO_PKG_VERSION`.
+    #[test]
+    fn a_node_release_decides_the_flip() {
+        assert_eq!(flip_decided("0.0.0", None, false), Ok(()));
+        assert!(flip_decided("0.1.0", None, false).is_err());
+        assert_eq!(flip_decided("0.1.0", Some("0.1.0"), false), Ok(()));
+        assert!(flip_decided("0.1.1", Some("0.1.0"), false).is_err());
+        assert!(flip_decided("0.10.0", Some("0.9.0"), false).is_err());
+        assert_eq!(flip_decided("0.2.0", Some("0.1.0"), true), Ok(()));
+        let version = env!("CARGO_PKG_VERSION");
+        let this_build = flip_decided(version, V1_WARNING_RELEASE, V1_TOKEN_CHECKS_REFUSE);
+        assert_eq!(this_build, Ok(()));
     }
 }
