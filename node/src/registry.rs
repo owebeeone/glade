@@ -275,8 +275,9 @@ impl Registry {
     }
 
     /// Ingest a fully-formed op with per-origin chain checks (the shared
-    /// verify path for both live appends and disk load).
-    fn ingest(&mut self, op: Op) -> Result<(), RegistryError> {
+    /// verify path for both live appends and disk load, and for the ops the
+    /// assembly's record host is handed, `assembly::Records::ingest`).
+    pub(crate) fn ingest(&mut self, op: Op) -> Result<(), RegistryError> {
         let chain = (op.glade_id.clone(), op.origin.clone());
         if let Some(&(last_seq, last_hash)) = self.tips.get(&chain) {
             if op.seq <= last_seq {

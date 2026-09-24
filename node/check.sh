@@ -11,14 +11,17 @@
 #
 #   architecture       glade-discover's checker over this workspace, against
 #                      architecture-policy.json
-#   arch002-node       arch002-fixture.sh: that checker is seen to refuse shaku
+#   arch002-node       arch002-fixture.sh: that checker is seen to refuse sdax
 #                      injected into glade-node, on a copy
 #   arch002-contracts  glade/contracts/arch002-fixture.sh, plan Step 3.1's
 #                      fixture for the port side; absent means red
 #   confinement        cargo tree --invert: each framework is seen only by the
 #                      crates the allowlist below names, on every target
 #                      platform for the node
-#   node-tests         cargo test for this workspace
+#   node-tests         cargo test for this workspace, twice: GLADE_NODE_ASSEMBLED
+#                      unset, so every glade-node the tests spawn starts from the
+#                      hand-written composition root, then =1, so each starts
+#                      from the assembled one (plan Step 3.2); both must pass
 #   contracts-gate     glade/contracts/check.sh (its checker, tests, fmt, clippy)
 #   fmt, clippy        by package: a held package must pass; a package whose
 #                      debt predates this gate is counted and printed as a
@@ -53,13 +56,14 @@ checker="$node_root/../../glade-discover/tools/architecture-check/Cargo.toml"
 # edges with all features on, so a registry or git crate in between does not
 # launder an edge.
 #
-# Today iroh may be seen only by glade-node, whose peer carrier it is, and no
-# crate may see shaku or the sdax family; Steps 3.2 and 3.3 name the assembly
-# crate that may, as a reviewed change to this table. The contracts workspace
-# must never reach iroh, tokio, shaku or sdax.
+# iroh may be seen only by glade-node, whose peer carrier it is, and shaku only
+# by glade-node, whose assembly it is (plan Step 3.2, src/assembly.rs). No
+# crate may see the sdax family until Step 3.3 names the one that may, as a
+# reviewed change to this table. The contracts workspace must never reach iroh,
+# tokio, shaku or sdax.
 confinement_allowlist='
 node       iroh          glade-node
-node       shaku         -
+node       shaku         glade-node
 node       sdax          -
 node       sdax-tokio    -
 node       sdax-testkit  -
@@ -182,7 +186,7 @@ c_architecture() {
 
 c_arch002_node() {
     if sh "$node_root/arch002-fixture.sh"; then
-        why "the checker refused shaku injected into glade-node, as a normal and as a cfg(windows) dependency, on a copy"
+        why "the checker refused sdax injected into glade-node, as a normal and as a cfg(windows) dependency, on a copy"
         return 0
     fi
     why "glade/node/arch002-fixture.sh failed closed; its message above names the branch"
@@ -347,15 +351,45 @@ tee_status() {
     return "$(cat "$tee_log.status")"
 }
 
+# tests_hand_written, tests_assembled: the workspace's tests, with the
+# composition root every spawned glade-node starts from chosen explicitly, so a
+# GLADE_NODE_ASSEMBLED in the caller's environment decides nothing.
+tests_hand_written() {
+    (
+        unset GLADE_NODE_ASSEMBLED
+        cargo test --locked --offline --manifest-path "$node_manifest" --workspace
+    )
+}
+
+tests_assembled() {
+    GLADE_NODE_ASSEMBLED=1 cargo test --locked --offline --manifest-path "$node_manifest" --workspace
+}
+
 c_node_tests() {
-    if tee_status "$results/node-tests.log" cargo test --locked --offline --manifest-path "$node_manifest" --workspace; then
-        passed=$(awk '/^test result: ok\./ { n += $4 } END { print n + 0 }' "$results/node-tests.log")
-        binaries=$(grep -c '^test result: ok\.' "$results/node-tests.log")
-        why "cargo test --locked --offline --workspace: $passed tests passed across $binaries test binaries"
-        return 0
+    bad=0
+    counts=""
+    for root in hand-written assembled; do
+        case "$root" in
+            hand-written) runner=tests_hand_written ;;
+            *) runner=tests_assembled ;;
+        esac
+        echo "-- cargo test --workspace, every spawned glade-node from the $root composition root"
+        log="$results/node-tests.$root.log"
+        if tee_status "$log" "$runner"; then
+            passed=$(awk '/^test result: ok\./ { n += $4 } END { print n + 0 }' "$log")
+            binaries=$(grep -c '^test result: ok\.' "$log")
+            counts="$counts${counts:+; }$root: $passed tests passed across $binaries test binaries"
+        else
+            counts="$counts${counts:+; }$root: FAILED"
+            bad=1
+        fi
+    done
+    if [ "$bad" -ne 0 ]; then
+        why "cargo test --locked --offline --workspace failed for the node workspace ($counts)"
+        return 1
     fi
-    why "cargo test --locked --offline --workspace failed for the node workspace"
-    return 1
+    why "cargo test --locked --offline --workspace, GLADE_NODE_ASSEMBLED unset then =1 -- $counts"
+    return 0
 }
 
 c_contracts_gate() {
@@ -644,12 +678,19 @@ dev-docs/LibraryBoundaryAndTestingPolicy.md:88-94 are the checklist:
                          glade-node is classified integration and names none, so
                          for it the checker only parses modules and finds its test
                          targets. The checker's #[cfg] blind spot is a gap above.
-  3 compiler witness     NOT PERFORMED for the node: no node type implements a
-                         contract port yet (Steps 3.1-3.2). The contracts' suites
-                         compile against their own fixtures only.
-  4 behavioural          PERFORMED for the contracts' own suites (their check.sh).
-    conformance          NOT PERFORMED for any node implementation of a port
-                         (LBT-009): none exists yet.
+  3 compiler witness     PERFORMED for the node's assembly: its module compiles
+                         only with every binding bound once and no constructor
+                         cycle, and node-tests runs its compile_fail doctests (a
+                         missing binding, a cycle, an ambiguous role, a carrier
+                         asked for by port type). Stable rustdoc checks that each
+                         fails, not its error code (the codes are recorded in
+                         glade/dev-docs/GladeNodeAssembly.md).
+  4 behavioural          PERFORMED for the contracts' own suites (their check.sh),
+    conformance          and by node-tests for the node's deterministic providers
+                         (tests/assembly: CL, CA, SI, GR) and the fail-closed half
+                         of the assembled path's grant fold and signer (GR-003,
+                         SI-003). NOT PERFORMED for any real adapter (LBT-009):
+                         none implements CarrierPort, GrantPort or SignerPort yet.
   5 CI invocation        NOT PERFORMED. This is a local script: no CI job runs it
                          and no required merge check exists (a hosting setting).
 Also not checked: public boundary types and transitive type leakage (LBT-004,

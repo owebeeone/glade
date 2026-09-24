@@ -7,6 +7,7 @@
 //! wire IR + corpus (`glade-wire`) and the fold oracle.
 
 pub mod appdecl;
+pub mod assembly;
 pub mod chain;
 pub mod claims;
 pub mod echo;

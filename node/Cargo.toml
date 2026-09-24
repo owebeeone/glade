@@ -22,3 +22,19 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "
 # NAT-probe misrouting (IrohReview §11). This line records the minimum; the
 # tracked Cargo.lock records the version a checkout builds.
 iroh = "1.2"
+# The assembly (plan Step 3.2, src/assembly.rs): Shaku, pinned exactly at the async
+# witness's measured baseline (a caret range would silently test another library),
+# and the four framework-free ports of Step 3.1 that its bindings carry.
+shaku = "=0.6.3"
+glade-carrier-api = { path = "../contracts/carrier-api" }
+glade-clock-api = { path = "../contracts/clock-api" }
+glade-grant-api = { path = "../contracts/grant-api" }
+glade-signer-api = { path = "../contracts/signer-api" }
+
+# The same four ports with their conformance suites, which tests/assembly runs
+# against the node's deterministic providers (LBT-009).
+[dev-dependencies]
+glade-carrier-api = { path = "../contracts/carrier-api", features = ["conformance"] }
+glade-clock-api = { path = "../contracts/clock-api", features = ["conformance"] }
+glade-grant-api = { path = "../contracts/grant-api", features = ["conformance"] }
+glade-signer-api = { path = "../contracts/signer-api", features = ["conformance"] }

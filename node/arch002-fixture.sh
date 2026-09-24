@@ -6,10 +6,10 @@
 # architecture-policy.json, whose exact allowlist is what keeps a framework out
 # of glade-node until a reviewed policy change lets one in. A gate that has
 # never been seen to refuse anything is not evidence that it would, so this
-# script injects `shaku` into glade-node's manifest twice -- once as an ordinary
+# script injects `sdax` into glade-node's manifest twice -- once as an ordinary
 # dependency, once under [target.'cfg(windows)'], a platform branch that is
 # disabled on every host but Windows -- and requires the checker to refuse each
-# with exactly `ARCH-002 glade-node: undeclared dependency normal:shaku`.
+# with exactly `ARCH-002 glade-node: undeclared dependency normal:sdax`.
 #
 # It passes on that diagnostic and on nothing else. A PASS, another diagnostic,
 # or a checker that could not run `cargo metadata` fails here, because each
@@ -18,13 +18,15 @@
 # Everything happens on a COPY in a temporary directory. The live Cargo.toml,
 # Cargo.lock and architecture-policy.json are only read, so an interrupted run
 # cannot leave the tree changed. The copy keeps the tree's depth below a
-# `glade` root, and `wire-rs`, which the manifest names by path, is a symlink
-# this script only reads through. The checker needs no lockfile (it shells
-# `cargo metadata --no-deps`), so Cargo.lock is not copied.
+# `glade` root, and `wire-rs` and `contracts`, which the manifest names by
+# path, are symlinks this script only reads through. The checker needs no
+# lockfile (it shells `cargo metadata --no-deps`), so Cargo.lock is not copied.
 #
-# When a reviewed step allows `normal:shaku` for glade-node (the plan's Step 3.2
-# puts the Shaku assembly in this crate), this fixture fails closed -- the
-# injection is then accepted, or collides with the real entry -- until
+# The framework injected is one glade-node may not declare. It was `shaku`
+# until plan Step 3.2 allowed `normal:shaku` (the Shaku assembly is in this
+# crate) and moved this fixture to `sdax`, in the same policy change. When a
+# reviewed step allows `sdax` (Step 3.3, lifecycle), this fixture fails closed
+# -- the injection is then accepted, or collides with the real entry -- until
 # `framework` below names one glade-node still may not declare. That edit
 # belongs to the same reviewed policy change.
 set -eu
@@ -38,8 +40,8 @@ if [ ! -f "$checker" ]; then
     exit 1
 fi
 
-framework=shaku
-version="=0.6.3"
+framework=sdax
+version="=0.1.0"
 expected="ARCH-002 glade-node: undeclared dependency normal:$framework"
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/glade-node-arch002.XXXXXX")
@@ -51,6 +53,7 @@ mkdir -p "$copy"
 (cd "$node_root" && tar -cf - Cargo.toml architecture-policy.json src tests) |
     (cd "$copy" && tar -xf -)
 ln -s "$glade_root/wire-rs" "$work/glade/wire-rs"
+ln -s "$glade_root/contracts" "$work/glade/contracts"
 
 gate() {
     cargo run --quiet --locked --offline --manifest-path "$checker" -- "$copy" 2>&1
