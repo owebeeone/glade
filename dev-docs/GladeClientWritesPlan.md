@@ -298,6 +298,10 @@ then the `Error`, and the absent route likewise, with `UnknownShare`; 3 and 4 as
 unread; 6 glade-gwz's run ids are fixed here, as Step 4.2; 7 1.1 at once, Phase 2 before 4.3's websocket
 enforcement, then Phase 3, and Phase 4 alongside in its own repositories.
 
+**Ruled, owner, 2026-09-24, from Step 1.1's open point:** an op below the first seq the node holds on its chain
+is answered `Retention`, not `Ok`, and a client treats it as settled, not as a refusal. Step 2.1 builds the
+node's half; Steps 3.1 and 3.3 the clients'.
+
 ## 6. The session contract
 
 Step 1.1 writes these rules, as ruled, into `glade/dev-docs/GladeSubstrateV1.md`

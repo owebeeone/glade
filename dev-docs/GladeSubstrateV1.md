@@ -288,9 +288,13 @@ channels are outside these rules. No frame or field changes: `Error`
 - Fails: an OS crash can lose an op after its `Ok`. The next ack then names a
   lower head for its origin, the client's next op on that chain is refused as
   a gap, and the lost op returns only if the client sends it again.
-- Open: the store takes an op below the first seq it holds on a chain as seen,
-  without holding it (`store.rs:302`, `:308`). `Ok` for it would break R2, and
-  no ruling names its code.
+- An op below the first seq the node holds on its chain, which the store takes
+  as seen without holding it (`store.rs:302`, `:308`), is answered `Retention`,
+  not `Ok` (owner, 2026-09-24). A client treats `Retention` as settled, not as
+  a refusal: it drops nothing, and its chain goes on.
+- An op on a share this node forwards stays here: see R2's third point. The
+  owner added cross-node writes as a planned item on 2026-09-24
+  (`GladeCrossNodeWritesPlan.md`).
 
 **R3. A refused op is not held by its sender.** The node adds an op's seq to
 the session's heads only once it holds the op, and keeps the highest seq.
