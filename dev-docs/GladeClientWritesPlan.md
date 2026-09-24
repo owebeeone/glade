@@ -665,6 +665,19 @@ unchanged.
   part may split off at build time as 3.3b. Either way, its resend rides the
   subscribe ack until 3.4 lands, as the unresumed mark does.
 - **Depends on:** 1.1, and 2.1's binary.
+- **Done, 2026-09-25,** glade `eddfbae`: R1 and R7 in client-ts, W5's client half
+  (X3.3b) kept in. `appendOutcome` and `sendOpsOutcome` resolve with the node's answer
+  and fail at once with no socket open. A refusal is told through `onRefused`, or
+  `console.warn` with no listener, and a session the client owns drops the op and its
+  chain's tail until its zone's next ack. An op answered `UnknownShare` is told once
+  through `onUnplaced`, kept, and sent again at its zone's next ack and on a backoff of
+  1 s doubling to 30 s, one timer per zone. At most 4,096 ops wait for an answer.
+  The edited files got their own inodes first, so gryth-ui's hard-linked install is
+  byte-identical and the desk takes the change only at a `pnpm install` there.
+  client-ts 36 (was 19); glial 99 and its typecheck; grip-share 19; demo 3 and its
+  typecheck. **Open for the owner:** `onUnplaced`, a listener the plan does not name;
+  outcome calls resolving at the node's first answer, "not placed" included; one
+  backoff rule for both clients (per zone); and the cross-node plan's open point (a).
 
 **Step 3.4 — client-ts: the subscribe outcome**
 

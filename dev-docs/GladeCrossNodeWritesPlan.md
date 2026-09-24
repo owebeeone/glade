@@ -471,6 +471,9 @@ linked node; c gets A's verdict; B holds only what A accepted.
   them. **Tests:** X3.3a's, in `glade/client-ts/test/answers.test.ts`.
 - **Proves / not:** as X3.3a. **Gate:** CW 3.3's (`GladeClientWritesPlan.md:656-661`).
 - **Size:** ~60 production, ~140 test lines. **Depends on:** X1.1; CW 3.3, 3.4.
+- **Built with CW 3.3, 2026-09-25,** glade `eddfbae`: X3.3a's tests in TypeScript, in
+  `answers.test.ts`, as pure tests and over a fake socket; the resend runs one timer per
+  zone. It is tested without a node until X2.3 answers `UnknownShare` on ops.
 
 ### Phase X4 — Grants, a returning link, and the journey
 
