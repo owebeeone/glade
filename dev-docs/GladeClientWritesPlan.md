@@ -808,6 +808,14 @@ unseen. A restarted glade-gwz streams its runs.
 - **Size:** ~25 production lines, ~100 test lines.
 - **Depends on:** nothing for the run ids, which may land first. The listener
   needs 3.1.
+- **Done, 2026-09-25,** glade-gwz `a079921` (the run ids) and `a4bb9ac` (refusals
+  reported): `serve` starts an `on_refused` listener before anything is written, and each
+  refused op gets one stderr line naming its chain, seq and code. glade-gwz 9 + 7 (was
+  9 + 6); clippy 0; its 38 rustfmt hunks predate the step. A refused record still ends that
+  run's visible output (the desk shows the run unfinished; the line says why), and ops not
+  placed are not logged. **Open for the owner:** gwz's output appends staying
+  fire-and-forget (recommended: each run writes a fresh chain, so a resume fixes nothing);
+  a format-only commit on glade-gwz, then `fmt --check` in its gate. Phase 4 is complete.
 
 ## 8. Order and parallelism
 
