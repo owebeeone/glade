@@ -15,7 +15,7 @@
 
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -105,53 +105,74 @@ fn refused(home: &Path, root: Root, args: &[&str]) -> (ExitStatus, String) {
     (status, stderr)
 }
 
+/// A node started from `root`, its stdout read up to its `listening <port>`
+/// line, and left running until `stop`.
+struct Running {
+    node: Child,
+    lines: Vec<String>,
+}
+
+impl Running {
+    fn start(home: &Path, root: Root, args: &[&str]) -> Running {
+        let mut node = glade_node(home, root, args)
+            .spawn()
+            .expect("spawn glade-node");
+        let stdout = node.stdout.take().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else {
+                    break;
+                };
+                let last = line.starts_with("listening ");
+                if tx.send(line).is_err() || last {
+                    break;
+                }
+            }
+        });
+        let deadline = Instant::now() + BOUND;
+        let mut lines: Vec<String> = Vec::new();
+        let outcome = loop {
+            match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(line) => {
+                    let last = line.starts_with("listening ");
+                    lines.push(line);
+                    if last {
+                        break Ok(());
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => break Err("did not print `listening` in time"),
+                Err(RecvTimeoutError::Disconnected) => break Err("stopped before `listening`"),
+            }
+        };
+        let running = Running { node, lines };
+        if let Err(why) = outcome {
+            let lines = running.lines.clone();
+            let stderr = running.stop();
+            let _ = reader.join();
+            panic!("glade-node ({root:?}) {why}: stdout {lines:?}, stderr {stderr}");
+        }
+        let _ = reader.join();
+        running
+    }
+
+    /// Kill the node; what it wrote to stderr.
+    fn stop(mut self) -> String {
+        let _ = self.node.kill();
+        let _ = self.node.wait();
+        let mut stderr = String::new();
+        let pipe = self.node.stderr.take();
+        pipe.unwrap().read_to_string(&mut stderr).unwrap();
+        stderr
+    }
+}
+
 /// Start a node, read its stdout up to its `listening <port>` line, then stop
 /// it. Returns the stdout lines read and everything it wrote to stderr.
 fn start_and_stop(home: &Path, root: Root, args: &[&str]) -> (Vec<String>, String) {
-    let mut node = glade_node(home, root, args)
-        .spawn()
-        .expect("spawn glade-node");
-    let stdout = node.stdout.take().unwrap();
-    let (tx, rx) = mpsc::channel();
-    let reader = std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines() {
-            let Ok(line) = line else {
-                break;
-            };
-            let last = line.starts_with("listening ");
-            if tx.send(line).is_err() || last {
-                break;
-            }
-        }
-    });
-    let deadline = Instant::now() + BOUND;
-    let mut lines: Vec<String> = Vec::new();
-    let outcome = loop {
-        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-            Ok(line) => {
-                let last = line.starts_with("listening ");
-                lines.push(line);
-                if last {
-                    break Ok(());
-                }
-            }
-            Err(RecvTimeoutError::Timeout) => break Err("did not print `listening` in time"),
-            Err(RecvTimeoutError::Disconnected) => break Err("stopped before `listening`"),
-        }
-    };
-    let _ = node.kill();
-    let _ = node.wait();
-    let _ = reader.join();
-    let mut stderr = String::new();
-    node.stderr
-        .take()
-        .unwrap()
-        .read_to_string(&mut stderr)
-        .unwrap();
-    if let Err(why) = outcome {
-        panic!("glade-node ({root:?}) {why}: stdout {lines:?}, stderr {stderr}");
-    }
-    (lines, stderr)
+    let node = Running::start(home, root, args);
+    let lines = node.lines.clone();
+    (lines, node.stop())
 }
 
 /// A line's first word: what the line reports, without the values (a port,
@@ -329,6 +350,64 @@ fn both_roots_revoke_a_replaced_endpoint_keys_binding() {
         assert_eq!(fold.binds(&node, &new, now_ms()), Bound::Live, "{root:?}");
     }
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Plan Step 4.2b, on each root: B's door refuses A, whose key it does not
+/// know. B says so on stderr, naming A's endpoint id, and A's line about
+/// the failed dial carries no reason. B started again with `--peer <A's
+/// endpoint id>` admits A, which links.
+#[test]
+fn both_roots_refuse_an_unknown_dialer_and_admit_a_configured_one() {
+    let dir = scratch("door");
+    let home = dir.join("glade-home");
+    for (root, a, b) in [
+        (Root::HandWritten, "ha", "hb"),
+        (Root::Assembled, "aa", "ab"),
+    ] {
+        let start = |name: &str, peer: Option<&str>| {
+            let peer = peer.map(|peer| ["--peer", peer]);
+            let args = ["--profile", "local", "--name", name].into_iter();
+            let args: Vec<&str> = args
+                .chain(peer.into_iter().flatten())
+                .chain(["0"])
+                .collect();
+            Running::start(&home, root, &args)
+        };
+        let dial = |b: &Running| format!("{}@{}", endpoint_id(&b.lines), port_line(&b.lines));
+        let b_node = start(b, None);
+        let target = dial(&b_node);
+        let a_node = start(a, Some(&target));
+        let a_key = endpoint_id(&a_node.lines);
+        let linked = a_node.lines.iter().any(|l| l.starts_with("peer-connected"));
+        assert!(!linked, "{root:?}: {:?}", a_node.lines);
+        let (a_err, b_err) = (a_node.stop(), b_node.stop());
+        let refused = format!("peer refused: endpoint {a_key}: unknown endpoint key");
+        assert!(b_err.lines().any(|l| l == refused), "{root:?}: {b_err}");
+        let failed = a_err
+            .lines()
+            .find(|l| l.starts_with(&format!("peer {target}: ")));
+        assert!(
+            failed.is_some_and(|l| !l.contains("unknown")),
+            "{root:?}: {a_err}"
+        );
+
+        let b_node = start(b, Some(&a_key));
+        let a_node = start(a, Some(&dial(&b_node)));
+        let b_id = b_node.lines[1].strip_prefix("node ").unwrap().to_string();
+        let linked = a_node
+            .lines
+            .iter()
+            .find_map(|l| l.strip_prefix("peer-connected "));
+        assert_eq!(linked, Some(b_id.as_str()), "{root:?}: {:?}", a_node.lines);
+        drop((a_node.stop(), b_node.stop()));
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The `<ip:port>` of a `peer <endpoint-id> <ip:port>` line among `lines`.
+fn port_line(lines: &[String]) -> String {
+    let peer = lines.iter().find_map(|line| line.strip_prefix("peer "));
+    peer.unwrap().split(' ').nth(1).unwrap().to_string()
 }
 
 /// What a node at `instance` wrote before plan Step 4.1a, under the id its key

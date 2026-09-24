@@ -2,7 +2,7 @@
 //! no sleep. It proves the contract's shape, never a transport.
 use glade_carrier_api::conformance::{self, Fixture};
 use glade_carrier_api::{
-    CarrierAddr, CarrierConfig, CarrierError, CarrierLink, CarrierPort, PortFuture,
+    CarrierAddr, CarrierConfig, CarrierError, CarrierLink, CarrierPort, PortFuture, TransportId,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::{Future, poll_fn, ready};
@@ -18,6 +18,8 @@ enum Wrong {
     EagerSend,
     /// Close leaves the address held, as closing a clone of the handle would.
     KeepsAddress,
+    /// A link names its own end, not the far one.
+    NamesItself,
 }
 
 #[derive(Default)]
@@ -66,6 +68,8 @@ impl Net {
 struct Link {
     net: Arc<Net>,
     endpoint: usize,
+    /// The endpoint at the far end, whose number is its identity here.
+    remote: usize,
     max: usize,
     tx: usize,
     rx: usize,
@@ -128,6 +132,15 @@ impl CarrierLink for Link {
     fn close(&self) -> PortFuture<'_, ()> {
         Box::pin(async move { self.net.with(|s| self.end(s)) })
     }
+
+    fn remote_id(&self) -> Option<TransportId> {
+        let named = if self.wrong == Some(Wrong::NamesItself) {
+            self.endpoint
+        } else {
+            self.remote
+        };
+        Some(TransportId(named.to_le_bytes().to_vec()))
+    }
 }
 
 enum Phase {
@@ -154,11 +167,13 @@ impl Port {
         }
     }
 
-    fn link(&self, endpoint: usize, max: usize, tx: usize, rx: usize) -> Box<dyn CarrierLink> {
+    fn link(&self, ends: (usize, usize), max: usize, tx: usize, rx: usize) -> Box<dyn CarrierLink> {
         let (net, wrong) = (self.net.clone(), self.wrong);
+        let (endpoint, remote) = ends;
         Box::new(Link {
             net,
             endpoint,
+            remote,
             max,
             tx,
             rx,
@@ -208,9 +223,9 @@ impl CarrierPort for Port {
                 };
                 let (out, back) = (s.pipes.len(), s.pipes.len() + 1);
                 s.pipes.extend([Pipe::default(), Pipe::default()]);
-                let accepted = self.link(target, target_max, back, out);
+                let accepted = self.link((target, id), target_max, back, out);
                 s.backlog.entry(target).or_default().push_back(accepted);
-                Ok(self.link(id, max, out, back))
+                Ok(self.link((id, target), max, out, back))
             })
         })
     }
@@ -298,6 +313,11 @@ fn ca_004_close_gives_the_endpoint_up_by_value() {
 }
 
 #[test]
+fn ca_005_each_link_names_the_far_ends_transport_identity() {
+    run(conformance::remote_identity(fixture(None)));
+}
+
+#[test]
 #[should_panic(expected = "CA-001 whole, once, in order")]
 fn rejects_reordered_frames() {
     run(conformance::frames(fixture(Some(Wrong::Reorders))));
@@ -320,5 +340,13 @@ fn rejects_a_send_that_acts_before_it_is_polled() {
 fn rejects_a_close_that_keeps_the_address() {
     run(conformance::close_by_value(fixture(Some(
         Wrong::KeepsAddress,
+    ))));
+}
+
+#[test]
+#[should_panic(expected = "CA-005 two endpoints name the endpoint that reached both alike")]
+fn rejects_a_link_that_names_its_own_end() {
+    run(conformance::remote_identity(fixture(Some(
+        Wrong::NamesItself,
     ))));
 }

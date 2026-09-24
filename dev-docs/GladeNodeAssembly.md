@@ -2432,15 +2432,19 @@ record's layout, stream, signed bytes and revocation to this step.
 Nothing changes in the wire IR, in `NodeHello` or in the ALPN. The node's own
 IR, `node/ir/sysdata.taut.py`, gains two record kinds.
 
-**The step is split in two.**
+**The step is split in three.**
 
-- **4.2a, built with this note:** the stable endpoint key, the two record
-  kinds, their fold, minting at boot, and the clock rule (sections 1 to 6).
-- **4.2b, designed here and not built:** the door. That is the refusal at
-  accept, the HELLO check, the refusal lines and the `CarrierPort` accessor
-  (sections 7 and 8).
+- **4.2a, built with this note** (glade `40647d2`): the stable endpoint key,
+  the two record kinds, their fold, minting at boot, and the clock rule
+  (sections 1 to 6).
+- **4.2b, built after the owner's ruling of 2026-09-25** (section 7): the
+  door. That is the refusal at accept, the HELLO check, the refusal lines,
+  the configuration of known peers and the `CarrierPort` accessor (sections
+  8 and 10).
+- **4.2c, its own step** (ruled the same day): an iroh `CarrierPort`
+  adapter that tracks its links.
 
-Two things force the split.
+Two things forced the first split.
 
 - **First contact needs the owner's word** (section 7). The plan and the
   rulings point to configured peers. They do not say how the accepting side
@@ -2643,6 +2647,11 @@ save of records.json it already makes.
 
 ### 7. First contact: a question for the owner
 
+**Ruled, owner, 2026-09-25 ("all recommended"):** (a2). An accepting node
+lists each peer's endpoint id with no address, known and not dialed; the door
+is closed by default on booted nodes; bindings learned through a configured
+peer's directory count as known. Built in 4.2b (section 8).
+
 **The fact.** A binding reaches a peer through the `home` pull that a
 completed HELLO opens (`mesh.rs:202-244`). So on first contact neither side
 holds the other's record. The plan's HELLO check ("the presented `node_id`
@@ -2711,22 +2720,37 @@ so closing by default changes only tests. The lifecycle and stop-signal tests
 would give the accepting node the dialer's key as an admit-only entry, having
 minted the dialer's key first.
 
-### 8. The door (4.2b, once section 7 is ruled)
+### 8. The door (plan Step 4.2b, as built)
 
-As recommended in section 7:
+Built on 2026-09-25, as section 7's ruling sets it, against glade `40647d2`.
+The tests and their red runs are in section 10.
 
-- **Where.** iroh's `EndpointHooks::after_handshake` on the accepting side,
-  installed when a booted endpoint binds. It is the one hook iroh offers
-  after TLS, and it sees `remote_id()` (iroh 1.2 `src/endpoint/hooks.rs`).
-  Then the HELLO check runs on both sides, in `hello_accept` and
-  `hello_dial` (`peer.rs:184-241`), before a WELCOME is sent or taken.
-- **The view.** The door keeps its own copy of the served store's binding
-  records and the configured keys. The copy is loaded from the store before
-  the accept loop starts, and fed wherever a `home` record lands:
-  `ingest_and_fanout` (`mesh.rs:498-511`), which the pull, the push and
-  `publish` all use. The hook cannot read the store through `Shared`, which
-  holds the endpoint: iroh warns that a hook holding its endpoint is a
-  reference cycle.
+- **Where.** The door is `transport::Door`. iroh's
+  `EndpointHooks::after_handshake`, on the accepting side, checks the key; it
+  is the one hook iroh offers after TLS, and it sees `remote_id()`. Then HELLO
+  checks the node on both sides, in `hello_accept` and `hello_dial`
+  (`peer.rs`), before a WELCOME is sent or taken. Each side checks the far
+  end's key, the channel's `dialer` or `acceptor` id. An outbound connection
+  passes the hook and is checked at HELLO.
+- **The configuration.** A `--peer` entry names an endpoint id, and the door
+  admits it on first contact (`iroh_carrier::PeerEntry`).
+  - `--peer <endpoint-id>` configures the key and dials nothing.
+  - `--peer <endpoint-id>@<ip:port>` configures the key and dials it, as
+    before.
+  - Anything else prints `peer <entry>: expected <endpoint-id> or
+    <endpoint-id>@<ip:port>`, where it printed the form with `@` alone.
+  - Both roots read the entries before they bind, and bind behind the door
+    (`PeerEndpoint::bind_door`).
+- **The view.** The door keeps the configured keys, fixed when it is made,
+  and its own copy of the fold.
+  - The copy is loaded from the served store's `home` share before the
+    accept loop starts (`enable_mesh`).
+  - It is fed each record that lands there after, in `ingest_and_fanout`,
+    which the pull, the push, a forward and `publish` all use.
+  - `seed_registry` does not feed it. Both roots adopt the instance before
+    they enable the mesh, so the load covers what adoption seeds.
+  - The hook holds the door, never the endpoint, which iroh warns would be a
+    reference cycle.
 - **The policy for an endpoint key E**, at the reader's clock:
 
   | What the fold and the configuration hold for E | At accept | At HELLO, node N |
@@ -2738,45 +2762,49 @@ As recommended in section 7:
   | no record, E configured | admitted: first contact | admitted; the pull brings the record |
   | no record, E not configured | refused | refused |
 
-- **A refusal** closes the connection with code 0 and an empty reason, so the
-  dialer learns nothing (the ruling of 2026-09-24), or the acceptor sends no
-  WELCOME. The refusing node prints one stderr line, `peer refused: endpoint
-  <E>: <reason>`. The reason is `clock uncertain`, `revoked by node <M>`,
-  `bound to node <M>, not <N>`, `bound from <valid_from>`, `unknown endpoint
-  key`, or the HELLO's own refusal. The accept loop's silent `Err(_) =>
-  continue` (`mesh.rs:180`) prints refusals.
-- **A live link whose key is revoked** is closed when the revocation lands,
-  through the same feed.
-- **Which endpoints get a door:** booted nodes, on both roots. `bind` and
-  `bind_with` keep none: they serve tests and the async witness, which boot
-  no instance.
+  A configured key whose record arrives is judged by the record from then
+  on: a revoked one is refused though configured.
+- **A refusal.**
+  - At accept, the connection is closed with code 0 and an empty reason.
+    The dialer learns nothing: its root prints `peer <target>: connection
+    lost`, and in-process the error is `ConnectionLost(ApplicationClosed(
+    ApplicationClose { error_code: 0, reason: b"" }))`.
+  - At HELLO, the acceptor sends no WELCOME and drops the connection.
+  - The refusing node prints one stderr line, `peer refused: endpoint <E>:
+    <reason>`. The reason is `clock uncertain`, `unknown endpoint key`,
+    `revoked by node <M>`, `bound from <valid_from>` or `bound to node <M>,
+    not <N>`; a refusal at HELLO reads `HELLO refused: <reason>`, or 4.1a's
+    signature refusal.
+  - The hook reports its refusals, and `PeerEndpoint::accept` those of
+    HELLO. The accept loop is unchanged.
+  - A dialer that refuses a WELCOME reports it with the line it printed
+    before, `peer <target>: HELLO refused: <reason>`.
+  - On the assembled root, the lines go to the console's stderr.
+- **A live link whose key is revoked** is closed when the revocation lands.
+  Only the revoking node's link on that key is closed: another node's live
+  binding of the same key is not revoked.
+- **Which endpoints get a door:** booted nodes, on both roots. `bind`,
+  `bind_with` and `bind_as` keep none: they serve tests and the async
+  witness, which boot no instance.
 - **The accessor.** `CarrierLink` gains `fn remote_id(&self) ->
-  Option<TransportId>`, with `TransportId(pub Vec<u8>)`: the remote's
-  transport identity, 32 bytes for iroh, `None` for a carrier with no key
-  identity, as the client role's WebSocket has none. CA-005 joins the
-  conformance suite: a dialed link names the acceptor's identity, and an
-  accepted link names the dialer's. The contracts' policy lists the method,
-  and the contract's fixture and the node's three fakes implement it.
-- **The iroh adapter's links.** No `CarrierPort` adapter over iroh exists: the
-  assembly binds `PendingIrohAdapter` (`assembly.rs:703-717`), and the mesh
-  runs on `PeerEndpoint`. An adapter is about 300 lines. To meet CA-004 it
-  must track its links and take their handles out at close, because a
-  surviving `Connection` keeps the port bound (the async witness's
-  `peer_release.rs`). No consumer on either root would read it yet.
-  Recommend it as a step of its own, 4.2c, or with 4.5.
+  Option<TransportId>`, with `TransportId(pub Vec<u8>)`. It is the identity
+  the transport authenticated for the far end: 32 bytes for iroh, `None`
+  from a carrier with none, as the client role's WebSocket has none. It names
+  a key, never a node, and outlives the link's close.
+  - CA-005 checks it over three endpoints: `a` dials `b`, then `fresh` bound
+    where `b` was. Two endpoints cannot tell a link that names its own end
+    from one that names the far end; a third can.
+  - The contract's fixture gains a deliberately wrong link that names its
+    own end, which CA-005 refuses. The node's fake network and its faulty
+    link implement the method.
+  - `glade/contracts/architecture-policy.json` lists `remote_id` among
+    `CarrierLink`'s methods, so the checker requires it. The lane owner
+    added it in 4.2b's commit, for the owner's review, as the policy's
+    earlier changes were.
+- **The iroh adapter's links:** 4.2c, ruled a step of its own.
 - **A gap for later.** A HELLO over a `CarrierLink` would also need the TLS
   exporter bytes (D6), which the port does not expose. That belongs to the
   step that moves the mesh onto the port.
-- **Its tests**, each begun red:
-  - an unknown key is refused at accept, with its stderr line, and the
-    dialer gets no answer;
-  - a bound key is admitted;
-  - a key bound to another node is refused at HELLO;
-  - a revoked binding is refused once the fold has the revocation, and its
-    live link is closed;
-  - a configured key is admitted on first contact, and checked by its record
-    after that;
-  - an unreadable clock refuses everyone.
 
 ### 9. Tests (4.2a), each begun red
 
@@ -2843,7 +2871,7 @@ about refusal, since 4.2a has no door.
 Nothing on the wire changes, and an ordinary start prints the lines it printed
 before.
 
-### Questions for the owner
+### Questions for the owner (4.2a)
 
 1. **First contact** (section 7). Recommend (a2): an admit-only `--peer
    <endpoint-id>`, the door closed by default on booted nodes, and
@@ -2868,7 +2896,12 @@ before.
    Recommend a step of its own, 4.2c, or with 4.5. 4.2b adds only the
    accessor and its conformance probe.
 
-### Measured
+**Ruled, owner, 2026-09-25 ("all recommended"):** 1 (a2), the door closed by
+default, introductions counting; 2 the two domains kept; 3 the clock rule
+stands; 4 a revoked key refuses the boot; 5 the adapter is 4.2c, a step of
+its own.
+
+### Measured (4.2a)
 
 2026-09-24, Apple M3 Pro, Rust 1.96.0, on the final tree:
 
@@ -2954,3 +2987,141 @@ before.
   - `assembly.rs` +5/−3, `lib.rs` +1;
 - tests: +524/−5, net +519;
 - beside them, the IR +23 (`sysdata.taut.py`).
+
+### 10. Tests (4.2b), each begun red
+
+Each was run against the code without the part it guards, switched off by one
+edit and restored after; the message is what that run printed.
+
+| Test | Proves | Red first |
+| --- | --- | --- |
+| `mesh`: `an_unknown_endpoint_key_is_refused_at_accept_and_reported` | over real iroh: a door that knows nothing refuses the dialer's key at accept, before HELLO; its node reports `peer refused: endpoint <E>: unknown endpoint key`; the dialer's error carries no reason; no link | without the accept hook, the key was refused a step later, at HELLO: left `…: HELLO refused: unknown endpoint key`, right `…: unknown endpoint key` |
+| `mesh`: `a_bound_key_links_and_is_refused_once_its_revocation_lands` | a key bound by a record in the served store links with no configuration; the node's revocation, landing as a push lands, closes the live link; the next dial is refused, `revoked by node <A>` | without the door's load: "a bound key links: … `ApplicationClose { error_code: 0, reason: b"" }`"; without the feed, and again without the close: "the live link was closed", left 1, right 0 |
+| `mesh`: `a_key_bound_to_another_node_cannot_complete_hello` | a key the fold binds to another node passes the hook, and the HELLO of the node that holds it is refused, unanswered: `HELLO refused: bound to node <M>, not <N>` | without the HELLO check: "a node linked through another's key" |
+| `peer`: `a_hello_completes_only_for_a_node_bound_to_its_endpoint_key` | in memory: an unknown key is refused and unanswered; a configured one admitted, first contact; one bound to another node refused; one bound to the dialer admitted; and the dialer refuses a WELCOME from a node not bound to the acceptor's key | with the check stubbed: "unknown: Ok(PeerHello { … })" |
+| `transport`: `the_door_admits_a_live_or_first_configured_key_and_refuses_the_rest` | section 8's table, row by row, and a configured key its record revokes | with the rule stubbed to admit: left `Ok(())`, right `Err(BoundElsewhere { … })` |
+| `transport`: `a_door_takes_records_as_they_land_and_reports_its_refusals` | the door's feed, its clock, and its line | the same stub: left `Ok(())`, right `Err(Unknown)` |
+| `iroh_carrier`: `a_peer_entry_names_a_key_and_perhaps_where_to_dial_it` | the two entry forms, and what is no entry | without the admit-only form: a bare endpoint id parsed to nothing |
+| `tests/assembled_path`: `both_roots_refuse_an_unknown_dialer_and_admit_a_configured_one` | on each root, as processes: B refuses A, naming A's key on stderr, and A's line carries no reason; B started again with `--peer <A's endpoint id>` admits A, which links | with the hand-written root bound without its door: A linked |
+| `tests/lifecycle`: `a_dialer_its_peer_does_not_know_is_refused_and_reported` | on the assembled root, in process: the refusal line reaches B's console, A's line carries no reason, and both stop clean | with the assembled root bound without its door: B reported no refusal |
+| `tests/lifecycle`: `a_node_links_to_a_peer_and_stops_clean_with_its_ports_free`; `tests/stop_signal`: `a_stop_signal_stops_the_assembled_node_cleanly`, both changed | Step 3.3's done-when, with B admitting A's key, minted by one boot of A's instance first | before the change, on this tree: "no `peer-connected` line", A's stderr `peer …: connection lost` |
+| contracts: `ca_005_each_link_names_the_far_ends_transport_identity`; node: `ca_005_the_fake_network_names_each_far_end` | CA-005 on the contract's fixture and on the node's fake network | on a fixture whose links named their own end: "two endpoints name the endpoint that reached both alike", left `[3, 0, …]`, right `[1, 0, …]` |
+| contracts: `rejects_a_link_that_names_its_own_end` | CA-005 refuses that fixture | none: it guards the probe |
+
+What they do not prove: Windows and Linux, which the lane owner runs on
+dabeest and the Pi; a relay (4.5); two nodes started at once, each dialing the
+other.
+
+### Named gaps (4.2b)
+
+- The door covers the iroh endpoint only. The websocket listener is as it
+  was: loopback, the `Origin` check, and 4.3's switch.
+- A key admitted on first contact is bound to its node by that connection's
+  HELLO. If a record later binds the key to another node, the live link stays
+  open until it closes; only a revocation closes one.
+- Introductions: under node trust, a configured peer can introduce any number
+  of nodes through its directory.
+- Until 4.1b, peers can push `home` records, transport records among them.
+  The fold ignores and counts any that do not prove themselves, and never
+  decodes them unsafely.
+- The accept loop takes one connection through HELLO at a time, as before: a
+  slow dialer delays the next.
+- The refusal line names endpoint ids, as ruled. 4.5 takes endpoint ids out of
+  logs.
+
+### Default-path changes (4.2b)
+
+1. A booted node's endpoint refuses, at accept, every endpoint key that no
+   record it holds binds and no `--peer` entry names, and prints `peer
+   refused: endpoint <id>: <reason>` on stderr. Before, any key that proved a
+   node key at HELLO linked.
+2. HELLO, both ways, refuses a node that is not bound to its connection's key,
+   save a configured key on first contact.
+3. `--peer <endpoint-id>`, with no address, is accepted: it configures a key
+   and dials nothing. A bad entry's message now names both forms.
+4. A revocation that lands closes the revoking node's live link on that key.
+5. One-sided `--peer` no longer links. The accepting node must name the
+   dialer's key, or hold its binding.
+6. `CarrierLink` has `remote_id`, which every implementer must provide. No
+   production implementer exists; the contract's fixture and the node's two
+   fakes provide it.
+
+**What the owner's desk sees at its next restart:** nothing new. The
+rehearsal below printed 4.2a's lines exactly, with the same node id and the
+same endpoint id and an empty stderr, and records.json gained only the claim
+every start mints. Nothing connects to the desk, since grazel passes no
+`--peer`, so its door refuses nothing. A desk that has not restarted since
+before 4.2a gets 4.2a's changes as well: `endpoint.key` and one binding.
+
+### Questions for the owner (4.2b)
+
+1. **The contracts' policy.** Add `remote_id` to `CarrierLink`'s methods in
+   `glade/contracts/architecture-policy.json`, a file outside this step.
+   Recommend yes: one line, in the lane owner's commit, so the checker
+   requires the method. Done so in 4.2b's commit, for the owner's review.
+2. **A first-contact link that a record later contradicts** (named gaps).
+   Recommend leaving it for the slice: it needs a record by another node
+   naming a key that node cannot hold, and the next connection is refused
+   anyway.
+3. **Learning an endpoint id before a peer starts.** Today one first start
+   prints it, and a node must be started once before its peer can name it.
+   Recommend that 4.5's configuration add a way to print it without
+   serving.
+
+### Measured (4.2b)
+
+2026-09-25, Apple M3 Pro, Rust 1.96.0, on the final tree:
+
+- **The gate** (`glade/node/check.sh`) passes all 8 components, in 42 s warm
+  and 89 s from an empty target. There are 256 node tests on each path,
+  across 15 test binaries, where there were 246. The ten new ones are section 10's rows, less the two changed
+  tests and the contract's own two.
+- **rustfmt**: glade-node 318 hunks, at its baseline; no touched file gained
+  a deviation. glade-wire 43.
+- **clippy**: glade-node 11 warnings and glade-wire 7, at baseline.
+- **The contracts**: `glade/contracts/check.sh` passes, with 89 tests where
+  there were 87 (CA-005 and its wrong fixture), and the checker passes.
+- **Time**: the door's library tests, eleven with the transport module's,
+  take 0.04-0.07 s together. The process test starts eight nodes; the
+  `assembled_path` binary's seven tests take about 1 s.
+- **The rehearsal.** HEAD's binary (`40647d2`, 4.2a, built to a scratch path,
+  deleted after) ran twice on a scratch instance with the desk's two app
+  files, as grazel starts it. This build then ran twice on that instance:
+
+  ```text
+  node 09ec287a…
+  registry ready (home served: true)
+  app grazel registered (+0 record(s), 11 unchanged)
+  app gyld registered (+0 record(s), 11 unchanged)
+  peer 452aa848… 127.0.0.1:56410
+  workspace ws-razel serving
+  workspace ws-razel serving
+  listening 55492
+  ```
+
+  These are 4.2a's lines, with the same node and endpoint ids and nothing on
+  stderr.
+- **Downstream**, against the rebuilt default binary,
+  `glade/node/target/debug/glade-node` (inode 399665534; the verified 4.2a
+  build was inode 399433812), each Rust suite with a scratch target deleted
+  after it:
+  - client-rs: 9 + 3;
+  - client-ts: 19;
+  - grip-share: 19;
+  - grazel, at `5fc2598`, clean before and after: 29 + 3, its new baseline,
+    with no skip, on that binary;
+  - glade-gwz: 9 + 6;
+  - glade-gyld: 233 (1 ignored) + 31.
+- **The async witness** type-checks against this tree, on a scratch copy.
+
+**Size**, in lines added and removed in `.rs` files, doc comments included:
+
+- production: +403/−55, net +348;
+  - the node +387/−53, net +334: `transport.rs` +172/−15, `iroh_carrier.rs`
+    +113/−11, `peer.rs` +32/−9, `mesh.rs` +26, `lifecycle.rs` +26/−11,
+    `bin/glade-node.rs` +18/−7;
+  - the carrier contract +16/−2: `TransportId`, `remote_id` and the trait's
+    note;
+- tests: +625/−69, net +556;
+  - the node +556/−64;
+  - the contract's CA-005 probe +37/−1, and its fixture +32/−4.

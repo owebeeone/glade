@@ -205,14 +205,28 @@ mod unix {
         peer.rsplit(':').next().unwrap().parse().unwrap()
     }
 
-    /// Two assembled nodes, the second linked to the first. SIGTERM stops the
-    /// second and SIGINT the first: each exits 0 with nothing on stderr past
-    /// the root's own line, frees both ports and removes its instance lock.
+    /// The endpoint id of the instance `name` under `home`, booted once so
+    /// its keys exist: what an operator reads from a node's first start.
+    fn endpoint_id(home: &Path, name: &str) -> String {
+        let boot = glade_node::sysdir::boot_at(home.join("sys").join(name), "local").unwrap();
+        glade_node::transport::hex(&boot.endpoint_key().endpoint_id)
+    }
+
+    /// Two assembled nodes, the second linked to the first, which admits the
+    /// second's endpoint key (plan Step 4.2b's `--peer <endpoint-id>`).
+    /// SIGTERM stops the second and SIGINT the first: each exits 0 with
+    /// nothing on stderr past the root's own line, frees both ports and
+    /// removes its instance lock.
     #[test]
     fn a_stop_signal_stops_the_assembled_node_cleanly() {
         let dir = scratch("stop-signal");
         let home = dir.join("glade-home");
-        let b = Node::start(&home, true, &["--profile", "local", "--name", "b", "0"]);
+        let a_key = endpoint_id(&home, "a");
+        let b = Node::start(
+            &home,
+            true,
+            &["--profile", "local", "--name", "b", "--peer", &a_key, "0"],
+        );
         let target = b.value("peer").replacen(' ', "@", 1);
         let args = ["--profile", "local", "--name", "a", "--peer", &target, "0"];
         let a = Node::start(&home, true, &args);

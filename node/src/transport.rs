@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io;
+use std::sync::{Mutex, PoisonError};
 
 use glade_signer_api::SignatureStatus;
 use glade_wire::cbor::{self, Cbor};
@@ -18,6 +19,7 @@ use crate::registry::{Record, Registry, G_TRANSPORT_BINDINGS, G_TRANSPORT_REVOCA
 use crate::signing::{self, TRANSPORT_BINDING, TRANSPORT_REVOCATION};
 use crate::store::Store;
 use crate::sysdata::{NodeTransportBinding, NodeTransportRevocation};
+use crate::sysdir::now_ms;
 
 /// A node's iroh endpoint key (the signing note's F1): `endpoint.key`, a
 /// second class-1 secret beside `node.key` and not derived from it, so the
@@ -148,23 +150,30 @@ impl TransportFold {
     /// counted: only the node may withdraw its key.
     pub fn over<'a>(ops: impl IntoIterator<Item = &'a Op>) -> TransportFold {
         let mut fold = TransportFold::default();
-        let streams = [G_TRANSPORT_BINDINGS, G_TRANSPORT_REVOCATIONS];
-        for op in ops
-            .into_iter()
-            .filter(|op| streams.contains(&op.glade_id.as_str()))
-        {
-            match proven(op) {
-                Some((pair, Some(valid_from))) => {
-                    let earliest = fold.bindings.entry(pair).or_insert(valid_from);
-                    *earliest = (*earliest).min(valid_from);
-                }
-                Some((pair, None)) => {
-                    fold.revoked.insert(pair);
-                }
-                None => fold.ignored += 1,
-            }
+        for op in ops {
+            fold.note(op);
         }
         fold
+    }
+
+    /// Fold in one op, if it is on a transport stream: the pair it revoked,
+    /// if it is a counted revocation new to the fold.
+    fn note(&mut self, op: &Op) -> Option<Pair> {
+        if ![G_TRANSPORT_BINDINGS, G_TRANSPORT_REVOCATIONS].contains(&op.glade_id.as_str()) {
+            return None;
+        }
+        match proven(op) {
+            Some((pair, Some(valid_from))) => {
+                let earliest = self.bindings.entry(pair).or_insert(valid_from);
+                *earliest = (*earliest).min(valid_from);
+                None
+            }
+            Some((pair, None)) => self.revoked.insert(pair).then_some(pair),
+            None => {
+                self.ignored += 1;
+                None
+            }
+        }
     }
 
     /// The fold of the served store's `home` share, every origin's records.
@@ -196,12 +205,158 @@ impl TransportFold {
         }
     }
 
+    /// The door's rule (plan Step 4.2b) for endpoint key `endpoint` at
+    /// `now_ms`: at accept, `node` being `None`, or for the HELLO of `node`.
+    /// A live binding of the key admits it, at HELLO only for its own node;
+    /// a key no record names is admitted only if `configured`, on first
+    /// contact; nothing is admitted while the clock cannot be read.
+    pub fn door(
+        &self,
+        endpoint: &[u8; 32],
+        node: Option<&[u8; 32]>,
+        configured: bool,
+        now_ms: i64,
+    ) -> Result<(), Refusal> {
+        if now_ms <= 0 {
+            return Err(Refusal::ClockUncertain);
+        }
+        let named = self.bindings.keys().chain(&self.revoked);
+        let nodes: BTreeSet<[u8; 32]> = named
+            .filter(|(e, _)| e == endpoint)
+            .map(|(_, n)| *n)
+            .collect();
+        let Some(first) = nodes.first() else {
+            return if configured {
+                Ok(())
+            } else {
+                Err(Refusal::Unknown)
+            };
+        };
+        let state = |n: &[u8; 32]| self.binds(n, endpoint, now_ms);
+        let why = |n: &[u8; 32]| match state(n) {
+            Bound::Revoked => Refusal::Revoked { node: *n },
+            Bound::NotYet { valid_from } => Refusal::NotYet { valid_from },
+            _ => Refusal::Unknown,
+        };
+        let live = nodes.iter().find(|n| state(n) == Bound::Live);
+        match (node, live) {
+            (None, Some(_)) => Ok(()),
+            (Some(n), _) if state(n) == Bound::Live => Ok(()),
+            (Some(n), _) if nodes.contains(n) => Err(why(n)),
+            (Some(n), Some(m)) => Err(Refusal::BoundElsewhere {
+                bound: *m,
+                node: *n,
+            }),
+            _ => Err(why(first)),
+        }
+    }
+
     /// The endpoint keys `node` has bound and not revoked, whatever their
     /// dates.
     pub fn endpoints_of(&self, node: &[u8; 32]) -> Vec<[u8; 32]> {
         let bound = self.bindings.keys().filter(|(_, n)| n == node);
         let live = bound.filter(|pair| !self.revoked.contains(pair));
         live.map(|(endpoint, _)| *endpoint).collect()
+    }
+}
+
+/// Why the door refused an endpoint key at accept, or a HELLO through it
+/// (plan Step 4.2b). Its text is the refusal line's reason.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// The reader's clock cannot be read.
+    ClockUncertain,
+    /// No record names the key, and the operator did not configure it.
+    Unknown,
+    /// The key's node revoked it.
+    Revoked { node: [u8; 32] },
+    /// The key is bound only from a date after the reader's clock.
+    NotYet { valid_from: i64 },
+    /// The key is bound to another node than the one that spoke.
+    BoundElsewhere { bound: [u8; 32], node: [u8; 32] },
+}
+
+impl fmt::Display for Refusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Refusal::ClockUncertain => write!(f, "clock uncertain"),
+            Refusal::Unknown => write!(f, "unknown endpoint key"),
+            Refusal::Revoked { node } => write!(f, "revoked by node {}", hex(node)),
+            Refusal::NotYet { valid_from } => write!(f, "bound from {valid_from}"),
+            Refusal::BoundElsewhere { bound, node } => {
+                write!(f, "bound to node {}, not {}", hex(bound), hex(node))
+            }
+        }
+    }
+}
+
+/// The door (plan Step 4.2b): a booted node's check of an endpoint key, at
+/// accept and at HELLO, against the transport records it holds, which are
+/// its served store's `home` share with every peer's records, and the keys
+/// its operator configured (`--peer`). The endpoint's accept hook and the
+/// mesh share it; the mesh feeds it each record that lands.
+pub struct Door {
+    configured: BTreeSet<[u8; 32]>,
+    fold: Mutex<TransportFold>,
+    report: Box<dyn Fn(&str) + Send + Sync>,
+}
+
+impl fmt::Debug for Door {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let configured = self.configured.len();
+        f.debug_struct("Door")
+            .field("configured", &configured)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Door {
+    /// A door that admits `configured` keys on first contact, and reports
+    /// each refusal to `report`: a stderr line, for the node.
+    pub fn new(
+        configured: impl IntoIterator<Item = [u8; 32]>,
+        report: impl Fn(&str) + Send + Sync + 'static,
+    ) -> Door {
+        let (configured, report) = (configured.into_iter().collect(), Box::new(report));
+        let fold = Mutex::new(TransportFold::default());
+        Door {
+            configured,
+            fold,
+            report,
+        }
+    }
+
+    fn fold(&self) -> std::sync::MutexGuard<'_, TransportFold> {
+        self.fold.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Take in what the served store holds, before the first connection.
+    pub fn load(&self, store: &Store) {
+        *self.fold() = TransportFold::of_store(store);
+    }
+
+    /// Take in `op`, landed in the served store: if it is a counted
+    /// revocation new to the door, the pair it revoked, `(endpoint key,
+    /// node)`, whose live link must now close.
+    pub fn note(&self, op: &Op) -> Option<([u8; 32], [u8; 32])> {
+        self.fold().note(op)
+    }
+
+    /// At accept: whether the key `endpoint` may connect, by the clock now.
+    pub fn admits(&self, endpoint: &[u8; 32]) -> Result<(), Refusal> {
+        let configured = self.configured.contains(endpoint);
+        self.fold().door(endpoint, None, configured, now_ms())
+    }
+
+    /// At HELLO: whether `node` may speak through the key `endpoint`, now.
+    pub fn binds(&self, node: &[u8; 32], endpoint: &[u8; 32]) -> Result<(), Refusal> {
+        let configured = self.configured.contains(endpoint);
+        self.fold().door(endpoint, Some(node), configured, now_ms())
+    }
+
+    /// Report a refusal of the key `endpoint`, with its reason.
+    pub fn refused(&self, endpoint: &[u8; 32], why: &dyn fmt::Display) {
+        (self.report)(&format!("peer refused: endpoint {}: {why}", hex(endpoint)));
     }
 }
 
@@ -336,6 +491,44 @@ fn head(bytes: &[u8], at: &mut usize) -> Option<(u8, u64)> {
         first >> 5,
         raw.iter().fold(0u64, |n, b| (n << 8) | u64::from(*b)),
     ))
+}
+
+// Records and doors for other modules' tests. A braced module, so the
+// condition encloses the whole section.
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::*;
+    use glade_wire::generated::Shape;
+
+    /// `record` as the `seq`th op of the chain of the node whose key is
+    /// `seed`, on its stream in `home`. The fold reads no chain link.
+    pub(crate) fn op_of(seed: &[u8; 32], record: Record, seq: i64) -> Op {
+        let (glade_id, payload) = (record.glade_id().into(), record.encode());
+        let origin = hex(&signing::public_key(seed));
+        let (share, shape) = (HOME.into(), Shape::Log);
+        Op {
+            share,
+            glade_id,
+            origin,
+            seq,
+            lamport: seq,
+            shape,
+            payload,
+            ..Op::default()
+        }
+    }
+
+    /// A door that configures nothing and holds one binding: of `endpoint`
+    /// to the node whose key is `seed`, from epoch millisecond 1.
+    pub(crate) fn bound_by(seed: &[u8; 32], endpoint: &[u8; 32]) -> Door {
+        let door = Door::new([], |_: &str| {});
+        door.note(&op_of(
+            seed,
+            Record::Transport(sign_binding(seed, endpoint, 1)),
+            0,
+        ));
+        door
+    }
 }
 
 // A braced module, so the condition encloses the whole section.
@@ -552,6 +745,83 @@ mod tests {
         let fold = TransportFold::over(&all);
         assert_eq!(fold.binds(&id(&NODE), &E1, 2_000), Bound::Live);
         assert_eq!(fold.ignored, bad.len());
+    }
+
+    /// Plan Step 4.2b's rule, row by row, at one clock: a live binding
+    /// admits, at HELLO only its own node; a revoked or not-yet-dated key is
+    /// refused, configured or not; a key no record names is admitted only if
+    /// configured; nothing is admitted while the clock cannot be read.
+    #[test]
+    fn the_door_admits_a_live_or_first_configured_key_and_refuses_the_rest() {
+        const E3: [u8; 32] = [3; 32];
+        const E4: [u8; 32] = [4; 32];
+        let ops = [
+            bind(&NODE, &E1, 1_000, 0),
+            bind(&NODE, &E2, 1_000, 1),
+            revoke(&NODE, &E2, 0),
+            bind(&NODE, &E3, 5_000, 2),
+        ];
+        let fold = TransportFold::over(&ops);
+        let (node, other) = (id(&NODE), id(&OTHER));
+        let door = |e: &[u8; 32], hello: Option<&[u8; 32]>, configured| {
+            fold.door(e, hello, configured, 2_000)
+        };
+        assert_eq!(door(&E1, None, false), Ok(()), "a live binding");
+        assert_eq!(door(&E1, Some(&node), false), Ok(()), "its own node");
+        let elsewhere = Refusal::BoundElsewhere {
+            bound: node,
+            node: other,
+        };
+        assert_eq!(door(&E1, Some(&other), false), Err(elsewhere));
+        let revoked = Err(Refusal::Revoked { node });
+        assert_eq!(door(&E2, None, true), revoked, "configured, and revoked");
+        assert_eq!(door(&E2, Some(&node), true), revoked);
+        let not_yet = Err(Refusal::NotYet { valid_from: 5_000 });
+        assert_eq!(
+            (door(&E3, None, false), door(&E3, Some(&node), true)),
+            (not_yet.clone(), not_yet)
+        );
+        assert_eq!(
+            door(&E4, None, true),
+            Ok(()),
+            "first contact on a configured key"
+        );
+        assert_eq!(door(&E4, Some(&other), true), Ok(()));
+        let unknown = Err(Refusal::Unknown);
+        assert_eq!(
+            (door(&E4, None, false), door(&E4, Some(&node), false)),
+            (unknown.clone(), unknown)
+        );
+        let unread = Err(Refusal::ClockUncertain);
+        assert_eq!(fold.door(&E1, None, false, 0), unread);
+        assert_eq!(fold.door(&E4, Some(&other), true, 0), unread);
+    }
+
+    /// Plan Step 4.2b: a door takes each record as it lands, answering a
+    /// counted revocation with the key it revoked, and judges at the clock
+    /// now; it reports a refusal as one line naming the key and the reason.
+    #[test]
+    fn a_door_takes_records_as_they_land_and_reports_its_refusals() {
+        let lines = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let sink = lines.clone();
+        let door = Door::new([E2], move |line: &str| {
+            sink.lock().unwrap().push(line.to_string())
+        });
+        assert_eq!(door.admits(&E1), Err(Refusal::Unknown));
+        assert_eq!(door.admits(&E2), Ok(()), "configured");
+        assert_eq!(door.note(&bind(&NODE, &E1, 1, 0)), None);
+        assert_eq!(door.binds(&id(&NODE), &E1), Ok(()));
+        let lands = door.note(&revoke(&NODE, &E1, 0));
+        assert_eq!(lands, Some((E1, id(&NODE))), "a revocation lands");
+        let revoked = Refusal::Revoked { node: id(&NODE) };
+        assert_eq!(door.admits(&E1), Err(revoked.clone()));
+        door.refused(&E1, &revoked);
+        let line = format!(
+            "peer refused: endpoint {}: revoked by node {}",
+            hex(&E1),
+            hex(&id(&NODE))
+        );
+        assert_eq!(*lines.lock().unwrap(), [line]);
     }
 
     fn rebound(minted: bool, revoked: usize) -> Rebound {

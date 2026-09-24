@@ -73,7 +73,15 @@ fn scratch(test: &str) -> PathBuf {
     dir
 }
 
-/// A booted start of the instance `name` under `dir`, dialing `peers`.
+/// The endpoint id of the instance `name` under `dir`, booted once so its
+/// keys exist: what an operator reads from a node's first start.
+fn endpoint_id(dir: &Path, name: &str) -> String {
+    let boot = glade_node::sysdir::boot_at(dir.join("sys").join(name), "local").unwrap();
+    glade_node::transport::hex(&boot.endpoint_key().endpoint_id)
+}
+
+/// A booted start of the instance `name` under `dir`, with `peers` as its
+/// `--peer` entries: dialed with an address, only admitted without one.
 fn booted(dir: &Path, name: &str, peers: &[String], lines: &Arc<Lines>) -> NodeStart {
     let mut args = vec![
         "--profile".to_owned(),
@@ -159,16 +167,18 @@ async fn the_release_check_can_answer_still_bound() {
     assert!(free_after(t, tcp).await.is_some());
 }
 
-/// The done-when. B is started first; A boots, links to B with `--peer`, and
-/// is stopped: a clean report with nothing incomplete, both of A's ports free
-/// within the bound, and A's instance lock removed. B stops cleanly after it.
+/// The done-when. B is started first, admitting A's endpoint key (plan Step
+/// 4.2b); A boots, links to B with `--peer`, and is stopped: a clean report
+/// with nothing incomplete, both of A's ports free within the bound, and A's
+/// instance lock removed. B stops cleanly after it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_node_links_to_a_peer_and_stops_clean_with_its_ports_free() {
     let dir = scratch("lifecycle");
     let rt = runtime();
 
     let b_lines = Arc::new(Lines::default());
-    let mut b = node_plan().start(rt.clone(), booted(&dir, "b", &[], &b_lines));
+    let a_key = endpoint_id(&dir, "a");
+    let mut b = node_plan().start(rt.clone(), booted(&dir, "b", &[a_key], &b_lines));
     let steady = tokio::time::timeout(BOUND, b.ready()).await;
     assert_eq!(steady.ok(), Some(Ok(())), "B steady: {:?}", b_lines.all());
     let b_peer = b_lines.value("peer");
@@ -232,6 +242,45 @@ async fn a_node_links_to_a_peer_and_stops_clean_with_its_ports_free() {
         free_after(b_udp, udp).await.is_some(),
         "B's UDP port {b_udp}"
     );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Plan Step 4.2b on the assembled root: B admits no key, so A's dial is
+/// refused at accept. B reports it on its console's stderr, naming A's
+/// endpoint key; A's own report of the failed dial carries no reason. Both
+/// still reach steady state and stop clean.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dialer_its_peer_does_not_know_is_refused_and_reported() {
+    let dir = scratch("lifecycle-door");
+    let rt = runtime();
+    let b_lines = Arc::new(Lines::default());
+    let mut b = node_plan().start(rt.clone(), booted(&dir, "b", &[], &b_lines));
+    let steady = tokio::time::timeout(BOUND, b.ready()).await;
+    assert_eq!(steady.ok(), Some(Ok(())), "B steady: {:?}", b_lines.all());
+    let target = b_lines.value("peer").replacen(' ', "@", 1);
+
+    let a_lines = Arc::new(Lines::default());
+    let a_start = booted(&dir, "a", std::slice::from_ref(&target), &a_lines);
+    let mut a = node_plan().start(rt.clone(), a_start);
+    let steady = tokio::time::timeout(BOUND, a.ready()).await;
+    assert_eq!(steady.ok(), Some(Ok(())), "A steady: {:?}", a_lines.all());
+    let a_key = a_lines.value("peer").split(' ').next().unwrap().to_owned();
+    let refused = format!("stderr: peer refused: endpoint {a_key}: unknown endpoint key");
+    assert!(b_lines.all().contains(&refused), "{:?}", b_lines.all());
+    let failed = a_lines.value(&format!("stderr: peer {target}:"));
+    assert!(!failed.contains("unknown"), "a reason crossed: {failed}");
+    assert!(!a_lines
+        .all()
+        .iter()
+        .any(|l| l.starts_with("peer-connected")));
+
+    for mut node in [a, b] {
+        node.handle().shutdown();
+        let report = tokio::time::timeout(BOUND, &mut node)
+            .await
+            .expect("stops in time");
+        assert!(report.is_clean(), "{}", shown(&report));
+    }
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

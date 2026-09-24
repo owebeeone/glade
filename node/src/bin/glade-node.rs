@@ -9,7 +9,7 @@
 //! singleton lock here would collide, and tests must never write $HOME).
 //!
 //! **Booted profile form** (opt-in): `glade-node --profile local|peer|server
-//! [--name NAME] [--operator OP] [--app FILE.glade]... [--peer ID@IP:PORT]...
+//! [--name NAME] [--operator OP] [--app FILE.glade]... [--peer ID[@IP:PORT]]...
 //! [PORT] [STORE_DIR]` —
 //! reads every `--app` file, then boots the system-data instance (GDL-036): acquires
 //! `~/.glade/sys/<name>/` (the profile picks the default name; `--name`
@@ -27,6 +27,12 @@
 //! flag on another node, the same at every start), and each `--peer` target
 //! is dialed and the home share converged. Then it serves the app-data
 //! carrier as before.
+//!
+//! The endpoint has a door (plan Step 4.2b): it admits an endpoint key bound
+//! by a record the node holds, or one a `--peer` entry names on first
+//! contact, and refuses every other, reporting `peer refused: endpoint <id>:
+//! <reason>` on stderr. `--peer ID` names a key to admit and dial nothing;
+//! `--peer ID@IP:PORT` names one and dials it.
 //!
 //! Each `--app FILE.glade` is LOADED as data and REGISTERED (GDL-037): its
 //! declarations append as ordinary records, its ACL seeds compile to grant
@@ -69,11 +75,12 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use glade_node::assembly::{Settings, ASSEMBLED_ROOT_LINE};
-use glade_node::iroh_carrier::{PeerAddr, PeerEndpoint};
+use glade_node::iroh_carrier::{PeerEndpoint, PeerEntry};
 use glade_node::lifecycle::{conclude, node_plan, Console, NodeStart, StdConsole};
 use glade_node::registry::{RegistryApi, StoreApi, HOME};
 use glade_node::server::Server;
 use glade_node::sysdir::{boot, now_ms, Profile};
+use glade_node::transport::Door;
 use sdax_tokio::{PlanStart, TokioRuntime};
 use tokio::net::TcpListener;
 
@@ -204,16 +211,20 @@ async fn run() -> std::io::Result<()> {
     if let Some((node, workspaces)) = booted {
         let (identity, key) = (node.identity()?, node.endpoint_key());
         server.adopt_boot(node).await?;
-        let endpoint = PeerEndpoint::bind_as(identity, key).await?;
+        let entries: Vec<Option<PeerEntry>> = peers.iter().map(|p| PeerEntry::parse(p)).collect();
+        let configured = entries.iter().flatten().map(PeerEntry::key);
+        let door = Arc::new(Door::new(configured, |line: &str| eprintln!("{line}")));
+        let endpoint = PeerEndpoint::bind_door(identity, key, door).await?;
         let addr = server.enable_mesh(endpoint).await?;
         println!("peer {} {}", addr.endpoint_id, addr.socket);
-        for p in &peers {
-            match PeerAddr::parse(p) {
-                Some(target) => match server.connect_peer(&target).await {
+        for (p, entry) in peers.iter().zip(&entries) {
+            match entry {
+                Some(PeerEntry::Dial(target)) => match server.connect_peer(target).await {
                     Ok(id) => println!("peer-connected {id}"),
                     Err(e) => eprintln!("peer {p}: {e}"),
                 },
-                None => eprintln!("peer {p}: expected <endpoint-id>@<ip:port>"),
+                Some(PeerEntry::Known(_)) => {}
+                None => eprintln!("peer {p}: expected <endpoint-id> or <endpoint-id>@<ip:port>"),
             }
         }
         for (share, name) in &workspaces {

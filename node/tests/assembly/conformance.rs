@@ -6,7 +6,7 @@
 //! signer (plan Step 4.1a) runs the whole of SI-001..003, SI-003 with no key
 //! lent; its system clock runs CL-002 (CL-001 needs a clock a test can set).
 //! No carrier on the assembled path implements `CarrierPort` yet, so
-//! CA-001..004 run on the fake network only.
+//! CA-001..005 run on the fake network only.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -76,6 +76,11 @@ fn ca_003_the_fake_networks_futures_are_lazy_and_recv_is_cancel_safe() {
 #[test]
 fn ca_004_a_fake_port_gives_its_endpoint_up_by_value() {
     run(carrier::close_by_value(carrier_fixture()));
+}
+
+#[test]
+fn ca_005_the_fake_network_names_each_far_end() {
+    run(carrier::remote_identity(carrier_fixture()));
 }
 
 #[test]

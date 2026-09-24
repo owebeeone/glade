@@ -37,6 +37,7 @@ use crate::session::{heads_map, missing_for};
 use crate::store::{Append, Store};
 use crate::sysdir::now_ms;
 use crate::tasks::Site;
+use crate::transport::Door;
 
 fn other<E: Into<Box<dyn std::error::Error + Send + Sync>>>(e: E) -> io::Error {
     io::Error::new(io::ErrorKind::Other, e)
@@ -62,6 +63,10 @@ pub struct Mesh {
     /// Zones whose interest is already forwarded to a claim holder — a second
     /// local subscriber joins the flow, it never opens a second stream.
     pub(crate) forwarded: Mutex<BTreeSet<(String, String, Vec<u8>)>>,
+    /// The endpoint's door (plan Step 4.2b), if it has one: loaded from the
+    /// served store before the first accept, then fed each transport record
+    /// that lands there.
+    pub(crate) door: Option<Arc<Door>>,
 }
 
 /// The mesh's lasting handle on its endpoint, which a composition root that
@@ -154,11 +159,16 @@ impl Server {
     pub(crate) async fn enable_mesh_over(&self, slot: EndpointSlot) -> io::Result<PeerAddr> {
         let endpoint = slot.get()?;
         let addr = endpoint.addr()?;
+        let door = endpoint.door();
+        if let Some(door) = &door {
+            door.load(&*self.shared.store.lock().await);
+        }
         let mesh = Arc::new(Mesh {
             self_id: hex_id(&endpoint.identity().node_id),
             endpoint: slot,
             links: Mutex::new(BTreeMap::new()),
             forwarded: Mutex::new(BTreeSet::new()),
+            door,
         });
         self.shared
             .mesh
@@ -500,12 +510,28 @@ pub(crate) async fn ingest_and_fanout(shared: &Arc<Shared>, from: SessionId, op:
     let _cut = shared.cut.lock().await;
     let res = shared.store.lock().await.append(op.clone());
     if matches!(res, Ok(Append::Appended)) {
+        let mesh = shared.mesh.get();
+        let revoked = mesh.and_then(|mesh| Some((mesh, mesh.door.as_ref()?.note(&op)?)));
+        if let Some((mesh, pair)) = revoked {
+            close_revoked(mesh, pair).await;
+        }
         let targets = shared.router.lock().await.route(from, &share, &glade_id, &key);
         if !targets.is_empty() {
             let frame = Frame::Ops(Ops { ops: vec![op], pri: None });
             for t in targets {
                 send(shared, t, &frame).await;
             }
+        }
+    }
+}
+
+/// Close the revoking node's live link, if it rides the key it revoked (plan
+/// Step 4.2b): its HELLO was taken before the door knew. The link leaves the
+/// table when its connection ends.
+async fn close_revoked(mesh: &Mesh, (endpoint, node): ([u8; 32], [u8; 32])) {
+    if let Some(conn) = mesh.links.lock().await.get(&hex_id(&node)) {
+        if conn.remote_id().as_bytes() == &endpoint {
+            conn.close(0u32.into(), b"");
         }
     }
 }
@@ -682,6 +708,159 @@ mod tests {
         );
         wait_for(&a, b_at_a, "B's binding at A").await;
         wait_for(&b, a_at_b, "A's binding at B").await;
+    }
+
+    // ---- the door (plan Step 4.2b), over real iroh ---------------------------
+
+    const A_SEED: [u8; 32] = [21; 32];
+    const A_KEY: [u8; 32] = [22; 32];
+    const B_SEED: [u8; 32] = [23; 32];
+    const B_KEY: [u8; 32] = [24; 32];
+
+    /// The endpoint id the seed `key` gives, and the node id of `seed`.
+    fn endpoint_of(key: [u8; 32]) -> [u8; 32] {
+        crate::transport::EndpointKey::from_seed(key).endpoint_id
+    }
+    fn node_of(seed: [u8; 32]) -> [u8; 32] {
+        crate::signing::public_key(&seed)
+    }
+
+    /// The refusal lines a door reported.
+    type Lines = Arc<std::sync::Mutex<Vec<String>>>;
+
+    /// A node behind a door that configures `configured`: node key `seed`,
+    /// endpoint key `key`; `records` in its served store before the mesh
+    /// starts; the door's refusal lines; its dialable address.
+    async fn behind_door(
+        name: &str,
+        (seed, key): ([u8; 32], [u8; 32]),
+        configured: &[[u8; 32]],
+        records: &[Op],
+    ) -> (Server, Lines, PeerAddr) {
+        let server = Server::open(fresh(name)).unwrap();
+        for op in records {
+            server.shared.store.lock().await.append(op.clone()).unwrap();
+        }
+        let lines = Lines::default();
+        let sink = lines.clone();
+        let door = Door::new(configured.iter().copied(), move |line: &str| {
+            sink.lock().unwrap().push(line.into())
+        });
+        let (identity, key) = (
+            crate::peer::NodeIdentity::from_key(seed),
+            crate::transport::EndpointKey::from_seed(key),
+        );
+        let endpoint = PeerEndpoint::bind_door(identity, key, Arc::new(door))
+            .await
+            .unwrap();
+        let addr = server.enable_mesh(endpoint).await.unwrap();
+        (server, lines, addr)
+    }
+
+    /// The node `seed`'s record, first on its chain.
+    fn signed(seed: [u8; 32], record: Record) -> Op {
+        crate::transport::testing::op_of(&seed, record, 0)
+    }
+
+    async fn links(server: &Server) -> usize {
+        server.shared.mesh.get().unwrap().links.lock().await.len()
+    }
+
+    /// Done-when (plan Step 4.2b): an endpoint key the door does not know is
+    /// refused at accept, before HELLO. The refusing node reports one line
+    /// naming the key and the reason; the dialer learns no reason.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unknown_endpoint_key_is_refused_at_accept_and_reported() {
+        let (b, b_lines, at_b) = behind_door("door-unknown-b", (B_SEED, B_KEY), &[], &[]).await;
+        let (a, _, _) = behind_door(
+            "door-unknown-a",
+            (A_SEED, A_KEY),
+            &[endpoint_of(B_KEY)],
+            &[],
+        )
+        .await;
+        let refused = a
+            .connect_peer(&at_b)
+            .await
+            .expect_err("an unknown key linked");
+        assert_ne!(refused.kind(), io::ErrorKind::PermissionDenied, "{refused}");
+        assert!(
+            !refused.to_string().contains("unknown"),
+            "a reason crossed: {refused}"
+        );
+        let line = format!(
+            "peer refused: endpoint {}: unknown endpoint key",
+            hex_id(&endpoint_of(A_KEY))
+        );
+        assert_eq!(*b_lines.lock().unwrap(), [line]);
+        assert_eq!(links(&b).await, 0);
+    }
+
+    /// Done-when: a key bound by a record the door holds links; once the
+    /// door's fold has the node's revocation of it, the live link is closed
+    /// and the next connection is refused at accept.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bound_key_links_and_is_refused_once_its_revocation_lands() {
+        use crate::transport::{sign_binding, sign_revocation};
+        let bound = signed(
+            A_SEED,
+            Record::Transport(sign_binding(&A_SEED, &endpoint_of(A_KEY), 1)),
+        );
+        let (b, b_lines, at_b) = behind_door("door-bound-b", (B_SEED, B_KEY), &[], &[bound]).await;
+        let (a, _, _) =
+            behind_door("door-bound-a", (A_SEED, A_KEY), &[endpoint_of(B_KEY)], &[]).await;
+        a.connect_peer(&at_b).await.expect("a bound key links");
+        assert_eq!(links(&b).await, 1);
+
+        let revoked = signed(
+            A_SEED,
+            Record::TransportRevoke(sign_revocation(&A_SEED, &endpoint_of(A_KEY))),
+        );
+        let from = b.shared.next.fetch_add(1, Ordering::SeqCst);
+        ingest_and_fanout(&b.shared, from, revoked).await;
+        for _ in 0..500 {
+            if links(&b).await == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(links(&b).await, 0, "the live link was closed");
+        a.connect_peer(&at_b)
+            .await
+            .expect_err("a revoked key linked");
+        let (key, node) = (hex_id(&endpoint_of(A_KEY)), hex_id(&node_of(A_SEED)));
+        let line = format!("peer refused: endpoint {key}: revoked by node {node}");
+        assert_eq!(*b_lines.lock().unwrap(), [line]);
+    }
+
+    /// Done-when's HELLO half: a key the door knows, bound to another node,
+    /// admits the connection at accept, and the HELLO of a node not bound to
+    /// it is refused and reported, unanswered.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_key_bound_to_another_node_cannot_complete_hello() {
+        let other = [25; 32];
+        let binding = crate::transport::sign_binding(&other, &endpoint_of(A_KEY), 1);
+        let elsewhere = signed(other, Record::Transport(binding));
+        let (b, b_lines, at_b) =
+            behind_door("door-elsewhere-b", (B_SEED, B_KEY), &[], &[elsewhere]).await;
+        let (a, _, _) = behind_door(
+            "door-elsewhere-a",
+            (A_SEED, A_KEY),
+            &[endpoint_of(B_KEY)],
+            &[],
+        )
+        .await;
+        a.connect_peer(&at_b)
+            .await
+            .expect_err("a node linked through another's key");
+        let (m, n) = (hex_id(&node_of(other)), hex_id(&node_of(A_SEED)));
+        let why = format!("HELLO refused: bound to node {m}, not {n}");
+        let line = format!(
+            "peer refused: endpoint {}: {why}",
+            hex_id(&endpoint_of(A_KEY))
+        );
+        assert_eq!(*b_lines.lock().unwrap(), [line]);
+        assert_eq!(links(&b).await, 0);
     }
 
     // ---- the s-discovery golden path, end to end ---------------------------

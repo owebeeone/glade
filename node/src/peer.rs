@@ -29,6 +29,7 @@ use crate::frame::Frame;
 use crate::session::missing_for;
 use crate::signing;
 use crate::store::{EquivProof, Store, StoreError};
+use crate::transport::Door;
 
 /// Wire protocol version spoken on the peer link: 2 from plan Step 4.1a, whose
 /// HELLO is signed. The carrier's ALPN names it too, so a node that speaks 1
@@ -179,13 +180,28 @@ fn verify_peer(
     }
 }
 
+/// The door's HELLO check (plan Step 4.2b): the node that spoke must be bound
+/// to the endpoint key its connection came from, by a record or, on first
+/// contact, by the operator's configuration. No door, no check.
+fn bound(door: Option<&Door>, peer: &PeerHello, endpoint: &[u8; 32]) -> io::Result<()> {
+    let Some(door) = door else {
+        return Ok(());
+    };
+    door.binds(&peer.peer_id, endpoint).map_err(|why| {
+        let why = format!("HELLO refused: {why}");
+        io::Error::new(io::ErrorKind::PermissionDenied, why)
+    })
+}
+
 /// Dialer side of the node<->node HELLO: send `NodeHello`, await `NodeWelcome`,
-/// and return the peer once its WELCOME verifies for `channel`.
+/// and return the peer once its WELCOME verifies for `channel` and, with a
+/// door, its node is bound to the acceptor's endpoint key.
 pub async fn hello_dial<R, W>(
     r: &mut R,
     w: &mut W,
     me: &NodeIdentity,
     channel: &Channel,
+    door: Option<&Door>,
 ) -> io::Result<PeerHello>
 where
     R: AsyncRead + Unpin,
@@ -197,24 +213,30 @@ where
         sig: hello_sig(me, Role::Dialer, channel),
     };
     write_frame(w, &Frame::NodeHello(hello)).await?;
-    match read_frame(r).await? {
+    let peer = match read_frame(r).await? {
         Frame::NodeWelcome(nw) => {
-            verify_peer(&nw.node_id, nw.protocol, &nw.sig, Role::Acceptor, channel)
+            verify_peer(&nw.node_id, nw.protocol, &nw.sig, Role::Acceptor, channel)?
         }
-        other => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("expected NodeWelcome, got {other:?}"),
-        )),
-    }
+        other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("expected NodeWelcome, got {other:?}"),
+            ))
+        }
+    };
+    bound(door, &peer, &channel.acceptor)?;
+    Ok(peer)
 }
 
-/// Acceptor side: await `NodeHello` and check it for `channel`; only then reply
+/// Acceptor side: await `NodeHello` and check it for `channel` and, with a
+/// door, its node's binding to the dialer's endpoint key; only then reply
 /// `NodeWelcome`. A refused HELLO gets no answer.
 pub async fn hello_accept<R, W>(
     r: &mut R,
     w: &mut W,
     me: &NodeIdentity,
     channel: &Channel,
+    door: Option<&Door>,
 ) -> io::Result<PeerHello>
 where
     R: AsyncRead + Unpin,
@@ -231,6 +253,7 @@ where
             ))
         }
     };
+    bound(door, &peer, &channel.dialer)?;
     let welcome = NodeWelcome {
         node_id: me.node_id.to_vec(),
         protocol: PROTOCOL,
@@ -399,9 +422,11 @@ mod hello_tests {
         let (mut ar, mut aw) = split(a);
         let (mut br, mut bw) = split(b);
 
-        let acc =
-            tokio::spawn(async move { hello_accept(&mut br, &mut bw, &acceptor, &CHANNEL).await });
-        let dialed = hello_dial(&mut ar, &mut aw, &dialer, &CHANNEL).await;
+        let acc = tokio::spawn(async move {
+            let (me, channel) = (&acceptor, &CHANNEL);
+            hello_accept(&mut br, &mut bw, me, channel, None).await
+        });
+        let dialed = hello_dial(&mut ar, &mut aw, &dialer, &CHANNEL, None).await;
         let seen_by_dialer = dialed.unwrap();
         let seen_by_acceptor = acc.await.unwrap().unwrap();
 
@@ -427,13 +452,22 @@ mod hello_tests {
     /// Present `hello` to an acceptor on `channel`: its verdict, and whether
     /// it answered with a WELCOME.
     async fn present(hello: NodeHello, channel: Channel) -> (io::Result<PeerHello>, bool) {
+        present_to(hello, channel, None).await
+    }
+
+    /// [`present`], to an acceptor behind `door`.
+    async fn present_to(
+        hello: NodeHello,
+        channel: Channel,
+        door: Option<&Door>,
+    ) -> (io::Result<PeerHello>, bool) {
         let acceptor = NodeIdentity::from_key([9u8; 32]);
         let (a, b) = tokio::io::duplex(4096);
         let (mut ar, mut aw) = split(a);
         let (mut br, mut bw) = split(b);
         let hello = Frame::NodeHello(hello);
         write_frame(&mut aw, &hello).await.unwrap();
-        let verdict = hello_accept(&mut br, &mut bw, &acceptor, &channel).await;
+        let verdict = hello_accept(&mut br, &mut bw, &acceptor, &channel, door).await;
         drop((br, bw));
         let answered = read_frame(&mut ar).await.is_ok();
         (verdict, answered)
@@ -516,7 +550,7 @@ mod hello_tests {
             };
             write_frame(&mut bw, &Frame::NodeWelcome(welcome)).await.unwrap();
         });
-        let verdict = hello_dial(&mut ar, &mut aw, &dialer, &CHANNEL).await;
+        let verdict = hello_dial(&mut ar, &mut aw, &dialer, &CHANNEL, None).await;
         mirror.await.unwrap();
         assert!(verdict.is_err(), "the dialer took its own HELLO back");
 
@@ -529,6 +563,45 @@ mod hello_tests {
         let (verdict, answered) = present(reflected, CHANNEL).await;
         assert!(verdict.is_err(), "the acceptor took its own WELCOME back");
         assert!(!answered);
+    }
+
+    /// Plan Step 4.2b: HELLO completes only for a node bound to the endpoint
+    /// key its connection came from (the channel's endpoint ids). The
+    /// dialer's key `[1; 32]`: unknown to the door, refused, unanswered;
+    /// configured, admitted on first contact; bound to another node, refused;
+    /// bound to the dialer, admitted. And the dialer refuses a WELCOME whose
+    /// node its door binds to no key the acceptor's endpoint holds.
+    #[tokio::test]
+    async fn a_hello_completes_only_for_a_node_bound_to_its_endpoint_key() {
+        use crate::transport::testing::bound_by;
+        let dialer = NodeIdentity::from_key([7u8; 32]);
+        let hello = hello_from(&dialer, &CHANNEL);
+        let unknown = Door::new([], |_: &str| {});
+        let configured = Door::new([CHANNEL.dialer], |_: &str| {});
+        let elsewhere = bound_by(&[8u8; 32], &CHANNEL.dialer);
+        let its_own = bound_by(&[7u8; 32], &CHANNEL.dialer);
+        for (what, door, admitted) in [
+            ("unknown", &unknown, false),
+            ("configured", &configured, true),
+            ("bound to another node", &elsewhere, false),
+            ("bound to the dialer", &its_own, true),
+        ] {
+            let (verdict, answered) = present_to(hello.clone(), CHANNEL, Some(door)).await;
+            assert_eq!(verdict.is_ok(), admitted, "{what}: {verdict:?}");
+            assert_eq!(answered, admitted, "{what}: answered");
+        }
+        let acceptor = NodeIdentity::from_key([9u8; 32]);
+        let (a, b) = tokio::io::duplex(4096);
+        let ((mut ar, mut aw), (mut br, mut bw)) = (split(a), split(b));
+        let welcomes = tokio::spawn(async move {
+            let (me, channel) = (&acceptor, &CHANNEL);
+            hello_accept(&mut br, &mut bw, me, channel, None).await
+        });
+        let not_its = bound_by(&[8u8; 32], &CHANNEL.acceptor);
+        let verdict = hello_dial(&mut ar, &mut aw, &dialer, &CHANNEL, Some(&not_its)).await;
+        assert!(welcomes.await.unwrap().is_ok(), "the acceptor answered");
+        let refused = verdict.expect_err("the dialer took a WELCOME from an unbound node");
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
     }
 }
 

@@ -22,6 +22,13 @@ pub type PortFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CarrierAddr(pub String);
 
+/// The identity a transport authenticated for the far end of a link, in the
+/// adapter's own bytes (for iroh, the 32-byte endpoint id its TLS session
+/// proved), opaque to this contract. It names a transport key, never a node:
+/// which node speaks through it is the session's HELLO to establish.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TransportId(pub Vec<u8>);
+
 /// What `bind` is given. The limit holds for every link of the endpoint, both ways.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CarrierConfig {
@@ -122,8 +129,10 @@ pub trait CarrierPort: Send + Sync {
 
 /// One duplex link of frames, owned by whoever dialed or accepted it.
 ///
-/// A carrier authenticates nothing: who is at the other end is for the session's
-/// HELLO to establish through a signer, never the carrier's word. Frames arrive
+/// A carrier authenticates no node: who is at the other end is for the session's
+/// HELLO to establish through a signer, never the carrier's word. It reports
+/// only the transport identity its transport authenticated (`remote_id`),
+/// which the HELLO checks against the node's binding record. Frames arrive
 /// whole, once and in send order; none is split, merged or interleaved, and
 /// `send` and `recv` may run concurrently. `send` resolves when the transport has
 /// taken the frame, not when the peer has read it: it is not an acknowledgement.
@@ -154,6 +163,11 @@ pub trait CarrierLink: Send + Sync {
 
     /// Give the link up by value.
     fn close(&self) -> PortFuture<'_, ()>;
+
+    /// The far end's transport identity, as the transport authenticated it,
+    /// or `None` from a transport that has none. It is the same for the
+    /// link's whole life, close included.
+    fn remote_id(&self) -> Option<TransportId>;
 }
 
 // The conformance probes exist only with the `conformance` feature. The
@@ -165,7 +179,9 @@ pub mod conformance {
     //! Probes over three unbound ports that can reach one another. They await
     //! only the ports, so any executor that polls to completion drives them. A
     //! real adapter adds its own I/O, partial-frame, backpressure and fault tests.
-    use crate::{CarrierAddr, CarrierConfig, CarrierError, CarrierLink, CarrierPort, PortFuture};
+    use crate::{
+        CarrierAddr, CarrierConfig, CarrierError, CarrierLink, CarrierPort, PortFuture, TransportId,
+    };
     use std::future::{Future, poll_fn};
     use std::num::NonZeroUsize;
     use std::pin::pin;
@@ -388,5 +404,39 @@ pub mod conformance {
         assert!(dialed, "CA-004 close is terminal");
         let accepted = matches!(survivor.accept().await, Ok(None));
         assert!(accepted, "CA-004 close is terminal");
+    }
+
+    /// CA-005. Each link names the far end's transport identity. `a` dials
+    /// `b`, then, once `b` has closed, `fresh` bound where `b` was: the two
+    /// endpoints `a` reached are named apart, both name `a` alike, a
+    /// transport with no identity names none on any link, and a name
+    /// outlives the link's close. It assumes the fixture's three ports are
+    /// three endpoints: `fresh` is not `b` again under the same identity.
+    pub async fn remote_identity(f: Fixture) {
+        let (at_b, a_to_b, b_from_a) = link(&f, 64, 64).await;
+        f.b.close().await;
+        f.fresh
+            .bind(config(&at_b, 64))
+            .await
+            .expect("bind fresh where b was");
+        let (a_to_fresh, fresh_from_a) = join(f.a.dial(&at_b), f.fresh.accept()).await;
+        let a_to_fresh = a_to_fresh.expect("dial");
+        let fresh_from_a = fresh_from_a.expect("accept").expect("an inbound link");
+        let (b, fresh): (Option<TransportId>, _) = (a_to_b.remote_id(), a_to_fresh.remote_id());
+        let a = b_from_a.remote_id();
+        let alike = "CA-005 two endpoints name the endpoint that reached both alike";
+        assert_eq!(fresh_from_a.remote_id(), a, "{alike}");
+        match (&a, &b, &fresh) {
+            (Some(a), Some(b), Some(fresh)) => {
+                let apart = a != b && b != fresh && a != fresh;
+                assert!(apart, "CA-005 three endpoints are named apart");
+            }
+            (None, None, None) => {}
+            _ => panic!("CA-005 a transport names every far end, or none"),
+        }
+        for link in [&a_to_b, &b_from_a, &a_to_fresh, &fresh_from_a] {
+            link.close().await;
+        }
+        assert_eq!(a_to_b.remote_id(), b, "CA-005 a name outlives the close");
     }
 }

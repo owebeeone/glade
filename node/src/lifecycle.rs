@@ -42,7 +42,7 @@ use crate::appdecl::AppDecl;
 use crate::assembly::{
     CommandLine, Config, Directory, InstanceSlot, NodeAssembly, Records, Settings,
 };
-use crate::iroh_carrier::{PeerAddr, PeerEndpoint};
+use crate::iroh_carrier::{PeerEndpoint, PeerEntry};
 use crate::mesh::{release_links, EndpointSlot};
 use crate::peer::NodeIdentity;
 use crate::registry::HOME;
@@ -50,7 +50,7 @@ use crate::server::{accept_clients, Server, Shared};
 use crate::signing::NodeSigner;
 use crate::sysdir::{boot_at, instance_dir, Boot, Profile};
 use crate::tasks::{self, Inbox};
-use crate::transport::EndpointKey;
+use crate::transport::{Door, EndpointKey};
 
 /// The node names, in one place, so a test and the plan cannot disagree
 /// about a spelling: `ReleaseOrder::before` answers `false` for a typo.
@@ -166,6 +166,9 @@ struct Booted {
     node_id: String,
     identity: NodeIdentity,
     endpoint: EndpointKey,
+    /// The endpoint's door (plan Step 4.2b): the `--peer` keys, and refusals
+    /// reported on the console's stderr.
+    door: Arc<Door>,
 }
 
 impl Instance {
@@ -178,11 +181,21 @@ impl Instance {
 
     fn boot(start: &NodeStart, at: &InstanceAt) -> io::Result<Instance> {
         let boot = boot_at(at.dir.clone(), &at.operator)?;
+        let entries = start
+            .settings
+            .peers
+            .iter()
+            .filter_map(|p| PeerEntry::parse(p));
+        let console = start.console.clone();
+        let door = Door::new(entries.map(|entry| entry.key()), move |line: &str| {
+            console.err(line)
+        });
         let booted = Booted {
             dir: boot.dir.clone(),
             node_id: boot.node_id.clone(),
             identity: boot.identity()?,
             endpoint: boot.endpoint_key(),
+            door: Arc::new(door),
         };
         start
             .console
@@ -368,21 +381,23 @@ fn assemble(start: &NodeStart, instance: &Instance) -> Result<Declared, Error> {
     Ok(workspaces)
 }
 
-/// Dial each `--peer` target, as the hand-written root does. The legacy form
-/// has no mesh and dials nothing.
+/// Dial each `--peer` target that has an address, as the hand-written root
+/// does; an entry with none only configures the door. The legacy form has no
+/// mesh and dials nothing.
 async fn dial_peers(start: &NodeStart, server: &Server) {
     if start.instance.is_none() {
         return;
     }
     for p in &start.settings.peers {
-        match PeerAddr::parse(p) {
-            Some(target) => match server.connect_peer(&target).await {
+        match PeerEntry::parse(p) {
+            Some(PeerEntry::Dial(target)) => match server.connect_peer(&target).await {
                 Ok(id) => start.console.out(&format!("peer-connected {id}")),
                 Err(e) => start.console.err(&format!("peer {p}: {e}")),
             },
-            None => start
-                .console
-                .err(&format!("peer {p}: expected <endpoint-id>@<ip:port>")),
+            Some(PeerEntry::Known(_)) => {}
+            None => start.console.err(&format!(
+                "peer {p}: expected <endpoint-id> or <endpoint-id>@<ip:port>"
+            )),
         }
     }
 }
@@ -494,9 +509,9 @@ pub fn node_plan() -> Plan<(), NodeStart> {
                 let Some(booted) = instance.booted.as_ref() else {
                     return Ok(cx.hold_value(EndpointSlot::empty()));
                 };
-                let (identity, key) = (booted.identity, booted.endpoint);
+                let (identity, key, door) = (booted.identity, booted.endpoint, booted.door.clone());
                 cx.hold(move || async move {
-                    PeerEndpoint::bind_as(identity, key)
+                    PeerEndpoint::bind_door(identity, key, door)
                         .await
                         .map(EndpointSlot::new)
                 })

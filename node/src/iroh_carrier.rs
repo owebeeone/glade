@@ -13,17 +13,22 @@
 //! bytes exported from the connection's TLS session, and hands them to
 //! `peer::hello_*` as the [`Channel`]. A booted node's endpoint key is its
 //! `endpoint.key`, the same at every start (plan Step 4.2), which a record in
-//! its chain binds to the node (`transport.rs`).
+//! its chain binds to the node (`transport.rs`). A booted node's endpoint has a
+//! door (plan Step 4.2b): an accept hook refuses an endpoint key the door does
+//! not know, and HELLO refuses a node not bound to its connection's key.
 
+use std::future::{ready, Future};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 
 use iroh::endpoint::presets;
+use iroh::endpoint::{AfterHandshakeOutcome, EndpointHooks, Side, VarInt};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr};
 
 use crate::peer::{hello_accept, hello_dial, Channel, NodeIdentity, PeerHello};
-use crate::transport::EndpointKey;
+use crate::transport::{Door, EndpointKey};
 
 /// ALPN for the glade node<->node protocol 2 (`peer::PROTOCOL`, plan Step
 /// 4.1a), whose HELLO is signed: a node of protocol 1 fails at connect, not
@@ -52,17 +57,53 @@ fn channel(conn: &Connection, dialer: EndpointId, acceptor: EndpointId) -> io::R
 }
 
 /// The one endpoint recipe every constructor shares: localhost,
-/// `presets::Minimal` (relay + discovery disabled), the glade ALPN, and the
-/// endpoint key `key`.
-async fn bind_endpoint(key: EndpointKey) -> io::Result<Endpoint> {
-    Endpoint::builder(presets::Minimal)
+/// `presets::Minimal` (relay + discovery disabled), the glade ALPN, the
+/// endpoint key `key`, and the accept hook of `door`, if any.
+async fn bind_endpoint(key: EndpointKey, door: Option<Arc<Door>>) -> io::Result<Endpoint> {
+    let mut builder = Endpoint::builder(presets::Minimal)
         .secret_key(SecretKey::from_bytes(&key.seed()))
-        .alpns(vec![ALPN.to_vec()])
+        .alpns(vec![ALPN.to_vec()]);
+    if let Some(door) = door {
+        builder = builder.hooks(DoorHook(door));
+    }
+    builder
         .bind_addr((Ipv4Addr::LOCALHOST, 0))
         .map_err(other)?
         .bind()
         .await
         .map_err(other)
+}
+
+/// The door's accept-time half (plan Step 4.2b), in iroh's one hook after
+/// TLS, which knows the far end's endpoint key: an inbound connection whose
+/// key the door refuses is closed with code 0 and no reason, before any
+/// stream opens, and the refusal is reported here. An outbound one waits for
+/// HELLO. The hook holds the door, never the endpoint: that would be a cycle.
+#[derive(Debug)]
+struct DoorHook(Arc<Door>);
+
+impl EndpointHooks for DoorHook {
+    fn after_handshake<'a>(
+        &'a self,
+        conn: &'a Connection,
+    ) -> impl Future<Output = AfterHandshakeOutcome> + Send + 'a {
+        let key = *conn.remote_id().as_bytes();
+        let verdict = match conn.side() {
+            Side::Client => Ok(()),
+            Side::Server => self.0.admits(&key),
+        };
+        ready(match verdict {
+            Ok(()) => AfterHandshakeOutcome::Accept,
+            Err(why) => {
+                self.0.refused(&key, &why);
+                let error_code = VarInt::from_u32(0);
+                AfterHandshakeOutcome::Reject {
+                    error_code,
+                    reason: Vec::new(),
+                }
+            }
+        })
+    }
 }
 
 /// A dialable address for a peer: its endpoint id + a direct socket address
@@ -82,6 +123,32 @@ impl PeerAddr {
             endpoint_id: id.parse().ok()?,
             socket: sock.parse().ok()?,
         })
+    }
+}
+
+/// A `--peer` entry (plan Step 4.2b): `<endpoint-id>`, a key the door admits
+/// on first contact and nothing dials, or `<endpoint-id>@<ip:port>`, which is
+/// dialed as well. Either way the operator has configured the key.
+#[derive(Clone, Copy, Debug)]
+pub enum PeerEntry {
+    Known(EndpointId),
+    Dial(PeerAddr),
+}
+
+impl PeerEntry {
+    pub fn parse(s: &str) -> Option<PeerEntry> {
+        if s.contains('@') {
+            return PeerAddr::parse(s).map(PeerEntry::Dial);
+        }
+        s.parse().ok().map(PeerEntry::Known)
+    }
+
+    /// The endpoint key the entry configures.
+    pub fn key(&self) -> [u8; 32] {
+        match self {
+            PeerEntry::Known(id) => *id.as_bytes(),
+            PeerEntry::Dial(addr) => *addr.endpoint_id.as_bytes(),
+        }
     }
 }
 
@@ -105,6 +172,7 @@ pub struct PeerLink {
 pub struct PeerEndpoint {
     endpoint: Endpoint,
     identity: NodeIdentity,
+    door: Option<Arc<Door>>,
 }
 
 impl PeerEndpoint {
@@ -132,12 +200,43 @@ impl PeerEndpoint {
     /// (`sysdir::Boot::endpoint_key`), so its endpoint id is the same at every
     /// start (plan Step 4.2) and its binding record names it.
     pub async fn bind_as(identity: NodeIdentity, key: EndpointKey) -> io::Result<PeerEndpoint> {
-        let endpoint = bind_endpoint(key).await?;
-        Ok(PeerEndpoint { endpoint, identity })
+        let endpoint = bind_endpoint(key, None).await?;
+        Ok(PeerEndpoint {
+            endpoint,
+            identity,
+            door: None,
+        })
+    }
+
+    /// [`PeerEndpoint::bind_as`], behind `door` (plan Step 4.2b): how both
+    /// roots bind a booted node, whose door is closed to keys it does not know.
+    pub async fn bind_door(
+        identity: NodeIdentity,
+        key: EndpointKey,
+        door: Arc<Door>,
+    ) -> io::Result<PeerEndpoint> {
+        let endpoint = bind_endpoint(key, Some(door.clone())).await?;
+        Ok(PeerEndpoint {
+            endpoint,
+            identity,
+            door: Some(door),
+        })
     }
 
     pub fn identity(&self) -> &NodeIdentity {
         &self.identity
+    }
+
+    /// The door this endpoint was bound behind, if any: the mesh feeds it.
+    pub fn door(&self) -> Option<Arc<Door>> {
+        self.door.clone()
+    }
+
+    /// Report a refused HELLO, naming the endpoint key it came from.
+    fn report(&self, endpoint: &[u8; 32], e: &io::Error) {
+        if let (Some(door), io::ErrorKind::PermissionDenied) = (&self.door, e.kind()) {
+            door.refused(endpoint, e);
+        }
     }
 
     /// This endpoint's dialable address (its id + first IPv4 bound socket).
@@ -158,7 +257,8 @@ impl PeerEndpoint {
         let conn = self.endpoint.connect(ea, ALPN).await.map_err(other)?;
         let channel = channel(&conn, self.endpoint.id(), conn.remote_id())?;
         let (mut send, mut recv) = conn.open_bi().await.map_err(other)?;
-        let peer = hello_dial(&mut recv, &mut send, &self.identity, &channel).await?;
+        let door = self.door.as_deref();
+        let peer = hello_dial(&mut recv, &mut send, &self.identity, &channel, door).await?;
         Ok(PeerLink { peer, conn, send, recv })
     }
 
@@ -169,7 +269,9 @@ impl PeerEndpoint {
         let conn = incoming.accept().map_err(other)?.await.map_err(other)?;
         let channel = channel(&conn, conn.remote_id(), self.endpoint.id())?;
         let (mut send, mut recv) = conn.accept_bi().await.map_err(other)?;
-        let peer = hello_accept(&mut recv, &mut send, &self.identity, &channel).await?;
+        let door = self.door.as_deref();
+        let peer = hello_accept(&mut recv, &mut send, &self.identity, &channel, door).await;
+        let peer = peer.inspect_err(|e| self.report(&channel.dialer, e))?;
         Ok(Some(PeerLink { peer, conn, send, recv }))
     }
 
@@ -196,6 +298,24 @@ mod tests {
     use crate::peer::{pull_sync, serve_sync};
     use crate::store::Store;
     use glade_wire::generated::{Op, Shape};
+
+    /// Plan Step 4.2b: a `--peer` entry is an endpoint id, perhaps with an
+    /// address. Without one it only configures the door; with one it is
+    /// dialed too; anything else is no entry.
+    #[test]
+    fn a_peer_entry_names_a_key_and_perhaps_where_to_dial_it() {
+        let key = EndpointKey::from_seed([5; 32]).endpoint_id;
+        let id = crate::transport::hex(&key);
+        let known = PeerEntry::parse(&id);
+        assert!(matches!(known, Some(PeerEntry::Known(_))), "{known:?}");
+        let dialed = PeerEntry::parse(&format!("{id}@127.0.0.1:4711"));
+        assert!(matches!(dialed, Some(PeerEntry::Dial(at)) if at.socket.port() == 4711));
+        let keys = (known.map(|e| e.key()), dialed.map(|e| e.key()));
+        assert_eq!(keys, (Some(key), Some(key)));
+        for junk in ["", "nope", &format!("{id}@"), "@127.0.0.1:1", &id[1..]] {
+            assert!(PeerEntry::parse(junk).is_none(), "{junk:?}");
+        }
+    }
 
     /// The DIAL over REAL iroh QUIC: dialer binds, acceptor binds, dialer dials
     /// by direct address, both complete the node<->node HELLO and each learns

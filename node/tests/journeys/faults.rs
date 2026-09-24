@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use glade_carrier_api::conformance::{self as carrier, Fixture};
 use glade_carrier_api::{
-    CarrierAddr, CarrierConfig, CarrierError, CarrierLink, CarrierPort, PortFuture,
+    CarrierAddr, CarrierConfig, CarrierError, CarrierLink, CarrierPort, PortFuture, TransportId,
 };
 use glade_grant_api::conformance::{self as grant, Record as GrantRecord};
 use glade_grant_api::{Denial, GrantPort, Holder};
@@ -129,6 +129,10 @@ impl CarrierLink for FaultyLink {
 
     fn close(&self) -> PortFuture<'_, ()> {
         self.link.close()
+    }
+
+    fn remote_id(&self) -> Option<TransportId> {
+        self.link.remote_id()
     }
 }
 

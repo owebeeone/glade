@@ -40,7 +40,7 @@
     "glade-carrier-api": {
       "role": "contract",
       "dependencies": [],
-      "traits": { "CarrierPort": ["bind", "dial", "accept", "close"], "CarrierLink": ["send", "recv", "close"] },
+      "traits": { "CarrierPort": ["bind", "dial", "accept", "close"], "CarrierLink": ["send", "recv", "close", "remote_id"] },
       "conformance_tests": ["public_contract"]
     },
     "glade-clock-api": {

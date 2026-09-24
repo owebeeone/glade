@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll, Waker};
 
 use glade_carrier_api::{
-    CarrierAddr, CarrierConfig, CarrierError, CarrierLink, CarrierPort, PortFuture,
+    CarrierAddr, CarrierConfig, CarrierError, CarrierLink, CarrierPort, PortFuture, TransportId,
 };
 use glade_clock_api::ClockPort;
 use glade_grant_api::conformance::{self as grant_conformance, Record as GrantRecord};
@@ -146,11 +146,12 @@ impl FakePort {
         }
     }
 
-    fn link(&self, endpoint: usize, max: usize, tx: usize, rx: usize) -> Box<dyn CarrierLink> {
-        let net = self.net.clone();
+    fn link(&self, ends: (usize, usize), max: usize, tx: usize, rx: usize) -> Box<dyn CarrierLink> {
+        let (net, (endpoint, remote)) = (self.net.clone(), ends);
         Box::new(FakeLink {
             net,
             endpoint,
+            remote,
             max,
             tx,
             rx,
@@ -203,9 +204,9 @@ impl CarrierPort for FakePort {
                 };
                 let (out, back) = (net.pipes.len(), net.pipes.len() + 1);
                 net.pipes.extend([Pipe::default(), Pipe::default()]);
-                let accepted = self.link(target, target_max, back, out);
+                let accepted = self.link((target, id), target_max, back, out);
                 net.backlog.entry(target).or_default().push_back(accepted);
-                Ok(self.link(id, max, out, back))
+                Ok(self.link((id, target), max, out, back))
             })
         })
     }
@@ -241,6 +242,8 @@ impl CarrierPort for FakePort {
 struct FakeLink {
     net: Arc<FakeNet>,
     endpoint: usize,
+    /// The far end, whose number is its transport identity on this network.
+    remote: usize,
     max: usize,
     tx: usize,
     rx: usize,
@@ -290,6 +293,10 @@ impl CarrierLink for FakeLink {
 
     fn close(&self) -> PortFuture<'_, ()> {
         Box::pin(async move { self.net.change(|net| self.end(net)) })
+    }
+
+    fn remote_id(&self) -> Option<TransportId> {
+        Some(TransportId(self.remote.to_le_bytes().to_vec()))
     }
 }
 
