@@ -1,15 +1,19 @@
-//! The node's answers to this client's ops (GladeSubstrateV1 §6, R1 and R7).
-//! Each op the client sends is kept by its hash until a status names it by
-//! `corr`, never by its place among other frames. `Ok` and `Retention` settle
-//! it; `UnknownShare` leaves it not placed, kept to be sent again, zone by zone
-//! (W5); any other code refuses it, and the session drops it with the rest of
-//! its chain (answer 4). Pure: no socket and no clock (LBT-008). `client.rs`
-//! feeds it the statuses and tells the waiters it hands back.
+//! The node's answers to this client's ops and subscribes (GladeSubstrateV1 §6,
+//! R1 and R5 to R7). Each op the client sends is kept by its hash until a
+//! status names it by `corr`, never by its place among other frames. `Ok` and
+//! `Retention` settle it; `UnknownShare` leaves it not placed, kept to be sent
+//! again, zone by zone (W5); any other code refuses it, and the session drops it
+//! with the rest of its chain (answer 4). A subscribe waits for its ack, which
+//! names its zone and each origin's head there, or names none for a refusal
+//! whose reason follows (R6); then for its replay, which is in once the
+//! connection has received, or sent and had answered `Ok`, an op at or above
+//! each head (R7). Pure: no socket and no clock (LBT-008). `client.rs` feeds it
+//! the frames and tells the waiters it hands back.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
-use glade_wire::generated::{Error, ErrorCode, Op};
+use glade_wire::generated::{Error, ErrorCode, Head, Heads, Op};
 
 use crate::hash::op_hash;
 use crate::session::Session;
@@ -194,6 +198,165 @@ impl<W> Answers<W> {
     }
 }
 
+/// A subscribe's answer, as data (R5, R6).
+#[derive(Clone, Debug, PartialEq)]
+pub enum SubscribeOutcome {
+    /// Taken, and its replay is in: each origin's head in the zone at the ack,
+    /// by seq and hash (R5, R7).
+    Accepted { heads: Vec<Head> },
+    /// Refused (R6), with the reason's code and message. No code when the
+    /// reason did not come before the connection ended.
+    Refused { code: Option<ErrorCode>, message: String },
+}
+
+/// A subscribe answered: its zone, what became of it, and who waits to hear.
+#[derive(Debug, PartialEq)]
+pub struct Subscribed<S> {
+    pub zone: Zone,
+    pub outcome: SubscribeOutcome,
+    pub waiter: S,
+}
+
+/// Every waiting subscribe, once none can be matched to its answer: the
+/// connection ended, or an ack came for another zone in a subscribe's turn.
+/// One already refused stays a refusal, its reason unknown; the rest fail.
+#[derive(Debug, PartialEq)]
+pub struct Abandoned<S> {
+    pub failed: Vec<S>,
+    pub refused: Vec<Subscribed<S>>,
+}
+
+/// The subscribes waiting on the node, and the highest seq of each origin in
+/// each zone that this connection has received, or sent and had answered `Ok`.
+pub struct Subscribes<S> {
+    /// Sent and not yet acked: the node acks them in the order sent.
+    unacked: VecDeque<(Zone, S)>,
+    /// Acked as refused, waiting for the reason (R6).
+    refused: VecDeque<(Zone, S)>,
+    /// Acked, waiting for the replay to reach each head the ack names (R7).
+    catching: Vec<(Zone, Vec<Head>, S)>,
+    seen: HashMap<(Zone, String), i64>,
+}
+
+impl<S> Default for Subscribes<S> {
+    fn default() -> Self {
+        Subscribes { unacked: VecDeque::new(), refused: VecDeque::new(), catching: Vec::new(), seen: HashMap::new() }
+    }
+}
+
+impl<S> Subscribes<S> {
+    /// A subscribe sent, to be acked after those sent before it.
+    pub fn sent(&mut self, zone: Zone, waiter: S) {
+        self.unacked.push_back((zone, waiter));
+    }
+
+    /// The ack of the oldest subscribe. One naming its zone waits for its
+    /// replay, over at once if the connection has seen every head it names.
+    /// One naming no zone is a refusal, which waits for its reason (R6). One
+    /// naming another zone leaves no subscribe matched to its answer, so every
+    /// one waiting is abandoned.
+    pub fn acked(&mut self, ack: &Heads) -> Result<Option<Subscribed<S>>, Abandoned<S>> {
+        let Some((zone, waiter)) = self.unacked.pop_front() else {
+            return Ok(None);
+        };
+        let Some(named) = ack.streams.first() else {
+            self.refused.push_back((zone, waiter));
+            return Ok(None);
+        };
+        if named.share != zone.0 || named.glade_id != zone.1 || named.key != zone.2 {
+            self.unacked.push_front((zone, waiter));
+            return Err(self.abandon());
+        }
+        self.catching.push((zone.clone(), named.heads.clone(), waiter));
+        Ok(self.caught_up(&[zone]).pop())
+    }
+
+    /// An `Error` with no `corr` is the reason for the oldest refused subscribe
+    /// of its share and stream (R6).
+    pub fn reason(&mut self, status: &Error) -> Option<Subscribed<S>> {
+        if status.corr.is_some() {
+            return None;
+        }
+        let named = |zone: &Zone| Some(&zone.0) == status.share.as_ref() && Some(&zone.1) == status.glade_id.as_ref();
+        let at = self.refused.iter().position(|(zone, _)| named(zone))?;
+        let (zone, waiter) = self.refused.remove(at)?;
+        let outcome = SubscribeOutcome::Refused { code: Some(status.code), message: status.message.clone() };
+        Some(Subscribed { zone, outcome, waiter })
+    }
+
+    /// Ops this connection received: the subscribes whose replay they complete.
+    pub fn received(&mut self, ops: &[Op]) -> Vec<Subscribed<S>> {
+        let mut zones: Vec<Zone> = Vec::new();
+        for op in ops {
+            self.see(op);
+            let zone = zone_of(op);
+            if !zones.contains(&zone) {
+                zones.push(zone);
+            }
+        }
+        self.caught_up(&zones)
+    }
+
+    /// An op this connection sent, and its answer. One the node holds counts
+    /// toward a replay, since the node does not send it back (R4, R7).
+    pub fn answered(&mut self, op: &Op, outcome: &OpOutcome) -> Vec<Subscribed<S>> {
+        if *outcome != OpOutcome::Accepted {
+            return Vec::new();
+        }
+        self.see(op);
+        self.caught_up(&[zone_of(op)])
+    }
+
+    /// A frame the session could not take: the replays of its zones cannot
+    /// complete, so their subscribes fail.
+    pub fn failed(&mut self, ops: &[Op]) -> Vec<S> {
+        let zones: Vec<Zone> = ops.iter().map(zone_of).collect();
+        let (failed, waiting): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.catching).into_iter().partition(|(zone, _, _)| zones.contains(zone));
+        self.catching = waiting;
+        failed.into_iter().map(|(_, _, waiter)| waiter).collect()
+    }
+
+    /// The connection ended: every waiting subscribe is abandoned, and what
+    /// the connection saw goes with it.
+    pub fn ended(&mut self) -> Abandoned<S> {
+        self.seen.clear();
+        self.abandon()
+    }
+
+    fn abandon(&mut self) -> Abandoned<S> {
+        let unacked = self.unacked.drain(..).map(|(_, waiter)| waiter);
+        let catching = self.catching.drain(..).map(|(_, _, waiter)| waiter);
+        let failed = unacked.chain(catching).collect();
+        let unknown = || SubscribeOutcome::Refused { code: None, message: "its reason did not come".into() };
+        let refused = self.refused.drain(..).map(|(zone, waiter)| Subscribed { zone, outcome: unknown(), waiter }).collect();
+        Abandoned { failed, refused }
+    }
+
+    fn see(&mut self, op: &Op) {
+        let seen = self.seen.entry((zone_of(op), op.origin.clone())).or_insert(op.seq);
+        *seen = (*seen).max(op.seq);
+    }
+
+    /// The subscribes of `zones` whose replay is in: the connection has seen
+    /// an op at or above every head their ack names (R7).
+    fn caught_up(&mut self, zones: &[Zone]) -> Vec<Subscribed<S>> {
+        let mut done = Vec::new();
+        let mut at = 0;
+        while at < self.catching.len() {
+            let (zone, heads, _) = &self.catching[at];
+            let reached = |head: &Head| self.seen.get(&(zone.clone(), head.origin.clone())).is_some_and(|seq| *seq >= head.seq);
+            if zones.contains(zone) && heads.iter().all(reached) {
+                let (zone, heads, waiter) = self.catching.remove(at);
+                done.push(Subscribed { zone, outcome: SubscribeOutcome::Accepted { heads }, waiter });
+            } else {
+                at += 1;
+            }
+        }
+        done
+    }
+}
+
 /// W5's backoff: 1 s, doubling, to 30 s.
 pub fn resend_delay(attempt: u32) -> Duration {
     Duration::from_secs(2u64.saturating_pow(attempt).min(30))
@@ -214,7 +377,7 @@ fn same_chain(a: &Op, b: &Op) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glade_wire::generated::Shape;
+    use glade_wire::generated::{Shape, StreamHeads};
 
     /// A status as the node sends it (R1): the op's share and stream, and its
     /// hash in lower-case hex as `corr`.
@@ -435,5 +598,119 @@ mod tests {
         answers.sent(a.clone(), None);
         answers.status(&mut session, &status(&a, ErrorCode::Ok)).unwrap();
         assert_eq!(answers.next_resend(&zone_of(&a)).as_secs(), 1, "a zone with every op placed starts again");
+    }
+
+    // ---- Catching up: the subscribe outcome (Step 3.2) --------------------
+
+    /// An op of `origin` at `seq` in `zone`.
+    fn op_in(zone: &Zone, origin: &str, seq: i64) -> Op {
+        Op { share: zone.0.clone(), glade_id: zone.1.clone(), key: zone.2.clone(), origin: origin.into(), seq, prev: None, lamport: 0, refs: vec![], shape: Shape::Value, payload: vec![] }
+    }
+
+    /// The node's ack of a subscribe to `zone`, naming each origin's head (R5).
+    fn ack(zone: &Zone, heads: &[(&str, i64)]) -> Heads {
+        let heads = heads.iter().map(|(origin, seq)| Head { origin: (*origin).into(), seq: *seq, hash: None }).collect();
+        Heads { streams: vec![StreamHeads { share: zone.0.clone(), glade_id: zone.1.clone(), key: zone.2.clone(), heads }] }
+    }
+
+    fn other() -> Zone {
+        ("s".into(), "other".into(), vec![])
+    }
+
+    #[test]
+    fn an_ack_with_no_origins_completes_at_once() {
+        let mut subs = Subscribes::default();
+        subs.sent(zone(), 0);
+        let done = subs.acked(&ack(&zone(), &[]));
+        let empty = SubscribeOutcome::Accepted { heads: vec![] };
+        assert_eq!(done, Ok(Some(Subscribed { zone: zone(), outcome: empty, waiter: 0 })), "an ack with no origins completes at once");
+    }
+
+    #[test]
+    fn ops_below_at_and_above_the_acked_seq() {
+        let mut subs = Subscribes::default();
+        subs.sent(zone(), 0);
+        let named = ack(&zone(), &[("a", 5), ("b", 2)]);
+        assert_eq!(subs.acked(&named), Ok(None), "nothing seen yet");
+        assert!(subs.received(&[op_in(&zone(), "a", 3)]).is_empty(), "below a's head");
+        assert!(subs.received(&[op_in(&other(), "a", 9)]).is_empty(), "another zone's op");
+        assert!(subs.received(&[op_in(&zone(), "b", 4)]).is_empty(), "above b's head, with a's not reached");
+        let done = subs.received(&[op_in(&zone(), "a", 5)]);
+        assert_eq!(done.len(), 1, "at a's head, every head is reached");
+        assert_eq!(done[0].outcome, SubscribeOutcome::Accepted { heads: named.streams[0].heads.clone() });
+    }
+
+    #[test]
+    fn the_sessions_own_accepted_ops_count() {
+        let mut subs = Subscribes::default();
+        subs.sent(zone(), 0);
+        subs.acked(&ack(&zone(), &[("w", 1)])).unwrap();
+        let own = op_in(&zone(), "w", 1);
+        let refused = OpOutcome::Refused { code: ErrorCode::Equivocation, message: String::new() };
+        for unheld in [refused, OpOutcome::Retained, OpOutcome::NotPlaced { message: String::new() }, OpOutcome::Unknown] {
+            assert!(subs.answered(&own, &unheld).is_empty(), "an op the node does not hold does not count: {unheld:?}");
+        }
+        let done = subs.answered(&own, &OpOutcome::Accepted);
+        assert_eq!(done.len(), 1, "an own op the node holds counts, since the node does not send it back");
+    }
+
+    #[test]
+    fn an_ack_that_names_no_zone_is_a_refusal() {
+        let attic: Zone = ("ws-attic".into(), "g".into(), vec![]);
+        let reason = |zone: &Zone, corr: Option<String>| Error { code: ErrorCode::UnknownShare, message: "no live claim".into(), share: Some(zone.0.clone()), glade_id: Some(zone.1.clone()), corr };
+        let mut subs = Subscribes::default();
+        subs.sent(attic.clone(), 0);
+        subs.sent(zone(), 1);
+        assert_eq!(subs.acked(&Heads { streams: vec![] }), Ok(None), "a refusal waits for its reason");
+        assert!(subs.reason(&reason(&attic, Some("ab".into()))).is_none(), "an op's status is no reason");
+        assert!(subs.reason(&reason(&zone(), None)).is_none(), "nor is an Error for a stream no refusal waits on");
+        let refused = subs.reason(&reason(&attic, None)).expect("the next Error for the zone with no corr is the reason");
+        let said = SubscribeOutcome::Refused { code: Some(ErrorCode::UnknownShare), message: "no live claim".into() };
+        assert_eq!(refused, Subscribed { zone: attic, outcome: said, waiter: 0 });
+        let next = subs.acked(&ack(&zone(), &[])).unwrap().map(|done| done.waiter);
+        assert_eq!(next, Some(1), "the next ack is the next subscribe's");
+    }
+
+    #[test]
+    fn an_ack_for_another_zone_abandons_every_waiting_subscribe() {
+        let attic: Zone = ("ws-attic".into(), "g".into(), vec![]);
+        let mut subs = Subscribes::default();
+        subs.sent(attic.clone(), 0);
+        subs.acked(&Heads { streams: vec![] }).unwrap();
+        subs.sent(zone(), 1);
+        subs.sent(other(), 2);
+        let unknown = SubscribeOutcome::Refused { code: None, message: "its reason did not come".into() };
+        let abandoned = Abandoned { failed: vec![1, 2], refused: vec![Subscribed { zone: attic, outcome: unknown, waiter: 0 }] };
+        assert_eq!(subs.acked(&ack(&other(), &[])), Err(abandoned), "no subscribe is matched to its answer any more");
+    }
+
+    #[test]
+    fn a_frame_the_session_cannot_take_fails_its_zones_subscribes() {
+        let mut subs = Subscribes::default();
+        subs.sent(zone(), 0);
+        subs.sent(other(), 1);
+        subs.acked(&ack(&zone(), &[("a", 0)])).unwrap();
+        subs.acked(&ack(&other(), &[("a", 0)])).unwrap();
+        assert_eq!(subs.failed(&[op_in(&zone(), "a", 0)]), vec![0], "the subscribe waiting on the frame's zone fails");
+        assert_eq!(subs.received(&[op_in(&other(), "a", 0)]).len(), 1, "another zone's still completes");
+    }
+
+    #[test]
+    fn the_connections_end_fails_every_waiting_subscribe() {
+        let mut subs = Subscribes::default();
+        subs.received(&[op_in(&zone(), "a", 5)]);
+        for waiter in 0..3 {
+            subs.sent(zone(), waiter);
+        }
+        subs.acked(&Heads { streams: vec![] }).unwrap();
+        subs.acked(&ack(&zone(), &[("b", 1)])).unwrap();
+        let ended = subs.ended();
+        assert_eq!(ended.failed, vec![2, 1], "every waiting subscribe fails");
+        let refusals: Vec<_> = ended.refused.iter().map(|refused| (refused.waiter, refused.outcome.clone())).collect();
+        let unknown = SubscribeOutcome::Refused { code: None, message: "its reason did not come".into() };
+        assert_eq!(refusals, vec![(0, unknown)], "but a refusal stays one, its reason unknown");
+        // What the connection saw goes with it.
+        subs.sent(zone(), 3);
+        assert_eq!(subs.acked(&ack(&zone(), &[("a", 5)])), Ok(None), "a new connection has seen nothing");
     }
 }

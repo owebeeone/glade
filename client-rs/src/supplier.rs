@@ -15,7 +15,8 @@
 //! Reattach-on-drop with backoff: on link loss the supplier re-Hellos and
 //! re-Subscribes every serving; the per-surface answer/op loops persist across
 //! reconnects (their receivers outlive the connection), so only the wire
-//! attachment is re-established.
+//! attachment is re-established. A refused subscribe is an error (R6), so a
+//! `serve_*` fails and a reattach tries again.
 
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,6 +27,7 @@ use tokio::sync::Mutex;
 
 use glade_wire::generated::{ExchangeReq, ExchangeRes, Op};
 
+use crate::answers::SubscribeOutcome;
 use crate::client::GladeClient;
 use crate::session::shape_of;
 
@@ -161,7 +163,7 @@ impl Supplier {
         }
         self.ensure_hello().await;
         self.state.servings.lock().await.push(surface.clone());
-        self.client.subscribe(&surface.share, &surface.glade_id, surface.key_slice()).await?;
+        subscribe_surface(&self.client, &surface).await?;
 
         let mut rx = self.client.on_exchange_req().await;
         let client = self.client.clone();
@@ -194,7 +196,7 @@ impl Supplier {
         shape_of(&surface.shape)?;
         self.ensure_hello().await;
         self.state.servings.lock().await.push(surface.clone());
-        self.client.subscribe(&surface.share, &surface.glade_id, surface.key_slice()).await?;
+        subscribe_surface(&self.client, &surface).await?;
 
         let mut rx = self.client.on_ops().await;
         let surf = surface.clone();
@@ -263,9 +265,21 @@ impl Supplier {
         self.ensure_hello().await;
         let servings = self.state.servings.lock().await.clone();
         for s in &servings {
-            self.client.subscribe(&s.share, &s.glade_id, s.key_slice()).await?;
+            subscribe_surface(&self.client, s).await?;
         }
         Ok(())
+    }
+}
+
+/// Subscribe a served surface. A refusal is an error (R6), so its `serve_*`
+/// fails and a reattach tries again.
+async fn subscribe_surface(client: &GladeClient, surface: &SupplierSurface) -> io::Result<()> {
+    match client.subscribe_outcome(&surface.share, &surface.glade_id, surface.key_slice()).await? {
+        SubscribeOutcome::Accepted { .. } => Ok(()),
+        SubscribeOutcome::Refused { code, message } => {
+            let code = code.map_or_else(|| "no code".to_string(), |code| format!("{code:?}"));
+            Err(io::Error::other(format!("subscribe to {}/{} refused ({code}): {message}", surface.share, surface.glade_id)))
+        }
     }
 }
 

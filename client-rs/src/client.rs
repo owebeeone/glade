@@ -2,8 +2,8 @@
 //! SUPPLIERS. One websocket to a glade node, the frozen frame protocol
 //! (`[FrameType tag][CBOR body]`), a background read loop dispatching inbound
 //! frames, and the request/response plumbing a supplier needs: `connect`,
-//! optional `hello(principal)` (S7), `subscribe` (Heads-acked), `append` /
-//! `send_ops`, the requester side `exchange`, and the provider side
+//! optional `hello(principal)` (S7), `subscribe` (returns once its replay is
+//! in), `append` / `send_ops`, the requester side `exchange`, and the provider side
 //! `on_exchange_req` + `respond_exchange` (corr preserved 1:1). Inbound ops and
 //! exchange requests fan out to as many listeners as a session multiplexes
 //! (mpsc receivers); `on_drop` fires when the link ends so a supplier reattaches
@@ -11,8 +11,9 @@
 //! (GladeSubstrateV1 §6, R1): `append_outcome` / `send_ops_outcome` return it
 //! as data, `on_refused` reports every refusal, and a refused op's chain stops
 //! until a subscribe (answer 4). An op not placed is kept and sent again, zone
-//! by zone, and `on_unplaced` reports it (W5). No node internals — the wire +
-//! tokio only.
+//! by zone, and `on_unplaced` reports it (W5). `subscribe_outcome` returns a
+//! subscribe's heads, or its refusal and reason (R5, R6). No node internals —
+//! the wire + tokio only.
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -28,12 +29,15 @@ use glade_wire::generated::{
 };
 use glade_wire::{cbor, generated};
 
-use crate::answers::{zone_of, Answered, Answers, OpOutcome, OpStatus, Zone, WAITING_BOUND};
+use crate::answers::{zone_of, Abandoned, Answered, Answers, OpOutcome, OpStatus, SubscribeOutcome, Subscribed, Subscribes, Zone, WAITING_BOUND};
 use crate::session::{require_op, shape_of, Session};
 use crate::ws::{self, Msg, WsWriter};
 
 /// Who waits to hear what became of one sent op.
 type Waiter = oneshot::Sender<OpOutcome>;
+
+/// Who waits for a subscribe's answer and replay.
+type SubWaiter = oneshot::Sender<io::Result<SubscribeOutcome>>;
 
 /// A provider's answer, as the requester sees it — the decoded `ExchangeRes`.
 #[derive(Clone, Debug, PartialEq)]
@@ -65,6 +69,17 @@ fn tell(answered: Answered<Waiter>) {
     }
 }
 
+/// Subscribes none can answer any more: each fails, but one already refused
+/// stays a refusal, its reason unknown (R6).
+fn abandon(abandoned: Abandoned<SubWaiter>, kind: io::ErrorKind, why: &str) {
+    for waiter in abandoned.failed {
+        let _ = waiter.send(Err(io::Error::new(kind, why)));
+    }
+    for refused in abandoned.refused {
+        let _ = refused.waiter.send(Ok(refused.outcome));
+    }
+}
+
 struct Inner {
     origin: String,
     /// `host:port` of the last connect — reused by `reconnect` (reattach).
@@ -73,8 +88,9 @@ struct Inner {
     writer: Mutex<Option<WsWriter>>,
     read_task: Mutex<Option<JoinHandle<()>>>,
     session: Mutex<Session>,
-    /// FIFO ack waiters — Heads pops one subscribe, Welcome pops one hello.
-    sub_acks: Mutex<VecDeque<oneshot::Sender<()>>>,
+    /// Subscribes waiting for their ack, reason or replay (R5-R7).
+    subscribes: Mutex<Subscribes<SubWaiter>>,
+    /// FIFO ack waiters — Welcome pops one hello.
     welcome_acks: Mutex<VecDeque<oneshot::Sender<()>>>,
     ex_corr: AtomicU64,
     ex_waiters: Mutex<HashMap<String, oneshot::Sender<ExchangeOutcome>>>,
@@ -103,46 +119,51 @@ impl Inner {
                 // The session folds every inbound op (so this client's own
                 // `fold_*` is live); listeners are an additive fan-out for a
                 // supplier serving several surfaces over one session.
-                if self.session.lock().await.apply_remote(&ops).is_err() {
+                let applied = self.session.lock().await.apply_remote(&ops);
+                if let Err(e) = applied {
+                    // Dropped whole, the frame leaves the replays it carries
+                    // incomplete: their subscribes fail.
+                    for waiter in self.subscribes.lock().await.failed(&ops) {
+                        let _ = waiter.send(Err(io::Error::new(e.kind(), e.to_string())));
+                    }
                     return;
                 }
                 self.ops_senders.lock().await.retain(|s| s.send(ops.clone()).is_ok());
+                let done = self.subscribes.lock().await.received(&ops);
+                self.caught_up(done).await;
             }
             FrameType::Heads => {
-                // An ack names its zone (R5; one naming none is R6's refusal).
-                // A chain a refusal stopped there goes on, and the ops not
-                // placed there go again (answer 4, W5), before the subscribe
-                // returns, so its caller's next op follows them. Step 3.2
-                // moves both to the end of the replay.
-                let acked = generated::Heads::from_cbor(&body);
-                let mut again = Vec::new();
-                {
-                    let mut session = self.session.lock().await;
-                    let answers = self.answers.lock().await;
-                    for heads in &acked.streams {
-                        session.resumed(&heads.share, &heads.glade_id, &heads.key);
-                        let zone: Zone = (heads.share.clone(), heads.glade_id.clone(), heads.key.clone());
-                        again.extend(answers.unplaced_in(&zone));
+                // The ack of the oldest subscribe: it names the zone and the
+                // heads its replay must reach (R5), or no zone, for a refusal
+                // whose reason follows (R6).
+                let ack = generated::Heads::from_cbor(&body);
+                let acked = self.subscribes.lock().await.acked(&ack);
+                match acked {
+                    Ok(done) => {
+                        self.caught_up(done.into_iter().collect()).await;
                     }
-                }
-                if !again.is_empty() {
-                    let waiters = again.iter().map(|_| None).collect();
-                    let _ = self.ship(again, waiters).await;
-                }
-                if let Some(tx) = self.sub_acks.lock().await.pop_front() {
-                    let _ = tx.send(());
+                    Err(abandoned) => {
+                        abandon(abandoned, io::ErrorKind::InvalidData, "an ack for another zone came in a subscribe's turn");
+                    }
                 }
             }
             FrameType::Error => {
                 // R1: a status names its op by hash. An `Error` with no `corr`
-                // is a refused subscribe's reason (R6), which Step 3.2 reads.
+                // is a refused subscribe's reason (R6).
                 let status = generated::Error::from_cbor(&body);
+                let refused = self.subscribes.lock().await.reason(&status);
+                if let Some(refused) = refused {
+                    let _ = refused.waiter.send(Ok(refused.outcome));
+                    return;
+                }
                 let answered = {
                     let mut session = self.session.lock().await;
                     self.answers.lock().await.status(&mut session, &status)
                 };
                 if let Some(answered) = answered {
+                    let done = self.subscribes.lock().await.answered(&answered.op, &answered.outcome);
                     self.answer(answered).await;
+                    self.caught_up(done).await;
                 }
             }
             FrameType::Welcome => {
@@ -189,25 +210,47 @@ impl Inner {
         }
     }
 
+    /// Subscribes whose replay is in (R7). Before each returns, its zone's
+    /// chain that a refusal stopped goes on, and its zone's ops not placed go
+    /// again (answer 4, W5), so the caller's next op follows them.
+    async fn caught_up(&self, done: Vec<Subscribed<SubWaiter>>) {
+        for subscribed in done {
+            let (share, glade_id, key) = &subscribed.zone;
+            let again = {
+                let mut session = self.session.lock().await;
+                session.resumed(share, glade_id, key);
+                self.answers.lock().await.unplaced_in(&subscribed.zone)
+            };
+            if !again.is_empty() {
+                let waiters = again.iter().map(|_| None).collect();
+                let _ = self.ship(again, waiters).await;
+            }
+            let _ = subscribed.waiter.send(Ok(subscribed.outcome));
+        }
+    }
+
     /// The connection ended (close/EOF): forget the writer, fail every pending
     /// waiter so awaiting calls return `dropped()` (a supplier re-issues them on
     /// reattach), and signal `on_drop` unless the caller closed us deliberately.
     async fn on_connection_end(&self) {
         *self.writer.lock().await = None;
-        self.sub_acks.lock().await.clear();
         self.welcome_acks.lock().await.clear();
         self.ex_waiters.lock().await.clear();
-        self.end_answers().await;
+        self.end_waiting().await;
         if !self.closing.load(Ordering::SeqCst) {
             self.drop_senders.lock().await.retain(|s| s.send(()).is_ok());
         }
     }
 
-    /// R7: no status is coming for an op sent on a connection that ended.
-    async fn end_answers(&self) {
+    /// R7: nothing sent on a connection that ended is answered. Each waiting
+    /// op's fate is unknown, and each waiting subscribe fails as `dropped()`,
+    /// but for one already refused.
+    async fn end_waiting(&self) {
         for answered in self.answers.lock().await.ended() {
             tell(answered);
         }
+        let abandoned = self.subscribes.lock().await.ended();
+        abandon(abandoned, io::ErrorKind::BrokenPipe, "connection dropped");
     }
 
     /// Send ops in one frame, each kept by its hash, with its waiter, until its
@@ -293,7 +336,7 @@ impl GladeClient {
                 writer: Mutex::new(None),
                 read_task: Mutex::new(None),
                 session: Mutex::new(Session::new(origin)),
-                sub_acks: Mutex::new(VecDeque::new()),
+                subscribes: Mutex::new(Subscribes::default()),
                 welcome_acks: Mutex::new(VecDeque::new()),
                 ex_corr: AtomicU64::new(0),
                 ex_waiters: Mutex::new(HashMap::new()),
@@ -339,7 +382,7 @@ impl GladeClient {
         }
         // R7: nothing sent before this connection is answered on it.
         *self.inner.writer.lock().await = None;
-        self.inner.end_answers().await;
+        self.inner.end_waiting().await;
         *self.inner.writer.lock().await = Some(writer);
         let task = tokio::spawn(read_loop(self.inner.clone(), reader));
         *self.inner.read_task.lock().await = Some(task);
@@ -363,21 +406,32 @@ impl GladeClient {
         rx.await.map_err(|_| dropped())
     }
 
-    /// Subscribe to a zone-surface (share, glade_id, key); resolves on the
-    /// node's Heads ack. A subscribe to a DECLARED exchange surface registers
+    /// Subscribe to a zone-surface (share, glade_id, key), and return once its
+    /// replay is in (R7). A subscribe to a DECLARED exchange surface registers
     /// this session as THE provider (`exchange.rs::attach_provider`); a
-    /// value/log surface streams its ops back. Empty/absent key = commons.
+    /// value/log surface streams its ops back. Empty/absent key = commons. A
+    /// refused subscribe returns as an empty zone (R6).
     pub async fn subscribe(&self, share: &str, glade_id: &str, key: Option<&[u8]>) -> io::Result<()> {
+        self.subscribe_outcome(share, glade_id, key).await.map(|_| ())
+    }
+
+    /// `subscribe`, returning the node's answer as data: each origin's head
+    /// in the zone by seq and hash, once the replay is in (R5, R7), or the
+    /// refusal and its reason (R6). `Err` if the connection ends first, or
+    /// the replay brings a frame the session cannot take.
+    pub async fn subscribe_outcome(&self, share: &str, glade_id: &str, key: Option<&[u8]>) -> io::Result<SubscribeOutcome> {
+        let key = key.filter(|k| !k.is_empty());
+        let zone: Zone = (share.into(), glade_id.into(), key.unwrap_or_default().to_vec());
+        let body = Subscribe { share: share.into(), glade_id: glade_id.into(), key: key.map(|k| k.to_vec()), from: None };
         let (tx, rx) = oneshot::channel();
-        self.inner.sub_acks.lock().await.push_back(tx);
-        let body = Subscribe {
-            share: share.into(),
-            glade_id: glade_id.into(),
-            key: key.filter(|k| !k.is_empty()).map(|k| k.to_vec()),
-            from: None,
-        };
-        self.inner.send(frame(FrameType::Subscribe, body.to_cbor())).await?;
-        rx.await.map_err(|_| dropped())
+        {
+            // Kept in the order sent, which is the order of the acks: its ack
+            // cannot be read before it is kept.
+            let mut subscribes = self.inner.subscribes.lock().await;
+            self.inner.send(frame(FrameType::Subscribe, body.to_cbor())).await?;
+            subscribes.sent(zone, tx);
+        }
+        rx.await.map_err(|_| dropped())?
     }
 
     /// Append a local op in a zone (default commons) and ship it — the value/log
@@ -519,7 +573,7 @@ impl GladeClient {
             task.abort();
         }
         *self.inner.writer.lock().await = None;
-        self.inner.end_answers().await;
+        self.inner.end_waiting().await;
     }
 }
 

@@ -9,9 +9,11 @@
 //!   (`on_exchange_req` + `respond_exchange`), fan-out `on_ops`, and reattach
 //!   (`on_drop` + `reconnect`). `append_outcome` / `send_ops_outcome` return
 //!   the node's answer to each op; `on_refused` reports every refusal, and
-//!   `on_unplaced` every op the node could not place.
+//!   `on_unplaced` every op the node could not place. `subscribe_outcome`
+//!   returns a subscribe's heads, or its refusal and reason.
 //! - [`answers::Answers`] — the sent ops, kept by hash until the node's status
-//!   names them (GladeSubstrateV1 §6, R1 and R7; W5's ops not placed).
+//!   names them (GladeSubstrateV1 §6, R1 and R7; W5's ops not placed), and
+//!   [`answers::Subscribes`], the subscribes waiting for their ack or replay.
 //! - [`supplier::Supplier`] — the thin authority helper (serve_exchange /
 //!   serve_share / reattach-on-drop) mirroring the glial kit.
 //! - [`session::Session`] — per-origin chain store + lww/log folds, the rust
@@ -26,6 +28,6 @@ pub mod session;
 pub mod supplier;
 pub mod ws;
 
-pub use answers::{OpOutcome, OpStatus};
+pub use answers::{OpOutcome, OpStatus, SubscribeOutcome};
 pub use client::{ExchangeOutcome, GladeClient};
 pub use supplier::{Backoff, ShareController, Supplier, SupplierConfig, SupplierSurface};

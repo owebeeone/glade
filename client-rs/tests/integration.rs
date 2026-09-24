@@ -11,6 +11,9 @@
 //!      + store dir, and the supplier's serving resumes on the new connection.
 //!   4. op outcomes (client-writes plan Step 3.1): an accepted op, a repeat,
 //!      and a refused op, whose chain then stops.
+//!   5. the subscribe outcome (Step 3.2): the node's heads come back, a
+//!      subscribe returns with its replay folded and resumes a refused chain,
+//!      and one fails on a frame the session cannot take.
 //!
 //! Requires the node binary; the harness builds it once if absent.
 
@@ -22,9 +25,12 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 
+use glade_client::hash::op_hash;
 use glade_client::supplier::{Supplier, SupplierConfig, SupplierSurface};
-use glade_client::{Backoff, GladeClient, OpOutcome};
-use glade_wire::generated::ErrorCode;
+use glade_client::ws::{self, Msg};
+use glade_client::{Backoff, GladeClient, OpOutcome, SubscribeOutcome};
+use glade_wire::cbor;
+use glade_wire::generated::{self, ErrorCode, FrameType, Head, Op, Ops, Shape};
 
 // ---- harness: spawn the real glade-node binary ----------------------------
 
@@ -402,13 +408,117 @@ async fn a_refused_append_stops_its_chain() {
     assert_eq!(second.fold_value("ws-app", "ws.state", None).await, None, "the session does not fold a refused op");
     let next = second.append("ws-app", "ws.state", "value", b"third".to_vec(), None).await;
     assert!(next.is_err(), "the next append on a refused chain must fail, got {next:?}");
-    // The zone's subscribe ack lets the chain go on. Whether the next op lands
-    // waits for the replay, Step 3.2's test.
-    second.subscribe("ws-app", "ws.state", None).await.unwrap();
-    let resumed = second.append("ws-app", "ws.state", "value", b"fourth".to_vec(), None).await;
-    assert!(resumed.is_ok(), "a subscribe ack lets the chain go on: {resumed:?}");
 
     first.close().await;
     second.close().await;
+    node.kill().await.ok();
+}
+
+// ---- 5. the subscribe outcome (client-writes plan Step 3.2) ----------------
+
+/// R7: `subscribe` returns once its replay is folded. A writer puts 2,000 ops
+/// on one chain, and a fresh client's subscribe returns with all of them.
+#[tokio::test(flavor = "multi_thread")]
+async fn subscribe_returns_after_the_replay_is_folded() {
+    let tmp = Tmp::new("replay");
+    let (mut node, port) = spawn_legacy(&tmp.path().join("store"), 0).await;
+    let url = format!("ws://127.0.0.1:{port}");
+    let writer = GladeClient::new("writer");
+    writer.connect(&url).await.unwrap();
+    for i in 0..1999 {
+        writer.append("ws-app", "chat.lines", "log", format!("line {i}").into_bytes(), None).await.unwrap();
+    }
+    let (_, last) = within(writer.append_outcome("ws-app", "chat.lines", "log", b"line 1999".to_vec(), None)).await.unwrap();
+    assert_eq!(last, OpOutcome::Accepted, "the node holds all 2,000");
+
+    let reader = GladeClient::new("reader");
+    reader.connect(&url).await.unwrap();
+    within(reader.subscribe("ws-app", "chat.lines", None)).await.unwrap();
+    let folded = reader.fold_log("ws-app", "chat.lines", None).await.len();
+    assert_eq!(folded, 2000, "subscribe returned before its replay was folded");
+
+    writer.close().await;
+    reader.close().await;
+    node.kill().await.ok();
+}
+
+/// R5: `subscribe_outcome` returns each origin's head in the zone, by seq and
+/// hash. An empty zone's ack names no origin.
+#[tokio::test(flavor = "multi_thread")]
+async fn subscribe_outcome_returns_the_nodes_heads() {
+    let tmp = Tmp::new("heads");
+    let (mut node, port) = spawn_legacy(&tmp.path().join("store"), 0).await;
+    let url = format!("ws://127.0.0.1:{port}");
+    let (a, b) = (GladeClient::new("a"), GladeClient::new("b"));
+    a.connect(&url).await.unwrap();
+    b.connect(&url).await.unwrap();
+    within(a.append_outcome("ws-app", "ws.state", "value", b"a0".to_vec(), None)).await.unwrap();
+    let (a1, _) = within(a.append_outcome("ws-app", "ws.state", "value", b"a1".to_vec(), None)).await.unwrap();
+    let (b0, _) = within(b.append_outcome("ws-app", "ws.state", "value", b"b0".to_vec(), None)).await.unwrap();
+
+    let reader = GladeClient::new("reader");
+    reader.connect(&url).await.unwrap();
+    let outcome = within(reader.subscribe_outcome("ws-app", "ws.state", None)).await.unwrap();
+    let head = |op: &Op| Head { origin: op.origin.clone(), seq: op.seq, hash: Some(op_hash(op).to_vec()) };
+    assert_eq!(outcome, SubscribeOutcome::Accepted { heads: vec![head(&a1), head(&b0)] }, "each origin's head, by seq and hash");
+    let empty = within(reader.subscribe_outcome("ws-app", "ws.empty", None)).await.unwrap();
+    assert_eq!(empty, SubscribeOutcome::Accepted { heads: vec![] }, "an empty zone's ack names no origin");
+
+    a.close().await;
+    b.close().await;
+    reader.close().await;
+    node.kill().await.ok();
+}
+
+/// Answer 4 and R7: a subscribe catches a refused chain up, so the refused
+/// client's next op lands on the node's op, at seq 1.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_chain_resumes_after_a_subscribe() {
+    let tmp = Tmp::new("resumes");
+    let (mut node, port) = spawn_legacy(&tmp.path().join("store"), 0).await;
+    let url = format!("ws://127.0.0.1:{port}");
+    let first = GladeClient::new("w");
+    first.connect(&url).await.unwrap();
+    let (held, _) = within(first.append_outcome("ws-app", "ws.state", "value", b"first".to_vec(), None)).await.unwrap();
+    let second = GladeClient::new("w");
+    second.connect(&url).await.unwrap();
+    let (_, refused) = within(second.append_outcome("ws-app", "ws.state", "value", b"second".to_vec(), None)).await.unwrap();
+    assert!(matches!(refused, OpOutcome::Refused { code: ErrorCode::Equivocation, .. }), "{refused:?}");
+
+    within(second.subscribe("ws-app", "ws.state", None)).await.unwrap();
+    let (op, outcome) = within(second.append_outcome("ws-app", "ws.state", "value", b"third".to_vec(), None)).await.unwrap();
+    let on_held = Some(op_hash(&held).to_vec());
+    assert_eq!((op.seq, &op.prev, outcome), (1, &on_held, OpOutcome::Accepted), "the refused client lands at seq 1, on the node's op");
+
+    first.close().await;
+    second.close().await;
+    node.kill().await.ok();
+}
+
+/// A frame the session cannot take fails the subscribe waiting on its zone. A
+/// raw writer puts a `stream` op, which no client folds, where the replay
+/// carries it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replay_the_session_cannot_take_fails_its_subscribe() {
+    let tmp = Tmp::new("untakeable");
+    let (mut node, port) = spawn_legacy(&tmp.path().join("store"), 0).await;
+    let (mut raw_in, raw) = ws::connect("127.0.0.1", port).await.unwrap();
+    let op = Op { share: "ws-app".into(), glade_id: "ws.feed".into(), key: vec![], origin: "raw".into(), seq: 0, prev: None, lamport: 1, refs: vec![], shape: Shape::Stream, payload: b"x".to_vec() };
+    let mut frame = vec![FrameType::Ops.wire() as u8];
+    frame.extend(cbor::encode(&Ops { ops: vec![op], pri: None }.to_cbor()));
+    raw.send_binary(&frame).await.unwrap();
+    let Ok(Msg::Binary(answer)) = within(raw_in.read()).await else {
+        panic!("no status for the raw op");
+    };
+    let status = generated::Error::from_cbor(&cbor::decode(&answer[1..]));
+    assert_eq!(status.code, ErrorCode::Ok, "the node holds the raw op: {status:?}");
+
+    let reader = GladeClient::new("reader");
+    reader.connect(&format!("ws://127.0.0.1:{port}")).await.unwrap();
+    let subscribed = within(reader.subscribe("ws-app", "ws.feed", None)).await;
+    assert!(subscribed.is_err(), "a replay the session cannot take fails its subscribe, got {subscribed:?}");
+    assert_eq!(subscribed.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+
+    reader.close().await;
     node.kill().await.ok();
 }

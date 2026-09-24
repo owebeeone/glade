@@ -206,8 +206,8 @@ impl Session {
         self.unresumed.insert(chain, op.seq);
     }
 
-    /// A subscribe ack named the zone, so its own chain goes on (answer 4).
-    /// Step 3.2 moves this to the end of the replay.
+    /// A subscribe of the zone has its replay in, so its own chain goes on,
+    /// from the node's ops (answer 4, R7).
     pub fn resumed(&mut self, share: &str, glade_id: &str, key: &[u8]) {
         self.unresumed.remove(&Store::chain_key(share, glade_id, key, &self.origin));
     }
