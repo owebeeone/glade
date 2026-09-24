@@ -75,6 +75,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use glade_node::assembly::{Settings, ASSEMBLED_ROOT_LINE};
+use glade_node::grants::GRANTS_UNAVAILABLE;
 use glade_node::iroh_carrier::{PeerEndpoint, PeerEntry};
 use glade_node::lifecycle::{conclude, node_plan, Console, NodeStart, StdConsole};
 use glade_node::registry::{RegistryApi, StoreApi, HOME};
@@ -166,6 +167,9 @@ async fn run() -> std::io::Result<()> {
         }
         if node.rejected > 0 {
             println!("quarantined {} record(s) at load", node.rejected);
+        }
+        if node.registry.policy_quarantined() {
+            println!("{GRANTS_UNAVAILABLE}");
         }
         let serves_home = node.registry.who_serves(HOME, now_ms()).is_some();
         println!("registry ready (home served: {serves_home})");

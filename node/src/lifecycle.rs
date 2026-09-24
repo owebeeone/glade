@@ -42,6 +42,7 @@ use crate::appdecl::AppDecl;
 use crate::assembly::{
     CommandLine, Config, Directory, InstanceSlot, NodeAssembly, Records, Settings,
 };
+use crate::grants::GRANTS_UNAVAILABLE;
 use crate::iroh_carrier::{PeerEndpoint, PeerEntry};
 use crate::mesh::{release_links, EndpointSlot};
 use crate::peer::NodeIdentity;
@@ -211,6 +212,9 @@ impl Instance {
             start
                 .console
                 .out(&format!("quarantined {} record(s) at load", boot.rejected));
+        }
+        if boot.registry.policy_quarantined() {
+            start.console.out(GRANTS_UNAVAILABLE);
         }
         Ok(Instance {
             slot: Arc::new(Mutex::new(Some(boot))),

@@ -7,7 +7,7 @@
 /// Who is asking, as the session established it: never a name read from a wire DTO.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Holder {
-    /// A node, by its 32-byte node id (`sha256` of its node key).
+    /// A node, by its 32-byte node id, the public key of its node key.
     Node([u8; 32]),
     /// A principal, by name.
     Principal(String),
@@ -30,9 +30,11 @@ pub enum Denial {
 /// Grants fold as a set union. A revocation denies its (holder, share) pair as
 /// `Revoked` whatever was granted, in whichever order the fold saw the grant and
 /// the revocation, and touches no other pair: revocation wins, as in
-/// `grants_for`. Matching is exact. No verb implies another, no share another,
-/// and no holder another's grants: a node does not hold its operator's, and a
-/// `Node` never matches a `Principal`.
+/// `grants_for`. Matching is exact, but for one pattern: a granted verb `p.*`
+/// admits every verb that begins `p.`, so `read.*` admits `read.subscribe`
+/// ([`admits`]). No other verb implies another, no share another, and no holder
+/// another's grants: a node does not hold its operator's, and a `Node` never
+/// matches a `Principal`.
 ///
 /// Each check reads the fold as it is when called, so a revocation denies the
 /// next check; an implementation MUST NOT answer from a decision cached across
@@ -73,6 +75,19 @@ pub enum Denial {
 /// ```
 pub trait GrantPort: Send + Sync {
     fn check(&self, holder: &Holder, verb: &str, share: &str) -> Result<(), Denial>;
+}
+
+/// Whether a granted verb admits the verb asked for: the same verb, or, for a
+/// granted `p.*` with `p` not empty, any verb that begins `p.`. So `read.*`
+/// admits `read.subscribe` and not `read`, and `*` alone admits only itself.
+pub fn admits(granted: &str, asked: &str) -> bool {
+    if granted == asked {
+        return true;
+    }
+    match granted.strip_suffix('*') {
+        Some(prefix) if prefix.len() > 1 && prefix.ends_with('.') => asked.starts_with(prefix),
+        _ => false,
+    }
 }
 
 // The conformance probes exist only with the `conformance` feature. The
@@ -123,10 +138,12 @@ pub mod conformance {
             revoke(principal("mallory"), "ws-a"),
             grant(principal("mallory"), "ws-a", &["read"]),
             grant(principal("eve"), "ws-b", &["read"]),
+            grant(principal("carol"), "ws-a", &["read.*"]),
         ]
     }
 
-    /// GR-001. Exact match on holder, verb and share; nothing is implied.
+    /// GR-001. Exact match on holder, verb and share; nothing is implied but
+    /// by a granted pattern `p.*`, which admits the verbs that begin `p.`.
     pub fn exact(port: &dyn GrantPort) {
         let alice = principal("alice");
         for verb in ["read", "write"] {
@@ -142,16 +159,30 @@ pub mod conformance {
             Ok(()),
             "GR-001 a node's own grant"
         );
+        // A principal named as the node's id is not the node.
+        let node_named: String = NODE.iter().map(|b| format!("{b:02x}")).collect();
         let refused = [
             (alice.clone(), "admin", "ws-a"),
             (alice, "read", "ws-b"),
             (principal("bob"), "read", "ws-a"),
             (Holder::Node([8; 32]), "read", "ws-a"),
             (node, "write", "ws-a"),
+            (principal(&node_named), "read", "ws-a"),
         ];
         for (holder, verb, share) in refused {
             let answer = port.check(&holder, verb, share);
             let message = format!("GR-001 nothing is implied: {holder:?} {verb} {share}");
+            assert_eq!(answer, Err(Denial::NoGrant), "{message}");
+        }
+        let carol = principal("carol");
+        assert_eq!(
+            port.check(&carol, "read.subscribe", "ws-a"),
+            Ok(()),
+            "GR-001 a pattern admits a verb it begins"
+        );
+        for verb in ["read", "readx.subscribe", "write.append"] {
+            let answer = port.check(&carol, verb, "ws-a");
+            let message = format!("GR-001 a pattern admits no other verb: {verb}");
             assert_eq!(answer, Err(Denial::NoGrant), "{message}");
         }
     }

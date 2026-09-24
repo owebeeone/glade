@@ -36,6 +36,12 @@ impl Router {
         }
     }
 
+    /// The zone-surfaces `session` is subscribed to, in order.
+    pub fn zones_of(&self, session: SessionId) -> Vec<(String, String, Vec<u8>)> {
+        let subscribed = self.subs.iter().filter(|(_, set)| set.contains(&session));
+        subscribed.map(|(zone, _)| zone.clone()).collect()
+    }
+
     /// Drop a session from every subscription (connection teardown).
     pub fn unsubscribe_all(&mut self, session: SessionId) {
         for set in self.subs.values_mut() {

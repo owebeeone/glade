@@ -21,10 +21,12 @@ use std::time::Duration;
 
 use iroh::endpoint::{RecvStream, SendStream};
 
+use glade_grant_api::{GrantPort, Holder};
 use glade_wire::generated::{ExchangeReq, ExchangeRes, Heads, StreamHeads};
 
 use crate::echo::Echo;
 use crate::frame::Frame;
+use crate::grants::refusal;
 use crate::mesh::{route_subscribe, Route};
 use crate::peer::{read_frame, write_frame};
 use crate::registry::{BindingFold, G_BINDINGS, G_BINDING_RETRACTIONS, G_SERVICES, HOME};
@@ -231,20 +233,49 @@ async fn try_forward(shared: &Arc<Shared>, peer: &str, req: ExchangeReq) -> io::
 /// session whose outbound IS the stream, so the ordinary request/response
 /// plumbing (provider lookup, pending map) serves the peer unchanged. One
 /// stream, one exchange, close.
+///
+/// The grant check (plan Step 4.3), enforced for every peer: on a share other
+/// than `home` the exchange is asked for by its glade id, and a node the fold
+/// does not grant it is answered `ok: false` with the reason, the path's
+/// failure form. `home` stays exempt, so a forwarded `workspace.create` is
+/// answered as before.
 pub(crate) async fn serve_peer_exchange(
     shared: Arc<Shared>,
+    node: [u8; 32],
     mut qsend: SendStream,
     _recv: RecvStream,
     req: ExchangeReq,
 ) -> io::Result<()> {
     use tokio::io::AsyncWriteExt;
     let corr = req.corr.clone();
+    let holder = Holder::Node(node);
+    let refused = match req.share.as_str() {
+        HOME => None,
+        share => shared.policy.check(&holder, &req.glade_id, share).err(),
+    };
+    let bytes = match refused {
+        Some(denial) => {
+            let why = refusal(&holder, &req.glade_id, &req.share, denial);
+            res_err(&corr, &why).to_bytes()
+        }
+        None => answer_forwarded(&shared, req).await,
+    };
+    qsend.write_all(&(bytes.len() as u32).to_le_bytes()).await?;
+    qsend.write_all(&bytes).await?;
+    qsend.flush().await?;
+    qsend.shutdown().await
+}
+
+/// Answer an admitted forwarded exchange through a synthetic session: the
+/// provider's `ExchangeRes`, or the timeout's, as the bytes of one frame.
+async fn answer_forwarded(shared: &Arc<Shared>, req: ExchangeReq) -> Vec<u8> {
+    let corr = req.corr.clone();
     let sid = shared.next.fetch_add(1, Ordering::SeqCst);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
     shared.out.lock().await.insert(sid, tx);
 
     let mut echo = Echo::new(); // undeclared ids keep the echo answer even here
-    handle_request(&shared, sid, req, &mut echo).await;
+    handle_request(shared, sid, req, &mut echo).await;
     let bytes = match tokio::time::timeout(PROVIDER_TIMEOUT, rx.recv()).await {
         Ok(Some(b)) => b,
         _ => res_err(&corr, "provider timeout at claim holder").to_bytes(),
@@ -256,12 +287,7 @@ pub(crate) async fn serve_peer_exchange(
     if pending.get(&corr) == Some(&sid) {
         pending.remove(&corr);
     }
-    drop(pending);
-
-    qsend.write_all(&(bytes.len() as u32).to_le_bytes()).await?;
-    qsend.write_all(&bytes).await?;
-    qsend.flush().await?;
-    qsend.shutdown().await
+    bytes
 }
 
 #[cfg(test)]
@@ -506,8 +532,16 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn workspace_create_routes_to_target_end_to_end() {
         let boot_a = boot_at(fresh("cr-a-sys"), "gianni").unwrap();
-        let boot_b = boot_at(fresh("cr-b-sys"), "gianni").unwrap();
+        let mut boot_b = boot_at(fresh("cr-b-sys"), "gianni").unwrap();
         let (a_id, b_id) = (boot_a.node_id.clone(), boot_b.node_id.clone());
+        // B's fold grants A's node id reads of the share A is about to create
+        // there, so (b)'s subscribe is served (plan Step 4.3).
+        let grant = CapabilityGrant {
+            principal: a_id.clone(),
+            share: "ws-new".into(),
+            verbs: vec!["read.*".into()],
+        };
+        boot_b.registry.append(Record::Grant(grant), &b_id).unwrap();
 
         let a = Server::open(fresh("cr-a-store")).unwrap();
         let b = Server::open(fresh("cr-b-store")).unwrap();
@@ -621,28 +655,37 @@ mod tests {
         }
     }
 
-    /// The grazel-attach E2E — the final stage-1 builder. Two booted nodes over
-    /// real iroh + real websockets; grazel-app.glade LOADED as data on B:
-    ///
-    ///   (a) the registered declarations + compiled ACL-seed grants appear at
-    ///       node A as ordinary records via directory subscriptions (s-app-
-    ///       register RL/RC/RM — reads are subscriptions, no privileged plane);
-    ///   (b) a client subscribing a DECLARED grazel surface (ws.tree) is served
-    ///       by the authority through the ordinary routed path, ops converging
-    ///       end to end (discovery C);
-    ///   (c) a gwz exchange (gwz.ops) round-trips: A routes it to the claim
-    ///       holder B — never answered from A's replica (fan-out asymmetry) —
-    ///       B's attached grazel provider answers, corr preserved 1:1 (D);
-    ///   (d) an exchange against a share with no live claim answers bounded
-    ///       `ok:false` data with the reason, and the session stays usable (E).
-    #[tokio::test(flavor = "multi_thread")]
-    async fn grazel_attach_end_to_end() {
+    /// Two booted nodes for the grazel-attach journeys, over real iroh and
+    /// websockets. B loads grazel-app.glade as data and claims its workspace,
+    /// with the lapsed `ws-attic` beside it; when `grant_a`, it also registers
+    /// a file whose one line grants A's node id `read.*,gwz.*` on `ws-razel`
+    /// (plan Step 4.3). B is adopted, so it checks its own fold; A is seeded
+    /// and dials B. B's grazel authority session has attached as the gwz.ops
+    /// provider and written two tree ops.
+    struct Attach {
+        a: Arc<Shared>,
+        a_id: String,
+        b_id: String,
+        port_a: u16,
+        /// The provider session on B.
+        rp: ws::WsReader,
+        wp: ws::WsWriter,
+    }
+
+    async fn attach_nodes(name: &str, grant_a: bool) -> Attach {
         // ---- node B: boot + LOAD grazel-app.glade + claim its workspace -----
-        let mut boot_b = boot_at(fresh("e2e-b-sys"), "gianni").unwrap();
-        let b_id = boot_b.node_id.clone();
+        let boot_a = boot_at(fresh(&format!("{name}-a-sys")), "gianni").unwrap();
+        let mut boot_b = boot_at(fresh(&format!("{name}-b-sys")), "gianni").unwrap();
+        let (a_id, b_id) = (boot_a.node_id.clone(), boot_b.node_id.clone());
         let loaded = appdecl::register(&grazel_decl(), &mut boot_b.registry, &b_id).unwrap();
         let registered = "7 bindings + 1 service + 2 seeds + 1 revocation + 1 workspace registered";
         assert_eq!(loaded.appended, 12, "{registered}");
+        if grant_a {
+            // The line B's operator writes for the reading node A (plan Step 4.3).
+            let text = format!("glade-app v1\napp peer-a\nseed {a_id} ws-razel read.*,gwz.*\n");
+            let grant = appdecl::parse(&text).unwrap();
+            appdecl::register(&grant, &mut boot_b.registry, &b_id).unwrap();
+        }
         boot_b
             .registry
             .append(
@@ -659,19 +702,19 @@ mod tests {
             )
             .unwrap();
 
-        let boot_a = boot_at(fresh("e2e-a-sys"), "gianni").unwrap();
-
-        let a = Server::open(fresh("e2e-a-store")).unwrap();
-        let b = Server::open(fresh("e2e-b-store")).unwrap();
+        let (id_a, id_b) = (boot_a.identity().unwrap(), boot_b.identity().unwrap());
+        let a = Server::open(fresh(&format!("{name}-a-store"))).unwrap();
+        let b = Server::open(fresh(&format!("{name}-b-store"))).unwrap();
         a.seed_registry(&boot_a.registry.snapshot()).await;
-        b.seed_registry(&boot_b.registry.snapshot()).await;
+        b.adopt_boot(boot_b).await.unwrap();
 
-        let ep_a = PeerEndpoint::bind_with(boot_a.identity().unwrap()).await.unwrap();
-        let ep_b = PeerEndpoint::bind_with(boot_b.identity().unwrap()).await.unwrap();
+        let ep_a = PeerEndpoint::bind_with(id_a).await.unwrap();
+        let ep_b = PeerEndpoint::bind_with(id_b).await.unwrap();
         a.enable_mesh(ep_a).await.unwrap();
         let addr_b = b.enable_mesh(ep_b).await.unwrap();
         a.connect_peer(&addr_b).await.unwrap();
 
+        let a_shared = a.shared.clone();
         let lis_a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let lis_b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let (port_a, port_b) = (lis_a.local_addr().unwrap().port(), lis_b.local_addr().unwrap().port());
@@ -702,6 +745,44 @@ mod tests {
                 other => panic!("the provider expected its op's status, got {other:?}"),
             }
         }
+        Attach {
+            a: a_shared,
+            a_id,
+            b_id,
+            port_a,
+            rp,
+            wp,
+        }
+    }
+
+    /// The grazel-attach E2E — the final stage-1 builder. Two booted nodes over
+    /// real iroh + real websockets; grazel-app.glade LOADED as data on B:
+    ///
+    ///   (a) the registered declarations + compiled ACL-seed grants appear at
+    ///       node A as ordinary records via directory subscriptions (s-app-
+    ///       register RL/RC/RM — reads are subscriptions, no privileged plane);
+    ///   (b) a client subscribing a DECLARED grazel surface (ws.tree) is served
+    ///       by the authority through the ordinary routed path, ops converging
+    ///       end to end (discovery C);
+    ///   (c) a gwz exchange (gwz.ops) round-trips: A routes it to the claim
+    ///       holder B — never answered from A's replica (fan-out asymmetry) —
+    ///       B's attached grazel provider answers, corr preserved 1:1 (D);
+    ///   (d) an exchange against a share with no live claim answers bounded
+    ///       `ok:false` data with the reason, and the session stays usable (E).
+    ///
+    /// B serves A in (b) and (c) because its fold grants A's node id `read.*`
+    /// and `gwz.*` on `ws-razel` (plan Step 4.3); without it, B refuses both
+    /// (`grazel_attach_without_a_grant_is_refused_by_its_claimed_node_id`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn grazel_attach_end_to_end() {
+        let Attach {
+            a_id,
+            b_id,
+            port_a,
+            mut rp,
+            wp,
+            ..
+        } = attach_nodes("e2e", true).await;
 
         // ---- (a) registered surfaces appear at A as ordinary records --------
         let (mut rc, wc) = ws::connect("127.0.0.1", port_a).await.unwrap();
@@ -727,7 +808,7 @@ mod tests {
         wc.send_binary(&sub(HOME, G_GRANTS)).await.unwrap();
         assert!(matches!(next_frame(&mut rc, "dir.grants ack").await, Frame::Heads(_)));
         let mut grants = Vec::new();
-        while grants.len() < 2 {
+        while grants.len() < 3 {
             if let Frame::Ops(ops) = next_frame(&mut rc, "seeded grant records").await {
                 for op in ops.ops {
                     let g = CapabilityGrant::from_cbor(&glade_wire::cbor::decode(&op.payload));
@@ -739,8 +820,21 @@ mod tests {
         assert_eq!(
             grants,
             vec![
-                ("owner".to_string(), "ws-razel".to_string(), "gwz.*".to_string()),
-                ("owner".to_string(), "ws-razel".to_string(), "read.*".to_string()),
+                (
+                    a_id.clone(),
+                    "ws-razel".to_string(),
+                    "read.*,gwz.*".to_string()
+                ),
+                (
+                    "owner".to_string(),
+                    "ws-razel".to_string(),
+                    "gwz.*".to_string()
+                ),
+                (
+                    "owner".to_string(),
+                    "ws-razel".to_string(),
+                    "read.*".to_string()
+                ),
             ]
         );
 
@@ -797,5 +891,46 @@ mod tests {
         // failure is data, not a dead session: the next ask still answers.
         wc.send_binary(&sub(HOME, crate::registry::G_CLAIMS)).await.unwrap();
         assert!(matches!(next_frame(&mut rc, "post-failure ack").await, Frame::Heads(_)));
+    }
+
+    /// `grazel_attach_end_to_end`, turned round (plan Step 4.3): B's fold
+    /// grants A's node id nothing on `ws-razel`. The forwarded `gwz.ops`
+    /// exchange is refused at B by that claimed node id and answered
+    /// `ok: false` with the reason, corr intact, at once, where a forwarded
+    /// exchange its provider never answered would wait for the timeout. The
+    /// forwarded `ws.tree` subscribe is refused too: A's forward lapses, and
+    /// nothing of the zone reaches A.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn grazel_attach_without_a_grant_is_refused_by_its_claimed_node_id() {
+        let t = attach_nodes("refused", false).await;
+        let (mut rc, wc) = ws::connect("127.0.0.1", t.port_a).await.unwrap();
+
+        let exchange = xreq("ws-razel", "gwz.ops", "x-44", b"workspace.status");
+        wc.send_binary(&exchange).await.unwrap();
+        let res = next_exchange_res(&mut rc, "the refused exchange").await;
+        assert_eq!((res.corr.as_str(), res.ok), ("x-44", false));
+        let a = &t.a_id;
+        let why = format!("unauthorized: node {a} holds no grant of gwz.ops on ws-razel");
+        assert_eq!(res.error.as_deref(), Some(why.as_str()));
+
+        wc.send_binary(&sub("ws-razel", "ws.tree")).await.unwrap();
+        let ack = next_frame(&mut rc, "ws.tree ack").await;
+        assert!(matches!(ack, Frame::Heads(_)), "{ack:?}");
+        let zone = ("ws-razel".to_string(), "ws.tree".to_string(), Vec::new());
+        let (share, glade_id) = (zone.0.clone(), zone.1.clone());
+        crate::mesh::forward_interest(&t.a, t.b_id.clone(), share, glade_id, vec![]).await;
+        let mesh = t.a.mesh.get().unwrap();
+        let mut lapsed = false;
+        for _ in 0..500 {
+            if !mesh.forwarded.lock().await.contains(&zone) {
+                lapsed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(lapsed, "A's forward of ws.tree lapsed");
+        let store = t.a.store.lock().await;
+        let held = store.scan("ws-razel", "ws.tree", &[], "grazel-b", i64::MIN);
+        assert!(held.is_empty(), "nothing of the zone reached A: {held:?}");
     }
 }

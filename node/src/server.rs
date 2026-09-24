@@ -16,12 +16,15 @@ use tokio::sync::{mpsc, Mutex};
 use glade_wire::cbor;
 use glade_wire::generated::{ErrorCode, Op, Ops, Welcome};
 
+use glade_grant_api::{GrantPort, Holder};
+
 use crate::echo::Echo;
 use crate::frame::Frame;
+use crate::grants::{refusal, Policy, PolicyView, READ_SUBSCRIBE};
 use crate::mesh::Mesh;
 use crate::registry::HOME;
 use crate::router::{Router, SessionId};
-use crate::session::{ack, error_frame, missing_for, op_status, refused_subscribe};
+use crate::session::{ack, error_frame, missing_for, op_status, refusal_frame, refused_subscribe};
 use crate::store::{Append, Store, StoreError};
 use crate::sysdata::SystemSnapshot;
 use crate::tasks::{Owners, Site, Tasks};
@@ -57,6 +60,15 @@ pub(crate) struct Shared {
     /// Hello naming a principal is BOUND to it — the attribution seam
     /// suppliers read (P1). Sessions absent here keep origin-as-identity.
     pub(crate) principals: Mutex<BTreeMap<SessionId, String>>,
+    /// The grant fold the serve paths check (plan Step 4.3, `grants.rs`):
+    /// this node's own grants and revocations, which adoption fills from the
+    /// instance's registry. Until then, and in the legacy form, it holds no
+    /// fold, and every check fails closed.
+    pub(crate) policy: PolicyView,
+    /// The admission table (plan Step 4.3): each peer subscription stream this
+    /// node serves, by the session id it is routed under, with the node it
+    /// serves. The re-check pass reads it whenever the fold is replaced.
+    pub(crate) admitted: Mutex<BTreeMap<SessionId, [u8; 32]>>,
     /// Where every task this node spawns goes (plan Step 3.3, `tasks.rs`):
     /// detached, unless the assembled root's lifecycle owns them.
     pub(crate) tasks: Tasks,
@@ -82,6 +94,8 @@ impl Server {
                 pending: Mutex::new(BTreeMap::new()),
                 dir: OnceLock::new(),
                 principals: Mutex::new(BTreeMap::new()),
+                policy: PolicyView::unavailable(),
+                admitted: Mutex::new(BTreeMap::new()),
                 tasks: Tasks::unowned(),
             }),
         })
@@ -135,6 +149,59 @@ pub(crate) async fn send(shared: &Arc<Shared>, sid: SessionId, frame: &Frame) {
     let tx = shared.out.lock().await.get(&sid).cloned();
     if let Some(tx) = tx {
         let _ = tx.send(frame.to_bytes());
+    }
+}
+
+/// Replace the grant fold, or leave none (plan Step 4.3), and check every
+/// admitted subscription again before returning. Returns the new generation.
+pub(crate) async fn refresh_policy(shared: &Arc<Shared>, fold: Option<Policy>) -> u64 {
+    let generation = shared.policy.replace(fold);
+    recheck(shared).await;
+    generation
+}
+
+/// The re-check pass (plan Step 4.3, the authorization model's §6): each
+/// admitted peer stream is checked against the fold as it now is, under the
+/// cut, so no op fanned out after a change reaches a stream it refuses. A
+/// refused stream is told why, and leaves the router, the session table and
+/// the admission table; its writer then finishes the stream, so the
+/// forwarding node's forward lapses. What it was sent before stays sent:
+/// revocation is forward-only.
+async fn recheck(shared: &Arc<Shared>) {
+    let _cut = shared.cut.lock().await;
+    let admitted: Vec<(SessionId, [u8; 32])> = shared
+        .admitted
+        .lock()
+        .await
+        .iter()
+        .map(|(sid, node)| (*sid, *node))
+        .collect();
+    let mut refused = Vec::new();
+    {
+        let router = shared.router.lock().await;
+        for (sid, node) in admitted {
+            let holder = Holder::Node(node);
+            for (share, glade_id, key) in router.zones_of(sid) {
+                if share == HOME {
+                    continue;
+                }
+                if let Err(denial) = shared.policy.check(&holder, READ_SUBSCRIBE, &share) {
+                    let why = refusal(&holder, READ_SUBSCRIBE, &share, denial);
+                    refused.push((sid, share, glade_id, key, why));
+                }
+            }
+        }
+    }
+    for (sid, share, glade_id, key, why) in refused {
+        shared
+            .router
+            .lock()
+            .await
+            .unsubscribe(sid, &share, &glade_id, &key);
+        let told = refusal_frame(ErrorCode::Unauthorized, why, &share, &glade_id);
+        send(shared, sid, &told).await;
+        shared.out.lock().await.remove(&sid);
+        shared.admitted.lock().await.remove(&sid);
     }
 }
 

@@ -35,7 +35,7 @@ use glade_wire::cbor;
 use glade_wire::generated::Op;
 
 use crate::registry::{Record, Registry, RegistryApi, G_CLAIMS, G_PRINCIPALS, HOME};
-use crate::server::{Server, Shared};
+use crate::server::{refresh_policy, Server, Shared};
 use crate::store::Store;
 use crate::sysdata::{PrincipalRecord, ServeClaim, WorkspaceCreateReq, WorkspaceCreateRes, WorkspaceEntry};
 use crate::sysdir::{now_ms, today, Boot};
@@ -116,12 +116,16 @@ impl Server {
     /// First, plan Step 4.1a: the replica's copies of this node's `home`
     /// records under its old id are set aside, as boot set records.json's
     /// aside, so the replica folds one id for this node, as the registry does.
+    ///
+    /// The registry's grant fold becomes the one the serve paths check (plan
+    /// Step 4.3): until adoption they had none, and refused.
     pub async fn adopt_boot_tuned(&self, boot: Boot, lease_ms: i64, renew_ms: u64) -> io::Result<usize> {
         {
             let mut store = self.shared.store.lock().await;
             store.set_aside(HOME, &boot.legacy_id(), &today())?;
         }
         let seeded = self.seed_registry(&boot.registry.snapshot()).await;
+        let policy = boot.registry.policy();
         let state = DirState {
             node_id: boot.node_id.clone(),
             lease_ms,
@@ -131,6 +135,7 @@ impl Server {
             .dir
             .set(state)
             .map_err(|_| other("directory authority already adopted"))?;
+        refresh_policy(&self.shared, policy).await;
         let shared = self.shared.clone();
         self.shared.tasks.spawn(Site::Renewal, async move {
             loop {
@@ -320,6 +325,40 @@ fn max_claim_epoch(store: &Store, share: &str) -> i64 {
         }
     }
     max
+}
+
+// How a test changes the grant fold at run time, as a runtime route would
+// (plan Step 4.3; `share.revoke`, or re-registration on a signal, neither
+// built): through the directory authority, saved, then the view replaced and
+// every admitted subscription checked again, then the records published. The
+// section is test-only, one braced conditional module.
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::io;
+    use std::sync::Arc;
+
+    use crate::registry::Record;
+    use crate::server::{refresh_policy, Shared};
+
+    /// Append `records` under the adopted node's own chain and make the
+    /// registry's grant fold the one checked. Returns the view's generation.
+    pub(crate) async fn accept(shared: &Arc<Shared>, records: Vec<Record>) -> io::Result<u64> {
+        let state = shared
+            .dir
+            .get()
+            .ok_or_else(|| super::other("no directory authority"))?;
+        let node = state.node_id.clone();
+        let mut dir = state.inner.lock().await;
+        let ops = dir.accept(|registry| {
+            let appended = records
+                .into_iter()
+                .map(|rec| super::append(registry, rec, &node));
+            appended.collect::<io::Result<Vec<_>>>()
+        })?;
+        let generation = refresh_policy(shared, dir.boot.registry.policy()).await;
+        super::publish(shared, dir, ops).await;
+        Ok(generation)
+    }
 }
 
 #[cfg(test)]

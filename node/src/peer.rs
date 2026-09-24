@@ -21,11 +21,14 @@ use std::io;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+use glade_grant_api::{GrantPort, Holder};
 use glade_signer_api::{Purpose, SignatureStatus};
 use glade_wire::cbor::{self, Cbor};
 use glade_wire::generated::{Heads, NodeHello, NodeWelcome, Op, Ops, Priority};
 
 use crate::frame::Frame;
+use crate::grants::READ_SUBSCRIBE;
+use crate::registry::HOME;
 use crate::session::missing_for;
 use crate::signing;
 use crate::store::{EquivProof, Store, StoreError};
@@ -302,10 +305,17 @@ pub struct SyncOutcome {
 /// exactly the ops it lacks for every zone we hold, in size-capped BULK chunks,
 /// then close the write half — that close is the "gap complete" terminator.
 ///
-/// Offers every zone this store holds. ACL zone-filtering (a peer withholding an
-/// entire private-zone chain) is a drop-in here: filter `store.zones()` — the
-/// per-(origin, zone) shape means absent chains are absences, not holes.
-pub async fn serve_sync<R, W>(r: &mut R, w: &mut W, store: &Store) -> io::Result<usize>
+/// Offers every zone of `home`, how grants arrive, and every other zone whose
+/// share `grants` lets `holder` read (plan Step 4.3's grant check,
+/// `read.subscribe`). A zone refused is left out whole: the per-(origin, zone)
+/// shape makes it an absence, not a hole.
+pub async fn serve_sync<R, W>(
+    r: &mut R,
+    w: &mut W,
+    store: &Store,
+    holder: &Holder,
+    grants: &dyn GrantPort,
+) -> io::Result<usize>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -324,6 +334,9 @@ where
     }
     let mut sent = 0usize;
     for (share, glade_id, key) in store.zones() {
+        if share != HOME && grants.check(holder, READ_SUBSCRIBE, &share).is_err() {
+            continue;
+        }
         let their_v = their_by_zone.get(&(share.clone(), glade_id.clone(), key.clone())).cloned().unwrap_or_default();
         let gap = missing_for(store, &share, &glade_id, &key, &their_v);
         for chunk in gap.chunks(OPS_PER_CHUNK) {
@@ -647,6 +660,15 @@ mod sync_tests {
         ops
     }
 
+    /// The holder the duplex tests serve, as its HELLO would claim it, and a
+    /// grant fold that lets it read `sh` (plan Step 4.3).
+    fn reader() -> (Holder, crate::grants::PolicyView) {
+        let mut policy = crate::grants::Policy::default();
+        policy.grant(&"ab".repeat(32), "sh", [READ_SUBSCRIBE.to_string()]);
+        let fold = crate::grants::PolicyView::of(Some(policy));
+        (Holder::Node([0xab; 32]), fold)
+    }
+
     /// SY1+SY2: a fresh replica pulls the exact gap over a duplex and verifies
     /// every op as it lands — two chains, both converge byte-for-byte.
     #[tokio::test]
@@ -660,7 +682,9 @@ mod sync_tests {
         let (mut ar, mut aw) = split(ca); // client end
         let (mut br, mut bw) = split(cb); // server end
 
-        let srv = tokio::spawn(async move { serve_sync(&mut br, &mut bw, &server).await });
+        let (holder, grants) = reader();
+        let serve = async move { serve_sync(&mut br, &mut bw, &server, &holder, &grants).await };
+        let srv = tokio::spawn(serve);
         let out = pull_sync(&mut ar, &mut aw, &mut client).await.unwrap();
         let sent = srv.await.unwrap().unwrap();
 
@@ -669,6 +693,46 @@ mod sync_tests {
         assert!(out.rejected.is_empty());
         assert_eq!(client.scan("sh", "g", b"", "a", -1).len(), 5);
         assert_eq!(client.scan("sh", "g", b"", "b", -1).len(), 3);
+    }
+
+    /// Plan Step 4.3: the responder offers `home` and each zone its holder may
+    /// read, and leaves every other zone out whole. The holder is granted
+    /// `sh`; the store also holds `other` and `home`.
+    #[tokio::test]
+    async fn serve_sync_leaves_out_a_zone_the_claimed_holder_may_not_read() {
+        let mut server = Store::open(fresh("grant-srv")).unwrap();
+        chained(&mut server, "a", b"", 2);
+        for (share, n) in [("other", 3), (HOME, 1)] {
+            let mut prev = None;
+            for seq in 0..n {
+                let o = Op {
+                    share: share.into(),
+                    ..op("b", seq, b"", prev.clone(), b"x")
+                };
+                server.append(o.clone()).unwrap();
+                prev = Some(crate::chain::op_hash(&o).to_vec());
+            }
+        }
+        let mut client = Store::open(fresh("grant-cli")).unwrap();
+        let (ca, cb) = tokio::io::duplex(64 * 1024);
+        let (mut ar, mut aw) = split(ca);
+        let (mut br, mut bw) = split(cb);
+        let (holder, grants) = reader();
+        let serve = async move { serve_sync(&mut br, &mut bw, &server, &holder, &grants).await };
+        let srv = tokio::spawn(serve);
+        let out = pull_sync(&mut ar, &mut aw, &mut client).await.unwrap();
+        assert_eq!(
+            srv.await.unwrap().unwrap(),
+            3,
+            "sh's two ops and home's one"
+        );
+        assert_eq!(out.applied, 3);
+        assert_eq!(client.scan("sh", "g", b"", "a", -1).len(), 2);
+        assert_eq!(client.scan(HOME, "g", b"", "b", -1).len(), 1);
+        assert!(
+            client.scan("other", "g", b"", "b", -1).is_empty(),
+            "a zone its holder may not read"
+        );
     }
 
     /// SY3: a tampering carrier flips op 3's `prev`. The chain check rejects op 3
@@ -704,7 +768,9 @@ mod sync_tests {
         let (ca2, cb2) = tokio::io::duplex(64 * 1024);
         let (mut ar2, mut aw2) = split(ca2);
         let (mut br2, mut bw2) = split(cb2);
-        let srv = tokio::spawn(async move { serve_sync(&mut br2, &mut bw2, &truth).await });
+        let (holder, grants) = reader();
+        let serve = async move { serve_sync(&mut br2, &mut bw2, &truth, &holder, &grants).await };
+        let srv = tokio::spawn(serve);
         let out2 = pull_sync(&mut ar2, &mut aw2, &mut client).await.unwrap();
         srv.await.unwrap().unwrap();
 

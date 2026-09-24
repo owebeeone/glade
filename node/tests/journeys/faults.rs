@@ -14,7 +14,7 @@ use glade_carrier_api::{
     CarrierAddr, CarrierConfig, CarrierError, CarrierLink, CarrierPort, PortFuture, TransportId,
 };
 use glade_grant_api::conformance::{self as grant, Record as GrantRecord};
-use glade_grant_api::{Denial, GrantPort, Holder};
+use glade_grant_api::{admits, Denial, GrantPort, Holder};
 use glade_node::cbor;
 use glade_node::registry::StoreApi;
 use glade_node::sysdata::SystemSnapshot;
@@ -234,7 +234,7 @@ impl GrantPort for LiveGrants {
                 holder: h,
                 share: s,
                 verbs,
-            } => pair(h, s) && verbs.contains(&verb),
+            } => pair(h, s) && verbs.iter().any(|granted| admits(granted, verb)),
             GrantRecord::Revoke { .. } => false,
         });
         match (revoked, granted) {

@@ -858,7 +858,17 @@ mod tests {
         let acc_ep = acceptor.clone();
         let acc = tokio::spawn(async move {
             let mut link = acc_ep.accept().await.unwrap().unwrap();
-            let sent = serve_sync(&mut link.recv, &mut link.send, &server).await;
+            // The dialer, as its HELLO proved it, may read `sh` (plan Step 4.3).
+            let dialer = link.peer.peer_id;
+            let mut policy = crate::grants::Policy::default();
+            policy.grant(
+                &crate::mesh::hex_id(&dialer),
+                "sh",
+                ["read.subscribe".to_string()],
+            );
+            let grants = crate::grants::PolicyView::of(Some(policy));
+            let holder = glade_grant_api::Holder::Node(dialer);
+            let sent = serve_sync(&mut link.recv, &mut link.send, &server, &holder, &grants).await;
             // Keep `link` (hence the connection) alive until the dialer has read
             // the finished stream — dropping it early would reset the stream.
             (link, sent)

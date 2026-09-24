@@ -28,6 +28,7 @@ use glade_wire::cbor;
 use glade_wire::generated::{Head, Op, Shape, StreamHeads};
 
 use crate::chain::op_hash;
+use crate::grants::Policy;
 use crate::sysdata::{
     BindingDecl, BindingRetraction, CapabilityGrant, CapabilityRevocation, NodeRecord, NodeTransportBinding,
     NodeTransportRevocation, PrincipalRecord, ServeClaim, ServiceDefinition, SystemSnapshot, WorkspaceEntry,
@@ -97,7 +98,8 @@ impl Record {
     }
 
     /// Is this a POLICY record? Policy records fail CLOSED on load (AZ-11): an
-    /// unparseable/broken policy op is dropped, never leniently kept.
+    /// unparseable/broken policy op is dropped, never leniently kept, and the
+    /// grant fold of a load that dropped one is unreadable (plan Step 4.3).
     pub fn is_policy(glade_id: &str) -> bool {
         matches!(glade_id, G_GRANTS | G_REVOCATIONS)
     }
@@ -298,6 +300,10 @@ pub struct Registry {
     /// Per (glade_id, origin) chain tip: (last_seq, last_hash) — for assigning
     /// the next append's seq/prev and for chain-continuity checks on ingest.
     tips: BTreeMap<(String, String), (i64, [u8; 32])>,
+    /// Whether the load that built this registry quarantined a grant or a
+    /// revocation ([`Registry::from_snapshot`]), so its grant fold cannot be
+    /// read ([`Registry::policy`]).
+    policy_quarantined: bool,
 }
 
 impl Registry {
@@ -312,6 +318,8 @@ impl Registry {
     /// A record held twice is taken once: the repeat is a duplicate, which
     /// quarantines nothing and leaves the rest of its chain loading.
     /// Returns the count of quarantined (rejected) records as load evidence.
+    /// A quarantined grant or revocation leaves the grant fold unreadable
+    /// ([`Registry::policy`]).
     pub fn from_snapshot(snap: &SystemSnapshot) -> (Registry, usize) {
         let mut reg = Registry::new();
         let mut rejected = 0usize;
@@ -320,19 +328,49 @@ impl Registry {
         for bytes in &snap.records {
             let op = Op::from_cbor(&cbor::decode(bytes));
             let chain = (op.glade_id.clone(), op.origin.clone());
+            let policy = Record::is_policy(&op.glade_id);
             if *poisoned.get(&chain).unwrap_or(&false) {
                 rejected += 1; // suffix of an already-rejected op
+                reg.policy_quarantined |= policy;
                 continue;
             }
             match reg.ingest(op) {
                 Ok(_) => {}
                 Err(_) => {
                     rejected += 1;
+                    reg.policy_quarantined |= policy;
                     poisoned.insert(chain, true);
                 }
             }
         }
         (reg, rejected)
+    }
+
+    /// The grant fold the serve paths check (plan Step 4.3): every grant and
+    /// every revocation this registry holds, folded as `grants_for` folds
+    /// them. `None` when its load quarantined a grant or a revocation: a
+    /// revocation set aside would let its grant stand, so the fold fails
+    /// closed rather than answer from what is left (AZ-11).
+    pub fn policy(&self) -> Option<Policy> {
+        if self.policy_quarantined {
+            return None;
+        }
+        let mut policy = Policy::default();
+        for o in self.fold_iter(G_GRANTS) {
+            let grant = CapabilityGrant::from_cbor(&cbor::decode(&o.payload));
+            policy.grant(&grant.principal, &grant.share, grant.verbs);
+        }
+        for o in self.fold_iter(G_REVOCATIONS) {
+            let revocation = CapabilityRevocation::from_cbor(&cbor::decode(&o.payload));
+            policy.revoke(&revocation.principal, &revocation.share);
+        }
+        Some(policy)
+    }
+
+    /// Whether the load that built this registry quarantined a grant or a
+    /// revocation, which leaves [`Registry::policy`] unreadable.
+    pub fn policy_quarantined(&self) -> bool {
+        self.policy_quarantined
     }
 
     /// Ingest a fully-formed op with per-origin chain checks (the shared
@@ -803,6 +841,61 @@ mod tests {
         assert!(rejected >= 1, "the tampered op (and its suffix) is quarantined");
         // the honest records still fold.
         assert_eq!(reg.nodes_of("gianni"), vec!["glade-local", "peer1"]);
+    }
+
+    /// Plan Step 4.3's fail direction at load: a grant or a revocation
+    /// quarantined by verify-as-ingest leaves the grant fold unreadable, since
+    /// what is left could let a revoked grant stand; a quarantined record of
+    /// another kind leaves it readable. Here the second of two revocations
+    /// loses its predecessor, so it arrives as a gap.
+    #[test]
+    fn a_quarantined_grant_or_revocation_leaves_the_fold_unreadable() {
+        use glade_grant_api::{Denial, GrantPort, Holder};
+
+        use crate::grants::PolicyView;
+
+        let revoke = |principal: &str| {
+            let (principal, share) = (principal.into(), "ws-a".into());
+            Record::Revoke(CapabilityRevocation { principal, share })
+        };
+        let mut r = Registry::new();
+        let grant = CapabilityGrant {
+            principal: "alice".into(),
+            share: "ws-a".into(),
+            verbs: vec!["read".into()],
+        };
+        r.append(Record::Grant(grant), "n1").unwrap();
+        r.append(revoke("eve"), "n1").unwrap();
+        r.append(revoke("mallory"), "n1").unwrap();
+        r.append(claim("n1", "ws-a", 1_000, 1), "n1").unwrap();
+        r.append(claim("n1", "ws-a", 2_000, 1), "n1").unwrap();
+        let alice = Holder::Principal("alice".into());
+        assert_eq!(
+            PolicyView::of(r.policy()).check(&alice, "read", "ws-a"),
+            Ok(())
+        );
+
+        // The snapshot without the first record of `glade_id`'s chain.
+        let without = |glade_id: &str| {
+            let mut snap = r.snapshot();
+            snap.records.retain(|bytes| {
+                let op = Op::from_cbor(&cbor::decode(bytes));
+                !(op.glade_id == glade_id && op.seq == 0)
+            });
+            Registry::from_snapshot(&snap)
+        };
+        let (claims_cut, rejected) = without(G_CLAIMS);
+        assert_eq!((rejected, claims_cut.policy_quarantined()), (1, false));
+        assert_eq!(
+            PolicyView::of(claims_cut.policy()).check(&alice, "read", "ws-a"),
+            Ok(())
+        );
+
+        let (policy_cut, rejected) = without(G_REVOCATIONS);
+        assert_eq!((rejected, policy_cut.policy_quarantined()), (1, true));
+        assert_eq!(policy_cut.policy(), None);
+        let answer = PolicyView::of(policy_cut.policy()).check(&alice, "read", "ws-a");
+        assert_eq!(answer, Err(Denial::Unavailable));
     }
 
     /// A byte-identical re-delivery is a duplicate (plan Step 4.4; owner,

@@ -1,10 +1,11 @@
 use glade_grant_api::conformance::{self, Record};
-use glade_grant_api::{Denial, GrantPort, Holder};
+use glade_grant_api::{Denial, GrantPort, Holder, admits};
 
 /// Deliberately wrong behaviours, each caught by one probe.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Wrong {
     AnyVerb,
+    ExactOnly,
     LastWriterWins,
     UnavailableAsNoGrant,
 }
@@ -41,7 +42,12 @@ impl GrantPort for Fold {
                     share: s,
                     verbs,
                 } if h == holder && *s == share => {
-                    granted |= verbs.contains(&verb) || self.wrong == Some(Wrong::AnyVerb);
+                    let admitted = if self.wrong == Some(Wrong::ExactOnly) {
+                        verbs.contains(&verb)
+                    } else {
+                        verbs.iter().any(|granted| admits(granted, verb))
+                    };
+                    granted |= admitted || self.wrong == Some(Wrong::AnyVerb);
                     revoked &= self.wrong != Some(Wrong::LastWriterWins);
                 }
                 Record::Revoke {
@@ -79,9 +85,39 @@ fn gr_003_an_unreadable_fold_is_unavailable() {
 }
 
 #[test]
+fn admits_reads_one_pattern_and_nothing_else() {
+    let admitted = [
+        ("read.subscribe", "read.subscribe"),
+        ("read.*", "read.subscribe"),
+        ("gwz.*", "gwz.ops"),
+        ("a.b.*", "a.b.c"),
+    ];
+    for (granted, asked) in admitted {
+        assert!(admits(granted, asked), "{granted} admits {asked}");
+    }
+    let refused = [
+        ("read.*", "read"),
+        ("read.*", "readx.subscribe"),
+        ("read", "read.subscribe"),
+        ("*", "read.subscribe"),
+        (".*", ".x"),
+        ("read.**", "read.x"),
+    ];
+    for (granted, asked) in refused {
+        assert!(!admits(granted, asked), "{granted} does not admit {asked}");
+    }
+}
+
+#[test]
 #[should_panic(expected = "GR-001 nothing is implied")]
 fn rejects_an_implied_verb() {
     conformance::exact(&fold(true, Some(Wrong::AnyVerb)));
+}
+
+#[test]
+#[should_panic(expected = "GR-001 a pattern admits a verb it begins")]
+fn rejects_a_pattern_read_as_an_exact_verb() {
+    conformance::exact(&fold(true, Some(Wrong::ExactOnly)));
 }
 
 #[test]

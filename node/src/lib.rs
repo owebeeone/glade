@@ -13,6 +13,7 @@ pub mod claims;
 pub mod echo;
 pub mod exchange;
 pub mod frame;
+pub mod grants;
 pub mod iroh_carrier;
 pub mod lifecycle;
 pub mod mesh;

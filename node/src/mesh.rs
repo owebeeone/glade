@@ -25,15 +25,17 @@ use std::sync::{Arc, PoisonError};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use tokio::sync::Mutex;
 
-use glade_wire::generated::{Head, Heads, Op, Ops, Priority, StreamHeads, Subscribe};
+use glade_grant_api::{GrantPort, Holder};
+use glade_wire::generated::{ErrorCode, Head, Heads, Op, Ops, Priority, StreamHeads, Subscribe};
 
 use crate::frame::Frame;
+use crate::grants::{refusal, READ_SUBSCRIBE};
 use crate::iroh_carrier::{PeerAddr, PeerEndpoint, PeerLink};
 use crate::peer::{read_frame, write_frame, OPS_PER_CHUNK};
 use crate::registry::HOME;
 use crate::router::SessionId;
 use crate::server::{send, Server, Shared};
-use crate::session::{heads_map, missing_for};
+use crate::session::{heads_map, missing_for, refused_subscribe};
 use crate::store::{Append, Store};
 use crate::sysdir::now_ms;
 use crate::tasks::Site;
@@ -212,6 +214,9 @@ impl Server {
 async fn run_link(shared: Arc<Shared>, mesh: Arc<Mesh>, link: PeerLink, dialed: bool) -> io::Result<()> {
     let PeerLink { peer, conn, send: s0_send, recv: s0_recv } = link;
     let peer_hex = hex_id(&peer.peer_id);
+    // The node its HELLO proved, which every stream of the link serves (the
+    // grant check's holder, plan Step 4.3).
+    let node = peer.peer_id;
     mesh.links.lock().await.insert(peer_hex.clone(), conn.clone());
 
     // Unlink on close, whoever closes first.
@@ -230,7 +235,7 @@ async fn run_link(shared: Arc<Shared>, mesh: Arc<Mesh>, link: PeerLink, dialed: 
             while let Ok((send, recv)) = conn.accept_bi().await {
                 let stream = dispatch.clone();
                 dispatch.tasks.spawn(Site::PeerStream, async move {
-                    let _ = handle_peer_stream(stream, send, recv).await;
+                    let _ = handle_peer_stream(stream, node, send, recv).await;
                 });
             }
         });
@@ -245,7 +250,7 @@ async fn run_link(shared: Arc<Shared>, mesh: Arc<Mesh>, link: PeerLink, dialed: 
         {
             let stream = shared.clone();
             shared.tasks.spawn(Site::StreamZero, async move {
-                let _ = handle_peer_stream(stream, s0_send, s0_recv).await;
+                let _ = handle_peer_stream(stream, node, s0_send, s0_recv).await;
             });
         }
         let (send, recv) = conn.open_bi().await.map_err(other)?;
@@ -259,12 +264,20 @@ async fn run_link(shared: Arc<Shared>, mesh: Arc<Mesh>, link: PeerLink, dialed: 
 /// `ExchangeReq` = a forwarded exchange (this node is the claim holder — the
 /// attached authority answers, one stream one exchange, `exchange.rs`);
 /// `Ops` = a peer's home-share PUSH (freshly-minted directory records, the B9
-/// step) — scoped ingest, home ops only, one frame per stream.
-async fn handle_peer_stream(shared: Arc<Shared>, mut send: SendStream, mut recv: RecvStream) -> io::Result<()> {
+/// step) — scoped ingest, home ops only, one frame per stream. `node` is the
+/// peer, as its HELLO proved it.
+async fn handle_peer_stream(
+    shared: Arc<Shared>,
+    node: [u8; 32],
+    mut send: SendStream,
+    mut recv: RecvStream,
+) -> io::Result<()> {
     match read_frame(&mut recv).await? {
         Frame::Heads(h) => serve_home(&shared, &mut send, h).await,
-        Frame::Subscribe(s) => serve_peer_subscribe(shared, send, recv, s).await,
-        Frame::ExchangeReq(x) => crate::exchange::serve_peer_exchange(shared, send, recv, x).await,
+        Frame::Subscribe(s) => serve_peer_subscribe(shared, node, send, recv, s).await,
+        Frame::ExchangeReq(x) => {
+            crate::exchange::serve_peer_exchange(shared, node, send, recv, x).await
+        }
         Frame::Ops(o) => {
             let from = shared.next.fetch_add(1, Ordering::SeqCst);
             for op in o.ops {
@@ -306,30 +319,56 @@ pub(crate) async fn push_home(shared: &Arc<Shared>, ops: Vec<Op>) {
 /// peer as an ordinary subscriber session of the zone, ship the resume gap
 /// against the `from` heads it announced, then let the normal fan-out feed the
 /// stream until the peer closes it (interest withdrawn / link gone).
+///
+/// The grant check (plan Step 4.3), enforced for every peer: a share other
+/// than `home` is served only to a node the fold grants `read.subscribe` on
+/// it. Refused, the stream gets the refused subscribe's two frames (R6), an
+/// ack that names no zone and the reason, and is finished, so the forwarding
+/// node's forward lapses; nothing is registered. Admitted, the stream joins
+/// the admission table, and the re-check pass ends it if a later fold
+/// refuses it (`server::refresh_policy`). Check and registration hold the
+/// cut, so no fold change falls between them unseen.
 async fn serve_peer_subscribe(
     shared: Arc<Shared>,
+    node: [u8; 32],
     mut qsend: SendStream,
     mut recv: RecvStream,
     s: Subscribe,
 ) -> io::Result<()> {
+    use tokio::io::AsyncWriteExt;
     let key = s.key.clone().unwrap_or_default();
+    let holder = Holder::Node(node);
+    let cut = shared.cut.lock().await;
+    if s.share != HOME {
+        if let Err(denial) = shared.policy.check(&holder, READ_SUBSCRIBE, &s.share) {
+            drop(cut);
+            let why = refusal(&holder, READ_SUBSCRIBE, &s.share, denial);
+            for frame in refused_subscribe(ErrorCode::Unauthorized, why, &s.share, &s.glade_id) {
+                write_frame(&mut qsend, &frame).await?;
+            }
+            return qsend.shutdown().await;
+        }
+    }
     let sid = shared.next.fetch_add(1, Ordering::SeqCst);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
     shared.out.lock().await.insert(sid, tx.clone());
     shared.router.lock().await.subscribe(sid, &s.share, &s.glade_id, &key);
+    shared.admitted.lock().await.insert(sid, node);
 
     // Writer: drain the session outbound onto the QUIC stream, u32-framed —
-    // the peer framing every glade stream speaks.
+    // the peer framing every glade stream speaks. Its channel closes when the
+    // session leaves the session table (the re-check pass refused it), and
+    // then it finishes the stream.
     let wtask = shared.tasks.spawn(Site::SubscriptionWriter, async move {
-        use tokio::io::AsyncWriteExt;
         while let Some(bytes) = rx.recv().await {
             let ok = qsend.write_all(&(bytes.len() as u32).to_le_bytes()).await.is_ok()
                 && qsend.write_all(&bytes).await.is_ok()
                 && qsend.flush().await.is_ok();
             if !ok {
-                break;
+                return;
             }
         }
+        let _ = qsend.shutdown().await;
     });
 
     // Ack + gap ride the SAME outbound channel as live fan-out, so a live op
@@ -352,11 +391,15 @@ async fn serve_peer_subscribe(
     if !gap.is_empty() {
         let _ = tx.send(Frame::Ops(Ops { ops: gap, pri: Some(Priority::Bulk) }).to_bytes());
     }
+    // From here the session table holds the only sender.
+    drop(tx);
+    drop(cut);
 
     // Hold the subscription open until the peer closes its end.
     while read_frame(&mut recv).await.is_ok() {}
     shared.out.lock().await.remove(&sid);
     shared.router.lock().await.unsubscribe_all(sid);
+    shared.admitted.lock().await.remove(&sid);
     wtask.abort();
     Ok(())
 }
@@ -577,8 +620,9 @@ pub fn directory_knows(store: &Store, share: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::claims::testing;
     use crate::registry::{Record, RegistryApi};
-    use crate::sysdata::{ServeClaim, WorkspaceEntry};
+    use crate::sysdata::{CapabilityGrant, CapabilityRevocation, ServeClaim, WorkspaceEntry};
     use crate::sysdir::{boot_at, now_ms};
     use std::path::PathBuf;
     use std::time::Duration;
@@ -898,58 +942,69 @@ mod tests {
         }
     }
 
-    /// The 30-step s-discovery trace's slice for this step, E2E over real iroh
-    /// + real websockets: (a) phase A — a client on node A lists
-    /// `home/dir.workspaces` from A's LOCAL replica and sees the workspace B
-    /// registered; (b) phase C — subscribing that workspace's share routes the
-    /// interest via the folded ServeClaim to B, the ops arrive, converge into
-    /// A's replica, and keep flowing live; (c) phase E — a share whose only
-    /// claim is lapsed at the reader's clock answers with an ack that names no
-    /// zone, then STATUS data, bounded, and the session stays usable.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn s_discovery_golden_path_end_to_end() {
-        // Node B (workspace host): registers ws-razel + its live claim; the
-        // sleeping ws-attic has only a claim that is LAPSED at any later read.
-        let mut boot_b = boot_at(fresh("e2e-b-sys"), "gianni").unwrap();
-        let b_id = boot_b.node_id.clone();
-        boot_b
-            .registry
-            .append(
-                Record::Workspace(WorkspaceEntry { workspace: "ws-razel".into(), name: "razel".into(), eligible_hosts: vec![b_id.clone()] }),
-                &b_id,
-            )
-            .unwrap();
-        boot_b
-            .registry
-            .append(
-                Record::Serve(ServeClaim { node: b_id.clone(), share: "ws-razel".into(), lease_expiry_ms: now_ms() + 30_000, epoch: 1 }),
-                &b_id,
-            )
-            .unwrap();
-        boot_b
-            .registry
-            .append(
-                Record::Workspace(WorkspaceEntry { workspace: "ws-attic".into(), name: "attic".into(), eligible_hosts: vec!["attic-mini".into()] }),
-                &b_id,
-            )
-            .unwrap();
-        boot_b
-            .registry
-            .append(
-                Record::Serve(ServeClaim { node: "attic-mini".into(), share: "ws-attic".into(), lease_expiry_ms: now_ms() - 1_000, epoch: 1 }),
-                &b_id,
-            )
-            .unwrap();
+    /// Two booted nodes for the grant check's journeys (plan Step 4.3), over
+    /// real iroh and websockets. B is adopted, so it checks its own fold: it
+    /// registers `ws-razel` with a live claim and `ws-attic` with a lapsed one,
+    /// and grants A's node id `grant` on `ws-razel`, when given one. A is
+    /// seeded and dials B. B's provider session has written two tree ops.
+    struct TwoNodes {
+        a: Arc<Shared>,
+        b: Arc<Shared>,
+        a_id: String,
+        b_id: String,
+        port_a: u16,
+        /// B's provider session, which writes the workspace content, and the
+        /// two ops it wrote.
+        provider: (crate::ws::WsReader, crate::ws::WsWriter),
+        tree: [Op; 2],
+    }
 
-        let boot_a = boot_at(fresh("e2e-a-sys"), "gianni").unwrap();
-
-        let a = Server::open(fresh("e2e-a-store")).unwrap();
-        let b = Server::open(fresh("e2e-b-store")).unwrap();
+    async fn two_nodes(name: &str, grant: Option<&[&str]>) -> TwoNodes {
+        let boot_a = boot_at(fresh(&format!("{name}-a-sys")), "gianni").unwrap();
+        let mut boot_b = boot_at(fresh(&format!("{name}-b-sys")), "gianni").unwrap();
+        let (a_id, b_id) = (boot_a.node_id.clone(), boot_b.node_id.clone());
+        let workspace = |share: &str, name: &str, host: &str| {
+            let eligible_hosts = vec![host.to_string()];
+            Record::Workspace(WorkspaceEntry {
+                workspace: share.into(),
+                name: name.into(),
+                eligible_hosts,
+            })
+        };
+        let claim = |node: &str, share: &str, lease_expiry_ms: i64| {
+            Record::Serve(ServeClaim {
+                node: node.into(),
+                share: share.into(),
+                lease_expiry_ms,
+                epoch: 1,
+            })
+        };
+        let mut records = vec![
+            workspace("ws-razel", "razel", &b_id),
+            claim(&b_id, "ws-razel", now_ms() + 30_000),
+            workspace("ws-attic", "attic", "attic-mini"),
+            claim("attic-mini", "ws-attic", now_ms() - 1_000),
+        ];
+        if let Some(verbs) = grant {
+            let verbs = verbs.iter().map(|verb| verb.to_string()).collect();
+            let share = "ws-razel".into();
+            records.push(Record::Grant(CapabilityGrant {
+                principal: a_id.clone(),
+                share,
+                verbs,
+            }));
+        }
+        for record in records {
+            boot_b.registry.append(record, &b_id).unwrap();
+        }
+        let (id_a, id_b) = (boot_a.identity().unwrap(), boot_b.identity().unwrap());
+        let a = Server::open(fresh(&format!("{name}-a-store"))).unwrap();
+        let b = Server::open(fresh(&format!("{name}-b-store"))).unwrap();
         a.seed_registry(&boot_a.registry.snapshot()).await;
-        b.seed_registry(&boot_b.registry.snapshot()).await;
+        b.adopt_boot(boot_b).await.unwrap();
 
-        let ep_a = PeerEndpoint::bind_with(boot_a.identity().unwrap()).await.unwrap();
-        let ep_b = PeerEndpoint::bind_with(boot_b.identity().unwrap()).await.unwrap();
+        let ep_a = PeerEndpoint::bind_with(id_a).await.unwrap();
+        let ep_b = PeerEndpoint::bind_with(id_b).await.unwrap();
         a.enable_mesh(ep_a).await.unwrap();
         let addr_b = b.enable_mesh(ep_b).await.unwrap();
         a.connect_peer(&addr_b).await.unwrap();
@@ -963,11 +1018,145 @@ mod tests {
 
         // B's authority provider session writes the workspace content (the C4
         // source) — an ordinary session appending ordinary chained ops.
-        let (_rp, wp) = crate::ws::connect("127.0.0.1", port_b).await.unwrap();
+        let provider = crate::ws::connect("127.0.0.1", port_b).await.unwrap();
         let o0 = tree_op(0, None, b"tree-v0");
         let o1 = tree_op(1, Some(crate::chain::op_hash(&o0).to_vec()), b"tree-v1");
-        wp.send_binary(&Frame::Ops(Ops { ops: vec![o0.clone(), o1.clone()], pri: None }).to_bytes()).await.unwrap();
-        wait_store(&b_shared, |st| st.scan("ws-razel", "ws.tree", &[], "prov-b", i64::MIN).len() == 2, "B to hold the provider ops").await;
+        let written = ops_frame(vec![o0.clone(), o1.clone()]);
+        provider.1.send_binary(&written).await.unwrap();
+        wait_store(&b_shared, |st| tree_len(st) == 2, "B to hold the tree").await;
+        TwoNodes {
+            a: a_shared,
+            b: b_shared,
+            a_id,
+            b_id,
+            port_a,
+            provider,
+            tree: [o0, o1],
+        }
+    }
+
+    /// The tree zone the journeys read, commons.
+    fn tree_zone() -> (String, String, Vec<u8>) {
+        ("ws-razel".into(), "ws.tree".into(), vec![])
+    }
+
+    /// How many of B's provider's tree ops `st` holds.
+    fn tree_len(st: &Store) -> usize {
+        st.scan("ws-razel", "ws.tree", &[], "prov-b", i64::MIN)
+            .len()
+    }
+
+    /// The tree ops a node's replica holds from B's provider, as payloads.
+    async fn tree_payloads(shared: &Arc<Shared>) -> Vec<Vec<u8>> {
+        let store = shared.store.lock().await;
+        let held = store.scan("ws-razel", "ws.tree", &[], "prov-b", i64::MIN);
+        held.into_iter().map(|op| op.payload).collect()
+    }
+
+    /// Whether a node's fan-out of the tree zone reaches any session.
+    async fn tree_routed(shared: &Arc<Shared>) -> bool {
+        let router = shared.router.lock().await;
+        !router.route(0, "ws-razel", "ws.tree", &[]).is_empty()
+    }
+
+    /// The nodes, in hex, whose subscription streams a node has admitted.
+    async fn admitted(shared: &Arc<Shared>) -> Vec<String> {
+        let admitted = shared.admitted.lock().await;
+        admitted.values().map(|node| hex_id(node)).collect()
+    }
+
+    /// One `Ops` frame, as bytes.
+    fn ops_frame(ops: Vec<Op>) -> Vec<u8> {
+        Frame::Ops(Ops { ops, pri: None }).to_bytes()
+    }
+
+    /// Payloads from `r`'s ops, in order, until `n` have arrived.
+    async fn payloads(r: &mut crate::ws::WsReader, n: usize, what: &str) -> Vec<Vec<u8>> {
+        let mut payloads = Vec::new();
+        while payloads.len() < n {
+            if let Frame::Ops(ops) = next_frame(r, what).await {
+                payloads.extend(ops.ops.into_iter().map(|o| o.payload));
+            }
+        }
+        payloads
+    }
+
+    /// A client on A subscribes the tree zone and reads its ack.
+    async fn a_client(t: &TwoNodes) -> (crate::ws::WsReader, crate::ws::WsWriter) {
+        let (mut rc, wc) = crate::ws::connect("127.0.0.1", t.port_a).await.unwrap();
+        wc.send_binary(&sub("ws-razel", "ws.tree")).await.unwrap();
+        let ack = next_frame(&mut rc, "ws.tree ack").await;
+        assert!(matches!(ack, Frame::Heads(_)), "{ack:?}");
+        (rc, wc)
+    }
+
+    /// Wait, bounded, until A's forward of the tree zone has lapsed.
+    async fn forward_lapses(a: &Arc<Shared>) {
+        let mesh = a.mesh.get().unwrap();
+        for _ in 0..500 {
+            if !mesh.forwarded.lock().await.contains(&tree_zone()) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("A's forward of the tree zone did not lapse");
+    }
+
+    /// Subscribe the tree zone on a fresh stream of A's link to B, as A's
+    /// forward does, and return B's answer: a refusal's two frames (R6), and
+    /// the reason, once B has finished the stream.
+    async fn refused_on_the_link(t: &TwoNodes) -> glade_wire::generated::Error {
+        let mesh = t.a.mesh.get().unwrap();
+        let conn = mesh.links.lock().await.get(&t.b_id).cloned().unwrap();
+        let (mut qsend, mut recv) = conn.open_bi().await.unwrap();
+        let (share, glade_id, _) = tree_zone();
+        let subscribe = Subscribe {
+            share,
+            glade_id,
+            key: None,
+            from: None,
+        };
+        write_frame(&mut qsend, &Frame::Subscribe(subscribe))
+            .await
+            .unwrap();
+        let mut frames = Vec::new();
+        loop {
+            let read = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut recv));
+            match read.await.expect("B answered and finished the stream") {
+                Ok(frame) => frames.push(frame),
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => panic!("reading B's answer: {e}"),
+            }
+        }
+        match frames.as_slice() {
+            [Frame::Heads(h), Frame::Error(e)] if h.streams.is_empty() => {
+                assert_eq!(e.code, ErrorCode::Unauthorized);
+                let named = (e.share.as_deref(), e.glade_id.as_deref());
+                assert_eq!(named, (Some("ws-razel"), Some("ws.tree")));
+                assert_eq!(e.corr, None);
+                e.clone()
+            }
+            other => panic!("expected an ack that names no zone, then the reason: {other:?}"),
+        }
+    }
+
+    /// The 30-step s-discovery trace's slice for this step, E2E over real iroh
+    /// + real websockets: (a) phase A — a client on node A lists
+    /// `home/dir.workspaces` from A's LOCAL replica and sees the workspace B
+    /// registered; (b) phase C — subscribing that workspace's share routes the
+    /// interest via the folded ServeClaim to B, the ops arrive, converge into
+    /// A's replica, and keep flowing live; (c) phase E — a share whose only
+    /// claim is lapsed at the reader's clock answers with an ack that names no
+    /// zone, then STATUS data, bounded, and the session stays usable. B serves
+    /// A in phase (b) because its fold grants A's node id `read.*` on the
+    /// share (plan Step 4.3); without it, B refuses
+    /// (`a_peer_without_a_grant_is_refused_by_its_claimed_node_id`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn s_discovery_golden_path_end_to_end() {
+        let t = two_nodes("e2e", Some(&["read.*"])).await;
+        let (a_shared, b_id, port_a) = (t.a.clone(), t.b_id.clone(), t.port_a);
+        let wp = &t.provider.1;
+        let o1 = t.tree[1].clone();
 
         // ---- (a) phase A: list the directory from A's LOCAL replica ---------
         let (mut rc, wc) = crate::ws::connect("127.0.0.1", port_a).await.unwrap();
@@ -1041,5 +1230,112 @@ mod tests {
             }
             other => panic!("expected the post-absence ack, got {other:?}"),
         }
+    }
+
+    // ---- the grant check at the serve hop (plan Step 4.3) ------------------
+
+    /// The golden path's phase (b), turned round: B's fold grants A's node id
+    /// nothing on `ws-razel`, so B refuses A's forwarded subscribe by the node
+    /// id A's HELLO claimed, and proved: the refused subscribe's two frames,
+    /// then the stream is finished. A's client is acked from A's replica, A's
+    /// forward lapses, and nothing of the zone reaches A.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_peer_without_a_grant_is_refused_by_its_claimed_node_id() {
+        let t = two_nodes("refused", None).await;
+        let a = &t.a_id;
+        let why = format!("unauthorized: node {a} holds no grant of read.subscribe on ws-razel");
+        assert_eq!(refused_on_the_link(&t).await.message, why);
+
+        let _client = a_client(&t).await;
+        let (share, glade_id, key) = tree_zone();
+        forward_interest(&t.a, t.b_id.clone(), share, glade_id, key).await;
+        forward_lapses(&t.a).await;
+        assert_eq!(tree_payloads(&t.a).await, Vec::<Vec<u8>>::new());
+        assert!(!tree_routed(&t.b).await, "B routes the zone to no one");
+        assert_eq!(admitted(&t.b).await, Vec::<String>::new());
+    }
+
+    /// Its twin: B's fold grants A's node id exactly `read.subscribe` on
+    /// `ws-razel`, so A's forwarded subscribe, by that claimed node id, is
+    /// admitted and served, and B's admission table holds the stream.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_peer_granted_by_its_claimed_node_id_is_served() {
+        let t = two_nodes("granted", Some(&["read.subscribe"])).await;
+        let (mut rc, _wc) = a_client(&t).await;
+        let got = payloads(&mut rc, 2, "routed tree ops").await;
+        assert_eq!(got, [b"tree-v0".to_vec(), b"tree-v1".to_vec()]);
+        assert_eq!(admitted(&t.b).await, [t.a_id.as_str()]);
+    }
+
+    /// A revocation accepted while A's forwarded stream is live, through B's
+    /// directory authority as a runtime route would take it, ends the stream
+    /// before the accepting call returns: the fold's generation advances, the
+    /// stream leaves B's router and admission table, and A's forward lapses.
+    /// An op written after the revocation stays at B, and a new subscribe by
+    /// A's claimed node id is refused as revoked. What A got before stays.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_revocation_ends_a_forwarded_stream_of_a_claimed_node_id() {
+        let t = two_nodes("revoke", Some(&["read.*"])).await;
+        let (mut rc, _wc) = a_client(&t).await;
+        assert_eq!(payloads(&mut rc, 2, "routed tree ops").await.len(), 2);
+        assert_eq!(admitted(&t.b).await, [t.a_id.as_str()]);
+
+        let before = t.b.policy.generation();
+        let revocation = CapabilityRevocation {
+            principal: t.a_id.clone(),
+            share: "ws-razel".into(),
+        };
+        let revoke = vec![Record::Revoke(revocation)];
+        let generation = testing::accept(&t.b, revoke).await.unwrap();
+        assert_eq!(generation, before + 1);
+        assert_eq!(
+            admitted(&t.b).await,
+            Vec::<String>::new(),
+            "the pass ended the stream"
+        );
+        assert!(!tree_routed(&t.b).await, "B routes the zone to no one");
+        forward_lapses(&t.a).await;
+
+        let prev = crate::chain::op_hash(&t.tree[1]).to_vec();
+        let written = ops_frame(vec![tree_op(2, Some(prev), b"tree-v2")]);
+        t.provider.1.send_binary(&written).await.unwrap();
+        wait_store(&t.b, |st| tree_len(st) == 3, "B to hold v2").await;
+        let at_a = tree_payloads(&t.a).await;
+        assert_eq!(
+            at_a,
+            [b"tree-v0".to_vec(), b"tree-v1".to_vec()],
+            "v2 stayed at B"
+        );
+
+        let why = format!(
+            "unauthorized: node {}'s grants on ws-razel are revoked",
+            t.a_id
+        );
+        assert_eq!(refused_on_the_link(&t).await.message, why);
+    }
+
+    /// The fail direction: once B's fold cannot be read, the live forwarded
+    /// stream of A's claimed node id ends and a new subscribe is refused, as
+    /// for no grant. The fold is made unreadable as a quarantined grant or
+    /// revocation leaves it at boot (`Registry::policy`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stale_fold_fails_closed() {
+        let t = two_nodes("stale", Some(&["read.*"])).await;
+        let (mut rc, _wc) = a_client(&t).await;
+        assert_eq!(payloads(&mut rc, 2, "routed tree ops").await.len(), 2);
+
+        crate::server::refresh_policy(&t.b, None).await;
+        assert_eq!(
+            admitted(&t.b).await,
+            Vec::<String>::new(),
+            "the pass ended the stream"
+        );
+        assert!(!tree_routed(&t.b).await, "B routes the zone to no one");
+        forward_lapses(&t.a).await;
+        let a = &t.a_id;
+        let why = format!(
+            "unauthorized: the grant fold is unavailable, so node {a} may not read.subscribe on ws-razel"
+        );
+        assert_eq!(refused_on_the_link(&t).await.message, why);
     }
 }

@@ -188,8 +188,9 @@ verbs on `<share>`. Verbs are separated by commas with no spaces, and a verb may
 be a pattern such as `read.*` ([Principals and verbs](#principals-and-verbs)
 says what each token means). At registration a seed becomes an ordinary grant
 record, and a revocation always wins over it, even when the file is loaded
-again: see [`revoke`](#revoke-withdrawing-grants). The node records grants but
-does not enforce them yet.
+again: see [`revoke`](#revoke-withdrawing-grants). The node checks grants when
+another node reads a share it serves, but not yet when a client does: see
+[Principals and verbs](#principals-and-verbs).
 
 `<share>` is the workspace share the app's surfaces live on, the share a
 `workspace` line declares (`ws-notes` in the example above), not a share named
@@ -351,9 +352,23 @@ refused for its retention.
 ## Principals and verbs
 
 A `seed` line names a principal and the verbs it is granted, and a `revoke`
-line names a principal. The node records grants but does not enforce them yet.
-This section says what the tokens mean, which is what the node checks once it
-enforces them.
+line names a principal. This section says what the tokens mean, which is what
+the node checks.
+
+**Where grants are checked.** A node checks the grants it registered itself,
+from the app files it loads. A grant registered on another node counts only
+there.
+
+- **Another node reading a share this node serves** needs a grant to its node
+  id: to read, `read.subscribe`, and for a request on an exchange, the
+  exchange's glade id. `seed <node-id> ws-razel read.*,gwz.*` lets that node
+  read `ws-razel` and use `gwz.ops` there. Without a grant it is refused, and
+  what it asks for is not served. The `home` share, where grants are kept,
+  needs no grant.
+- **A client** (a browser tab or a supplier on the node's websocket) is not
+  checked yet: everything it reads is served, as before.
+- A node that cannot read its own grants refuses every check, and says so when
+  it starts, with `grants unavailable: …`.
 
 **Principals.** A principal is one token, naming who holds a grant.
 
@@ -363,7 +378,7 @@ enforces them.
 | 64 lower-case hexadecimal digits | A node: the id a node prints when it starts, on its `node <id>` line. A grant to a node is how the node that serves a share lets another node read it. The id comes from the node's key, so a grant to it is written again if that node's key is replaced. |
 | any other token | Whoever a client names in its Hello. The node takes the name on the client's word: it does not yet check who the client is. |
 
-Once grants are enforced, a client whose Hello names a node's id, or names no
+Once clients are checked, a client whose Hello names a node's id, or names no
 principal at all, holds no grant.
 
 **Verbs.** A verb names what a grant allows on its share.

@@ -16,7 +16,7 @@ use glade_carrier_api::{
 };
 use glade_clock_api::ClockPort;
 use glade_grant_api::conformance::{self as grant_conformance, Record as GrantRecord};
-use glade_grant_api::{Denial, GrantPort, Holder};
+use glade_grant_api::{admits, Denial, GrantPort, Holder};
 use glade_node::assembly::{ConfigPort, Settings};
 use glade_signer_api::{
     NodeId, Purpose, SignError, SignatureStatus, SignerPort, VerificationError,
@@ -413,7 +413,7 @@ impl GrantPort for MemGrants {
                     share: s,
                     verbs,
                 } if h == holder && *s == share => {
-                    granted |= verbs.contains(&verb);
+                    granted |= verbs.iter().any(|granted| admits(granted, verb));
                 }
                 GrantRecord::Revoke {
                     holder: h,

@@ -13,7 +13,7 @@
 //! | `record_transport_binding` | [`RecordTransport`] | [`TransportPort`] | [`CarrierTransport`], over the peer occurrence |
 //! | `directory_host_binding` | [`RecordHost`] | [`RecordHostPort`] | [`Records`] |
 //! | `directory_profile_binding` | [`RecordProfile`] | [`RecordProfilePort`] | [`DirectoryRules`] |
-//! | grant | [`Grants`] | `GrantPort` | [`PendingGrantFold`] |
+//! | grant | [`Grants`] | `GrantPort` | [`PolicyView`], the node's fold (plan Step 4.3) |
 //! | signer | [`Signer`] | `SignerPort` | [`NodeSigner`], Ed25519 (plan Step 4.1a) |
 //! | configuration | [`Config`] | [`ConfigPort`] | [`CommandLine`] |
 //!
@@ -182,6 +182,7 @@ use glade_wire::generated::Op;
 use shaku::{module, Component, HasComponent, Module, ModuleBuildContext};
 
 use crate::appdecl::{register, AppDecl, Registered};
+use crate::grants::PolicyView;
 use crate::iroh_carrier::IrohCarrier;
 use crate::peer::NodeIdentity;
 use crate::registry::{
@@ -206,8 +207,9 @@ static REAL_PROVIDERS: AtomicUsize = AtomicUsize::new(0);
 
 /// How many real providers `NodeAssembly` modules have constructed in this
 /// process: the system clock, the command line, the record host as the
-/// module builds it, the three pending adapters and the node signer. A test
-/// composition overrides each of them, so it adds nothing here (DI-E01).
+/// module builds it, the iroh carrier, the pending WebSocket adapter, the
+/// grant fold and the node signer. A test composition overrides each of them,
+/// so it adds nothing here (DI-E01).
 pub fn real_providers_constructed() -> usize {
     REAL_PROVIDERS.load(Ordering::SeqCst)
 }
@@ -738,24 +740,18 @@ impl<M: Module> Component<M> for PendingWebSocketAdapter {
     }
 }
 
-/// The grant binding's registration: no grant adapter over the node's fold
-/// exists before plan Step 4.3, so every check is `Unavailable` and fails
-/// closed (GR-003).
-pub struct PendingGrantFold;
-
-impl GrantPort for PendingGrantFold {
-    fn check(&self, _holder: &Holder, _verb: &str, _share: &str) -> Result<(), Denial> {
-        Err(Denial::Unavailable)
-    }
-}
-
-impl<M: Module> Component<M> for PendingGrantFold {
+/// The grant binding's registration: the adapter over the node's grant fold
+/// (plan Step 4.3, `grants.rs`), built holding no fold, so every check is
+/// `Unavailable` and fails closed (GR-003). The module registers the app files
+/// and is dropped before the node serves; the served node checks the view its
+/// `Server` holds, which adopting the instance fills.
+impl<M: Module> Component<M> for PolicyView {
     type Interface = dyn Grants;
     type Parameters = ();
 
     fn build(_: &mut ModuleBuildContext<M>, _: ()) -> Box<dyn Grants> {
         constructed();
-        Box::new(PendingGrantFold)
+        Box::new(PolicyView::unavailable())
     }
 }
 
@@ -913,7 +909,7 @@ module! {
             DirectoryFacade,
             #[lazy] PendingWebSocketAdapter,
             #[lazy] RoleSessions,
-            #[lazy] PendingGrantFold,
+            #[lazy] PolicyView,
             #[lazy] GrantAdmission,
             #[lazy] NodeSigner
         ],

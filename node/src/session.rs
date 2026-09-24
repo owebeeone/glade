@@ -51,15 +51,23 @@ pub fn refused_subscribe(
     share: &str,
     glade_id: &str,
 ) -> [Frame; 2] {
-    let reason = Error {
+    let names_no_zone = WireHeads { streams: vec![] };
+    let reason = refusal_frame(code, message, share, glade_id);
+    [Frame::Heads(names_no_zone), reason]
+}
+
+/// A refusal's reason on its own: an `Error` naming the share and the stream,
+/// and no op. A subscribe refused when it is asked gets it after the `Heads`
+/// that names no zone; a subscription refused later, by the grant check's
+/// re-check pass (plan Step 4.3), gets it alone.
+pub fn refusal_frame(code: ErrorCode, message: String, share: &str, glade_id: &str) -> Frame {
+    Frame::Error(Error {
         code,
         message,
         share: Some(share.into()),
         glade_id: Some(glade_id.into()),
         corr: None,
-    };
-    let names_no_zone = WireHeads { streams: vec![] };
-    [Frame::Heads(names_no_zone), Frame::Error(reason)]
+    })
 }
 
 /// The status of one client op (GladeSubstrateV1 §6, R1): an `Error` frame

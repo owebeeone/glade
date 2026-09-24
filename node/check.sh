@@ -103,7 +103,7 @@ confinement_all_targets='node'
 # starts clean. A name here that is no longer in scope fails the component, as
 # a stale entry.
 style_dispositions='
-glade-node  gap:315  gap:11
+glade-node  gap:307  gap:11
 glade-wire  gap:43   gap:7
 '
 
@@ -695,12 +695,12 @@ dev-docs/LibraryBoundaryAndTestingPolicy.md:88-94 are the checklist:
                          glade/dev-docs/GladeNodeAssembly.md).
   4 behavioural          PERFORMED for the contracts' own suites (their check.sh),
     conformance          and by node-tests for the node's deterministic providers
-                         (tests/assembly: CL, CA, SI, GR), the fail-closed half
-                         of the assembled path's grant fold (GR-003), and the
-                         real adapters: the Ed25519 signer (SI-001..003) and
-                         the iroh carrier (CA-001..005 on loopback, in
-                         src/iroh_carrier.rs's tests). NOT PERFORMED for a real
-                         GrantPort adapter (LBT-009): none exists yet.
+                         (tests/assembly: CL, CA, SI, GR) and the real
+                         adapters: the node's grant fold (GR-001..003, over a
+                         registry holding the fixture's records; plan Step
+                         4.3), the Ed25519 signer (SI-001..003) and the iroh
+                         carrier (CA-001..005 on loopback, in
+                         src/iroh_carrier.rs's tests).
   5 CI invocation        NOT PERFORMED. This is a local script: no CI job runs it
                          and no required merge check exists (a hosting setting).
 Also not checked: public boundary types and transitive type leakage (LBT-004,

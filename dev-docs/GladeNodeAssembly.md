@@ -1000,6 +1000,127 @@ file carries it. No production code changed.
   fixture, and two comment lines in gyld-app.glade. The page: 4 added and 5
   removed; the attach notes: 12 added and 4 removed.
 
+### Part 2, first half: the check on the peer paths
+
+Built on 2026-09-25 against glade `1b62a69`, on the owner's rulings of
+2026-09-24. Part 2 is split at the lane owner's seam: this half is the fold
+adapter, the checks on the three peer paths, the admission table and the
+re-check pass. The websocket path, behind its switch, and the Hello rule for
+node ids are the second half. The split is because this half alone is past
+the whole of part 2's estimate (below, "Size").
+
+- **The contract** (`contracts/grant-api`, as ruled: a sentence and a pattern
+  probe).
+  - `GrantPort`'s documentation: matching is exact, but a granted `p.*`
+    admits every verb that begins `p.`.
+  - `admits(granted, asked)` states that rule once, for every adapter and fake.
+    A lone `*` admits only itself, and so does `.*`.
+  - GR-001 gains the pattern probe, and a probe that a principal named as the
+    node's id is not the node ("a `Node` never matches a `Principal`", which
+    the contract said and nothing tested).
+  - `Holder::Node`'s documentation names the id as the public key (plan Step
+    4.1a), not `sha256`.
+- **The fold and the adapter** (`node/src/grants.rs`).
+  - `Registry::policy` folds this registry's grants and revocations, as
+    `grants_for` does. A load that quarantined a grant or a revocation leaves
+    it unreadable: `Record::is_policy` (AZ-11) is called at last.
+  - `PolicyView` is the `GrantPort` adapter the serve paths ask (LBT-009). It
+    holds the last fold it was given, or none, and a generation. A node holds
+    one in `Shared`; adoption fills it. Until then, and in the legacy form, it
+    has none and refuses.
+  - A grant names a node by its id in hex. A principal named with 64
+    lower-case hex digits matches nothing.
+  - The assembly binds `PolicyView` in place of `PendingGrantFold`, built
+    with no fold; the module is dropped before the node serves.
+  - A start whose load quarantined a grant or a revocation prints
+    `grants unavailable: …`, on both roots.
+- **The three peer paths**, enforced by default. The holder is the node id
+  the link's HELLO proved (signed since 4.1a), threaded from `run_link`.
+  `home` is exempt on each.
+  - `serve_peer_subscribe` asks `read.subscribe`. Refused, the stream gets
+    the refused subscribe's two frames (R6), `Heads{streams: []}` then
+    `Error{Unauthorized}`, and is finished, so the forwarding node's forward
+    lapses. Check, registration, ack and gap hold the cut. An admitted
+    stream joins the admission table, and its writer finishes the stream
+    when the re-check pass removes it.
+  - `serve_peer_exchange` asks the exchange's glade id. Refused, it answers
+    `ExchangeRes{ok: false}` with the reason, at once.
+  - `serve_sync` asks `read.subscribe` per zone, and leaves a refused zone
+    out whole. It still has no production caller.
+- **The re-check pass** (`server::refresh_policy`). Whenever the view is
+  replaced, each admitted peer stream is checked again under the cut, before
+  the call returns. A refused one gets `Error{Unauthorized}` alone, and
+  leaves the router, the session table and the admission table. In
+  production the fold changes only at adoption, when no stream exists yet;
+  tests change it through the directory authority (`claims::testing::accept`),
+  as a runtime route would.
+- **The refusal's reason**: `unauthorized: node <id> holds no grant of <verb>
+  on <share>`, `… grants on <share> are revoked`, or `the grant fold is
+  unavailable, so …`.
+- **Tests**, each seen red in a scratch copy with the part it guards
+  switched off.
+  - The contract's `gr_001_exact_match_implies_nothing`, on a reference fold
+    that matches exactly: "GR-001 a pattern admits a verb it begins",
+    `left: Err(NoGrant)`, `right: Ok(())`.
+  - `gr_001_to_003_the_nodes_grant_fold_keeps_the_grant_contract`
+    (`tests/assembly`): without the pattern, the same; without the
+    node-name rule, "GR-001 nothing is implied" on the principal named as
+    the node, `left: Ok(())`.
+  - `a_quarantined_grant_or_revocation_leaves_the_fold_unreadable`
+    (`registry.rs`): without the quarantine flag, `left: (1, false)`,
+    `right: (1, true)`.
+  - `serve_sync_leaves_out_a_zone_the_claimed_holder_may_not_read`
+    (`peer.rs`): unfiltered, `left: 6`, `right: 3`.
+  - `a_peer_without_a_grant_is_refused_by_its_claimed_node_id` (`mesh.rs`):
+    unchecked, B serves the stream and keeps it open, "B answered and
+    finished the stream: Elapsed".
+  - `a_peer_granted_by_its_claimed_node_id_is_served`: with no node holding
+    anything, "timed out waiting for routed tree ops".
+  - `a_revocation_ends_a_forwarded_stream_of_a_claimed_node_id` and
+    `a_stale_fold_fails_closed`: with the pass off, "the pass ended the
+    stream".
+  - `grazel_attach_without_a_grant_is_refused_by_its_claimed_node_id`
+    (`exchange.rs`): unchecked, the exchange waits on the provider, "timed
+    out waiting for the refused exchange".
+- **Existing tests changed**, as the design said: the node serving a peer now
+  checks its own fold, so it is adopted and grants the reader.
+  - `s_discovery_golden_path_end_to_end`: B grants A's id `read.*`.
+  - `grazel_attach_end_to_end`: B registers `seed <A's id> ws-razel
+    read.*,gwz.*`; its grants seen at A are three.
+  - `workspace_create_routes_to_target_end_to_end`: B grants A's id `read.*`
+    on `ws-new`.
+- **Default-path changes.**
+  - A peer that asks for a share, or an exchange on it, without a grant from
+    the serving node is refused. No shipped flow uses a peer: grazel passes
+    no `--peer`.
+  - A node whose load quarantined a grant or a revocation refuses every
+    peer check, and prints a line saying so.
+  - The desk's next restart is unchanged. Replayed in a temp home with both
+    app files, the default binary and this build print the same lines, and a
+    desk tab (a random principal), the suppliers (`grazel`) and a session
+    with no Hello are each accepted on `ws-razel`, and on `home`.
+- **Named gaps.**
+  - The websocket path is not checked: the second half.
+  - A forwarding node's local subscribers are not told when the claim holder
+    refuses: they have their ack from the local replica, and nothing more.
+  - The pass runs in production only at adoption, since no runtime route
+    changes the fold.
+  - `serve_sync` has no production caller.
+  - A provider attach is not gated (B1), `workspace.create` is exempt, and a
+    peer can write `home` until 4.1b.
+- **Measured** on 2026-09-25.
+  - The gate passes all 8 components, with 278 node tests on each path.
+  - rustfmt: glade-node 307, eight below the old baseline, which is lowered
+    to 307; the moved two-node setup took rustfmt's layout. glade-wire 43.
+  - clippy stays at 11 and 7. The contracts gate holds grant-api rustfmt- and
+    clippy-clean.
+  - Against the default binary, through the shims: client-rs 25 + 10,
+    client-ts 48, grip-share 19, grazel 29 + 3, glade-gyld 233 (1 ignored) +
+    33, glade-gwz 9 + 7.
+- **Size.** Production: 448 lines added and 50 removed, 134 of the added
+  comments; the new module `grants.rs` is 167. Tests: 708 added and 98
+  removed.
+
 ### The grant fold: the node's own registry
 
 Two folds hold `dir.grants` and `dir.revocations`.
@@ -1497,7 +1618,9 @@ over the ~400-line production cap, so it splits in two.
   - precondition 4's warning;
   - the format page: the route beside `seed`, and the definitions of `service
     <name>`, the verbs and the principals.
-- **Part 2: the check.** About 300 production lines and 500 test lines:
+- **Part 2: the check.** About 300 production lines and 500 test lines (its
+  first half, the peer paths, is built, and larger: see "Part 2, first half:
+  the check on the peer paths"):
   - the policy view and its generation;
   - the `GrantPort` adapter;
   - the checks, on the paths the answer to question 4 enforces;
