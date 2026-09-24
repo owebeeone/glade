@@ -2092,3 +2092,157 @@ production +568/−158 (net +410): `signing.rs` +138, `peer.rs` +160/−50,
 +4/−4, `lib.rs` +1. Tests +586/−24. Beside them `Cargo.toml` +8, the policy
 +3/−1, and `check.sh`'s rows, text and ratchet.
 
+## Client answers (client-writes plan Phase 2)
+
+Design addition, 2026-09-24, written before the code against glade `54e5999`.
+The red runs and the measured figures are filled in afterwards. The spec is
+Phase 2 of `glade/dev-docs/GladeClientWritesPlan.md` as ruled: its §5 answers
+("all recommended"), and the later ruling that an op below the first seq the
+node holds on its chain is answered `Retention`, not `Ok`. The contract is
+`GladeSubstrateV1.md` §6, "Session answers (client path)", R1 to R8. Step 2.1
+builds R1 to R3 with R2's `Retention` point. Step 2.2 builds R4 to R6, and gets
+its own subsection here when it starts.
+
+Nothing changes in the wire IR. `Error.corr`, `ErrorCode::Ok` and
+`ErrorCode::Retention` are in it (`taut/ir/glade.taut.py:55-57`, `:187-192`),
+and in both copies a client decodes with: `taut/corpus/glade.ir.json`, which
+client-ts's suites, grip-share and the demo load, and gryth-ui's vendored copy.
+
+### Step 2.1: a status for every client op
+
+**What changes.**
+
+- The `Frame::Ops` arm (`server.rs`) answers each op with one `Error` frame, in
+  the order of the frame's ops. Its `corr` is the op's hash (`chain::op_hash`)
+  in lower-case hex, and its `share` and `glade_id` are the op's. One helper,
+  `session::op_status`, builds every status, so no status goes out without its
+  `corr`.
+- The code is:
+  - `Ok` when the node holds the op: `Append::Appended`, or `Append::Duplicate`,
+    a byte-identical op already held at its seq;
+  - `Retention` when the op's seq is below the first op its chain holds;
+  - otherwise the refusal's code, as today, from `error_frame` and
+    `home_refused` (`Unauthorized`), both of which now take the op.
+- An appended op's status is queued on the sender's outbound channel after the
+  op has been queued for every other session subscribed to its zone, a peer's
+  forwarded interest included (R2). Any other status goes out at once, since
+  nothing fans out.
+- The store tells the two kinds of repeat apart. `classify` answered
+  `Duplicate` both for an op it holds and for one below the chain's first held
+  seq ("below retained range — treat as seen", `store.rs:308`). The second
+  becomes its own outcome, `Append::BelowRetained`. The other callers act only
+  on `Appended` (`ingest_and_fanout`, `seed_registry`) or count any `Ok`
+  (`peer::pull_sync`), so they behave as before.
+- R3: the session's heads (`client_heads`) take an op's seq only in the two
+  `Ok` arms, and never fall, so a repeat of a lower seq leaves the head where it
+  is. Before, each op's seq was recorded before its append, whatever the
+  outcome, and replaced the one held. A `Retention` op is not held and adds
+  nothing. Every op of its chain is above it, so no gap changes.
+
+**Not changed.** The peer paths answer nothing. The `Hello` arm still replaces
+the heads a session announces, and the subscribe arm is untouched: both belong
+to R4, in Step 2.2. The store lock is still released between an append and its
+fan-out (2.2 holds it).
+
+**Tests**, in `server.rs` unless named. Each, new or updated, was run first
+against the code without the change, and the last column gives what that run
+printed. Two were also run against a halfway form, with the statuses built but
+the store not telling the two repeats apart and the heads still replaced, to
+show that each pins its own clause.
+
+| Test | Proves | Red first |
+| --- | --- | --- |
+| `every_client_op_gets_one_status_named_by_its_hash` | one frame of five ops (a new op, its repeat, another op at the held seq, an op past a gap, an op on `home`) gets `Ok`, `Ok`, `Equivocation`, `Protocol` and `Unauthorized`, in order, each naming its op's hash, share and stream | three statuses, not five: `Equivocation`, `Protocol` and `Unauthorized`, each with `corr: None` |
+| `a_refused_op_is_not_held_by_its_sender` | a second session's refused `(w, 0)` leaves that session's heads alone, so its subscribe ships the first session's `(w, 0)`. Then R3's second clause: a session that repeats a lower seq keeps its head, so its own later op does not come back to it | "session 2's gap carries the op its refused op contested", `left: []`. Halfway: "session 1's own op came back after it repeated a lower seq", with its `(w, 1)` |
+| `an_op_below_the_first_seq_held_is_answered_retention` | on a chain that starts at seq 5, an op at seq 3 gets `Retention` and is not stored, and a repeat of seq 5 still gets `Ok` | no status at all, `left: []`. Halfway: `Ok` where `Retention` was wanted |
+| `a_client_op_on_home_is_refused_and_never_stored`, updated | the refusal's `corr` is the op's hash | "the refusal names the op by its hash", `left: None` |
+| `a_client_op_on_any_other_share_still_lands`, updated | two `Ok` statuses, in order | `left: []` |
+| `end_to_end_over_websocket`, updated | the writer reads its `Ok` before its exchange's answer. Its reads are now bounded (5 s) | "timed out waiting for client 1's status" |
+| `grazel_attach_end_to_end` (`exchange.rs`), updated | the provider reads its two `Ok` statuses, by hash, before the forwarded request | "timed out waiting for the provider's op status" |
+| `forked_op_surfaces_error_frame_not_silent` (`session.rs`), updated | `error_frame` names the refused op's hash | with the old signature, `error_frame(&err, "sh", "g")`: `left: None` |
+
+**Default-path changes** (the plan's §9, items 1 and 2).
+
+1. Every op a client sends gets one frame back: `Ok`, `Retention` or the
+   refusal. Before, a held op got nothing. The shipped clients drop `Error`
+   frames: client-rs without decoding them (`client-rs/src/client.rs:108`),
+   client-ts after decoding them (`client.ts:97-136`).
+2. A refusal carries the op's hash as `corr`, where it carried none.
+3. A refused op no longer counts as held by its sender, so a later subscribe on
+   that session ships the node's op at that seq. A session that repeats a lower
+   seq no longer has its own later ops shipped back to it.
+4. An op below its chain's first held seq was answered nothing, and now gets
+   `Retention`.
+5. The extra frame is queued once per client op. The `Ok` status of an
+   appended op is 85 bytes plus the lengths of the share's and the stream's
+   names (counted from the encoding, not captured): 104 for
+   `ws-razel/gyld.output`. Most of it is the 64-digit `corr`. Its message is
+   `appended` or `already held`, since the `corr` names the op. `Retention`
+   and the refusals keep a message that names the origin and the seq.
+
+**Named gaps.**
+
+- The peer paths (push, pull, forward) get no status, as the plan says.
+- A frame the node cannot decode is still dropped unanswered, so a client may
+  not count on a status arriving (R1's failure mode).
+- `Ok` promises only what R2 says: the op was written without fsync.
+- The extra traffic is not measured.
+
+**Questions for the owner.**
+
+1. **The store's new outcome.** The plan named `server.rs` and `session.rs`
+   for this step. The `Retention` ruling came later, and the store is the one
+   place that knows which kind of repeat it saw, so `Append` gained
+   `BelowRetained`. It is a public enum, but nothing outside the node matches
+   it. Recommend keeping it. The other choice is a second look at the chain
+   from the server after a `Duplicate`.
+2. **The `Hello` arm.** It still replaces a zone's heads with what a `Hello`
+   announces. So a `Hello` sent after held ops can lower a head, and the gap
+   would then ship the session's own ops back to it, which R4 rules out. No
+   client announces heads today. Recommend that Step 2.2 makes the `Hello` arm
+   keep the highest too, with a test, since R4 is its rule.
+3. **The substrate document.** `GladeSubstrateV1.md` §6 still says the rules
+   are "not built" and describes the old answers. This step may not edit it.
+   Recommend one edit when 2.2 lands: mark R1 to R6 as built, and reconcile the
+   contradictions Step 1.1 listed "to reconcile when the plan's Phase 2 lands".
+4. **The rustfmt ratchet.** It drops from 325 to 322 in `check.sh`, as 4.4,
+   the hardening and 4.1a lowered it. Recommend keeping it at 322.
+
+**Measured**, on 2026-09-24, on an Apple M3 Pro with Rust 1.96.0, on the final
+tree:
+
+- **The gate** (`glade/node/check.sh`) passes all 8 components, in 39-43 s warm.
+  There are 229 node tests on each path, across 15 test binaries, where there
+  were 226. The 3 new ones are the three new `server.rs` tests.
+- **rustfmt**: glade-node has 322 hunks, 3 below the baseline of 325. The rewrite
+  removed three old ones: two in the `Ops` arm (the zone tuple and the fan-out)
+  and one in `end_to_end_over_websocket` (the op's send). No new line is a
+  deviation. The baseline is lowered to 322 in `check.sh`. glade-wire stays at
+  43.
+- **clippy**: glade-node 11 warnings and glade-wire 7, both at baseline. The
+  first gate run counted 12. The extra one was a `clone` in a test, now
+  `std::slice::from_ref`.
+- **Time**: `server::` and `session::` run 10 tests in 0.01 s, warm.
+- **Downstream**, against the rebuilt default binary
+  (`glade/node/target/debug/glade-node`), each Rust suite with a scratch target:
+  - client-rs: 9 + 3;
+  - client-ts: 19, three of them through the node;
+  - grip-share: 19;
+  - grazel: 26 + 3;
+  - glade-gwz: 9 + 6;
+  - glade-gyld: 233 (1 ignored) + 31.
+
+  All passed, unchanged. grazel, glade-gwz and glade-gyld are at their
+  baselines.
+
+**Size**, in lines added and removed in `.rs` files, doc comments included:
+
+- production: +83/−37, net +46;
+  - `server.rs` +57/−26;
+  - `session.rs` +17/−9;
+  - `store.rs` +9/−2;
+- tests: +257/−19;
+  - `server.rs` +228/−15;
+  - `session.rs` +12/−3;
+  - `exchange.rs` +17/−1;
+- `check.sh`: the ratchet, one line.

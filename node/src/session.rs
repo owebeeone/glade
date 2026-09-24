@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 
 use glade_wire::generated::{Error, ErrorCode, Op};
 
+use crate::chain::op_hash;
 use crate::frame::Frame;
 use crate::store::{Store, StoreError};
 
@@ -32,9 +33,22 @@ pub fn missing_for(store: &Store, share: &str, glade_id: &str, key: &[u8], their
     out
 }
 
+/// The status of one client op (GladeSubstrateV1 §6, R1): an `Error` frame
+/// naming the op's share and stream, whose `corr` is the op's hash in
+/// lower-case hex. The code says whether the node holds the op.
+pub fn op_status(op: &Op, code: ErrorCode, message: String) -> Frame {
+    Frame::Error(Error {
+        code,
+        message,
+        share: Some(op.share.clone()),
+        glade_id: Some(op.glade_id.clone()),
+        corr: Some(op_hash(op).iter().map(|b| format!("{b:02x}")).collect()),
+    })
+}
+
 /// Map a rejected append to a diagnostic `Error` frame (P1.S4): a fork is
-/// surfaced, never propagated or silently dropped.
-pub fn error_frame(err: &StoreError, share: &str, glade_id: &str) -> Frame {
+/// surfaced, never propagated or silently dropped. It is the op's status (R1).
+pub fn error_frame(err: &StoreError, op: &Op) -> Frame {
     let (code, message) = match err {
         StoreError::Equivocation { origin, seq } => {
             (ErrorCode::Equivocation, format!("forked chain at ({origin},{seq})"))
@@ -56,13 +70,7 @@ pub fn error_frame(err: &StoreError, share: &str, glade_id: &str) -> Frame {
         }
         StoreError::Io(e) => (ErrorCode::Internal, format!("io: {e}")),
     };
-    Frame::Error(Error {
-        code,
-        message,
-        share: Some(share.into()),
-        glade_id: Some(glade_id.into()),
-        corr: None,
-    })
+    op_status(op, code, message)
 }
 
 #[cfg(test)]
@@ -144,10 +152,19 @@ mod tests {
     fn forked_op_surfaces_error_frame_not_silent() {
         let mut s = Store::open(fresh("err")).unwrap();
         s.append(op("a", 0, b"p0")).unwrap();
-        let err = s.append(op("a", 0, b"p0-fork")).unwrap_err(); // forked chain
-        let frame = error_frame(&err, "sh", "g");
+        let fork = op("a", 0, b"p0-fork");
+        let err = s.append(fork.clone()).unwrap_err(); // forked chain
+        let frame = error_frame(&err, &fork);
         match &frame {
-            Frame::Error(e) => assert_eq!(e.code, ErrorCode::Equivocation),
+            Frame::Error(e) => {
+                assert_eq!(e.code, ErrorCode::Equivocation);
+                // it names the refused op by its hash, in lower-case hex (R1)
+                let hash: String = crate::chain::op_hash(&fork)
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                assert_eq!(e.corr, Some(hash));
+            }
             other => panic!("expected Error frame, got {other:?}"),
         }
         // and it survives the wire

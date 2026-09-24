@@ -28,6 +28,10 @@ pub enum Append {
     Appended,
     /// `seq` already present with the *same* hash (idempotent re-delivery).
     Duplicate,
+    /// `seq` below the first op its chain holds: taken as seen, and not held,
+    /// so nothing here can judge it. The client path answers `Retention`
+    /// (GladeSubstrateV1 §6, R2).
+    BelowRetained,
 }
 
 /// A self-contained equivocation proof (GQ-9, SY4): two validly-shaped ops
@@ -128,7 +132,8 @@ impl Store {
     /// Append `op` to its `(share, glade_id, key, origin)` chain, with per-chain
     /// checks (P1.S4, GQ-9):
     /// - `seq <= last.seq`: idempotent if the stored op has the same hash;
-    ///   **equivocation** (rejected) if a different hash — a forked chain.
+    ///   **equivocation** (rejected) if a different hash — a forked chain;
+    ///   below the chain's first held op, taken as seen but not held.
     /// - `seq == last.seq + 1`: if `prev` is present it must equal the
     ///   predecessor's hash (else **chain break**); absent `prev` is accepted
     ///   unverified (M-LIMP lenient — honest clients always set it).
@@ -140,6 +145,7 @@ impl Store {
         // across the proof write / push (equivocation records into `proofs`).
         match classify(self.logs.get(&chain), &op) {
             Verdict::Duplicate => Ok(Append::Duplicate),
+            Verdict::BelowRetained => Ok(Append::BelowRetained),
             Verdict::Gap { expected, got } => Err(StoreError::Gap { expected, got }),
             Verdict::ChainBreak => Err(StoreError::ChainBreak { origin: op.origin, seq: op.seq }),
             Verdict::Equivocation(stored) => {
@@ -291,6 +297,7 @@ pub(crate) fn unused_path(dir: &Path, stem: &str, ext: &str) -> PathBuf {
 enum Verdict {
     Appended,
     Duplicate,
+    BelowRetained,
     Gap { expected: i64, got: i64 },
     ChainBreak,
     /// An op already sits at this `(origin, seq)` with a different hash — a fork.
@@ -305,7 +312,7 @@ fn classify(log: Option<&Vec<Op>>, op: &Op) -> Verdict {
         return match log.unwrap().iter().find(|o| o.seq == op.seq) {
             Some(stored) if op_hash(stored) == op_hash(op) => Verdict::Duplicate,
             Some(stored) => Verdict::Equivocation(stored.clone()),
-            None => Verdict::Duplicate, // below retained range — treat as seen
+            None => Verdict::BelowRetained, // below retained range — seen, not held
         };
     }
     if op.seq != last.seq + 1 {

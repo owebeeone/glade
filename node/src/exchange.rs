@@ -684,7 +684,23 @@ mod tests {
         assert!(matches!(next_frame(&mut rp, "grazel attach ack").await, Frame::Heads(_)));
         let o0 = tree_op(0, None, b"tree-v0");
         let o1 = tree_op(1, Some(crate::chain::op_hash(&o0).to_vec()), b"tree-v1");
-        wp.send_binary(&Frame::Ops(Ops { ops: vec![o0, o1], pri: None }).to_bytes()).await.unwrap();
+        wp.send_binary(&Frame::Ops(Ops { ops: vec![o0.clone(), o1.clone()], pri: None }).to_bytes()).await.unwrap();
+        // each op is answered on the provider's session, by its hash (R1).
+        for o in [&o0, &o1] {
+            match next_frame(&mut rp, "the provider's op status").await {
+                Frame::Error(e) => {
+                    let hash: String = crate::chain::op_hash(o)
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect();
+                    assert_eq!(
+                        (e.code, e.corr),
+                        (glade_wire::generated::ErrorCode::Ok, Some(hash))
+                    );
+                }
+                other => panic!("the provider expected its op's status, got {other:?}"),
+            }
+        }
 
         // ---- (a) registered surfaces appear at A as ordinary records --------
         let (mut rc, wc) = ws::connect("127.0.0.1", port_a).await.unwrap();
