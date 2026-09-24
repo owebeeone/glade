@@ -2,12 +2,13 @@
 
 Plan, 2026-09-24, for the owner. It answers the item added on 2026-09-24: a
 client's write to a share another node serves stays on the node the client
-reached (`glade/dev-docs/GladeSubstrateV1.md:285-287`, `:295-297`;
-`dev-docs/GladeFirstSlicePlan.md:937`; `dev-docs/GladeProgramStatus.md:37`).
-Nothing here is implemented, built or committed. The code was read in the working
-trees on 2026-09-24 with no git command, so no revision is named; another agent
-was editing `glade/node/` and `glade/dev-docs/GladeNodeAssembly.md` (slice Step
-4.1a), so line numbers there may move.
+reached (`glade/dev-docs/GladeSubstrateV1.md:332-334`, `:346-348`;
+`dev-docs/GladeFirstSlicePlan.md:938`; `dev-docs/GladeProgramStatus.md:37`).
+Step X1.1 is done (glade `55e636c`); nothing else is built. The code was read
+in the working trees on 2026-09-24 with no git command, so no revision is
+named; another agent was editing `glade/node/` and
+`glade/dev-docs/GladeNodeAssembly.md` (slice Step 4.1a), so line numbers there
+may move, and the client-writes plan's Phase 2 has since moved the node's.
 
 Paths are from the glade-wz root; bare `.rs` names are in `glade/node/src/`. "The
 substrate document" is `GladeSubstrateV1.md` (R1–R8 are its §6 session answers);
@@ -70,7 +71,7 @@ client c is connected to B. The node's tests use them the other way round: in
 
 | Party | Sees O? |
 | --- | --- |
-| c | no answer if B took O (`server.rs:294-301`), an `Error` with no `corr` if not (`:302`). After CW 2.1, B's `Ok`, which "promises nothing ... about any other node" (substrate document `:285-287`) |
+| c | no answer if B took O (`server.rs:294-301`), an `Error` with no `corr` if not (`:302`). After CW 2.1, B's `Ok`, which "promises nothing ... about any other node" (substrate document `:332-334`) |
 | B's store and B's other clients | yes: held (R2), fanned out (`server.rs:294-300`), and in every later gap (`:250-254`; `session.rs:26-33`) |
 | A and A's clients | never |
 | a third node C | never: C's fold routes S to A (`mesh.rs:121-142`), so C gets only what A holds, and no node forwards S to B |
@@ -101,7 +102,7 @@ node's websocket binds 127.0.0.1 (`bin/glade-node.rs:219`).
   the heads and gap are read (`:329-332`), so a live op can reach B first. B's
   store takes a chain's first op at any seq (`store.rs:302`) and the gap's earlier
   ops as already seen (`:308`): B's copy loses the chain's start. CW 2.2 leaves
-  this path to slice 4.3 (`GladeClientWritesPlan.md:490-493`).
+  this path to slice 4.3 (`GladeClientWritesPlan.md:508-510`).
 - **A forward is not reopened.** It ends with its stream; "a later subscribe
   retries" (`mesh.rs:354-359`, `:372-375`). After a link drop, B's subscribers get
   nothing more from A.
@@ -129,9 +130,9 @@ path. B relays A's answer and lands only what A accepted. §3 states it as W1–
 
 B takes c's op as today and answers `Ok`; its fan-out also sends the op up the
 forward, and when a forward opens B ships what A's ack heads lack ("both
-directions", substrate document `:201`). It is the substrate's own model:
+directions", substrate document `:223`). It is the substrate's own model:
 appending never blocks on the network, convergence is by fold, "never from
-coordination" (`:37-43`), and writes work offline
+coordination" (`:42-53`), and writes work offline
 (`dev-docs/glade/GladeAuthzModel.md:26`).
 
 Its flaw: A can refuse what B already stored, answered `Ok` and fanned out, for
@@ -162,17 +163,17 @@ op back, so the zone then differs between A and B for good.
   checks no claim and `run_forward` already pulls (`mesh.rs:395-426`). B, pulled,
   with B's flaw.
 - **D. Writes as exchanges** to a provider at A that appends under its own origin
-  (substrate document `:89-90`; H-R3, `GladeAuthzModel.md:402-410`). It crosses
-  nodes today (`exchange.rs:115-144`, `:207-228`), so the end-to-end app can use it
-  now for effects. But the op is the provider's, each surface needs one, and each
-  write is a round trip bounded at 12 s (`exchange.rs:42-46`).
+  (substrate document `:102-103`; H-R3, `GladeAuthzModel.md:402-410`). It
+  crosses nodes today (`exchange.rs:115-144`, `:207-228`), so the end-to-end app
+  can use it now for effects. But the op is the provider's, each surface needs
+  one, and each write is a round trip bounded at 12 s (`exchange.rs:42-46`).
 - **E. Push app ops as `home` records are pushed:** one stream per push reorders a
   chain into a gap (`GladeNodeAssembly.md:1658-1665`), and gets no answer. Rejected.
 - **F. Sync whole shares** (`serve_sync`, `pull_sync`, `peer.rs:285-359`): app
   shares move by interest only (`mesh.rs:14-18`), and every node would hold every
   share, against the `metadata_exposure` ruling. A repair tool for B.
 - **G. The client connects to A:** a browser reaches only its own node
-  (`bin/glade-node.rs:219`; substrate document `:185-188`).
+  (`bin/glade-node.rs:219`; substrate document `:203-206`).
 
 ### Recommendation
 
@@ -209,7 +210,7 @@ X1.1 writes these into the substrate document §6, after "Session answers".
 - **W4. `Ok` on a forwarded share** is R2 at A (in A's served store, not synced;
   queued for every session subscribed at A, other nodes' forwards included) and R2
   at B; nothing about any other node's store. It replaces R2's third point and
-  last bullet (substrate document `:285-287`, `:295-297`).
+  last bullet (substrate document `:332-334`, `:346-348`).
 - **W5. Not placed.** `UnknownShare` on an op means B could not place it: no live
   claim, holder unreachable, or the forward ended, or waited 12 s, with the op
   unanswered. It is not a refusal: the client keeps the op and the rest of its
@@ -225,11 +226,11 @@ X1.1 writes these into the substrate document §6, after "Session answers".
 - **W8. The forward carries app ops only.** `home` moves by the directory's pull
   and push, which slice 4.1b verifies.
 
-For the substrate document's list of contradictions (`:397-414`): R1's order
-(`:267-269`) holds per zone (W6); CW answer 4 (`GladeClientWritesPlan.md:276-282`)
+For the substrate document's list of contradictions (`:465-483`): R1's order
+(`:309-311`) holds per zone (W6); CW answer 4 (`GladeClientWritesPlan.md:278-284`)
 gains W5's exception; and on a forwarded share a node places a write only through
 the holder, against the substrate document's "appending never blocks on the
-network" (`:37-38`) and §5's offline-first (`:167-168`), and against
+network" (`:42-43`) and §5's offline-first (`:180-181`), and against
 `GladeAuthzModel.md:26`. The client still appends without blocking.
 
 ## 4. Questions for the owner
@@ -300,7 +301,7 @@ a forward reopens (W4).
 
 ## 5. Phases and steps
 
-**Rules for every step** (`GladeClientWritesPlan.md:352-363`): one commit per
+**Rules for every step** (`GladeClientWritesPlan.md:358-369`): one commit per
 step through gwz, member then root lock, no attribution trailer; braced bodies,
 and `#[cfg]` only inside `cfg_if!` or a module; rustfmt and clippy counts are
 ratchets; a behaviour change starts with a failing test (LBT-007); pure tests
@@ -315,7 +316,7 @@ glade/node/Cargo.toml --lib -- mesh:: server::` while working; `sh
 glade/node/check.sh`, 8 of 8 on both roots; then, with the binary rebuilt
 (`cargo build --offline --locked --manifest-path glade/node/Cargo.toml --bin
 glade-node`), the client-rs, client-ts, glial, grip-share, grazel, glade-gwz and
-glade-gyld suites (`GladeClientWritesPlan.md:545-550`, `:622-627`).
+glade-gyld suites (`GladeClientWritesPlan.md:571-576`, `:656-661`).
 
 ### Phase X1 — The rules written
 
@@ -325,7 +326,7 @@ Milestone: W1–W8, as ruled, in the substrate document.
 
 - **Goal:** a §6 subsection "Cross-node writes (forwarded shares)" holding W1–W8;
   R2's third point and last bullet point to it; R1's order as question 7 rules;
-  §3's changes join the list at `:397-414`.
+  §3's changes join the list at `:465-483`.
 - **Files:** the substrate document. **Tests:** none; it names the steps' tests.
 - **Proves:** nothing about the code. **Gate:** the lane owner reads it against
   the rulings. **Done when:** each rule states its guarantee and its failures
@@ -455,10 +456,11 @@ linked node; c gets A's verdict; B holds only what A accepted.
   every code but `Ok` drops the chain. A known, unserved share needs a holder that
   has gone, so X4.3 runs it end to end.
 - **Proves:** the client's half of W5. **Not:** the node's (X3.2).
-- **Gate:** CW 3.1's (`GladeClientWritesPlan.md:545-550`). **Size:** ~60
+- **Gate:** CW 3.1's (`GladeClientWritesPlan.md:571-576`). **Size:** ~60
   production, ~150 test lines.
-- **Depends on:** X1.1; CW 3.1, 3.2; nothing in the slice. Folded into CW 3.1–3.2
-  if question 4 is ruled first.
+- **Depends on:** X1.1; CW 3.1, 3.2; nothing in the slice. Question 4 was ruled
+  first, so it folds into CW 3.1 (as 3.1b where that step splits), whose resend
+  rides the subscribe ack until 3.2 lands.
 
 **X3.3b — client-ts keeps a write that was not placed**
 
@@ -467,7 +469,7 @@ linked node; c gets A's verdict; B holds only what A accepted.
   resends what it sent.
 - **Files:** `glade/client-ts/src/answers.ts`, `client.ts`, as CW 3.3–3.4 leave
   them. **Tests:** X3.3a's, in `glade/client-ts/test/answers.test.ts`.
-- **Proves / not:** as X3.3a. **Gate:** CW 3.3's (`GladeClientWritesPlan.md:622-627`).
+- **Proves / not:** as X3.3a. **Gate:** CW 3.3's (`GladeClientWritesPlan.md:656-661`).
 - **Size:** ~60 production, ~140 test lines. **Depends on:** X1.1; CW 3.3, 3.4.
 
 ### Phase X4 — Grants, a returning link, and the journey
@@ -546,7 +548,7 @@ inputs:  CW 2.1 -> X2.1   CW 2.2 -> X2.2   slice 4.3 part 2 -> X4.1
 - **Foundations first:** the rules; one acceptance path and the peer cut; the
   route; A's half, then B's.
 - **The clients** run beside the node steps in their own worktrees, sharing no
-  file with them (`GladeClientWritesPlan.md:737-739`).
+  file with them (`GladeClientWritesPlan.md:774-776`).
 - **One agent at a time in the glade checkout** (slice plan `:714-716`, `:933`).
   X2.1 and X2.2 edit different files, and X4.1 and X4.2 different functions, so a
   second worktree can take one of each pair.

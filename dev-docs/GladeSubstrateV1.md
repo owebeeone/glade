@@ -268,7 +268,7 @@ subscribe, not the store's lock (R4). The *Amended 2026-09-24* notes in these
 rules point to the cross-node writes below, which are ruled, not built.
 
 **Sources.** The owner ruled the plan's seven questions "all recommended"
-(`GladeClientWritesPlan.md:296-299`; "answer N" below), and the plan with them
+(`GladeClientWritesPlan.md:298-301`; "answer N" below), and the plan with them
 (root `dev-docs/GladeFirstSlicePlan.md:833`). The plan answers the two gaps
 that Step 4.4 recorded and handed on (`GladeFirstSlicePlan.md:830-831`). Step
 4.3's ruling fixes the refusal form, "an empty `Heads` and then
@@ -494,8 +494,8 @@ arm asks no route (`server.rs:280-337`), the forward only reads
 (`:347`).
 
 **Sources.** The owner ruled the plan's eight questions "all recommended"
-(`GladeCrossNodeWritesPlan.md:267-273`; "ruling N" below), and recorded ruling
-4 on the client-writes plan too (`GladeClientWritesPlan.md:305-307`). The slice
+(`GladeCrossNodeWritesPlan.md:268-274`; "ruling N" below), and recorded ruling
+4 on the client-writes plan too (`GladeClientWritesPlan.md:307-309`). The slice
 plan's order places the steps (root `dev-docs/GladeFirstSlicePlan.md:934`).
 Below, "the plan" is the cross-node writes plan; "answer N" and "CW 3.1" are
 the client-writes plan's. Paths are as in the session answers. Lines were read
@@ -675,8 +675,8 @@ X1.1; lines are this document's; each passage now carries a note that opens
 
 Outside this document, root `dev-docs/glade/GladeAuthzModel.md:26` has a write
 executed by "the receiving replica", and working offline; on a forwarded share
-the holder executes it. Answer 4 (`GladeClientWritesPlan.md:276-282`) gains
-W5's exception, as its ruling records (`:305-307`).
+the holder executes it. Answer 4 (`GladeClientWritesPlan.md:278-284`) gains
+W5's exception, as its ruling records (`:307-309`).
 
 ## 7. Reassembler layer (delta-heavy surfaces)
 

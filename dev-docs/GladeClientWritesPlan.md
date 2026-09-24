@@ -2,13 +2,15 @@
 
 Plan, 2026-09-24, for the owner. It answers the ruling on Step 4.4: "the client
 libraries' two gaps (no answer to an append, the heads ack dropped) get a plan
-of their own" (`dev-docs/GladeFirstSlicePlan.md:828`). Nothing here is
-implemented, built or committed.
+of their own" (`dev-docs/GladeFirstSlicePlan.md:831`). Phases 1 and 2 are
+done: Step 1.1 (glade `8dd0f94`), Step 2.1 (glade `bc606f4`) and Step 2.2
+(glade `e89335a`), each marked below. Phases 3 and 4 are not built.
 
-The code was read in the working trees on 2026-09-24. No git command was run, so
-no revision is named. The glade tree holds 4.3's part 1 (glade `e0100dc`,
-`GladeFirstSlicePlan.md:807`). Another agent was editing `glade/node/` during the
-read, so its line numbers may move.
+The code was read in the working trees on 2026-09-24, before Phase 2. No git
+command was run, so no revision is named. The glade tree held 4.3's part 1
+(glade `e0100dc`, `GladeFirstSlicePlan.md:809`). Another agent was editing
+`glade/node/` during the read, so its line numbers may move, and Phase 2 has
+since moved many of them.
 
 Paths are from the glade-wz root. `gryth-wz/` is the sibling workspace: read,
 never written. Short names:
@@ -32,8 +34,9 @@ never written. Short names:
     reason.
   - The clients read all of it (§4).
 - **Four phases, nine steps,** about 2,300 lines, 850 of them production code
-  (§7). The phases are: the contract (1.1), the node (2.1, 2.2), the two clients
-  (3.1-3.4) and the two suppliers (4.1, 4.2).
+  (§7), and about 410 more, 120 of them production, with W5's client half in
+  3.1 and 3.3. The phases are: the contract (1.1), the node (2.1, 2.2), the two
+  clients (3.1-3.4) and the two suppliers (4.1, 4.2).
 - **The code showed four more problems** (§2):
   - a refused op counts as held by its sender;
   - the subscribe ack is not a cut;
@@ -177,7 +180,7 @@ never written. Short names:
   - one ordered queue of replies per client. A single missing answer, as in F3,
     throws off every reply after it;
   - replies are matched by order, which the substrate calls not load-bearing
-    (`glade/dev-docs/GladeSubstrateV1.md:190-194`);
+    (`glade/dev-docs/GladeSubstrateV1.md:208-212`);
   - a session without a `Hello` cannot opt in. That includes grazel's probes
     (`GladeNodeAssembly.md:1226`) and a client-rs `Supplier` with no principal
     (`glade/client-rs/src/supplier.rs:222-231`).
@@ -239,7 +242,7 @@ Choose (A) with (a):
 - no IR change, as the first-slice plan requires (`GladeFirstSlicePlan.md:38-42`,
   `:931`);
 - nothing an unmodified client can trip on;
-- answers matched by `corr`, not by order (`GladeSubstrateV1.md:190-194`);
+- answers matched by `corr`, not by order (`GladeSubstrateV1.md:208-212`);
 - the cheapest option for every consumer.
 
 Its one cost is the name: an `Error` with code `Ok` carries good news.
@@ -393,7 +396,7 @@ as ruled. The node work and both clients' pure logic can then start at once.
 **Step 1.1 — The session answers, in the substrate document**
 
 - **Goal:** R1-R8 as ruled, in a new subsection "Session answers (client path)"
-  of `glade/dev-docs/GladeSubstrateV1.md` §6 (`:176-220`), with the rulings
+  of `glade/dev-docs/GladeSubstrateV1.md` §6 (`:194-253`), with the rulings
   cited.
 - **Files:** that document only. `glade.taut.py` is untouched.
 - **Tests:** none, since it is a document. It names the tests the steps write.
@@ -402,6 +405,9 @@ as ruled. The node work and both clients' pure logic can then start at once.
 - **Done when:** each rule states its guarantee and its failure modes (LBT-006).
 - **Size:** ~120 lines of text.
 - **Depends on:** the rulings.
+- **Done, 2026-09-24,** glade `8dd0f94`: R1-R8, as ruled, in the substrate
+  document's §6, "Session answers (client path)". Glade `e42824e` marked R1-R6
+  built there, and put a note at each older passage the rules contradict.
 
 ### Phase 2 — The node answers
 
@@ -451,6 +457,10 @@ client changes.
      3.1 and 3.3.
 - **Size:** ~50 production lines, ~220 test lines.
 - **Depends on:** 1.1.
+- **Done, 2026-09-24,** glade `bc606f4`: R1-R3, with R2's `Retention` point,
+  for which the store gained an outcome, `Append::BelowRetained`, that the
+  owner kept. The record is `GladeNodeAssembly.md`'s Step 2.1 subsection
+  (`:2111-2255`).
 
 **Step 2.2 — The subscribe ack: a cut, with hashes, and one refusal form**
 
@@ -471,6 +481,11 @@ client changes.
     while it takes the store lock (`server.rs:128`, `:151`, `:249`, `:295`,
     `:310-311`; `mesh.rs:308-309`, `:348-349`, `:499`; `exchange.rs:244`,
     `:253`).
+  - As built, the lock is a dedicated one, `cut`, not the store lock. Holding
+    the store lock through fan-out deadlocked the hardening test that takes
+    the router lock and then the store lock
+    (`a_renewal_racing_a_serve_reaches_the_served_store_in_chain_order`): see
+    `GladeNodeAssembly.md`'s Step 2.2 subsection (`:2276-2286`, `:2330-2333`).
   - The absent route sends R6's two frames.
 - **Tests:**
   - `no_op_of_a_zone_reaches_a_subscriber_before_its_ack`.
@@ -502,6 +517,9 @@ client changes.
 - **Size:** ~60 production lines, ~160 test lines.
 - **Depends on:** 1.1. In one checkout it runs after 2.1, since both edit
   `server.rs`, in different arms.
+- **Done, 2026-09-24,** glade `e89335a`: R4-R6, with `cut` for the lock, and a
+  `Hello` that only raises heads, as the owner ruled on 2.1. The record is
+  `GladeNodeAssembly.md`'s Step 2.2 subsection (`:2257-2418`).
 
 ### Phase 3 — The clients read the answers
 
@@ -557,7 +575,10 @@ unchanged.
      (`glade/client-rs/.gitignore`).
   2. `cargo test --offline --locked --manifest-path grazel/Cargo.toml`, and
      likewise for `glade-gwz/Cargo.toml` and `glade-gyld/Cargo.toml`.
-- **Size:** ~200 production lines, ~220 test lines.
+- **Size:** ~200 production lines, ~220 test lines. W5's client half adds
+  X3.3a's ~60 production and ~150 test lines, about 630 lines in all. Its W5
+  part may split off at build time as 3.1b. Either way, its resend rides the
+  subscribe ack until 3.2 lands, as the unresumed mark does.
 - **Depends on:** 1.1, and 2.1's binary for the integration tests.
 
 **Step 3.2 — client-rs: the subscribe outcome**
@@ -639,7 +660,10 @@ unchanged.
      kit drives the real client (`glial/test/supplier.test.ts:6-9`).
   3. `pnpm --dir glade/grip-share test`.
   4. `pnpm --dir glade/demo test` and `pnpm --dir glade/demo typecheck`.
-- **Size:** ~180 production lines, ~200 test lines.
+- **Size:** ~180 production lines, ~200 test lines. W5's client half adds
+  X3.3b's ~60 production and ~140 test lines, about 580 lines in all. Its W5
+  part may split off at build time as 3.3b. Either way, its resend rides the
+  subscribe ack until 3.4 lands, as the unresumed mark does.
 - **Depends on:** 1.1, and 2.1's binary.
 
 **Step 3.4 — client-ts: the subscribe outcome**
@@ -779,7 +803,7 @@ As each phase lands, the owner's running desk and suppliers see these changes:
   - No fsync per client op. `Ok` means held, not synced (R2), as 4.4 left it
     (`GladeNodeAssembly.md:410-412`).
   - A tail the node lost is not re-sent. That would be the other direction of
-    resume (`GladeSubstrateV1.md:201`).
+    resume (`GladeSubstrateV1.md:223`).
   - No offline outbox (GAP-11, `client.rs:241-245`). `append` still fails fast
     when disconnected.
 - **`Subscribe.from`** stays unread on the client path (§5, question 5).
