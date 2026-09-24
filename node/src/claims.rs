@@ -12,6 +12,9 @@
 //! landed in the served replica through the same verify path as any carrier,
 //! (4) fanned out to local home subscribers, and (5) PUSHED to every live peer
 //! link — the traces' B9 "directory ops replicate" step (`mesh::push_home`).
+//! (3) and (4) run before the directory lock is let go, so the served replica
+//! takes each of this node's chains in the order the registry minted it (plan
+//! Step 4.4's question 5); (5) runs after it.
 //!
 //! Serving a workspace ([`Server::serve_workspace`]) mints the entry (diffed —
 //! re-serving appends nothing) + the first claim (epoch = fold max + 1, so a
@@ -26,7 +29,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard};
 
 use glade_wire::cbor;
 use glade_wire::generated::Op;
@@ -55,6 +58,8 @@ pub(crate) struct DirState {
     /// Our directory node id — the origin every mint is attributed to.
     pub(crate) node_id: String,
     lease_ms: i64,
+    /// The directory lock. Lock order: this one, then the served store's, the
+    /// router's or the session table's; never the reverse.
     inner: Mutex<DirAuthority>,
 }
 
@@ -144,43 +149,40 @@ pub(crate) async fn serve_workspace_on(shared: &Arc<Shared>, share: &str, name: 
         return Err(other("no directory authority (adopt_boot first)"));
     };
     let node = state.node_id.clone();
-    let ops = {
-        let mut dir = state.inner.lock().await;
-        if dir.served.contains_key(share) {
-            return Ok(false); // already serving: records diff to nothing
-        }
-        let entry = WorkspaceEntry {
-            workspace: share.into(),
-            name: name.into(),
-            eligible_hosts: vec![node.clone()],
-        };
-        // Epoch fencing reads the SERVED replica (it may hold peer claims the
-        // boot registry never saw); +1 bumps over any stale claim, ours or not.
-        let epoch = 1 + {
-            let st = shared.store.lock().await;
-            max_claim_epoch(&st, share)
-        };
-        let claim = ServeClaim {
-            node: node.clone(),
-            share: share.into(),
-            lease_expiry_ms: now_ms() + state.lease_ms,
-            epoch,
-        };
-        // Entry and claim are accepted together, after the last await: a
-        // cancelled call has folded nothing, and a failed save leaves the
-        // share unserved, so a retry mints both again.
-        let ops = dir.accept(|registry| {
-            let mut ops = Vec::new();
-            if let Some(op) = append_diffed(registry, Record::Workspace(entry), &node)? {
-                ops.push(op);
-            }
-            ops.push(append(registry, Record::Serve(claim), &node)?);
-            Ok(ops)
-        })?;
-        dir.served.insert(share.into(), epoch);
-        ops
+    let mut dir = state.inner.lock().await;
+    if dir.served.contains_key(share) {
+        return Ok(false); // already serving: records diff to nothing
+    }
+    let entry = WorkspaceEntry {
+        workspace: share.into(),
+        name: name.into(),
+        eligible_hosts: vec![node.clone()],
     };
-    publish(shared, ops).await;
+    // Epoch fencing reads the SERVED replica (it may hold peer claims the
+    // boot registry never saw); +1 bumps over any stale claim, ours or not.
+    let epoch = 1 + {
+        let st = shared.store.lock().await;
+        max_claim_epoch(&st, share)
+    };
+    let claim = ServeClaim {
+        node: node.clone(),
+        share: share.into(),
+        lease_expiry_ms: now_ms() + state.lease_ms,
+        epoch,
+    };
+    // Entry and claim are accepted together, after the last await before the
+    // save: a cancelled call has folded nothing, and a failed save leaves the
+    // share unserved, so a retry mints both again.
+    let ops = dir.accept(|registry| {
+        let mut ops = Vec::new();
+        if let Some(op) = append_diffed(registry, Record::Workspace(entry), &node)? {
+            ops.push(op);
+        }
+        ops.push(append(registry, Record::Serve(claim), &node)?);
+        Ok(ops)
+    })?;
+    dir.served.insert(share.into(), epoch);
+    publish(shared, dir, ops).await;
     Ok(true)
 }
 
@@ -219,20 +221,18 @@ pub(crate) async fn note_principal(shared: &Arc<Shared>, principal: &str) {
         }
     }
     let node = state.node_id.clone();
-    let ops = {
-        let mut dir = state.inner.lock().await;
-        // append_diffed re-checks under the lock: two racing Hellos for the
-        // same principal serialize here and the second diffs away. A record
-        // that fails to save is not published; the next Hello retries it.
-        let record = Record::Principal(PrincipalRecord {
-            principal: principal.into(),
-        });
-        match dir.accept(|registry| append_diffed(registry, record, &node)) {
-            Ok(Some(op)) => vec![op],
-            _ => Vec::new(),
-        }
+    let mut dir = state.inner.lock().await;
+    // append_diffed re-checks under the lock: two racing Hellos for the
+    // same principal serialize here and the second diffs away. A record
+    // that fails to save is not published; the next Hello retries it.
+    let record = Record::Principal(PrincipalRecord {
+        principal: principal.into(),
+    });
+    let ops = match dir.accept(|registry| append_diffed(registry, record, &node)) {
+        Ok(Some(op)) => vec![op],
+        _ => Vec::new(),
     };
-    publish(shared, ops).await;
+    publish(shared, dir, ops).await;
 }
 
 /// Does the replica hold a PrincipalRecord for `principal` (any origin)?
@@ -253,39 +253,41 @@ async fn renew_leases(shared: &Arc<Shared>) {
     let Some(state) = shared.dir.get() else { return };
     let node = state.node_id.clone();
     let lease_ms = state.lease_ms;
-    let ops = {
-        let mut dir = state.inner.lock().await;
-        if dir.served.is_empty() {
-            return;
-        }
-        let served: Vec<(String, i64)> = dir.served.iter().map(|(s, e)| (s.clone(), *e)).collect();
-        // One acceptance for the tick's renewals: if the save fails, none is
-        // folded or published, and the next tick retries.
-        let renewed = dir.accept(|registry| {
-            let mut ops = Vec::new();
-            for (share, epoch) in served {
-                let claim = ServeClaim {
-                    node: node.clone(),
-                    share,
-                    lease_expiry_ms: now_ms() + lease_ms,
-                    epoch,
-                };
-                match append(registry, Record::Serve(claim), &node) {
-                    Ok(op) => ops.push(op),
-                    Err(_) => break, // a rejected chain append: stop, next tick retries
-                }
+    let mut dir = state.inner.lock().await;
+    if dir.served.is_empty() {
+        return;
+    }
+    let served: Vec<(String, i64)> = dir.served.iter().map(|(s, e)| (s.clone(), *e)).collect();
+    // One acceptance for the tick's renewals: if the save fails, none is
+    // folded or published, and the next tick retries.
+    let renewed = dir.accept(|registry| {
+        let mut ops = Vec::new();
+        for (share, epoch) in served {
+            let claim = ServeClaim {
+                node: node.clone(),
+                share,
+                lease_expiry_ms: now_ms() + lease_ms,
+                epoch,
+            };
+            match append(registry, Record::Serve(claim), &node) {
+                Ok(op) => ops.push(op),
+                Err(_) => break, // a rejected chain append: stop, next tick retries
             }
-            Ok(ops)
-        });
-        renewed.unwrap_or_default()
-    };
-    publish(shared, ops).await;
+        }
+        Ok(ops)
+    });
+    publish(shared, dir, renewed.unwrap_or_default()).await;
 }
 
-/// Land freshly-minted directory ops: into the served replica (same verify
-/// path as any carrier), out to local home subscribers, and pushed to every
-/// live peer link (trace B9 — directory ops replicate).
-pub(crate) async fn publish(shared: &Arc<Shared>, ops: Vec<Op>) {
+/// Land freshly minted directory ops, then send them to peers. `dir` is the
+/// directory lock they were minted under. Before it is let go, the ops go into
+/// the served replica (the same verify path as any carrier) and out to local
+/// home subscribers, so the served store takes each of this node's chains in
+/// the order the registry minted it (plan Step 4.4's question 5). Local
+/// fan-out only queues each session's frames on its unbounded channel, for
+/// its writer task to send. The push to every live peer link (trace B9 —
+/// directory ops replicate) comes after the release: no peer holds the lock.
+pub(crate) async fn publish(shared: &Arc<Shared>, dir: MutexGuard<'_, DirAuthority>, ops: Vec<Op>) {
     if ops.is_empty() {
         return;
     }
@@ -293,6 +295,7 @@ pub(crate) async fn publish(shared: &Arc<Shared>, ops: Vec<Op>) {
     for op in &ops {
         crate::mesh::ingest_and_fanout(shared, from, op.clone()).await;
     }
+    drop(dir);
     crate::mesh::push_home(shared, ops).await;
 }
 
@@ -317,7 +320,10 @@ mod tests {
     use crate::iroh_carrier::PeerEndpoint;
     use crate::mesh::who_serves;
     use crate::sysdir::boot_at;
+    use std::future::Future;
     use std::path::PathBuf;
+    use std::pin::{pin, Pin};
+    use std::task::Poll;
 
     fn fresh(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("glade-claims-{name}"));
@@ -486,6 +492,63 @@ mod tests {
         }
         assert!(serve_workspace_on(&shared, "ws-a", "a").await.unwrap());
         assert_eq!(published_serve(&*shared.store.lock().await, "ws-a"), (1, 1));
+    }
+
+    /// Poll `mint` once, outside tokio's cooperative budget, so it takes every
+    /// lock it can: the test decides where each mint stops, not the scheduler.
+    async fn step<F: Future + Unpin>(mint: &mut F) -> Poll<F::Output> {
+        let once = std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut *mint).poll(cx)));
+        tokio::task::unconstrained(once).await
+    }
+
+    /// The seqs of this node's `dir.claims` chain that the served store
+    /// holds, and that records.json at `sys` holds.
+    async fn claims_chain(shared: &Arc<Shared>, sys: &std::path::Path) -> (Vec<i64>, Vec<i64>) {
+        let node = &shared.dir.get().unwrap().node_id;
+        let held = {
+            let store = shared.store.lock().await;
+            store.scan(HOME, G_CLAIMS, &[], node, i64::MIN)
+        };
+        let served = held.iter().map(|op| op.seq).collect();
+        let ours = |op: &&Op| op.glade_id == G_CLAIMS && &op.origin == node;
+        let saved = saved(sys).iter().filter(ours).map(|op| op.seq).collect();
+        (served, saved)
+    }
+
+    /// Plan Step 4.4's question 5 (owner, 2026-09-24): a renewal racing a
+    /// serve on the node's `dir.claims` chain. The test holds the router's
+    /// lock, so a serve of `ws-b` stops after it has landed its workspace
+    /// entry and before its claim, and then polls a renewal, which mints the
+    /// chain's next two claims. Before the fix the serve had let the
+    /// directory lock go by then: the renewal's claims reached the served
+    /// store first and were refused as a gap, as was every later claim until
+    /// the next boot. Now the renewal waits for the serve to land, and the
+    /// served store holds the chain as records.json does. The held lock and
+    /// polling each mint by hand force the interleaving, not timing. It does
+    /// not force two Hellos (a principal mint lands one record, with no await
+    /// a test can hold between the release and the append), and it does not
+    /// reach a peer.
+    #[tokio::test]
+    async fn a_renewal_racing_a_serve_reaches_the_served_store_in_chain_order() {
+        let (shared, sys) = adopted("in-order").await;
+        assert!(serve_workspace_on(&shared, "ws-a", "a").await.unwrap());
+        let router = shared.router.lock().await;
+        let mut serve = pin!(serve_workspace_on(&shared, "ws-b", "b"));
+        assert!(step(&mut serve).await.is_pending(), "the serve waits");
+        let stopped = published_serve(&*shared.store.lock().await, "ws-b");
+        assert_eq!(stopped, (1, 0), "stopped between its entry and its claim");
+        let mut renew = pin!(renew_leases(&shared));
+        let renewed = step(&mut renew).await.is_ready();
+        drop(router);
+        assert!(serve.await.unwrap());
+        if !renewed {
+            renew.await;
+        }
+        let (served, saved) = claims_chain(&shared, &sys).await;
+        assert_eq!(served, saved, "the served store holds records.json's chain");
+        renew_leases(&shared).await;
+        let (served, saved) = claims_chain(&shared, &sys).await;
+        assert_eq!(served, saved, "and does after the next renewal");
     }
 
     /// F1 live, two booted nodes over real iroh: B starts serving a workspace

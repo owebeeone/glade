@@ -3,7 +3,8 @@
 //! node's sdax plan to shut down: a clean stop exits 0, releases the instance
 //! lock and frees both ports within the witness's 2 s bound. The hand-written
 //! root installs no handler, so a signal still ends it as before, by the signal
-//! itself.
+//! itself. A node killed outright (SIGKILL) cleans nothing up; one test shows
+//! that its instance lock still does not outlive it (plan Step 4.4's question 3).
 //!
 //! Each test sets or removes the variable on the node it spawns, so it reads
 //! the same whichever way the suite runs. Signals go only to the processes this
@@ -39,7 +40,7 @@ mod unix {
     }
 
     /// A node started from the chosen root, with its stdout lines read up to
-    /// the one it was waited for (`listening`, unless the test says).
+    /// the one it was waited for (`listening`, unless the test says), if any.
     struct Node {
         child: Child,
         lines: Vec<String>,
@@ -52,6 +53,34 @@ mod unix {
         }
 
         fn start_until(home: &Path, assembled: bool, args: &[&str], until: &str) -> Node {
+            let mut node = Node::spawn(home, assembled, args);
+            let deadline = Instant::now() + BOUND;
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                match node.rest.recv_timeout(left) {
+                    Ok(line) => {
+                        let last = line.starts_with(until);
+                        node.lines.push(line);
+                        if last {
+                            return node;
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
+                        let _ = node.child.kill();
+                        let _ = node.child.wait();
+                        let mut stderr = String::new();
+                        if let Some(mut pipe) = node.child.stderr.take() {
+                            let _ = pipe.read_to_string(&mut stderr);
+                        }
+                        let lines = &node.lines;
+                        panic!("glade-node did not print `{until}`: {lines:?}, stderr: {stderr}");
+                    }
+                }
+            }
+        }
+
+        /// A node started from the chosen root, with no line waited for.
+        fn spawn(home: &Path, assembled: bool, args: &[&str]) -> Node {
             let mut command = Command::new(env!("CARGO_BIN_EXE_glade-node"));
             command
                 .args(args)
@@ -78,27 +107,9 @@ mod unix {
                     }
                 }
             });
-            let deadline = Instant::now() + BOUND;
-            let mut lines = Vec::new();
-            loop {
-                match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-                    Ok(line) => {
-                        let last = line.starts_with(until);
-                        lines.push(line);
-                        if last {
-                            break;
-                        }
-                    }
-                    Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        panic!("glade-node did not print `{until}`: {lines:?}");
-                    }
-                }
-            }
             Node {
                 child,
-                lines,
+                lines: Vec::new(),
                 rest: rx,
             }
         }
@@ -151,6 +162,20 @@ mod unix {
                 let _ = self.child.wait();
             }
         }
+    }
+
+    /// A node that must be refused as it starts: it exits 1 within the bound,
+    /// and never prints `listening`. Returns its stderr.
+    fn refused(home: &Path, assembled: bool, args: &[&str]) -> String {
+        let mut node = Node::spawn(home, assembled, args);
+        let (status, stderr) = node.wait();
+        let listening = node.lines.iter().any(|l| l.starts_with("listening "));
+        assert!(
+            status.code() == Some(1) && !listening,
+            "not refused: {status}, {:?}, stderr {stderr}",
+            node.lines
+        );
+        stderr
     }
 
     /// Whether `bind` succeeds on `port` within the bound.
@@ -272,5 +297,33 @@ mod unix {
             "{status}: {stderr}"
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Plan Step 4.4's question 3 (owner, 2026-09-24): a node killed with
+    /// SIGKILL cleans nothing up, so its `instance.lock` stays behind, but the
+    /// OS lock on the file ends with the process. A node started on the same
+    /// instance then starts; before, it was refused, "instance already
+    /// locked", until someone removed the file. A second node started while
+    /// that one runs is still refused. Both roots boot through
+    /// `sysdir::boot_at`, and each is run. It does not prove the lock off
+    /// Unix, or across hosts.
+    #[test]
+    fn a_node_killed_outright_restarts_and_a_second_node_is_still_refused() {
+        for assembled in [false, true] {
+            let dir = scratch("stop-signal-kill");
+            let home = dir.join("glade-home");
+            let args = ["--profile", "local", "--name", "a", "0"];
+            let lock = home.join("sys").join("a").join("instance.lock");
+            let mut killed = Node::start(&home, assembled, &args);
+            killed.signal("-KILL");
+            assert_eq!(killed.wait().0.signal(), Some(9), "killed outright");
+            assert!(lock.exists(), "the killed node's lock file stays");
+
+            let restarted = Node::start(&home, assembled, &args);
+            let stderr = refused(&home, assembled, &args);
+            assert!(stderr.contains("instance already locked"), "{stderr}");
+            drop(restarted);
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
     }
 }

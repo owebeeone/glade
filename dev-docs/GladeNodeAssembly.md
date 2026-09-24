@@ -481,7 +481,8 @@ Three things are not decided, so they are not promised. Each comes with options:
   the lock (honest, but not automatic); use an OS lock that the kernel releases
   when the process exits (`File::try_lock`, in std since Rust 1.89, so no new
   dependency); or check the pid that the lock file holds. Recommendation: the OS
-  lock, as a separate change with its own failing test.
+  lock, as a separate change with its own failing test. Built on 2026-09-24:
+  see "Hardening (after Step 4.4 and 4.3 part 1)", fix 2.
 - (b) Finishing the interrupted round's sends. The node keeps no outbox. A push
   lost to a link failure or a restart is healed only by the peer's next
   connect-time pull (`mesh.rs:271-276`). Discovery's driver commits its effects
@@ -711,7 +712,8 @@ out of this step.
   as a gap, and then refuses every later record on that chain the same way,
   until the next boot's seed fills the hole. This predates the step, and
   publishing under the lock would close it. It is not changed here, because no
-  deterministic test shows it.
+  deterministic test shows it. Closed on 2026-09-24, with such a test: see
+  "Hardening (after Step 4.4 and 4.3 part 1)", fix 3.
 - Off Unix, the directory is not synced after the rename.
 
 **Behaviour changes on the default (hand-written) path.** Nothing changes in
@@ -1117,7 +1119,8 @@ The options:
 - (d) Nothing until session identity lands, recorded as a named gap.
 
 Recommend (a) now, and (c) with session identity. It is not built: the owner's
-word is pending, because it changes the path the live desk uses.
+word is pending, because it changes the path the live desk uses. Ruled (a) on
+2026-09-24 and built: see "Hardening (after Step 4.4 and 4.3 part 1)", fix 1.
 
 ### The preconditions
 
@@ -1430,3 +1433,344 @@ claimed.
 2 (a), with the contract's sentence and pattern probe; 3 as recommended; 4 (c),
 the peer paths enforced by default and the websocket path behind a switch that
 is off by default; 5 (b); 6 landed; 7 (a); 8, 4.3 before 4.1b.
+
+## Hardening (after Step 4.4 and 4.3 part 1)
+
+Design addition, 2026-09-24, written before the code against glade `39b8b25`.
+The red runs' messages and the measured figures were filled in afterwards.
+Three fixes, each approved by the owner on 2026-09-24, and each begun with a
+failing test:
+
+1. the `Origin` check: 4.3's question 7, option (a);
+2. an OS lock for the instance: 4.4's question 3;
+3. publishing in chain order: 4.4's question 5.
+
+Nothing changes in the wire, in any durable format, in the contracts, in the
+node policy or in the dependencies. `glade/node/Cargo.toml` gains a
+`rust-version` (fix 2), and the gate's rustfmt ratchet for glade-node comes
+down to 333 (see "Measured").
+
+### 1. The `Origin` check
+
+**Cause.** `ws::accept` (`node/src/ws.rs:93-118`) reads one header of the
+upgrade request, `Sec-WebSocket-Key`, and answers `101` to any request that
+has one. The node binds 127.0.0.1, but a browser lets any page open a websocket
+to any address, and only the server can refuse it, by its `Origin` (4.3, "The
+`Origin` header"). So a page from any site, open in the owner's browser, can
+reach `ws://127.0.0.1:9099` and send a Hello naming any principal.
+
+**Fix.** In `accept`, before the key is read:
+
+- Every `Origin` header is collected. Its name is matched without regard to
+  case, as the key's is.
+- A request with no `Origin` is upgraded. That is every client that is not a
+  browser.
+- A request with one `Origin` that is a loopback origin is upgraded. A
+  loopback origin is `http://` or `https://`, then a host that is exactly
+  `localhost`, `127.0.0.1` or `[::1]`, then either nothing or `:` and a port of
+  one to five digits, no greater than 65535. A browser serializes an origin in
+  lower case and with no path (RFC 6454 §6.2), so the match is byte for byte.
+- Every other request is refused. That includes `null`, a lookalike
+  (`http://localhost.evil.example`, `http://127.0.0.1.evil.example`,
+  `http://localhost@evil.example`), another scheme, a path, an empty or
+  malformed port, an empty value, and two `Origin` headers.
+- A refusal is answered `HTTP/1.1 403 Forbidden`, with an empty body, and the
+  connection is closed. No `101` is sent. `accept` returns an error
+  (`PermissionDenied`), so `server::handle` makes no session.
+
+Both roots accept clients through `server::accept_clients`
+(`server.rs:114-125`), so the one check covers both.
+
+**The clients it keeps**, re-read on 2026-09-24 against 4.3's table:
+
+| Client | `Origin` | Kept because |
+| --- | --- | --- |
+| the Gyld desk in dev (`gyld-ui.py start`, `pnpm dev:gyld`) and gryth-ui's full desktop (`pnpm dev`) | `http://localhost:5173`, or a port moved by an offset for a second instance. Vite binds `localhost`: neither config sets `server.host` | a loopback host, any port |
+| the Gyld desk built, served by grazel | `http://127.0.0.1:8080` (grazel binds 127.0.0.1, `grazel/src/main.rs:321`) | a loopback host |
+| glade/demo (`run_demo.py`, `start-demo.sh`) | `http://localhost:5175` | a loopback host |
+| client-rs: grazel's probes, the glade-gwz and glade-gyld suppliers and their suites; and the node's own test client | none (`client-rs/src/ws.rs:48-55`, `node/src/ws.rs:121-128`) | no `Origin` |
+| Node 22's `WebSocket`: client-ts, grip-share and their suites | none. Measured again on 2026-09-24 with Node 22.19: its upgrade request carries no `Origin` | no `Origin` |
+
+No other client of the node was found. grip-react-demo's websockets go to
+exchange feeds, and glade-decl-ts's taut client to a taut service. There is no
+Electron or Tauri shell, and no page is loaded from a file, which would send
+`Origin: null`.
+
+**Tests** (`ws.rs`), over a loopback socket, with the upgrade request written
+by hand:
+
+- `a_non_loopback_origin_is_refused_before_the_upgrade`: 18 requests, one for
+  each refused form above and for the header name in upper and in lower case.
+  Each must be answered `403`, with no session made. Red on the old code: all
+  18 were answered `HTTP/1.1 101 Switching Protocols`, each with a session.
+- `no_origin_or_a_loopback_origin_is_upgraded`: 8 requests: no `Origin`, the
+  shipped clients' origins, a second desk's moved port, each loopback host,
+  `https`, and the header name in lower case. Each is upgraded. It passed
+  before the fix and after: it guards the check's scope.
+
+**What it does not prove.**
+
+- What a browser sends. The origins in the table are read from the launchers
+  and configs, not captured from a browser.
+- Protection from anything but a page from another site. It does not stop a
+  page served from another loopback port, a local process, or any client that
+  leaves the header out. 4.3's option (c), a per-start token, is the later
+  step.
+- A DNS-rebinding page is refused only because its origin names its own site,
+  not a loopback host.
+
+**Default-path change.** An upgrade request whose `Origin` is not a loopback
+origin is refused with `403`. Before, it was upgraded. No shipped client sends
+one.
+
+### 2. An OS lock for the instance
+
+**Cause.** `InstanceLock::acquire` (`sysdir.rs:79-106`) creates
+`instance.lock` O_EXCL, and its drop removes the file. A crash skips the drop.
+The file stays, and every later boot on the instance is refused (`AddrInUse`,
+"instance already locked") until someone deletes it. gryth-ui's `gyld-ui.py`
+does that: it reads the pid in the file, and removes the file when that
+process is gone (`gyld-ui.py:343-398`, `:1450-1463`).
+
+**Fix.**
+
+- The boot opens `instance.lock`, creating it if absent and truncating
+  nothing, and takes `File::try_lock` on the handle. That is an exclusive
+  advisory lock: `flock` on Unix, `LockFileEx` on Windows. `Boot` keeps the
+  handle for the instance's life, as it kept the file before. The kernel
+  releases the lock when the process ends, however it ends.
+- If another handle holds the lock, the boot is refused with the same error as
+  before: `AddrInUse`, "instance already locked: <path>". That holds within
+  one process too: a second boot opens a second handle, and a `flock` lock
+  belongs to the open file, not to the process.
+- A leftover file that no one holds is locked. The boot empties it and writes
+  its own pid.
+- What the file records is unchanged: the holder's pid, with no newline, which
+  is what `gyld-ui.py` reads.
+- A clean release still removes the file. It removes it first, while the lock
+  is held, and the handle closes after. So `gyld-ui.py` and the node's own
+  tests (`tests/lifecycle.rs:186-217`, `tests/stop_signal.rs:199-213`, `:256`)
+  see what they saw before.
+- Removing the file brings a race that O_EXCL did not have. A boot that opens
+  the file just before its holder removes it and exits would lock the removed
+  file. A third boot could then create a new file at the path and lock that:
+  two holders. So once it holds the lock, a boot checks that the path still
+  names the file it locked (the same device and inode). If not, it starts
+  again, up to three times, and is then refused as locked.
+- Off Unix, std has no stable file identity, so no check is made there. That
+  is a named gap: the window is two system calls wide.
+- The check lives in a braced platform module, `sysdir::platform`.
+  `check_key_perms` and `write_secret`, which carried bare `#[cfg(unix)]` and
+  `#[cfg(not(unix))]` attributes (`sysdir.rs:225-251`), move into the same
+  module, laid out as rustfmt lays them out; their logic is unchanged. So does
+  the key-permissions test in `sysdir`'s tests, which carried a bare
+  `#[cfg(unix)]`, into a braced `unix` module of its own.
+- `File::try_lock` is stable since Rust 1.89. glade-node declared no
+  `rust-version`. It now declares 1.91, the floor its dependency graph already
+  set: iroh 1.2.0 and seven crates of its family (iroh-base, iroh-dns,
+  iroh-relay, n0-dns-resolver, n0-watcher, netwatch, portmapper) declare 1.91.
+  So the lock raises no floor. Clippy reads the field as its MSRV; the
+  warning count is 11 with the field and without it.
+
+**Tests.**
+
+- `sysdir::tests::a_lock_file_left_by_a_crash_blocks_no_boot`: an
+  `instance.lock` that holds another process's pid and that no one has locked,
+  as a crash leaves it; the test writes it. The boot succeeds, and the file
+  then holds this process's pid. A second boot while the first lives is
+  refused (`AddrInUse`). A clean release removes the file. Red on the old
+  code: the first boot failed, `Custom { kind: AddrInUse, error: "instance
+  already locked: …/glade-sysdir-crash/instance.lock" }`.
+- `stop_signal.rs`, `a_node_killed_outright_restarts_and_a_second_node_is_still_refused`
+  (Unix), on both roots: a node killed with SIGKILL leaves its
+  `instance.lock`. A node started on the same instance then starts, and a
+  second node started while that one runs exits 1 with "instance already
+  locked". Red on the old code, on the hand-written root (the loop's first):
+  ``glade-node did not print `listening `: [], stderr: instance already
+  locked: …/glade-home/sys/a/instance.lock``. For that message, the file's
+  `start_until` now shows a failed start's stderr, and a `spawn` it shares
+  with a new `refused` helper starts a node without waiting on a line.
+- `sysdir::tests::unix::the_lock_path_names_only_the_file_it_opened`: the
+  identity check. A file removed after it was opened is not what its path
+  names, nor is a new file made at the path since. It is written with the
+  check, so it has no red form.
+- `sysdir::tests::instance_lock_is_single_writer` is unchanged. It still
+  passes: a second handle in one process is refused.
+
+**What it does not prove.**
+
+- The race above. It lies between two system calls in `acquire`, and no test
+  forces it. The identity test proves the check, not that a boot meets the
+  race.
+- Any platform but this one. The suite runs on macOS. The branch for other
+  platforms is only type-checked (see "Measured").
+- File systems whose locks do not reach across hosts, such as some network
+  mounts. On a platform where std offers no lock, the boot now fails
+  (`Unsupported`), where O_EXCL worked.
+
+**Default-path change.** A boot on an instance whose last process crashed now
+starts. Before, it was refused until the file was removed. Nothing else
+changes: a live holder refuses a second boot with the same error, the file
+holds the holder's pid, and a clean stop removes it.
+
+**Upgrading a running instance.** A node started from an older binary holds
+its instance by the O_EXCL file alone, with no OS lock. So a node started from
+this binary on the same instance while the older one runs is not refused: it
+locks the file, and when it exits it removes the file from under the older
+node. The other way round is safe: an older binary is refused by the file.
+`gyld-ui.py start` still refuses while the older node runs, by its pid and its
+ports. So stop a running node before starting this binary on its instance:
+`gyld-ui.py stop`, then `start`.
+
+### 3. Publishing in chain order
+
+**Cause.** `claims.rs`'s three mints (serve, renewal, principal) accept their
+records under the directory lock (`DirState.inner`), release it, and then
+`publish` (`claims.rs:288-297`). The publish lands the records in the served
+store (`mesh::ingest_and_fanout`), fans them out, and pushes them to peers. So
+two mints on one chain can publish in either order: two Hellos naming new
+principals (`dir.principals`), or a renewal racing a serve (`dir.claims`). The
+served store takes a record only at its chain's next seq (`Store::append`). It
+refuses the later one as a gap, and then every later record of that chain the
+same way, until the next boot's seed fills the hole.
+
+**Fix.**
+
+- `publish` takes the directory lock's guard from its caller. It lands the
+  records in the served store, and fans them out to local subscribers, before
+  it drops the guard. It pushes them to peers after.
+- So the served store takes each of this node's chains in the order the
+  registry minted it, since the registry orders each chain under the same
+  lock. The three mints hand `publish` their guard.
+- What is now done under the lock: the served store's appends (a write each,
+  no fsync), and taking the router's and the session table's locks. Local
+  fan-out only queues each session's frames on its unbounded channel, for its
+  writer task to send. So no slow client or peer holds the lock up.
+- The push to peers stays outside the lock. `push_home` spawns one task per
+  link and returns.
+- The lock order is the directory lock, then the served store's, the router's
+  or the session table's, never the reverse. The mints' callers hold none of
+  those: the renewal loop, the Hello arm (`server.rs:209-212`), the
+  `workspace.create` exchange (`exchange.rs:171-172`) and
+  `Server::serve_workspace`. `note_principal` lets the store's lock go before
+  it takes the directory's.
+
+**Peers can still see a chain out of order.** Each push is its own QUIC stream,
+written by its own task and read on the peer by its own task
+(`mesh.rs:277-293`, `:253-266`), so two pushes can be ingested in either order.
+The peer refuses the later as a gap, and then every later push on that chain.
+What repairs it is the peer's next pull, from its heads, which the mesh runs
+only when a link comes up (`run_link`, `mesh.rs:202-244`). That is 4.4's
+ruling, "a lost push waits for the next pull", and this step does not change
+it.
+
+**Test** (`claims.rs`),
+`a_renewal_racing_a_serve_reaches_the_served_store_in_chain_order`:
+
+1. A node serves `ws-a`.
+2. The test holds the router's lock and polls a serve of `ws-b` by hand. The
+   serve lands its workspace entry and stops at the router, before its claim.
+   The test checks that it stopped there.
+3. It polls a renewal once. The renewal mints the next two claims of the same
+   chain.
+4. It lets the router go, and drives both mints to their end.
+5. The served store must hold the node's `dir.claims` chain exactly as
+   records.json holds it, and must still after one more renewal.
+
+Each mint is polled by hand, outside tokio's cooperative budget
+(`tokio::task::unconstrained`), so the held lock alone decides where each mint
+stops, not timing. Red on the old code: "the served store holds records.json's
+chain", left `[0, 1, 2]`, right `[0, 1, 2, 3, 4]`. The renewal had completed
+while the serve was stopped, and its two claims were refused as a gap.
+
+**What it does not prove.**
+
+- The Hello race. A principal mint lands one record, with no await between the
+  release and the append that a test can hold. The same change covers it, but
+  no test forces it.
+- Peers, which can still see pushes in either order (above).
+- A mint cancelled after its save, while it lands. Its later records stay out
+  of the served store until the next boot's seed, as 4.4 recorded. That is
+  unchanged.
+
+**Default-path change.** A mint holds the directory lock until its records are
+in the served store and queued to local subscribers. A second mint waits that
+long, a store append per record. A chain of the node's own records no longer
+stalls in the served store.
+
+### Named gaps
+
+- The `Origin` check stops only a browser page from another site (fix 1).
+- Off Unix, the instance lock's identity check is not made (fix 2).
+- A peer can see one of this node's chains out of order, and then stalls on
+  that chain until its next pull (fix 3).
+- A mint cancelled while it lands leaves its later records out of the served
+  store until the next boot (fix 3; 4.4's named gap).
+
+### Questions for the owner
+
+1. **`rust-version`.** glade-node now declares 1.91, the floor its dependencies
+   already set; the lock alone needs 1.89. Recommend keeping it: a toolchain
+   below 1.91 is then refused by name, not deep in iroh's build, which matters
+   for 4.5's Pi and dabeest. It leaves the clippy count unchanged. The other
+   choice is to declare none, as before.
+2. **A reordered push stalls a peer's copy of a chain.** A peer that ingests one
+   of this node's renewals ahead of the one before it refuses it as a gap, and
+   then every later renewal on that chain until the link comes up again. The
+   claim's lease then lapses at the peer, which routes the workspace as absent.
+   The options:
+   - (a) keep 4.4's ruling: the next pull repairs it;
+   - (b) a node that refuses a pushed op as a gap pulls the pusher's home share
+     from its heads. That is receiver-side only and needs no wire change;
+   - (c) one ordered push stream per link, a change to the mesh's protocol.
+
+   Recommend (b), as its own small step before 4.5's crossing, which is the
+   first to keep two nodes linked for longer than a test.
+3. **Off Unix, the identity check.** Recommend accepting the gap for the slice:
+   the race needs three boots of one instance within two system calls. Revisit
+   if a supervisor ever restarts dabeest's node in a tight loop. The options
+   then are to leave the file in place on Windows (the lifecycle test's check
+   that the file is gone becomes a check that the lock can be taken), or
+   Windows' file index, which std has not stabilized.
+
+### Measured
+
+2026-09-24, Apple M3 Pro, Rust 1.96.0, on the final tree:
+
+- **The gate** (`glade/node/check.sh`) passes all 8 components, in 27 s warm.
+  There are 213 node tests on each path, across 15 test binaries (207 before).
+  The six new ones are the two `ws` tests, the two `sysdir` tests, the
+  `claims` test and the `stop_signal` test.
+- **rustfmt**: glade-node has 333 hunks, 4 below the old baseline of 337. The
+  four went from `sysdir.rs` code this change rewrote or moved: the old
+  `acquire`'s error arm, the two moved functions and the moved key test. No new
+  line is a deviation: `ws.rs` holds 8 hunks and `claims.rs` 23, as before, and
+  `stop_signal.rs` none. The baseline is lowered to 333 in `check.sh`, as Step
+  4.4 lowered it. glade-wire stays at 43.
+- **clippy**: glade-node 11 warnings and glade-wire 7, both at baseline, with
+  `rust-version` declared and without it.
+- **Red runs**: each new test against the old production code, with the
+  messages above. The `Origin` guard test passed there too.
+- **The branches not compiled here**: `InstanceLock` and both `platform`
+  modules, extracted verbatim into a scratch crate, type-check with no warning
+  (`rustc --emit=metadata`) against the standard library of
+  x86_64-pc-windows-msvc, x86_64-pc-windows-gnu, x86_64-unknown-linux-gnu and
+  aarch64-apple-darwin.
+- **Time**: the five new lib tests take 0.04-0.05 s together, and the
+  cross-process test 1.1-1.6 s, over three warm runs each. It starts six nodes.
+- **Downstream**, against the rebuilt default binary
+  (`glade/node/target/debug/glade-node`), each suite with a scratch target:
+  grazel 26 + 3, glade-gwz 9 + 5, glade-gyld 233 (1 ignored) + 31. All are at
+  baseline.
+
+**Size**, in lines added and removed:
+
+| Fix | Production | Tests |
+| --- | --- | --- |
+| 1, the `Origin` check | `ws.rs` +73/−1 | `ws.rs` +112 |
+| 2, the instance lock | `sysdir.rs` +96/−35 (+88/−27 ignoring whitespace); `Cargo.toml` +3 | `sysdir.rs` +73/−23, the key test moved into a braced module among them; `stop_signal.rs` +74/−21, the start helper's split among them |
+| 3, chain order | `claims.rs` +83/−80, or +24/−21 ignoring whitespace: the three mints lose a block and its indent | `claims.rs` +60 |
+| the gate | `check.sh`: the rustfmt ratchet, one line | |
+
+Production code grows by 136 lines net in `.rs` files, doc comments included,
+and by 3 in `Cargo.toml`.

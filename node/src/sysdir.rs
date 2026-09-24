@@ -76,31 +76,53 @@ pub fn glade_home() -> PathBuf {
     PathBuf::from(home).join(".glade")
 }
 
-/// Best-effort single-writer lock: an `instance.lock` created O_EXCL, removed on
-/// drop (the workspace.lock precedent). Advisory — a crash leaves a stale lock
-/// a human clears; real fencing is the filesystem lock, ground truth (WD §4).
+/// The single-writer lock (plan Step 4.4's question 3, owner 2026-09-24): an
+/// exclusive OS lock (`File::try_lock`: `flock` on Unix, `LockFileEx` on
+/// Windows) on an open handle to `instance.lock`, held for the instance's
+/// life. The kernel releases it with its process, so a crash leaves no lock
+/// that refuses the next boot, while a live holder, in this process or
+/// another, still refuses it. The file records the holder's pid for diagnosis
+/// (gryth-ui's `gyld-ui.py` reads it), and a clean release removes it, as the
+/// O_EXCL lock before it did: removed first, then the handle closed.
 pub struct InstanceLock {
     path: PathBuf,
+    _held: fs::File,
 }
 
 impl InstanceLock {
     fn acquire(path: PathBuf) -> io::Result<InstanceLock> {
-        match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(mut f) => {
-                let _ = write!(f, "{}", std::process::id());
-                Ok(InstanceLock { path })
+        let locked = || {
+            let what = format!("instance already locked: {}", path.display());
+            io::Error::new(io::ErrorKind::AddrInUse, what)
+        };
+        // A holder removes the file before it lets the lock go, so a boot
+        // that opened the file just then may lock one its path no longer
+        // names. It starts again: a third boot could lock a new file there.
+        for _ in 0..3 {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)?;
+            match file.try_lock() {
+                Ok(()) => {}
+                Err(fs::TryLockError::WouldBlock) => return Err(locked()),
+                Err(fs::TryLockError::Error(e)) => return Err(e),
             }
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(io::Error::new(
-                io::ErrorKind::AddrInUse,
-                format!("instance already locked: {}", path.display()),
-            )),
-            Err(e) => Err(e),
+            if platform::names(&path, &file)? {
+                let pid = std::process::id();
+                let _ = file.set_len(0).and_then(|()| write!(file, "{pid}"));
+                return Ok(InstanceLock { path, _held: file });
+            }
         }
+        Err(locked())
     }
 }
 
 impl Drop for InstanceLock {
     fn drop(&mut self) {
+        // Removed while still locked; the handle, and with it the lock, goes
+        // after this.
         let _ = fs::remove_file(&self.path);
     }
 }
@@ -195,13 +217,13 @@ pub fn boot_at(dir: PathBuf, operator: &str) -> io::Result<Boot> {
 fn load_or_create_node_key(dir: &Path) -> io::Result<(Vec<u8>, String)> {
     let path = dir.join("node.key");
     let key = if path.exists() {
-        check_key_perms(&path)?;
+        platform::check_key_perms(&path)?;
         let mut buf = Vec::new();
         fs::File::open(&path)?.read_to_end(&mut buf)?;
         buf
     } else {
         let key = random_key()?;
-        write_secret(&path, &key)?;
+        platform::write_secret(&path, &key)?;
         key
     };
     let node_id = node_id_of(&key);
@@ -222,32 +244,71 @@ fn node_id_of(key: &[u8]) -> String {
     h.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
+// What std offers on Unix alone: file modes, and a file's identity. Each
+// platform's branch is one braced module, so the condition encloses the whole
+// section.
 #[cfg(unix)]
-fn check_key_perms(path: &Path) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mode = fs::metadata(path)?.permissions().mode();
-    if mode & 0o077 != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("node.key is group/world-accessible (mode {:o}) — refusing", mode & 0o777),
-        ));
+mod platform {
+    use std::fs;
+    use std::io::{self, Write};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::path::Path;
+
+    pub(super) fn check_key_perms(path: &Path) -> io::Result<()> {
+        let mode = fs::metadata(path)?.permissions().mode();
+        if mode & 0o077 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "node.key is group/world-accessible (mode {:o}) — refusing",
+                    mode & 0o777
+                ),
+            ));
+        }
+        Ok(())
     }
-    Ok(())
-}
-#[cfg(not(unix))]
-fn check_key_perms(_path: &Path) -> io::Result<()> {
-    Ok(())
+
+    pub(super) fn write_secret(path: &Path, bytes: &[u8]) -> io::Result<()> {
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(bytes)
+    }
+
+    /// Whether `path` names `file`: the same device and inode. A file removed
+    /// since it was opened is named by nothing, or by a new file.
+    pub(super) fn names(path: &Path, file: &fs::File) -> io::Result<bool> {
+        let held = file.metadata()?;
+        match fs::metadata(path) {
+            Ok(named) => Ok(named.dev() == held.dev() && named.ino() == held.ino()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
 }
 
-#[cfg(unix)]
-fn write_secret(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
-    f.write_all(bytes)
-}
 #[cfg(not(unix))]
-fn write_secret(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    fs::write(path, bytes)
+mod platform {
+    use std::fs;
+    use std::io;
+    use std::path::Path;
+
+    pub(super) fn check_key_perms(_path: &Path) -> io::Result<()> {
+        Ok(())
+    }
+
+    pub(super) fn write_secret(path: &Path, bytes: &[u8]) -> io::Result<()> {
+        fs::write(path, bytes)
+    }
+
+    /// std has no stable file identity here, so the path is taken to name the
+    /// file: a named gap (`GladeNodeAssembly.md`, "Hardening").
+    pub(super) fn names(_path: &Path, _file: &fs::File) -> io::Result<bool> {
+        Ok(true)
+    }
 }
 
 /// 32 random bytes from the OS CSPRNG (`/dev/urandom`) — zero-dep, matching the
@@ -310,29 +371,6 @@ mod tests {
         assert_eq!(boot.registry.who_serves(HOME, 0), Some(boot.node_id.clone()));
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn node_key_is_0600_and_group_readable_is_refused() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = fresh("perms");
-        let boot = boot_at(dir.clone(), "gianni").unwrap();
-        let node_id = boot.node_id.clone();
-        drop(boot); // release the lock so we can reboot
-        // the key was created 0600.
-        let mode = fs::metadata(dir.join("node.key")).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
-        // widen to group-readable -> the ssh discipline refuses the next boot.
-        fs::set_permissions(dir.join("node.key"), fs::Permissions::from_mode(0o640)).unwrap();
-        let err = boot_at(dir.clone(), "gianni").map(|_| ()).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
-        // restore + reboot: SAME NodeId (derived from the same key) — identity
-        // is stable across reboots; verify-as-ingest re-materialises the fold.
-        fs::set_permissions(dir.join("node.key"), fs::Permissions::from_mode(0o600)).unwrap();
-        let again = boot_at(dir, "gianni").unwrap();
-        assert_eq!(again.node_id, node_id);
-        assert_eq!(again.rejected, 0);
-    }
-
     #[test]
     fn reboot_is_idempotent_presence_not_duplicated() {
         let dir = fresh("reboot");
@@ -393,6 +431,27 @@ mod tests {
         assert!(boot_at(dir, "gianni").is_ok());
     }
 
+    /// Plan Step 4.4's question 3 (owner, 2026-09-24): a crash leaves
+    /// `instance.lock` behind, holding its dead process's pid, with no one
+    /// holding its lock; the test writes that file itself. The next boot
+    /// takes the instance and records its own pid, a second boot while it
+    /// lives is still refused, and a clean release removes the file, as
+    /// before. It crashes no process: `tests/stop_signal.rs` kills a node.
+    #[test]
+    fn a_lock_file_left_by_a_crash_blocks_no_boot() {
+        let dir = fresh("crash");
+        fs::create_dir_all(&dir).unwrap();
+        let lock = dir.join("instance.lock");
+        fs::write(&lock, "4242").unwrap();
+        let boot = boot_at(dir.clone(), "gianni").unwrap();
+        let pid = std::process::id().to_string();
+        assert_eq!(fs::read_to_string(&lock).unwrap(), pid, "the holder's pid");
+        let err = boot_at(dir.clone(), "gianni").map(|_| ()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+        drop(boot);
+        assert!(!lock.exists(), "a clean release removes the file");
+    }
+
     /// One identity, two renderings: the peer-link NodeIdentity derived from
     /// node.key is the raw-bytes twin of the hex NodeId in directory records —
     /// the identity match claim routing (WD §4) stands on.
@@ -418,6 +477,58 @@ mod tests {
     impl Boot {
         fn nodes_of_ops(&self) -> usize {
             self.registry.nodes_of(&self.operator).len()
+        }
+    }
+
+    // File modes and file identity are Unix notions. A braced module, so the
+    // condition encloses the whole section.
+    #[cfg(unix)]
+    mod unix {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+
+        #[test]
+        fn node_key_is_0600_and_group_readable_is_refused() {
+            let dir = fresh("perms");
+            let boot = boot_at(dir.clone(), "gianni").unwrap();
+            let node_id = boot.node_id.clone();
+            // release the lock so we can reboot
+            drop(boot);
+            // the key was created 0600.
+            let mode = fs::metadata(dir.join("node.key"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+            // widen to group-readable -> the ssh discipline refuses the next boot.
+            fs::set_permissions(dir.join("node.key"), fs::Permissions::from_mode(0o640)).unwrap();
+            let err = boot_at(dir.clone(), "gianni").map(|_| ()).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+            // restore + reboot: SAME NodeId (derived from the same key) — identity
+            // is stable across reboots; verify-as-ingest re-materialises the fold.
+            fs::set_permissions(dir.join("node.key"), fs::Permissions::from_mode(0o600)).unwrap();
+            let again = boot_at(dir, "gianni").unwrap();
+            assert_eq!(again.node_id, node_id);
+            assert_eq!(again.rejected, 0);
+        }
+
+        /// The instance lock's identity check (plan Step 4.4's question 3): a
+        /// file removed after it was opened is not what its path names, nor
+        /// is a new file made at the path since. A boot that locked such a
+        /// file starts again; that race lies between two system calls, and
+        /// this test does not force it.
+        #[test]
+        fn the_lock_path_names_only_the_file_it_opened() {
+            let dir = fresh("names");
+            fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("instance.lock");
+            let opened = fs::File::create(&path).unwrap();
+            assert!(platform::names(&path, &opened).unwrap(), "opened");
+            fs::remove_file(&path).unwrap();
+            assert!(!platform::names(&path, &opened).unwrap(), "removed");
+            fs::write(&path, "").unwrap();
+            assert!(!platform::names(&path, &opened).unwrap(), "a new file");
         }
     }
 }

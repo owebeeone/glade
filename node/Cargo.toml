@@ -2,6 +2,9 @@
 name = "glade-node"
 version = "0.0.0"
 edition = "2021"
+# The toolchain floor: iroh 1.2 and its family declare 1.91. The instance lock's
+# `File::try_lock` (src/sysdir.rs) needs 1.89, which is below it.
+rust-version = "1.91"
 description = "Glade node (GLP-0005) — localhost glade server: per-(share,origin) log store, WS carrier, routing, chain verification, echo provider."
 
 [lib]
