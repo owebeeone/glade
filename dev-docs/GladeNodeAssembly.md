@@ -256,3 +256,76 @@ their order, and no client is accepted before `listening`, but a start whose
 port is taken now fails before printing `peer`. `TokioRuntime::tracked()` does
 not count owned tasks. The Shaku module still assembles over the instance alone,
 because no `CarrierPort` adapter exists before Phase 4.
+
+## Journeys (plan Step 3.4)
+
+Design addition, 2026-09-24, written before the code against glade `0a8733d`,
+with the fast loop's figures filled in once measured; the spec is plan Step
+3.4, and AR-05 (`arch1/RuntimeAndAssurance.md:123`) is the criterion.
+`tests/journeys/` is a test binary of its own. Nothing in it starts a runtime,
+a socket or a file: `fakes::run` polls every future, and the fake clock and
+the test's own steps are the whole schedule (LBT-008).
+
+**Two test nodes, one fixed route.** A and B are each a whole test composition
+of `NodeAssembly` (3.2's, every real provider overridden), bound on one fake
+network at the addresses their configuration names; A's `Config` names B as
+its one peer, the fixed authorized locator (no lookup, no referral). The
+registration is the node's own family, which is the one the plan's steps name
+(slice profile §8 item 1): a `WorkspaceEntry` and a `ServeClaim` on `home`,
+with the lease `claims.rs` mints (`LEASE_TTL_MS`, renewed every
+`RENEW_EVERY_MS` with the same epoch), stamped at the node's injected clock. A
+publishes through its directory's record host, which persists through a
+volatile engine; A's record transport pushes the persisted ops, a frame each,
+over its peer carrier; B's test code plays the session: it accepts, decodes
+and hands each op to B's record host (`ingest`). The lookup is
+`Directory::serves`, at each node's own clock. `claims.rs` itself is not run:
+it sleeps on tokio and stamps with `sysdir::now_ms()` (the AR-03 gap above), so
+the journeys write the records it writes.
+
+**Test-only providers** (`tests/journeys/faults.rs`), beside 3.2's fakes,
+which the binary shares by `#[path]`; each says what it does not prove.
+`FaultyPort` wraps a fake port: a dialed link can be given one transport
+failure at its k-th frame, before or after that frame arrives; the link then
+ends and the sender's `send` answers `Transport`, which the carrier contract
+allows ("unless the transport fails"; `send` is no acknowledgement). Passing
+through, it runs CA-001..004. `VolatileStore` is the `StoreApi` engine
+a host persists through and a journey reads back: the last snapshot, in memory.
+`LiveGrants` is a grant fold a journey appends to between two decisions (the
+contract's fixture fold, then later records); it runs GR-001..003.
+
+**One production seam**, additive: `Records::in_memory_over(profile, transport,
+store)`, the in-memory record host persisting through a given engine;
+`Records::in_memory` keeps `MemStore`, and no composition path builds either.
+
+| Journey | Drives (binding, port) | Asserts | The fakes do not prove | Phase 4 |
+| --- | --- | --- | --- | --- |
+| `publish` (i) | A: `directory_host_binding` `append` (entry, claim); `record_transport_binding` `push` over `peer_carrier_binding` to the configured peer. B: its peer carrier's `accept`, `ingest`. Both: `Directory::serves` at `clock_binding` | `Ok(true)` twice, `push` `Ok(2)`, both ingested; A and B answer A; B's persisted snapshot equals A's | a transport, durability, a signature (the ops are unsigned) | the iroh `CarrierPort` (4.2, 4.5); the served store as record host (4.4); signing (4.1); 4.6's route |
+| `exact_retry` (i) | A: `append` of the same record, before and after its lease lapses | `Ok(false)` both times, the snapshot unchanged, the lease not extended, nothing revived; only a new stamp is `Ok(true)` | a restart: the engine is volatile | 4.4: the exact retry across a restart |
+| `lost_acknowledgement` (i) | A's push over a link whose transport fails after the last frame arrives; A retries (`append` is `Ok(false)`, nothing to re-mint) and pushes the same persisted bytes; B ingests each op twice | the first `push` is `Transport`; B holds each op once, its snapshot byte-equal, answering A; the duplicate's answer is pinned (below) | an acknowledgement: the push has none | the iroh adapter's failure evidence and TR-002's unknown outcome (4.2, 4.5); 4.4 |
+| `renewal` (ii) | A: `append` of a renewal every `RENEW_EVERY_MS` of fake time, each pushed to B | each `Ok(true)`, one epoch; past the first lease both answer A; a lease after the last renewal both answer none | `claims.rs`'s loop and its clock reads | `claims.rs` on the clock binding, the `Records` owner (3.3), over iroh |
+| `expiry` (ii) | A and B with a clock each, B's ahead | live at `lease - 1`, none at `lease`, at each reader's instant; B sees the lapse first; no record changes | a real clock, or a skew bound | the system clock; clock uncertainty is not decided (SP-C2) |
+| `wrong_scope` (ii) | A pushes an op on another share, one on a stream the profile does not host, then one in scope; B: `ingest` via `directory_profile_binding` | `OutOfScope` twice, before verification, nothing persisted, B answering none; then `Ok` and A | a referral (none in the slice, SP-N1); a copied or forged op: ops carry no signature (SP-P3(a)); who may connect | 4.1's origin signatures; 4.2's accept-time check |
+| `unknown_or_denied_authority` (ii) | `Admission` (grant binding, `GrantPort`, over `LiveGrants`) at the fake clock; A's `Directory::register`, read back through the R9 fold (`bindings_of`) | an unknown holder `NoGrant`; a grant copied to another holder, or an operator's to its node, admits nothing; a revocation between two decisions makes the second `Revoked` and a later grant stays `Revoked`; an unreadable fold `Unavailable`; an unknown authority token refuses the file; a surface's declared authority (`share` or `external`) is its live declaration's; an app's retraction withdraws its own only, and another app's later declaration stands | enforcement: no serve path consults either before 4.3; the fold's chain, issuer or persistence | 4.3's grant adapter over the node's fold, at the serve hop |
+| `partial_lookup` (ii) | A pushes three stamps of its lease, one link each: the second lost, the third delivered; then the rest, from B's head | B refuses the third (`Gap`) and answers from its prefix (none, where A answers A); after the retry, A | truncation, a limit or an observed-at stamp: the node's lookup answers one node or none; clock uncertainty (slice profile §8 item 11) | 4.6's sync round over the route |
+
+**Pinned, not endorsed.** `Registry::ingest` answers a byte-identical
+re-delivery `Equivocation` (`registry.rs:283-286`), against its own comment and
+the wire store's `Duplicate` (`store.rs:266-272`). The fold is unchanged either
+way, and `lost_acknowledgement` pins the label; a fix changes what boot does
+with a duplicated stored record, so it is the owner's call, with that pin,
+turned round, as its failing test.
+
+**Fast loop** (LBT-010), from the glade-wz root: `cargo test --offline --locked
+--manifest-path glade/node/Cargo.toml --test journeys --test assembly`, the test
+composition's two binaries, 35 tests. Measured on an Apple M3 Pro (12 cores),
+Rust 1.96, with `/usr/bin/time -p` around the command (user+sys includes cargo
+and both binaries), 2026-09-24:
+
+- warm, 7 runs at load average 3.5: wall 0.14-0.18 s, CPU 0.13-0.17 s. Cargo's
+  start-up and freshness check are nearly all of it; each binary reports 0.00 s.
+- after touching one journey file, 5 runs at load 4.3 (rebuild the journeys
+  binary, then run both): wall 0.93-1.18 s, CPU 1.17-1.32 s.
+
+Proposed budget: warm 1.0 s wall, and 3.0 s wall after an edit to one journey
+file, about six and three times the figures, for a machine other sessions
+load. Compare two trees by CPU time over interleaved runs, not one wall time.

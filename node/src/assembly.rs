@@ -482,8 +482,9 @@ pub type InstanceSlot = Arc<Mutex<Option<Boot>>>;
 enum Held {
     /// The booted instance, lent through the composition root's slot.
     Instance(InstanceSlot),
-    /// The node's own in-memory engine: a `Registry` over `MemStore`.
-    Memory(Mutex<(Registry, MemStore)>),
+    /// The node's own in-memory engine: a `Registry` over a volatile engine,
+    /// `MemStore` unless a test composition hands one in.
+    Memory(Mutex<(Registry, Box<dyn StoreApi + Send>)>),
 }
 
 /// `directory_host_binding`'s provider, the record host: the node's `Registry`
@@ -505,7 +506,18 @@ impl Records {
         profile: Arc<dyn RecordProfile>,
         transport: Arc<dyn RecordTransport>,
     ) -> Records {
-        let held = Held::Memory(Mutex::new((Registry::new(), MemStore::default())));
+        Records::in_memory_over(profile, transport, Box::new(MemStore::default()))
+    }
+
+    /// As [`Records::in_memory`], persisting the fold through `store`, an
+    /// engine the test composition can read back (plan Step 3.4's journeys).
+    /// The fold starts empty whatever `store` holds. Never built by the module.
+    pub fn in_memory_over(
+        profile: Arc<dyn RecordProfile>,
+        transport: Arc<dyn RecordTransport>,
+        store: Box<dyn StoreApi + Send>,
+    ) -> Records {
+        let held = Held::Memory(Mutex::new((Registry::new(), store)));
         Records {
             profile,
             transport,
@@ -527,7 +539,7 @@ impl Records {
             Held::Memory(memory) => {
                 let mut memory = lock(memory);
                 let (registry, store) = &mut *memory;
-                f(registry, store)
+                f(registry, store.as_mut())
             }
         }
     }
