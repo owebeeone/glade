@@ -31,7 +31,7 @@ use glade_carrier_api::{
     CarrierAddr, CarrierConfig, CarrierError, CarrierLink, CarrierPort, PortFuture, TransportId,
 };
 use iroh::endpoint::presets;
-use iroh::endpoint::{AfterHandshakeOutcome, EndpointHooks, Side, VarInt};
+use iroh::endpoint::{AfterHandshakeOutcome, EndpointHooks, PortmapperConfig, Side, VarInt};
 use iroh::endpoint::{Connection, ConnectionError, ReadError, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr};
 
@@ -68,8 +68,10 @@ fn channel(conn: &Connection, dialer: EndpointId, acceptor: EndpointId) -> io::R
 /// `presets::Minimal` (relay + discovery disabled), the ALPN `alpn`, the
 /// endpoint key `key`, and the accept hook of `door`, if any. iroh comes
 /// with `0.0.0.0` and `[::]` pre-bound, every interface, and a loopback bind
-/// replaces only its own family's, so both are cleared first: nothing
-/// listens beyond this machine, and macOS's firewall has nothing to ask.
+/// replaces only its own family's, so both are cleared first; and its
+/// portmapper, which opens a UDP socket on every interface to find the
+/// router over UPnP, is off. Nothing listens beyond this machine, and
+/// macOS's firewall has nothing to ask. The bind address is plan Step 4.5's.
 async fn bind_endpoint(
     key: EndpointKey,
     door: Option<Arc<Door>>,
@@ -82,6 +84,7 @@ async fn bind_endpoint(
         builder = builder.hooks(DoorHook(door));
     }
     builder
+        .portmapper_config(PortmapperConfig::Disabled)
         .clear_ip_transports()
         .bind_addr((Ipv4Addr::LOCALHOST, 0))
         .map_err(other)?
@@ -792,6 +795,7 @@ mod tests {
         let v1: &[u8] = b"glade/node/1";
         let old = Endpoint::builder(presets::Minimal)
             .alpns(vec![v1.to_vec()])
+            .portmapper_config(PortmapperConfig::Disabled)
             .clear_ip_transports()
             .bind_addr((Ipv4Addr::LOCALHOST, 0))
             .unwrap()
@@ -1035,6 +1039,7 @@ mod tests {
     /// raw.
     async fn raw_dial(to: &CarrierAddr, first: &[u8]) -> (Endpoint, SendStream) {
         let endpoint = Endpoint::builder(presets::Minimal)
+            .portmapper_config(PortmapperConfig::Disabled)
             .clear_ip_transports()
             .bind_addr((Ipv4Addr::LOCALHOST, 0))
             .unwrap()
