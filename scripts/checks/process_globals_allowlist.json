@@ -1,0 +1,20 @@
+{
+  "rule": "No process-global mutable state in production code: statics with interior mutability, thread-local slots, environment or working-directory reads at the point of use, process-wide hooks and child processes that inherit the live environment. Pass state through the node's configuration and context instead, read the process's arguments and environment once at the composition root, and spawn children with env_clear() plus an explicit environment. check_process_globals.py fails on anything unlisted and on entries that no longer match, so this list only shrinks. 'debt' entries are scheduled for removal (dev-docs/ProcessGlobalsPlan.md in the glade-wz workspace); 'permanent' entries are read once at a program's entry point or carry no shared state.",
+  "source": "scripts/checks/check_process_globals.py is gwz-core's checker at commit 730e7119 (gwz-dev workspace), vendored byte for byte; its own tests live there.",
+  "roots": ["node/src/lib.rs", "node/src/bin/glade-node.rs", "wire-rs/src/lib.rs", "contracts/*/src/lib.rs", "client-rs/src/lib.rs"],
+  "test_features": ["conformance"],
+  "entries": [
+    {"path": "node/src/assembly.rs", "kind": "static", "name": "REAL_PROVIDERS", "disposition": "debt",
+     "reason": "Counts the real providers NodeAssembly modules construct, so tests/assembly_registration.rs can see which were built; production code carries state that only a test reads. Give the test an observer of its own (ProcessGlobalsPlan Step 4.1)."},
+    {"path": "node/src/bin/glade-node.rs", "kind": "env", "name": "env::args", "count": 2, "disposition": "permanent",
+     "reason": "The hand-written composition root reads the process's arguments once, at its entry point, and passes them down."},
+    {"path": "node/src/bin/glade-node.rs", "kind": "env", "name": "env::temp_dir", "disposition": "debt",
+     "reason": "The legacy form's default store directory is the process temp dir, read where it is used; take it from the settings the root builds, as the booted form does (ProcessGlobalsPlan Step 2.1)."},
+    {"path": "node/src/bin/glade-node.rs", "kind": "env", "name": "env::var_os", "disposition": "permanent",
+     "reason": "GLADE_NODE_ASSEMBLED chooses the composition root at the entry point, read once before anything else runs."},
+    {"path": "node/src/lifecycle.rs", "kind": "env", "name": "env::temp_dir", "disposition": "debt",
+     "reason": "The assembled root's legacy default store directory is the process temp dir, read where it is used; take it from Settings (ProcessGlobalsPlan Step 2.1)."},
+    {"path": "node/src/sysdir.rs", "kind": "env", "name": "env::var", "count": 2, "disposition": "debt",
+     "reason": "glade_home() reads GLADE_HOME and HOME at the point of use; both roots should read them once and pass the instance root in (ProcessGlobalsPlan Step 2.1)."}
+  ]
+}

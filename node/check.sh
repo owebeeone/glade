@@ -24,6 +24,11 @@
 #                      hand-written composition root, then =1, so each starts
 #                      from the assembled one (plan Step 3.2); both must pass
 #   contracts-gate     glade/contracts/check.sh (its checker, tests, fmt, clippy)
+#   process-globals    glade/scripts/checks/check_process_globals.py, gwz-core's
+#                      process-global state ratchet, over every production
+#                      crate root in glade against its allowlist: a new
+#                      static, thread-local, environment read, hook or
+#                      inheriting child process fails, and so does a stale entry
 #   fmt, clippy        by package: a held package must pass; a package whose
 #                      debt predates this gate is counted and printed as a
 #                      named gap, never fixed here and never hidden, and is
@@ -413,6 +418,23 @@ c_contracts_gate() {
     return 1
 }
 
+# process-globals: the ratchet runs on Python 3.10 or later, found on PATH;
+# without one it fails closed. It reads sources only and builds nothing.
+c_process_globals() {
+    checker="$glade_root/scripts/checks/check_process_globals.py"
+    if [ ! -f "$checker" ]; then
+        why "glade/scripts/checks/check_process_globals.py is absent"
+        return 1
+    fi
+    if out=$(python3 "$checker" --repo "$glade_root" 2>&1); then
+        why "$(printf '%s\n' "$out" | tail -n 1)"
+        return 0
+    fi
+    printf '%s\n' "$out"
+    why "glade/scripts/checks/check_process_globals.py failed: new or stale process-global state, listed above"
+    return 1
+}
+
 # style_scope: "name dir" for every local package the node workspace reaches on
 # the host target that this repository owns and no other gate here holds. The
 # contract crates are held by glade/contracts/check.sh; a path package outside
@@ -659,6 +681,7 @@ run_component arch002-contracts c_arch002_contracts
 run_component confinement c_confinement
 run_component node-tests c_node_tests
 run_component contracts-gate c_contracts_gate
+run_component process-globals c_process_globals
 run_component fmt c_fmt
 run_component clippy c_clippy
 
