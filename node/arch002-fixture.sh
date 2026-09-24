@@ -6,10 +6,10 @@
 # architecture-policy.json, whose exact allowlist is what keeps a framework out
 # of glade-node until a reviewed policy change lets one in. A gate that has
 # never been seen to refuse anything is not evidence that it would, so this
-# script injects `sdax` into glade-node's manifest twice -- once as an ordinary
+# script injects `dill` into glade-node's manifest twice -- once as an ordinary
 # dependency, once under [target.'cfg(windows)'], a platform branch that is
 # disabled on every host but Windows -- and requires the checker to refuse each
-# with exactly `ARCH-002 glade-node: undeclared dependency normal:sdax`.
+# with exactly `ARCH-002 glade-node: undeclared dependency normal:dill`.
 #
 # It passes on that diagnostic and on nothing else. A PASS, another diagnostic,
 # or a checker that could not run `cargo metadata` fails here, because each
@@ -24,9 +24,12 @@
 #
 # The framework injected is one glade-node may not declare. It was `shaku`
 # until plan Step 3.2 allowed `normal:shaku` (the Shaku assembly is in this
-# crate) and moved this fixture to `sdax`, in the same policy change. When a
-# reviewed step allows `sdax` (Step 3.3, lifecycle), this fixture fails closed
-# -- the injection is then accepted, or collides with the real entry -- until
+# crate), then `sdax` until plan Step 3.3 allowed `normal:sdax` (the lifecycle,
+# src/lifecycle.rs), each moved in the same policy change that allowed it. It is
+# now `dill`, at the version arch1/DependencyInjectionEvaluation.md measured:
+# the other DI framework that evaluation weighed against Shaku, and did not
+# select. Were a reviewed step ever to allow it, this fixture fails closed --
+# the injection is then accepted, or collides with the real entry -- until
 # `framework` below names one glade-node still may not declare. That edit
 # belongs to the same reviewed policy change.
 set -eu
@@ -40,8 +43,8 @@ if [ ! -f "$checker" ]; then
     exit 1
 fi
 
-framework=sdax
-version="=0.1.0"
+framework=dill
+version="=0.17.0"
 expected="ARCH-002 glade-node: undeclared dependency normal:$framework"
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/glade-node-arch002.XXXXXX")

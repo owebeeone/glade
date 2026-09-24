@@ -23,6 +23,7 @@ use crate::router::{Router, SessionId};
 use crate::session::{error_frame, heads_map, missing_for};
 use crate::store::{Append, Store, StoreError};
 use crate::sysdata::SystemSnapshot;
+use crate::tasks::{Owners, Site, Tasks};
 use crate::ws::{self, Msg};
 
 pub(crate) struct Shared {
@@ -49,6 +50,9 @@ pub(crate) struct Shared {
     /// Hello naming a principal is BOUND to it — the attribution seam
     /// suppliers read (P1). Sessions absent here keep origin-as-identity.
     pub(crate) principals: Mutex<BTreeMap<SessionId, String>>,
+    /// Where every task this node spawns goes (plan Step 3.3, `tasks.rs`):
+    /// detached, unless the assembled root's lifecycle owns them.
+    pub(crate) tasks: Tasks,
 }
 
 /// A glade node bound to a store directory.
@@ -70,8 +74,15 @@ impl Server {
                 pending: Mutex::new(BTreeMap::new()),
                 dir: OnceLock::new(),
                 principals: Mutex::new(BTreeMap::new()),
+                tasks: Tasks::unowned(),
             }),
         })
+    }
+
+    /// Hand every task this node spawns from here on to `owners` (plan Step
+    /// 3.3): the assembled root's lifecycle, before anything is spawned.
+    pub(crate) fn own_tasks(&self, owners: Owners) -> std::io::Result<()> {
+        self.shared.tasks.own(owners)
     }
 
     /// Seed the live replica with a boot registry snapshot: the home-share
@@ -93,13 +104,22 @@ impl Server {
 
     /// Accept connections until the listener errors.
     pub async fn run(self, listener: TcpListener) -> std::io::Result<()> {
-        loop {
-            let (stream, _) = listener.accept().await?;
-            let shared = self.shared.clone();
-            tokio::spawn(async move {
-                let _ = handle(shared, stream).await;
-            });
-        }
+        accept_clients(&self.shared, &listener).await
+    }
+}
+
+/// `Server::run`'s loop: one client session per accepted connection, until
+/// the listener errors. The assembled root's `Sessions` runs it too.
+pub(crate) async fn accept_clients(
+    shared: &Arc<Shared>,
+    listener: &TcpListener,
+) -> std::io::Result<()> {
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let session = shared.clone();
+        shared.tasks.spawn(Site::ClientSession, async move {
+            let _ = handle(session, stream).await;
+        });
     }
 }
 
@@ -117,7 +137,7 @@ async fn handle(shared: Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
     shared.out.lock().await.insert(sid, tx);
 
     // writer task: drain this session's outbound onto the socket.
-    let wtask = tokio::spawn(async move {
+    let wtask = shared.tasks.spawn(Site::ClientWriter, async move {
         while let Some(bytes) = rx.recv().await {
             if writer.send_binary(&bytes).await.is_err() {
                 break;

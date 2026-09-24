@@ -11,8 +11,9 @@
 #
 #   architecture       glade-discover's checker over this workspace, against
 #                      architecture-policy.json
-#   arch002-node       arch002-fixture.sh: that checker is seen to refuse sdax
-#                      injected into glade-node, on a copy
+#   arch002-node       arch002-fixture.sh: that checker is seen to refuse dill,
+#                      a framework glade-node may not declare, injected into it,
+#                      on a copy
 #   arch002-contracts  glade/contracts/arch002-fixture.sh, plan Step 3.1's
 #                      fixture for the port side; absent means red
 #   confinement        cargo tree --invert: each framework is seen only by the
@@ -56,17 +57,17 @@ checker="$node_root/../../glade-discover/tools/architecture-check/Cargo.toml"
 # edges with all features on, so a registry or git crate in between does not
 # launder an edge.
 #
-# iroh may be seen only by glade-node, whose peer carrier it is, and shaku only
-# by glade-node, whose assembly it is (plan Step 3.2, src/assembly.rs). No
-# crate may see the sdax family until Step 3.3 names the one that may, as a
-# reviewed change to this table. The contracts workspace must never reach iroh,
-# tokio, shaku or sdax.
+# iroh may be seen only by glade-node, whose peer carrier it is, shaku only by
+# glade-node, whose assembly it is (plan Step 3.2, src/assembly.rs), and the
+# sdax family only by glade-node, whose lifecycle it is (plan Step 3.3,
+# src/lifecycle.rs; sdax-testkit as a dev-dependency). The contracts workspace
+# must never reach iroh, tokio, shaku or sdax.
 confinement_allowlist='
 node       iroh          glade-node
 node       shaku         glade-node
-node       sdax          -
-node       sdax-tokio    -
-node       sdax-testkit  -
+node       sdax          glade-node
+node       sdax-tokio    glade-node
+node       sdax-testkit  glade-node
 contracts  iroh          -
 contracts  tokio         -
 contracts  shaku         -
@@ -95,7 +96,7 @@ confinement_all_targets='node'
 # starts clean. A name here that is no longer in scope fails the component, as
 # a stale entry.
 style_dispositions='
-glade-node  gap:339  gap:11
+glade-node  gap:338  gap:11
 glade-wire  gap:43   gap:7
 '
 
@@ -186,7 +187,7 @@ c_architecture() {
 
 c_arch002_node() {
     if sh "$node_root/arch002-fixture.sh"; then
-        why "the checker refused sdax injected into glade-node, as a normal and as a cfg(windows) dependency, on a copy"
+        why "the checker refused dill injected into glade-node, as a normal and as a cfg(windows) dependency, on a copy"
         return 0
     fi
     why "glade/node/arch002-fixture.sh failed closed; its message above names the branch"
@@ -697,7 +698,8 @@ Also not checked: public boundary types and transitive type leakage (LBT-004,
 review only); test determinism (LBT-008) -- the node suite starts real iroh
 endpoints on loopback and is the whole suite, not a measured fast loop
 (LBT-010); disabled platform branches -- tests and clippy build the host target
-only, so code under another platform's #[cfg] is neither compiled nor linted;
+only, so code under another platform's #[cfg] is neither compiled nor linted
+(the assembled root's stop signal off Unix is one such branch);
 the standing rule that #[cfg] sits inside cfg_if! or a platform module; a new
 rustfmt deviation a few lines from an existing one -- the fmt ratchet counts
 hunks, and rustfmt merges nearby deviations into one hunk, so such a line need

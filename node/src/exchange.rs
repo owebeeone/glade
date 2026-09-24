@@ -32,6 +32,7 @@ use crate::router::SessionId;
 use crate::server::{send, Shared};
 use crate::store::Store;
 use crate::sysdata::{ServiceDefinition, WorkspaceCreateReq};
+use crate::tasks::Site;
 
 /// The reserved built-in create surface (s-create D1–D3, audit F2): a system
 /// glade id the NODE answers itself, never a supplier — creation precedes
@@ -130,9 +131,9 @@ pub(crate) async fn handle_request(shared: &Arc<Shared>, sid: SessionId, req: Ex
             }
         }
         Route::Forward(peer) => {
-            let shared = shared.clone();
-            tokio::spawn(async move {
-                forward_exchange(&shared, peer, req, sid).await;
+            let forward = shared.clone();
+            shared.tasks.spawn(Site::ForwardExchange, async move {
+                forward_exchange(&forward, peer, req, sid).await;
             });
         }
         Route::Absent(reason) => {
@@ -181,9 +182,9 @@ async fn handle_create(shared: &Arc<Shared>, sid: SessionId, req: ExchangeReq) {
         return;
     }
     if mesh.links.lock().await.contains_key(&create.target) {
-        let (shared, peer) = (shared.clone(), create.target.clone());
-        tokio::spawn(async move {
-            forward_exchange(&shared, peer, req, sid).await;
+        let (forward, peer) = (shared.clone(), create.target.clone());
+        shared.tasks.spawn(Site::ForwardCreate, async move {
+            forward_exchange(&forward, peer, req, sid).await;
         });
     } else {
         let reason = format!("create target {} is not self or a linked peer", create.target);

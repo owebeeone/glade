@@ -14,7 +14,10 @@ path = "src/bin/glade-node.rs"
 [dependencies]
 glade-wire = { path = "../wire-rs" }
 sha2 = "0.10"
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+# `signal` (plan Step 3.3): the assembled root stops on SIGTERM or SIGINT. It adds
+# no crate: iroh's graph already builds tokio with it. `"1"` stays a range; the
+# tracked Cargo.lock holds the =1.53.1 that sdax-tokio pins.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
 # node<->node QUIC carrier (Lane R step 2). Client-facing WS carrier (ws.rs) has
 # no new deps; iroh rides only the peer path. tls-ring gives the crypto provider
 # used by presets::Minimal (relay + discovery disabled — direct dial only).
@@ -30,6 +33,12 @@ glade-carrier-api = { path = "../contracts/carrier-api" }
 glade-clock-api = { path = "../contracts/clock-api" }
 glade-grant-api = { path = "../contracts/grant-api" }
 glade-signer-api = { path = "../contracts/signer-api" }
+# The lifecycle (plan Step 3.3, src/lifecycle.rs): the assembled path's start-up and
+# cleanup as one sdax plan. Git-only until crates.io, pinned at the async witness's
+# revision (version_pin: every 0.x pinned exactly). sdax, sdax-tokio and, below,
+# sdax-testkit share one rev: a mismatch between them is a failure case upstream.
+sdax = { git = "https://github.com/owebeeone/sdax-rs", package = "sdax", rev = "ccf06e76a90e22a454471a71f0cf6f5cb878baac" }
+sdax-tokio = { git = "https://github.com/owebeeone/sdax-rs", package = "sdax-tokio", rev = "ccf06e76a90e22a454471a71f0cf6f5cb878baac" }
 
 # The same four ports with their conformance suites, which tests/assembly runs
 # against the node's deterministic providers (LBT-009).
@@ -38,3 +47,6 @@ glade-carrier-api = { path = "../contracts/carrier-api", features = ["conformanc
 glade-clock-api = { path = "../contracts/clock-api", features = ["conformance"] }
 glade-grant-api = { path = "../contracts/grant-api", features = ["conformance"] }
 glade-signer-api = { path = "../contracts/signer-api", features = ["conformance"] }
+# The scripted driver and plan invariants tests/release_order.rs runs over the
+# node's plan. publish = false upstream, so it can only come from Git.
+sdax-testkit = { git = "https://github.com/owebeeone/sdax-rs", package = "sdax-testkit", rev = "ccf06e76a90e22a454471a71f0cf6f5cb878baac" }

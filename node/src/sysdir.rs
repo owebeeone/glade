@@ -140,9 +140,14 @@ impl Boot {
 /// Boot a node for `profile`, optionally overriding the instance name and the
 /// operator. Resolves the instance dir under [`glade_home`]. See [`boot_at`].
 pub fn boot(profile: Profile, name: Option<&str>, operator: Option<&str>) -> io::Result<Boot> {
+    boot_at(instance_dir(profile, name), operator.unwrap_or("local"))
+}
+
+/// Where [`boot`] puts the instance for `profile`, or for `name` when given:
+/// `<glade_home>/sys/<name>`.
+pub fn instance_dir(profile: Profile, name: Option<&str>) -> PathBuf {
     let name = name.unwrap_or_else(|| profile.default_name());
-    let dir = glade_home().join("sys").join(name);
-    boot_at(dir, operator.unwrap_or("local"))
+    glade_home().join("sys").join(name)
 }
 
 /// Run the load-validation ladder at an explicit instance dir (tests pass a

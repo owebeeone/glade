@@ -145,3 +145,114 @@ As in the witness (its caveats 1 and 6), E0275 names a bound, not the loop, and 
 missing binding and a port-type request read alike. The ambiguous role is refused
 where it is declared (E0119), each role being its own interface; the witness's
 keyed roles were refused at the request (E0599).
+
+## Lifecycle (plan Step 3.3)
+
+Design addition, 2026-09-24, written before the code against glade `3f97a3d`
+and corrected where the code taught otherwise; the spec is plan Step 3.3. The
+assembled root starts one sdax plan (`src/lifecycle.rs`; `sdax`, `sdax-tokio`,
+and `sdax-testkit` for tests, all at `ccf06e76…`) and awaits it where `run()`
+awaits `server.run(listener)`. The hand-written root builds none and behaves as
+before.
+
+**The plan.** Resident, fail-fast, a 30 s shutdown budget, 10 s for each owner
+to stop. The legacy form declares the same nodes; those it does not use hold
+nothing, so each form prints the same lines as before.
+
+| Node | Kind | Needs | Acquire, or start | Release, or stop |
+| --- | --- | --- | --- | --- |
+| `Instance` | resource | | `boot_at` the instance dir; prints `instance`, `node` | drops a `Boot` that was never adopted |
+| `Assembly` | step | Instance | `NodeAssembly` over the acquired instance (3.2's slot); prints `registry` and `app` | |
+| `Storage` | resource | Instance, Assembly | `Server::open` with owned tasks; adopts the instance by value | takes the `Server` by value; a cleanup failure if anything else still owns its state; dropping it releases the instance lock |
+| `PeerCarrier` | resource | Instance, Storage | `PeerEndpoint::bind_with` into an `EndpointSlot` | takes the endpoint out: `PeerEndpoint::close(self)` |
+| `ClientCarrier` | resource | Storage | `TcpListener::bind` | takes the listener out and drops it |
+| `Records` | service | Storage, PeerCarrier | owner of the renewal loop and record pushes | admission closed, tasks cancelled and joined |
+| `Sessions` | service | Storage, PeerCarrier, ClientCarrier | enables the mesh over the slot (`peer`); owner of links, streams, subscriptions, forwards and client sessions; runs `Server::run`'s accept loop once clients are admitted | admission and accept loop closed, tasks cancelled and joined, then every link closed by value and forwarded interests cleared |
+| `Peers` | step | Storage, Sessions | `connect_peer` per `--peer` | |
+| `Workspaces` | step | Assembly, Storage, Peers, Records | `serve_workspace` per declared workspace | |
+| `Listening` | step | Sessions, ClientCarrier, Workspaces | prints `listening`, then admits clients | |
+
+**The release graph** is the reverse of those edges. Four of them are the
+partial order of `arch1/InjectionGraphRefinement.md:42-45`: Records→Storage and
+Records→PeerCarrier, Sessions→PeerCarrier and Sessions→ClientCarrier. Records
+and Sessions stop concurrently, then the two carriers are released concurrently,
+then Storage, then Instance. Each owner's stop follows
+`RuntimeAndAssurance.md:91-93`: admission closes, its children are cancelled at
+their next await point and joined, and only then are their resources released.
+`tests/release_order.rs` reproduces the witness's partial-order test on this
+plan, statically and by a simulated run (sdax-testkit).
+
+**The task-owner seam** (`src/tasks.rs`). `Shared` gains a `Tasks`, and every
+production spawn becomes `shared.tasks.spawn(Site::…, future)`. `Server::open`
+makes it unowned, and then the call is `tokio::spawn`: the same detached task at
+the same place, and the two writers are still aborted through their handle. The
+hand-written root never leaves that mode. The assembled root makes it owned, and
+the task is sent to the owner of its site's role, which spawns it into its own
+`JoinSet` and reaps it. After that owner stops, a send is refused and the
+future is dropped: admission is closed. There is not one sdax instance per task,
+for two reasons. The node spawns per stream and per push, and an sdax run keeps
+history for every instance it ever spawned ("historical inspection and trace
+storage still grow with churn", `sdax/src/host/engine/compaction.rs:22-23`), so
+a resident node would grow without bound. And the spawns sit deep in shared
+code, which would then have to carry a service's `Cx`. sdax sees the owner: its
+stop is bounded by `stop_within`, and an owner that cannot finish is abandoned
+and named in `report.incomplete`, while the `JoinSet` dropped with it aborts
+whatever is left.
+
+| Site | Task | Owner |
+| --- | --- | --- |
+| `mesh.rs:124` | the peer accept loop | Sessions |
+| `mesh.rs:131, 166, 175, 178, 193` | a link's driver, its unlink watcher, its stream dispatcher, one inbound stream, the acceptor's stream 0 | Sessions |
+| `mesh.rs:269`, `:328` | a served subscription's writer; a forwarded interest | Sessions |
+| `mesh.rs:241` | a record push to one link | Records |
+| `claims.rs:115` | the renewal loop | Records |
+| `exchange.rs:134`, `:185` | a forwarded exchange; a forwarded `workspace.create` | Sessions |
+| `server.rs:99`, `:120` | a client session; its writer | Sessions |
+
+The two `exchange.rs` spawns, and `server.rs:99` and `:120`, which the plan
+does not name either, come under the plan with no special handling, so none is
+left as a gap. Links are acquired by the accept loop and `Peers` (HELLO
+completed) and registered in the mesh's link table; once no task that could
+register one is left, `Sessions` takes the table by value and closes each
+connection (`glade node stopping`) and clears the forwarded interests. Served
+peer subscriptions end with their streams, client ones with their sessions.
+
+**Handles given up by value.** The mesh reaches its endpoint only through the
+`EndpointSlot` it shares with `PeerCarrier`; accept and dial hold a clone only
+while they run, so after the release the mesh holds nothing. Service handles
+hold no node state (each serve body takes its own). `Storage`'s last-owner check
+(`Arc::strong_count`) turns a leaked task into a cleanup failure in the report,
+where it would otherwise show only as a socket still bound.
+
+**Stop signal and exit status.** The assembled root installs SIGTERM and SIGINT
+handlers before it starts the plan (Ctrl-C only, off Unix). Every signal asks the
+run to shut down. Start-up still in flight is cancelled at once, sdax's settle
+(T5). The release graph then runs within the budget, and a later signal changes
+nothing, since sdax never interrupts a cleanup that has begun (INV-7). A clean
+stop exits 0; clean means `report.is_clean()`: outcome `Ok`, and no fault, cleanup
+failure, `incomplete` or `ambiguous` record. Anything else exits 1. Each fault's
+message goes to stderr, as `run()` prints a failed start, and then the report if
+it records more than faults. `tracked()` is never consulted. The hand-written
+root installs no handler, so a signal still ends it by the signal itself.
+
+**Retry loops stay above sdax.** No node declares `Retry`; the release graph runs
+once. The node's retries stay in the loops the owners run (the accept loop goes
+on past a bad handshake, the next renewal tick retries a failed one, a later
+subscribe retries a lapsed forward). A failed release is a cleanup failure and
+exit 1; nothing runs it again.
+
+**Gate.** `glade-node` may declare the three sdax crates; confinement lets only
+it see them, and the contracts none. `arch002-fixture.sh` now injects `dill` at
+the `=0.17.0` `arch1/DependencyInjectionEvaluation.md` measured, the framework
+that evaluation weighed against Shaku and did not select, since `sdax` would now
+be accepted. The lockfile moves tokio 1.52.3→1.53.1 and tokio-util
+0.7.18→0.7.19, as `sdax-tokio` pins them, for both paths; the manifest keeps
+`tokio = "1"` a range and adds tokio's `signal` feature, already compiled in
+through iroh's graph.
+
+**Named gaps.** Client sessions are cancelled, not drained. The listener now
+binds before the mesh is enabled, because `Sessions` needs it. The lines keep
+their order, and no client is accepted before `listening`, but a start whose
+port is taken now fails before printing `peer`. `TokioRuntime::tracked()` does
+not count owned tasks. The Shaku module still assembles over the instance alone,
+because no `CarrierPort` adapter exists before Phase 4.

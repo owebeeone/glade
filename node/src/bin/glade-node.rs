@@ -44,10 +44,16 @@
 //!
 //! - unset: the hand-written straight line, `run` below, which the demo and
 //!   grazel use;
-//! - `1`: the assembled root, `run_assembled`, which resolves its bindings
-//!   from the Shaku module `glade_node::assembly::NodeAssembly` and composes
-//!   the same `Server` calls. It prints the same lines, and before them one
-//!   stderr line naming itself (`assembly::ASSEMBLED_ROOT_LINE`);
+//! - `1`: the assembled root, `run_assembled`, which starts the sdax plan
+//!   `glade_node::lifecycle::node_plan` (plan Step 3.3). The plan acquires the
+//!   instance, the store, the peer endpoint and the listener, resolves its
+//!   bindings from the Shaku module `glade_node::assembly::NodeAssembly`, and
+//!   composes the same `Server` calls. It prints the same lines, and before
+//!   them one stderr line naming itself (`assembly::ASSEMBLED_ROOT_LINE`).
+//!   SIGTERM or SIGINT stops it: the plan stops admitting work, cancels its
+//!   tasks and any start-up still in flight, and releases what it acquired, in
+//!   reverse. A clean stop exits 0; anything else prints why on stderr and
+//!   exits 1;
 //! - any other value, the empty string included: the start is refused before
 //!   anything is read or written, with a message naming the variable, and
 //!   the node exits 1.
@@ -55,17 +61,15 @@
 use std::ffi::OsString;
 use std::io::Write;
 use std::process::ExitCode;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 
-use glade_node::assembly::{
-    CommandLine, Config, Directory, InstanceSlot, NodeAssembly, Records, Settings,
-    ASSEMBLED_ROOT_LINE,
-};
+use glade_node::assembly::{Settings, ASSEMBLED_ROOT_LINE};
 use glade_node::iroh_carrier::{PeerAddr, PeerEndpoint};
+use glade_node::lifecycle::{conclude, node_plan, Console, NodeStart, StdConsole};
 use glade_node::registry::{RegistryApi, StoreApi, HOME};
 use glade_node::server::Server;
 use glade_node::sysdir::{boot, now_ms, Profile};
-use shaku::HasComponent;
+use sdax_tokio::{PlanStart, TokioRuntime};
 use tokio::net::TcpListener;
 
 /// The variable that chooses the composition root.
@@ -88,18 +92,11 @@ fn assembled(value: Option<OsString>) -> std::io::Result<bool> {
 }
 
 /// Start the node from the composition root the environment chooses.
-async fn start() -> std::io::Result<()> {
+async fn start() -> std::io::Result<ExitCode> {
     if assembled(std::env::var_os(ASSEMBLED))? {
         return run_assembled().await;
     }
-    run().await
-}
-
-/// Parse a `--peer` target: `<endpoint-id-hex>@<ip:port>` (the two values a
-/// peer prints as `peer <id> <addr>`).
-fn parse_peer(s: &str) -> Option<PeerAddr> {
-    let (id, sock) = s.split_once('@')?;
-    Some(PeerAddr { endpoint_id: id.parse().ok()?, socket: sock.parse().ok()? })
+    run().await.map(|()| ExitCode::SUCCESS)
 }
 
 /// Runs the node, and prints a failure with `Display`, its message as written
@@ -109,7 +106,7 @@ fn parse_peer(s: &str) -> Option<PeerAddr> {
 #[tokio::main]
 async fn main() -> ExitCode {
     match start().await {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(e) => {
             eprintln!("{e}");
             ExitCode::FAILURE
@@ -200,7 +197,7 @@ async fn run() -> std::io::Result<()> {
         let addr = server.enable_mesh(endpoint).await?;
         println!("peer {} {}", addr.endpoint_id, addr.socket);
         for p in &peers {
-            match parse_peer(p) {
+            match PeerAddr::parse(p) {
                 Some(target) => match server.connect_peer(&target).await {
                     Ok(id) => println!("peer-connected {id}"),
                     Err(e) => eprintln!("peer {p}: {e}"),
@@ -221,110 +218,92 @@ async fn run() -> std::io::Result<()> {
     server.run(listener).await
 }
 
-/// The assembled composition root (plan Step 3.2): `run`'s start, step for
-/// step, with its bindings resolved from `NodeAssembly`, one node scope.
-///
-/// Acquisition is I/O, so it stays here and never happens in a constructor.
-/// The root boots the instance and lends it to the record host through a
-/// slot, then takes it back out, by value, when the `Server` adopts it. It
-/// still binds the peer endpoint and the TCP listener itself: their carrier
-/// adapters are plan Phase 4's, and until then the `Server` runs both.
-async fn run_assembled() -> std::io::Result<()> {
+/// The assembled composition root (plan Steps 3.2 and 3.3): `run`'s start,
+/// step for step, as the sdax plan `glade_node::lifecycle::node_plan`, which
+/// owns every acquisition and every task. The root parses the arguments and
+/// loads every `--app` file, then waits on the plan where `run` waits on
+/// `server.run`. A stop signal asks the plan to shut down; the report decides
+/// the exit status.
+async fn run_assembled() -> std::io::Result<ExitCode> {
     eprintln!("{ASSEMBLED_ROOT_LINE}");
     let settings = Settings::from_args(std::env::args().skip(1));
-    let slot: InstanceSlot = Arc::new(Mutex::new(None));
-
-    // Where the booted instance lives, and the node id its records are
-    // attributed to.
-    let (decls, booted) = if settings.booted() {
-        // Every `--app` file is loaded, and two naming one app are refused,
-        // before `boot` opens the instance (L1-14): a refused start writes
-        // nothing.
-        let decls = glade_node::appdecl::load_all(&settings.apps)?;
-        let profile = settings.profile.unwrap_or(Profile::Local);
-        let (name, operator) = (settings.name.as_deref(), settings.operator.as_deref());
-        let node = boot(profile, name, operator)?;
-        println!("instance {}", node.dir.display());
-        println!("node {}", node.node_id);
-        if node.rejected > 0 {
-            println!("quarantined {} record(s) at load", node.rejected);
-        }
-        let booted = (node.dir.clone(), node.node_id.clone());
-        *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(node);
-        (decls, Some(booted))
+    // Every `--app` file is loaded, and two naming one app are refused,
+    // before the plan boots the instance (L1-14): a refused start writes
+    // nothing.
+    let decls = if settings.booted() {
+        glade_node::appdecl::load_all(&settings.apps)?
     } else {
-        (Vec::new(), None)
+        Vec::new()
     };
-
-    // The parsed settings and the lent instance are the module's parameters;
-    // everything below is resolved from it.
-    let module = NodeAssembly::builder()
-        .with_component_parameters::<CommandLine>(settings)
-        .with_component_parameters::<Records>(slot.clone())
-        .build();
-    let config: Arc<dyn Config> = module.resolve();
-    let settings = config.settings();
-    let directory: Arc<dyn Directory> = module.resolve();
-
-    let mut workspaces: Vec<(String, String)> = Vec::new();
-    if let Some((_, registrant)) = &booted {
-        let serves_home = directory.serves(HOME)?.is_some();
-        println!("registry ready (home served: {serves_home})");
-        for (path, decl) in settings.apps.iter().zip(decls) {
-            // The non-fatal channel (R10(a)), as `run` prints it.
-            for line in decl.warning_lines(path) {
-                eprintln!("{line}");
-            }
-            let reg = directory.register(&decl, registrant)?;
-            println!(
-                "app {} registered (+{} record(s), {} unchanged)",
-                decl.app, reg.appended, reg.unchanged
-            );
-            let declared = decl.workspaces.iter();
-            workspaces.extend(declared.map(|w| (w.share.clone(), w.name.clone())));
-        }
-    }
-
-    let dir = match (settings.store_dir(), &booted) {
-        (Some(dir), _) => dir.to_owned(),
-        (None, Some((instance, _))) => {
-            let store = instance.join("cache").join("store");
-            store.to_string_lossy().into_owned()
-        }
-        (None, None) => {
-            let store = std::env::temp_dir().join("glade-node-bin");
-            store.to_string_lossy().into_owned()
+    let console: Arc<dyn Console> = Arc::new(StdConsole);
+    let start = NodeStart::from_settings(settings, decls, console.clone());
+    let mut stop = stop_signal::StopSignal::install()?;
+    let runtime = Arc::new(TokioRuntime::new(tokio::runtime::Handle::current()));
+    let mut running = node_plan().start(runtime, start);
+    let run = running.handle();
+    let report = loop {
+        tokio::select! {
+            report = &mut running => break report,
+            // A normal end, from wherever the run is: start-up bodies still in
+            // flight are cancelled, and the release graph runs within the
+            // plan's shutdown budget. sdax never interrupts a cleanup that has
+            // begun (INV-7), so a later signal changes nothing.
+            () = stop.received() => run.shutdown(),
         }
     };
-    let server = Server::open(&dir)?;
+    if conclude(&report, &*console) {
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Ok(ExitCode::FAILURE)
+    }
+}
 
-    // Adoption: the instance comes back out of the slot by value, and from
-    // here on the record host holds nothing (it answers `NotOpen`).
-    let adopted = slot.lock().unwrap_or_else(PoisonError::into_inner).take();
-    if let Some(node) = adopted {
-        let identity = node.identity()?;
-        server.adopt_boot(node).await?;
-        let endpoint = PeerEndpoint::bind_with(identity).await?;
-        let addr = server.enable_mesh(endpoint).await?;
-        println!("peer {} {}", addr.endpoint_id, addr.socket);
-        for p in &settings.peers {
-            match parse_peer(p) {
-                Some(target) => match server.connect_peer(&target).await {
-                    Ok(id) => println!("peer-connected {id}"),
-                    Err(e) => eprintln!("peer {p}: {e}"),
-                },
-                None => eprintln!("peer {p}: expected <endpoint-id>@<ip:port>"),
-            }
-        }
-        for (share, name) in &workspaces {
-            server.serve_workspace(share, name).await?;
-            println!("workspace {share} serving");
-        }
+// The stop signal the assembled root waits for: SIGTERM or SIGINT on Unix,
+// Ctrl-C elsewhere. Each platform's branch is one braced module, so the
+// condition encloses the whole section.
+#[cfg(unix)]
+mod stop_signal {
+    use tokio::signal::unix::{signal, Signal, SignalKind};
+
+    pub struct StopSignal {
+        term: Signal,
+        interrupt: Signal,
     }
 
-    let listener = TcpListener::bind(("127.0.0.1", settings.port())).await?;
-    let actual = listener.local_addr()?.port();
-    println!("listening {actual}");
-    std::io::stdout().flush().ok();
-    server.run(listener).await
+    impl StopSignal {
+        /// Install the handlers: from here on the signals no longer end the
+        /// process themselves.
+        pub fn install() -> std::io::Result<StopSignal> {
+            Ok(StopSignal {
+                term: signal(SignalKind::terminate())?,
+                interrupt: signal(SignalKind::interrupt())?,
+            })
+        }
+
+        /// Resolves at the next SIGTERM or SIGINT.
+        pub async fn received(&mut self) {
+            tokio::select! {
+                _ = self.term.recv() => {}
+                _ = self.interrupt.recv() => {}
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+mod stop_signal {
+    pub struct StopSignal;
+
+    impl StopSignal {
+        pub fn install() -> std::io::Result<StopSignal> {
+            Ok(StopSignal)
+        }
+
+        /// Resolves at the next Ctrl-C; never, if it cannot be listened for.
+        pub async fn received(&mut self) {
+            if tokio::signal::ctrl_c().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
 }

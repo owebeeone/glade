@@ -14,6 +14,7 @@ pub mod echo;
 pub mod exchange;
 pub mod frame;
 pub mod iroh_carrier;
+pub mod lifecycle;
 pub mod mesh;
 pub mod peer;
 pub mod registry;
@@ -23,6 +24,7 @@ pub mod session;
 pub mod store;
 pub mod sysdata;
 pub mod sysdir;
+mod tasks;
 pub mod ws;
 
 // Re-export the wire CBOR runtime as `crate::cbor` so the taut-generated

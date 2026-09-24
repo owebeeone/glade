@@ -35,6 +35,7 @@ use crate::server::{Server, Shared};
 use crate::store::Store;
 use crate::sysdata::{PrincipalRecord, ServeClaim, WorkspaceCreateReq, WorkspaceCreateRes, WorkspaceEntry};
 use crate::sysdir::{now_ms, Boot};
+use crate::tasks::Site;
 
 /// Default serve-lease TTL — matches the 30s the traces and tests use.
 pub const LEASE_TTL_MS: i64 = 30_000;
@@ -112,7 +113,7 @@ impl Server {
             .set(state)
             .map_err(|_| other("directory authority already adopted"))?;
         let shared = self.shared.clone();
-        tokio::spawn(async move {
+        self.shared.tasks.spawn(Site::Renewal, async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(renew_ms)).await;
                 renew_leases(&shared).await;

@@ -47,6 +47,18 @@ pub struct PeerAddr {
     pub socket: SocketAddr,
 }
 
+impl PeerAddr {
+    /// Parse a `--peer` target, `<endpoint-id-hex>@<ip:port>`: the two values
+    /// a node prints as `peer <id> <addr>`.
+    pub fn parse(s: &str) -> Option<PeerAddr> {
+        let (id, sock) = s.split_once('@')?;
+        Some(PeerAddr {
+            endpoint_id: id.parse().ok()?,
+            socket: sock.parse().ok()?,
+        })
+    }
+}
+
 /// An established peer connection after HELLO: the verified peer identity plus
 /// the bidirectional stream (kept as split halves for the sync driver).
 pub struct PeerLink {

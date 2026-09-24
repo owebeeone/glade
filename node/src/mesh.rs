@@ -20,7 +20,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use tokio::sync::Mutex;
@@ -36,6 +36,7 @@ use crate::server::{send, Server, Shared};
 use crate::session::{heads_map, missing_for};
 use crate::store::{Append, Store};
 use crate::sysdir::now_ms;
+use crate::tasks::Site;
 
 fn other<E: Into<Box<dyn std::error::Error + Send + Sync>>>(e: E) -> io::Error {
     io::Error::new(io::ErrorKind::Other, e)
@@ -50,7 +51,9 @@ pub(crate) fn hex_id(id: &[u8]) -> String {
 /// peer's directory node id (hex). A link is a QUIC connection that survived the
 /// HELLO seam; the ServeClaim fold picks WHICH link a subscribe rides (C2).
 pub struct Mesh {
-    pub(crate) endpoint: PeerEndpoint,
+    /// The bound endpoint. Accept and dial take a clone for as long as they
+    /// run; the slot itself is the mesh's only lasting handle on it.
+    pub(crate) endpoint: EndpointSlot,
     /// Our directory node id (hex of the HELLO identity) — the id our own
     /// ServeClaims carry, so `who_serves == self` short-circuits to local.
     pub(crate) self_id: String,
@@ -59,6 +62,40 @@ pub struct Mesh {
     /// Zones whose interest is already forwarded to a claim holder — a second
     /// local subscriber joins the flow, it never opens a second stream.
     pub(crate) forwarded: Mutex<BTreeSet<(String, String, Vec<u8>)>>,
+}
+
+/// The mesh's lasting handle on its endpoint, which a composition root that
+/// acquired the endpoint shares, so its release can take the endpoint back by
+/// value for `PeerEndpoint::close(self)` (plan Step 3.3). A mesh whose root
+/// never takes it back, the hand-written root's, holds it for its lifetime.
+#[derive(Clone)]
+pub(crate) struct EndpointSlot(Arc<std::sync::Mutex<Option<PeerEndpoint>>>);
+
+impl EndpointSlot {
+    pub(crate) fn new(endpoint: PeerEndpoint) -> EndpointSlot {
+        EndpointSlot(Arc::new(std::sync::Mutex::new(Some(endpoint))))
+    }
+
+    /// A slot with no endpoint: the legacy form binds none.
+    pub(crate) fn empty() -> EndpointSlot {
+        EndpointSlot(Arc::new(std::sync::Mutex::new(None)))
+    }
+
+    /// A clone of the endpoint, for one accept loop or one dial.
+    pub(crate) fn get(&self) -> io::Result<PeerEndpoint> {
+        let held = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        held.clone().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "the peer endpoint has been released",
+            )
+        })
+    }
+
+    /// Take the endpoint out, by value. `None` once taken, or if never held.
+    pub(crate) fn give_up(&self) -> Option<PeerEndpoint> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).take()
+    }
 }
 
 /// Where a subscribe is served (the C2 decision). Decided per subscribe, at
@@ -109,10 +146,17 @@ impl Server {
     /// accept loop (hello + serve on accept). Returns the dialable address.
     /// Call once, before `run`.
     pub async fn enable_mesh(&self, endpoint: PeerEndpoint) -> io::Result<PeerAddr> {
+        self.enable_mesh_over(EndpointSlot::new(endpoint)).await
+    }
+
+    /// [`Server::enable_mesh`] over an endpoint the caller keeps a handle on
+    /// (the assembled root's lifecycle, which closes it by value on release).
+    pub(crate) async fn enable_mesh_over(&self, slot: EndpointSlot) -> io::Result<PeerAddr> {
+        let endpoint = slot.get()?;
         let addr = endpoint.addr()?;
         let mesh = Arc::new(Mesh {
             self_id: hex_id(&endpoint.identity().node_id),
-            endpoint,
+            endpoint: slot,
             links: Mutex::new(BTreeMap::new()),
             forwarded: Mutex::new(BTreeSet::new()),
         });
@@ -121,15 +165,15 @@ impl Server {
             .set(mesh.clone())
             .map_err(|_| other("mesh already enabled"))?;
         let shared = self.shared.clone();
-        tokio::spawn(async move {
-            // The accept loop borrows the mesh's endpoint clone, so the
-            // endpoint outlives every link it produces (the R2 footgun).
+        self.shared.tasks.spawn(Site::AcceptLoop, async move {
+            // The accept loop holds its own endpoint clone, so the endpoint
+            // outlives every link it produces (the R2 footgun).
             loop {
-                match mesh.endpoint.accept().await {
+                match endpoint.accept().await {
                     Ok(Some(link)) => {
-                        let (shared, mesh) = (shared.clone(), mesh.clone());
-                        tokio::spawn(async move {
-                            let _ = run_link(shared, mesh, link, false).await;
+                        let (link_shared, mesh) = (shared.clone(), mesh.clone());
+                        shared.tasks.spawn(Site::AcceptedLink, async move {
+                            let _ = run_link(link_shared, mesh, link, false).await;
                         });
                     }
                     Ok(None) => break, // endpoint closed
@@ -145,7 +189,7 @@ impl Server {
     /// directory node id (hex).
     pub async fn connect_peer(&self, addr: &PeerAddr) -> io::Result<String> {
         let mesh = self.shared.mesh.get().cloned().ok_or_else(|| other("mesh not enabled"))?;
-        let link = mesh.endpoint.dial(addr).await?;
+        let link = mesh.endpoint.get()?.dial(addr).await?;
         let peer = hex_id(&link.peer.peer_id);
         run_link(self.shared.clone(), mesh, link, true).await?;
         Ok(peer)
@@ -163,7 +207,7 @@ async fn run_link(shared: Arc<Shared>, mesh: Arc<Mesh>, link: PeerLink, dialed: 
     // Unlink on close, whoever closes first.
     {
         let (mesh, conn, peer_hex) = (mesh.clone(), conn.clone(), peer_hex.clone());
-        tokio::spawn(async move {
+        shared.tasks.spawn(Site::Unlink, async move {
             conn.closed().await;
             mesh.links.lock().await.remove(&peer_hex);
         });
@@ -171,12 +215,12 @@ async fn run_link(shared: Arc<Shared>, mesh: Arc<Mesh>, link: PeerLink, dialed: 
 
     // Dispatch every inbound stream by its first frame.
     {
-        let (shared, conn) = (shared.clone(), conn.clone());
-        tokio::spawn(async move {
+        let (dispatch, conn) = (shared.clone(), conn.clone());
+        shared.tasks.spawn(Site::StreamDispatch, async move {
             while let Ok((send, recv)) = conn.accept_bi().await {
-                let shared = shared.clone();
-                tokio::spawn(async move {
-                    let _ = handle_peer_stream(shared, send, recv).await;
+                let stream = dispatch.clone();
+                dispatch.tasks.spawn(Site::PeerStream, async move {
+                    let _ = handle_peer_stream(stream, send, recv).await;
                 });
             }
         });
@@ -189,9 +233,9 @@ async fn run_link(shared: Arc<Shared>, mesh: Arc<Mesh>, link: PeerLink, dialed: 
     } else {
         // Stream 0 on the acceptor side is the DIALER's pull channel: serve it.
         {
-            let shared = shared.clone();
-            tokio::spawn(async move {
-                let _ = handle_peer_stream(shared, s0_send, s0_recv).await;
+            let stream = shared.clone();
+            shared.tasks.spawn(Site::StreamZero, async move {
+                let _ = handle_peer_stream(stream, s0_send, s0_recv).await;
             });
         }
         let (send, recv) = conn.open_bi().await.map_err(other)?;
@@ -238,7 +282,7 @@ pub(crate) async fn push_home(shared: &Arc<Shared>, ops: Vec<Op>) {
     let links: Vec<Connection> = mesh.links.lock().await.values().cloned().collect();
     for conn in links {
         let ops = ops.clone();
-        tokio::spawn(async move {
+        shared.tasks.spawn(Site::RecordPush, async move {
             if let Ok((mut send, _recv)) = conn.open_bi().await {
                 use tokio::io::AsyncWriteExt;
                 let _ = write_frame(&mut send, &Frame::Ops(Ops { ops, pri: None })).await;
@@ -266,7 +310,7 @@ async fn serve_peer_subscribe(
 
     // Writer: drain the session outbound onto the QUIC stream, u32-framed —
     // the peer framing every glade stream speaks.
-    let wtask = tokio::spawn(async move {
+    let wtask = shared.tasks.spawn(Site::SubscriptionWriter, async move {
         use tokio::io::AsyncWriteExt;
         while let Some(bytes) = rx.recv().await {
             let ok = qsend.write_all(&(bytes.len() as u32).to_le_bytes()).await.is_ok()
@@ -324,11 +368,28 @@ pub(crate) async fn forward_interest(shared: &Arc<Shared>, peer: String, share: 
         mesh.forwarded.lock().await.remove(&zone);
         return;
     };
-    let shared = shared.clone();
-    tokio::spawn(async move {
-        let _ = run_forward(&shared, conn, &share, &glade_id, &key).await;
+    let forward = shared.clone();
+    shared.tasks.spawn(Site::ForwardInterest, async move {
+        let _ = run_forward(&forward, conn, &share, &glade_id, &key).await;
         mesh.forwarded.lock().await.remove(&(share, glade_id, key));
     });
+}
+
+/// Close every live peer link and forget it, with the interests forwarded
+/// over them: the assembled root's `Sessions` stop (plan Step 3.3), once
+/// every task that could register a link has ended. The link table is taken
+/// by value, so the mesh keeps no `Connection` that could hold the endpoint's
+/// socket open. Returns how many links were closed.
+pub(crate) async fn release_links(shared: &Arc<Shared>) -> usize {
+    let Some(mesh) = shared.mesh.get() else {
+        return 0;
+    };
+    let links = std::mem::take(&mut *mesh.links.lock().await);
+    for conn in links.values() {
+        conn.close(0u32.into(), b"glade node stopping");
+    }
+    mesh.forwarded.lock().await.clear();
+    links.len()
 }
 
 async fn run_forward(shared: &Arc<Shared>, conn: Connection, share: &str, glade_id: &str, key: &[u8]) -> io::Result<()> {
