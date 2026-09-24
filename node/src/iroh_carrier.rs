@@ -66,7 +66,10 @@ fn channel(conn: &Connection, dialer: EndpointId, acceptor: EndpointId) -> io::R
 
 /// The one endpoint recipe every constructor shares: localhost,
 /// `presets::Minimal` (relay + discovery disabled), the ALPN `alpn`, the
-/// endpoint key `key`, and the accept hook of `door`, if any.
+/// endpoint key `key`, and the accept hook of `door`, if any. iroh comes
+/// with `0.0.0.0` and `[::]` pre-bound, every interface, and a loopback bind
+/// replaces only its own family's, so both are cleared first: nothing
+/// listens beyond this machine, and macOS's firewall has nothing to ask.
 async fn bind_endpoint(
     key: EndpointKey,
     door: Option<Arc<Door>>,
@@ -79,6 +82,7 @@ async fn bind_endpoint(
         builder = builder.hooks(DoorHook(door));
     }
     builder
+        .clear_ip_transports()
         .bind_addr((Ipv4Addr::LOCALHOST, 0))
         .map_err(other)?
         .bind()
@@ -760,6 +764,25 @@ mod tests {
         );
     }
 
+    /// Every endpoint the node binds listens on loopback alone. iroh
+    /// pre-binds `0.0.0.0` and `[::]`, and a loopback IPv4 bind replaced only
+    /// the first: the `[::]` socket stayed, open to the LAN over IPv6, and
+    /// macOS's firewall asked about every new node and test binary.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_endpoint_listens_on_loopback_alone() {
+        let key = EndpointKey::from_seed([7; 32]);
+        let endpoint = bind_endpoint(key, None, ALPN).await.unwrap();
+        let sockets = endpoint.bound_sockets();
+        assert!(!sockets.is_empty(), "no socket bound");
+        for socket in &sockets {
+            assert!(
+                socket.ip().is_loopback(),
+                "{socket} listens beyond this machine: {sockets:?}"
+            );
+        }
+        endpoint.close().await;
+    }
+
     /// Plan Step 4.1a: the ALPN names protocol 2, so a node of protocol 1, an
     /// endpoint offering only `glade/node/1`, fails at connect in either
     /// direction, before any HELLO is sent.
@@ -769,6 +792,7 @@ mod tests {
         let v1: &[u8] = b"glade/node/1";
         let old = Endpoint::builder(presets::Minimal)
             .alpns(vec![v1.to_vec()])
+            .clear_ip_transports()
             .bind_addr((Ipv4Addr::LOCALHOST, 0))
             .unwrap()
             .bind()
@@ -1011,6 +1035,7 @@ mod tests {
     /// raw.
     async fn raw_dial(to: &CarrierAddr, first: &[u8]) -> (Endpoint, SendStream) {
         let endpoint = Endpoint::builder(presets::Minimal)
+            .clear_ip_transports()
             .bind_addr((Ipv4Addr::LOCALHOST, 0))
             .unwrap()
             .bind()
