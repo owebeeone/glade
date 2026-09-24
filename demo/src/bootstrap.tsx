@@ -10,7 +10,12 @@ import App from "./App";
 // 3. mount the UI (dumb projections over the grips).
 registerAllTaps();
 
-const NODE_URL = "ws://127.0.0.1:9099";
+// The node's port, set by vite when it serves or builds the page (`define` in
+// vite.config.ts: GLADE_NODE_PORT, which run_demo.py sets to the port its node
+// reports, or 9099).
+declare const __GLADE_NODE_PORT__: string;
+
+const NODE_URL = `ws://127.0.0.1:${__GLADE_NODE_PORT__}`;
 startGladeSync(NODE_URL).catch((e) => console.error("glade sync:", (e as Error).message));
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
