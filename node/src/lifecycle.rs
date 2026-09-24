@@ -237,7 +237,8 @@ struct Storage {
 }
 
 impl Storage {
-    /// Open the store, give its tasks to the two owners, adopt the instance.
+    /// Open the store, give its tasks to the two owners, adopt the instance,
+    /// and say whether `home` is served.
     async fn open(start: &NodeStart, instance: &Instance) -> io::Result<Storage> {
         let dir = match (start.settings.store_dir(), &instance.booted) {
             (Some(dir), _) => PathBuf::from(dir),
@@ -255,7 +256,13 @@ impl Storage {
         let (owners, sessions, records) = tasks::owners();
         server.own_tasks(owners)?;
         if let Some(boot) = instance.take() {
+            // Adoption renews the `home` claim, which the line then reads, at
+            // the point the hand-written root prints it.
             server.adopt_boot(boot).await?;
+            let serves_home = server.serves(HOME).await.is_some();
+            start
+                .console
+                .out(&format!("registry ready (home served: {serves_home})"));
         }
         Ok(Storage {
             server: Mutex::new(Some(server)),
@@ -367,10 +374,6 @@ fn assemble(start: &NodeStart, instance: &Instance) -> Result<Declared, Error> {
     let Some(booted) = &instance.booted else {
         return Ok(workspaces);
     };
-    let serves_home = directory.serves(HOME).map_err(io::Error::from)?.is_some();
-    start
-        .console
-        .out(&format!("registry ready (home served: {serves_home})"));
     for (path, decl) in config.settings().apps.iter().zip(&start.decls) {
         // The non-fatal channel (R10(a)), as the hand-written root prints it.
         for line in decl.warning_lines(path) {

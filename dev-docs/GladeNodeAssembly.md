@@ -4895,3 +4895,235 @@ the lock; Windows and Linux, which the lane owner runs on dabeest and the Pi.
 - tests: +395/−21: `records_file.rs` +269, `sysdir.rs` +61, `tests/durable/
   adapter.rs` +31/−20, `tests/assembled_path.rs` +33/−1, `registry.rs` +1;
 - beside them, the IR +11/−1.
+
+## The `home` claim renewed like any served share (the lane owner's ruling of 2026-09-25)
+
+Design addition, 2026-09-25, written before the code against glade `83ba787`.
+The red runs and the measured figures were filled in afterwards. The
+persistence suite's part 1 found the defect (its named gaps, "Seen in
+passing"). The lane owner ruled the fix for the lane: "`home` joins the renewal
+loop at adoption, like any served share", which fits GDL-038's "the home share
+stays an ORDINARY share".
+
+Nothing changes in the wire, in any durable format, in the contracts or in the
+dependencies. The code is in `node/src/claims.rs`, with the start line in both
+composition roots.
+
+### 1. The defect
+
+- A first boot (`sysdir::boot_at`) mints the node's presence and a
+  `ServeClaim` on `home`, at epoch 1, on a 30 s lease.
+- Adoption (`adopt_boot_tuned`) starts the renewal set, `DirAuthority.served`,
+  empty. `renew_leases` renews only the shares in it, which
+  `serve_workspace_on` enters.
+- So the `home` claim lapses 30 s after the first boot and is never renewed.
+  Every later start prints `registry ready (home served: false)`, and a peer
+  holds the node's `home` claim as lapsed.
+- Routing never reads it: `mesh::route_subscribe` answers `Local` for `home`.
+  The damage is a false status line and a stale claim in the directory.
+
+### 2. `home` in the renewal set
+
+- Adoption starts the renewal set with `home` in it, at the epoch of section
+  3. Every tick renews it with the other served shares: one acceptance, one
+  save of records.json, one push.
+- **Adoption renews it at once**, before it returns, as a serve mints its
+  first claim at once. A claim that lapsed while the node was stopped is live
+  again before the peer endpoint binds or the listener opens, so no peer or
+  client of this run sees it lapsed. A renewal whose save fails is neither
+  folded nor published, as at any tick, and the next tick retries it; the
+  start goes on.
+- So a running node's `home` claim is live from adoption on, renewed every
+  10 s. It lapses one lease, 30 s, after the last renewal, once the node has
+  stopped.
+
+### 3. The claim rules
+
+`serve_workspace_on` mints a share's first claim one epoch above the highest
+the served replica holds for that share, live or lapsed, from any node. A node
+that restarts or takes over so fences out any stale claim, and its renewals
+keep that epoch.
+
+- **The epoch.** `home` joins at the highest epoch among this node's own
+  claims on it in the served replica, live or lapsed. For every node so far
+  that is 1, the epoch the first boot minted. A node with no claim of its own
+  on `home` (its claims chain quarantined at load) joins at 1, as a first boot
+  mints.
+  - Not one above the highest. Every node serves `home` at once, from its own
+    replica, so no node's claim on it is stale for another's to fence out.
+    Under a serve's rule, each start would move `who_serves(home)` to
+    whichever node started last, as though it had taken `home` over.
+  - So a renewal and a later boot both keep the epoch: all of a node's claims
+    on `home` carry one epoch.
+- **A lapsed claim** is renewed at its epoch with a fresh expiry, an ordinary
+  `ServeClaim` append like any renewal. Expiry is judged at the reader's
+  clock, so the newest claim decides.
+- **A later boot** finds the claim its last run renewed: live if the node
+  stopped less than 30 s before, lapsed otherwise. Adoption takes it up at its
+  epoch and renews it at once.
+- **`serve_workspace_on` of `home`**, from a `workspace home ...` line or the
+  create ceremony, finds `home` in the set and mints nothing (`created:
+  false`). Before, it minted a `WorkspaceEntry` naming `home` and a claim one
+  epoch above the highest.
+
+### 4. The start line
+
+- `registry ready (home served: ...)` reads `who_serves(home)` from the
+  registry's fold. Both roots print it before adoption: the hand-written root
+  right after boot, the assembled root in its `Assembly` step, through
+  `Directory::serves`.
+- Printed there, a start more than 30 s after the node stopped still reads the
+  claim as lapsed, which it is at that moment, and prints `false`, even with
+  section 2: adoption renews the claim only afterwards.
+- **So the line moves.** Both roots print it right after adoption, from the
+  adopted registry's fold (a new `Server::serves`), where it reads `true`. Its
+  words stay. The hand-written root prints it after `adopt_boot`, the
+  assembled root in `Storage`, after the same call. If the save at adoption
+  fails, a lapsed claim stays lapsed, and the line says `false`, which is
+  then true.
+- The order of the lines becomes: `instance`, `node`, any of the boot's own
+  lines (`set aside`, `revoked`, `quarantined`, the grant fold's), each file's
+  `app` line, any of the served store's (`set aside`, `client grants
+  enforced`), `registry ready`, `peer` and any `peer-connected`, each
+  `workspace` line, `listening`. Before, `registry ready` came before the
+  first `app` line. Nothing downstream reads the line: every consumer reads
+  `listening` alone.
+- `Directory::serves` keeps its tests; no root calls it any more.
+
+### 5. The cost
+
+- **One more renewal record every 10 s** on every adopted node: 8,640 a day,
+  each about 290 bytes signed, so about 2.5 MB a day in records.json and as
+  much again in the served store's `home` journal. The desk serves one
+  workspace, `ws-razel`, so its renewals double, from 8,640 a day to 17,280.
+- **Saves.** Where a workspace is served, a tick still makes one acceptance
+  and one save. A node that serves none, which saved nothing on a tick
+  before, now saves records.json every 10 s.
+- **One more record at each start**: the renewal at adoption.
+- **Each tick's push** carries two records instead of one.
+- **Boot.** The signature checks at load grow with the records (4.1b's F4): a
+  week of the desk's renewals becomes about 121,000 records instead of
+  60,000. Nothing compacts them (named gaps).
+
+### 6. Tests, each begun red
+
+Built on 2026-09-25 against glade `83ba787`. Each test was run first against
+that commit's production code, in a copy of its sources with the three tests
+added; the message is what each red run printed. `<node>` stands for the
+node's id.
+
+| Test | Proves | Red first |
+| --- | --- | --- |
+| `claims`: `the_home_claim_is_renewed_while_the_node_runs` | a node whose `home` claim was leased for 300 ms, written as the node writes it, adopted on 300 ms leases renewed every 100 ms, holds a claim on `home` live three leases past the first one's end, in the served store and in records.json, every one at epoch 1 | "timed out waiting for a claim on home live three leases past the first", after 6.3 s |
+| `claims`: `a_later_boot_renews_its_lapsed_home_claim_at_once_at_its_epoch` | a node whose `home` claim lapsed while it was stopped, adopted with the loop an hour off, holds it live at once, in the served store and in the adopted registry, and the renewal carries epoch 1 (`[1, 1]`), where a serve's rule would have minted 2 | "live at once": `left: None`, `right: Some("<node>")` |
+| `assembled_path`: `both_roots_report_home_served_on_a_start_after_the_claim_lapsed` | on each root, a start on an instance whose `home` claim lapsed prints `instance`, `node`, `registry`, `peer`, `listening`, the third `registry ready (home served: true)`, and records.json then holds the claim live | on the hand-written root, the first: `left: "registry ready (home served: false)"`, `right: "registry ready (home served: true)"` |
+
+Changed and passing: `both_roots_boot_register_and_serve_alike` and
+`both_roots_set_an_unsigned_instance_aside_and_serve_signed` expect
+`registry ready` after the `app` line (section 4), and
+`adoption_after_the_unsigned_home_journal_is_set_aside_serves_signed` holds
+three claims at epoch 1 on the node's chain, where it held two: the `home`
+claim, its renewal at adoption, then `ws-x`'s.
+
+What they do not prove:
+
+- A save that fails at adoption. `a_renewal_whose_save_fails_is_not_published`
+  covers a failed save in `renew_leases`, which adoption calls.
+- The epoch for a node with no claim of its own on `home` (1).
+- A peer taking the renewed claim. The two-node F1 test covers a served
+  share's renewals reaching a peer, and `home`'s ride the same push.
+- `serve_workspace_on` of `home` minting nothing.
+- Windows and Linux.
+
+### Named gaps
+
+- **Nothing compacts renewals**, and the desk's now accumulate twice as fast
+  (section 5). Boot's signature checks and each save's read of records.json
+  grow with them (4.1b's F4; the persistence suite's part 1, "Each save reads
+  records.json whole").
+- **A first boot writes two claims on `home`**, the boot's and adoption's
+  renewal, milliseconds apart.
+- **A `workspace home ...` line** loads and now mints nothing (section 3).
+  Refusing it at load would be `appdecl`'s; nothing ships one.
+- **A start that fails after adoption**, say on a port already bound, leaves
+  its `home` claim live for up to 30 s, as it leaves a served workspace's
+  today.
+- **`Directory::serves`** has no caller outside its tests.
+
+### Default-path changes
+
+1. Every adopted node renews its `home` claim every 10 s, like a served
+   workspace, and once at adoption. The claim lapses 30 s after the node
+   stops.
+2. Both roots print `registry ready (home served: ...)` after adoption, after
+   the `app` lines. On the desk it moves from the third line to the fifth, and
+   every start prints `true`.
+3. The desk's records.json and served store gain 17,280 renewal records a
+   day, where they gained 8,640, and one more record at each start.
+4. A node that serves no workspace saves records.json every 10 s; before, a
+   tick saved nothing.
+5. A peer receives one more record at each of a node's ticks: two from the desk's, where it received one.
+6. `serve_workspace` or a create ceremony naming `home` mints nothing.
+7. A downgrade to today's binary starts. It prints `home served: false`, as
+   today, and no longer renews `home` (Measured).
+
+### Questions for the owner
+
+1. **The epoch** (section 3). Recommend the node's own epoch, as built: every
+   node serves `home` at once, so a serve's rule, one above the highest at
+   each start, would fence out nothing real and move `who_serves(home)` to
+   whichever node started last.
+2. **The line** (section 4). Recommend moving it after adoption, as built,
+   with its words kept. The other choice keeps its place and has it answer
+   whether the fold holds a claim of this node's on `home` at all, live or
+   lapsed; that is true of every booted node from now on, so it could not say
+   `false` when a renewal fails.
+3. **The renewal at once** (section 2). Recommend keeping it: one record per
+   start. Without it, a start more than 30 s after a stop keeps its `home`
+   claim lapsed until the first tick, 10 s on, which peers see, and the moved
+   line would print `false`.
+
+### Measured
+
+2026-09-25, Apple M3 Pro, Rust 1.96.0, on the final tree:
+
+- **The gate** passes all 8 components, in 101 s from an empty scratch target,
+  with 313 node tests on each path, across 15 test binaries, where there were
+  310: the three new tests.
+  - rustfmt: glade-node 298 hunks, below its baseline of 299. The literal
+    this change rewrote, `DirAuthority { boot, served }`, was one of the 299;
+    no line it wrote is a deviation. glade-wire 43.
+  - clippy: glade-node 11 warnings and glade-wire 7, at their baselines.
+  - The contracts gate passes, untouched.
+- **Time.** The `claims` module's ten tests finish in 0.97 s: the renewal test
+  waits, by design, until a renewal's lease ends three 300 ms leases past the
+  first one's, about 0.9 s. `assembled_path`'s twelve take 1.2 to 1.4 s.
+- **The replay**, from `glade-wz/grazel` as grazel starts the node
+  (`--profile local --name grazel --app apps/grazel-app.glade --app
+  apps/gyld-app.glade 0`), on one scratch instance. Each start lived 11 s past
+  `listening`, one renewal tick, and was stopped, and 35 s passed before the
+  next, so the `home` claim of the start before had lapsed. Today's default
+  binary (inode 401590725), this build twice, then today's binary again:
+
+  | Start | Lines | records.json after it |
+  | --- | --- | --- |
+  | today's, the first boot | `registry ready (home served: true)` third, `+12 record(s), 0 unchanged`, `+10 record(s), 2 unchanged`, `ws-razel` serving (twice), `listening` | revision 5, 27 records; one claim on `home`, epoch 1, left to lapse 30 s after the boot |
+  | this build, 1 | `+0 record(s), 12 unchanged` for each app, then **`registry ready (home served: true)`**, `peer`, `ws-razel` serving (twice), `listening` | revision 10, 31 records; three claims on `home` (the boot's, adoption's, one tick's), all epoch 1, live 28.7 s past the stop |
+  | this build, 2 | the same | revision 15, 35 records; five claims on `home`, all epoch 1 |
+  | today's, again | `registry ready (home served: false)` third, then as before | revision 19, 37 records; the same five claims on `home`, lapsed |
+
+  Every start printed nothing on stderr, and the node and endpoint ids were
+  the same throughout. `ws-razel`'s claims took a new epoch at each start, 1
+  to 4, as a serve does. A signed renewal on `home` is 291 bytes in
+  records.json (the first claim, at seq 0 with no `prev`, is 258), one on
+  `ws-razel` 295; the served store's `home` journal grew 1,188 bytes over this
+  build's first start, four records.
+- **Downstream**, against the default binary (inode 401590725, not rebuilt),
+  through the shims: client-rs 25 + 10, client-ts 48, grip-share 19, grazel
+  29 + 3, glade-gyld 233 (1 ignored) + 33, glade-gwz 9 + 7. All at baseline.
+
+**Size**, in lines added and removed in `.rs` files, doc comments included:
+
+- production: +72/−21, net +51, of which 24 lines are code:
+  `claims.rs` +51/−6, `bin/glade-node.rs` +13/−10, `lifecycle.rs` +8/−5;
+- tests: +159/−13: `claims.rs` +104/−4, `tests/assembled_path.rs` +55/−9.

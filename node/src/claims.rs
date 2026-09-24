@@ -22,6 +22,15 @@
 //! lease on a cadence while serving. Lease expiry stays an absolute wall-clock
 //! stamp judged at each reader's clock — the write path uses the clock, the
 //! fold never does (WD §2).
+//!
+//! The `home` share is served like any other (GDL-038; the lane owner's ruling
+//! of 2026-09-25): it joins the renewal set at adoption, at the epoch of the
+//! node's own claim on it, which a first boot minted (`sysdir.rs`), and is
+//! renewed at once. So a node's `home` claim is live while the node runs, and
+//! lapses a lease after it stops. Its epoch never moves: every node serves
+//! `home` at once, so there is no stale holder to fence out. The design is
+//! `glade/dev-docs/GladeNodeAssembly.md`, "The `home` claim renewed like any
+//! served share".
 
 use std::collections::BTreeMap;
 use std::io;
@@ -53,7 +62,8 @@ fn other<E: Into<Box<dyn std::error::Error + Send + Sync>>>(e: E) -> io::Error {
 
 /// The adopted directory-write authority: the boot instance (registry = chain
 /// tips + records.json engine + instance lock) plus the shares this node is
-/// live-serving (share -> claim epoch, the renewal set).
+/// live-serving (share -> claim epoch, the renewal set): `home` from adoption
+/// on, and each share `serve_workspace_on` enters.
 pub(crate) struct DirState {
     /// Our directory node id — the origin every mint is attributed to.
     pub(crate) node_id: String,
@@ -109,9 +119,16 @@ impl Server {
     /// Adopt the boot instance: seed its registry snapshot into the served
     /// replica (the home share stays an ORDINARY share, GDL-038), keep the
     /// registry as the chain authority for this node's own directory writes,
-    /// and spawn the lease-renewal loop. `lease_ms`/`renew_ms` tune the claim
-    /// TTL and renewal cadence (tests shorten them to observe renewal live).
-    /// Returns how many ops the seed newly appended. Call once, before serving.
+    /// start the renewal set with `home` at its epoch (`home_epoch`), renew
+    /// it at once, and spawn the lease-renewal loop. `lease_ms`/`renew_ms`
+    /// tune the claim TTL and renewal cadence (tests shorten them to observe
+    /// renewal live). Returns how many ops the seed newly appended. Call once,
+    /// before serving.
+    ///
+    /// The renewal at once makes a `home` claim that lapsed while the node was
+    /// stopped live again before any peer or client can connect. If its save
+    /// fails, it is neither folded nor published, as at any tick, and the next
+    /// tick retries it.
     ///
     /// The replica holds none of this node's `home` records from before plan
     /// Step 4.1b, unsigned: its `open` set those aside (as it did plan Step
@@ -123,16 +140,19 @@ impl Server {
     pub async fn adopt_boot_tuned(&self, boot: Boot, lease_ms: i64, renew_ms: u64) -> io::Result<usize> {
         let seeded = self.seed_registry(&boot.registry.snapshot()).await;
         let policy = boot.registry.policy();
+        let home = home_epoch(&*self.shared.store.lock().await, &boot.node_id);
+        let served = BTreeMap::from([(HOME.to_string(), home)]);
         let state = DirState {
             node_id: boot.node_id.clone(),
             lease_ms,
-            inner: Mutex::new(DirAuthority { boot, served: BTreeMap::new() }),
+            inner: Mutex::new(DirAuthority { boot, served }),
         };
         self.shared
             .dir
             .set(state)
             .map_err(|_| other("directory authority already adopted"))?;
         refresh_policy(&self.shared, policy).await;
+        renew_leases(&self.shared).await;
         let shared = self.shared.clone();
         self.shared.tasks.spawn(Site::Renewal, async move {
             loop {
@@ -145,9 +165,19 @@ impl Server {
 
     /// Serve `share` from this node (F1): mint the `WorkspaceEntry` (diffed)
     /// and the first `ServeClaim` (epoch = fold max + 1), join the renewal
-    /// set. In-process idempotent: a share already being served is a no-op.
+    /// set. In-process idempotent: a share already being served is a no-op,
+    /// and so is `home`, in the set from adoption on.
     pub async fn serve_workspace(&self, share: &str, name: &str) -> io::Result<()> {
         serve_workspace_on(&self.shared, share, name).await.map(|_| ())
+    }
+
+    /// Which node serves `share` now, by the adopted registry's fold at this
+    /// node's clock: what both roots print for `home` after adoption, in
+    /// `registry ready (home served: ...)`. `None` before adoption.
+    pub async fn serves(&self, share: &str) -> Option<String> {
+        let state = self.shared.dir.get()?;
+        let dir = state.inner.lock().await;
+        dir.boot.registry.who_serves(share, now_ms())
     }
 }
 
@@ -307,6 +337,21 @@ pub(crate) async fn publish(shared: &Arc<Shared>, dir: MutexGuard<'_, DirAuthori
     }
     drop(dir);
     crate::mesh::push_home(shared, ops).await;
+}
+
+/// The epoch `home` joins the renewal set at, at adoption: the highest of
+/// `node`'s own claims on it in the served replica, live or lapsed, so its
+/// renewals, and every later boot's, keep the epoch its first boot minted; 1,
+/// that first epoch, if it holds none. Not a serve's [`max_claim_epoch`] + 1:
+/// every node serves `home` at once, so no claim on it is a stale one to
+/// fence out.
+fn home_epoch(store: &Store, node: &str) -> i64 {
+    let claims = store.scan(HOME, G_CLAIMS, &[], node, i64::MIN);
+    let claims = claims
+        .iter()
+        .map(|op| envelope::record(op, ServeClaim::from_cbor));
+    let home = claims.filter(|claim| claim.share == HOME);
+    home.map(|claim| claim.epoch).max().unwrap_or(1)
 }
 
 /// Highest claim epoch the replica has seen for `share` — live or lapsed;
@@ -596,6 +641,101 @@ mod tests {
         assert_eq!(served, saved, "and does after the next renewal");
     }
 
+    /// An instance whose node holds its presence and a claim on `home` at
+    /// epoch 1, leased until `lease_expiry_ms`: records.json written as the
+    /// node writes it, signed. A first boot leases `home` for 30 s; this lets
+    /// a test shorten the lease, or start from one that lapsed while the node
+    /// was stopped. Returns the instance dir and the node's id.
+    fn instance_holding_home(name: &str, lease_expiry_ms: i64) -> (PathBuf, String) {
+        use crate::registry::{BlobStore, StoreApi};
+        let sys = fresh(&format!("{name}-sys"));
+        let boot = boot_at(sys.clone(), "gianni").unwrap();
+        let (identity, node) = (boot.identity().unwrap(), boot.node_id.clone());
+        drop(boot);
+        let mut records = Registry::sealed(identity);
+        let presence = crate::sysdata::NodeRecord {
+            node_id: node.clone(),
+            operator: "gianni".into(),
+        };
+        records.append(Record::Node(presence), &node).unwrap();
+        let claim = ServeClaim {
+            node: node.clone(),
+            share: HOME.into(),
+            lease_expiry_ms,
+            epoch: 1,
+        };
+        records.append(Record::Serve(claim), &node).unwrap();
+        BlobStore::new(&sys).save(&records.snapshot()).unwrap();
+        (sys, node)
+    }
+
+    /// The epochs of `node`'s claims on `home` in `store`, in chain order.
+    fn home_epochs(store: &Store, node: &str) -> Vec<i64> {
+        let claims = store.scan(HOME, G_CLAIMS, &[], node, i64::MIN);
+        let claims = claims
+            .iter()
+            .map(|op| envelope::record(op, ServeClaim::from_cbor));
+        let home = claims.filter(|claim| claim.share == HOME);
+        home.map(|claim| claim.epoch).collect()
+    }
+
+    /// The lane owner's ruling of 2026-09-25: `home` joins the renewal set at
+    /// adoption, like any served share. A node whose `home` claim was leased
+    /// for 300 ms, adopted on 300 ms leases renewed every 100 ms, holds a
+    /// claim on `home` still live three leases past the first one's end, in
+    /// the served store and in records.json, every one at epoch 1. Before,
+    /// nothing renewed the claim a boot had minted, so it lapsed.
+    #[tokio::test]
+    async fn the_home_claim_is_renewed_while_the_node_runs() {
+        const LEASE: i64 = 300;
+        let first = now_ms() + LEASE;
+        let (sys, node) = instance_holding_home("home-renewed", first);
+        let boot = boot_at(sys.clone(), "gianni").unwrap();
+        let server = Server::open(fresh("home-renewed-store")).unwrap();
+        server.adopt_boot_tuned(boot, LEASE, 100).await.unwrap();
+        let shared = server.shared.clone();
+        let past = first + 3 * LEASE;
+        let renewed = |st: &Store| max_lease(st, HOME, &node) > past;
+        let what = "a claim on home live three leases past the first";
+        wait_store(&shared, renewed, what).await;
+        let st = shared.store.lock().await;
+        assert_eq!(who_serves(&st, HOME, past), Some(node.clone()));
+        let epochs = home_epochs(&st, &node);
+        let kept = epochs.iter().all(|epoch| *epoch == 1);
+        assert!(epochs.len() > 3 && kept, "{epochs:?}");
+        drop(st);
+        let live = |p: &[u8]| {
+            let claim = ServeClaim::from_cbor(&cbor::decode(p));
+            claim.share == HOME && claim.lease_expiry_ms > past
+        };
+        assert!(count(&saved(&sys), G_CLAIMS, live) > 0, "and saved");
+    }
+
+    /// The same ruling at a later boot: a node whose `home` claim lapsed
+    /// while it was stopped takes the claim up at adoption, at its epoch, and
+    /// renews it at once, before any tick (the loop here is an hour off). The
+    /// served store and the adopted registry, which the start line reads,
+    /// then hold it live, and the renewal carries epoch 1, where a serve's
+    /// rule would have minted epoch 2. Before, the claim stayed lapsed.
+    #[tokio::test]
+    async fn a_later_boot_renews_its_lapsed_home_claim_at_once_at_its_epoch() {
+        let (sys, node) = instance_holding_home("home-lapsed", now_ms() - 1);
+        let boot = boot_at(sys, "gianni").unwrap();
+        assert_eq!(boot.registry.who_serves(HOME, now_ms()), None, "lapsed");
+        let server = Server::open(fresh("home-lapsed-store")).unwrap();
+        let adopted = server.adopt_boot_tuned(boot, LEASE_TTL_MS, 3_600_000);
+        adopted.await.unwrap();
+        let shared = server.shared.clone();
+        let st = shared.store.lock().await;
+        let serves = who_serves(&st, HOME, now_ms());
+        assert_eq!(serves, Some(node.clone()), "live at once");
+        assert_eq!(home_epochs(&st, &node), [1, 1], "renewed at its epoch");
+        drop(st);
+        let dir = shared.dir.get().unwrap().inner.lock().await;
+        let serves = dir.boot.registry.who_serves(HOME, now_ms());
+        assert_eq!(serves, Some(node), "in the adopted registry too");
+    }
+
     /// Plan Step 4.1b (D8): an instance whose records.json and served store
     /// hold its `home` records unsigned, as every node wrote them before the
     /// step (here by an unsealed registry, and into the journal unchecked): an
@@ -604,9 +744,10 @@ mod tests {
     /// `ws-x`. The served store's `open` sets the node's `home` journal
     /// aside, as boot sets records.json's records aside, so adoption seeds
     /// signed records alone: the dropped binding routes no exchange, `alice`
-    /// is minted again, `ws-x` is claimed at epoch 1, and `who_serves`
-    /// answers the node from both stores. Every `home` record held verifies,
-    /// the app data stays, and the old journal is kept beside the new one.
+    /// is minted again, `ws-x` is claimed at epoch 1, as `home` is renewed at
+    /// adoption, and `who_serves` answers the node from both stores. Every
+    /// `home` record held verifies, the app data stays, and the old journal
+    /// is kept beside the new one.
     #[tokio::test]
     async fn adoption_after_the_unsigned_home_journal_is_set_aside_serves_signed() {
         use crate::registry::StoreApi;
@@ -677,7 +818,11 @@ mod tests {
             .iter()
             .map(|op| envelope::record(op, ServeClaim::from_cbor).epoch)
             .collect();
-        assert_eq!(epochs, [1, 1], "the home claim, then ws-x's, at epoch 1");
+        assert_eq!(
+            epochs,
+            [1, 1, 1],
+            "the home claim, its renewal at adoption, then ws-x's, at epoch 1"
+        );
         assert_eq!(who_serves(&st, "ws-x", now_ms()), Some(node.clone()));
         for (share, glade_id, key) in st.zones().into_iter().filter(|(share, ..)| share == HOME) {
             for (origin, _) in st.heads(&share, &glade_id, &key) {

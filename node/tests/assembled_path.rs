@@ -3,7 +3,8 @@
 //! unset starts the hand-written root; `1` starts the assembled root, which
 //! resolves its bindings from `glade_node::assembly::NodeAssembly`; any other
 //! value refuses to start, exits 1, names the variable and writes nothing.
-//! Either root starts a node that prints the same lines.
+//! Either root starts a node that prints the same lines. One test starts each
+//! root on an instance whose `home` claim lapsed while its node was stopped.
 //!
 //! Each test sets or removes the variable on the node it spawns, so it reads
 //! the same whichever way the suite runs (the node gate runs it both ways).
@@ -274,8 +275,8 @@ fn both_roots_boot_register_and_serve_alike() {
     let expected = [
         "instance",
         "node",
-        "registry",
         "app",
+        "registry",
         "peer",
         "workspace",
         "listening",
@@ -285,9 +286,54 @@ fn both_roots_boot_register_and_serve_alike() {
     for at in [2, 3, 5] {
         assert_eq!(hand[at], assembled[at], "line {at} differs");
     }
-    assert_eq!(assembled[2], "registry ready (home served: true)");
-    assert_eq!(assembled[3], "app x registered (+2 record(s), 0 unchanged)");
+    assert_eq!(assembled[2], "app x registered (+2 record(s), 0 unchanged)");
+    assert_eq!(assembled[3], "registry ready (home served: true)");
     assert_eq!(assembled[5], "workspace ws-x serving");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The `home` claim renewed like any served share (the lane owner's ruling
+/// of 2026-09-25), on each root: an instance whose `home` claim lapsed while
+/// its node was stopped, written as the node writes it, signed. The start
+/// renews the claim at adoption and prints `registry ready (home served:
+/// true)`, and records.json then holds the claim live. Before, the line read
+/// the lapsed claim, and nothing renewed it.
+#[test]
+fn both_roots_report_home_served_on_a_start_after_the_claim_lapsed() {
+    let dir = scratch("home-lapsed");
+    let home = dir.join("glade-home");
+    for (root, name) in [(Root::HandWritten, "h"), (Root::Assembled, "a")] {
+        let instance = home.join("sys").join(name);
+        let boot = boot_at(instance.clone(), "local").unwrap();
+        let (identity, node) = (boot.identity().unwrap(), boot.node_id.clone());
+        drop(boot);
+        let mut registry = Registry::sealed(identity);
+        let presence = NodeRecord {
+            node_id: node.clone(),
+            operator: "local".into(),
+        };
+        registry.append(Record::Node(presence), &node).unwrap();
+        let lapsed = ServeClaim {
+            node: node.clone(),
+            share: HOME.into(),
+            lease_expiry_ms: now_ms() - 1,
+            epoch: 1,
+        };
+        registry.append(Record::Serve(lapsed), &node).unwrap();
+        BlobStore::new(&instance)
+            .save(&registry.snapshot())
+            .unwrap();
+
+        let args = ["--profile", "local", "--name", name, "0"];
+        let (lines, stderr) = start_and_stop(&home, root, &args);
+        let expected = ["instance", "node", "registry", "peer", "listening"];
+        assert_eq!(kinds(&lines), expected, "{root:?}: {lines:?}, {stderr}");
+        let line = "registry ready (home served: true)";
+        assert_eq!(lines[2], line, "{root:?}");
+        let saved = BlobStore::new(&instance).load().unwrap();
+        let serves = Registry::from_snapshot(&saved).0.who_serves(HOME, now_ms());
+        assert_eq!(serves, Some(node), "{root:?}: records.json holds it live");
+    }
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -650,9 +696,9 @@ fn both_roots_set_an_unsigned_instance_aside_and_serve_signed() {
         "instance",
         "node",
         "set",
-        "registry",
         "app",
         "set",
+        "registry",
         "peer",
         "workspace",
         "listening",
@@ -660,8 +706,8 @@ fn both_roots_set_an_unsigned_instance_aside_and_serve_signed() {
     let again = [
         "instance",
         "node",
-        "registry",
         "app",
+        "registry",
         "peer",
         "workspace",
         "listening",
@@ -675,11 +721,11 @@ fn both_roots_set_an_unsigned_instance_aside_and_serve_signed() {
         assert_eq!(lines[1], format!("node {node}"), "{root:?}: the same id");
         let aside = format!("set aside {written} unsigned record(s) in records.legacy-");
         assert!(lines[2].starts_with(&aside), "{root:?}: {}", lines[2]);
-        assert_eq!(lines[4], "app x registered (+2 record(s), 0 unchanged)");
+        assert_eq!(lines[3], "app x registered (+2 record(s), 0 unchanged)");
         let journal = format!(
             "set aside 1 journal(s) of the served store's home share ({written} record(s)) that do not verify, renamed *.legacy-"
         );
-        assert!(lines[5].starts_with(&journal), "{root:?}: {}", lines[5]);
+        assert!(lines[4].starts_with(&journal), "{root:?}: {}", lines[4]);
 
         let saved = BlobStore::new(&instance).load().unwrap();
         let ops: Vec<Op> = saved
@@ -711,7 +757,7 @@ fn both_roots_set_an_unsigned_instance_aside_and_serve_signed() {
 
         let (lines, stderr) = start_and_stop(&home, root, &args);
         assert_eq!(kinds(&lines), again, "{root:?}: {lines:?}, {stderr}");
-        assert_eq!(lines[3], "app x registered (+0 record(s), 2 unchanged)");
+        assert_eq!(lines[2], "app x registered (+0 record(s), 2 unchanged)");
     }
     std::fs::remove_dir_all(&dir).unwrap();
 }

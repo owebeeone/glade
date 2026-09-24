@@ -22,9 +22,11 @@
 //! the node serves itself from its own disk BEFORE any client connects (the
 //! s-boot trace). The served store opens, setting aside any `home` journal
 //! that does not verify (plan Step 4.1b; one more `set aside …` line). The
-//! registry then seeds it (the home share is an ORDINARY share, GDL-038), the
-//! iroh peer endpoint binds with the node's
-//! directory identity and its `endpoint.key`, and accepts inbound peer links
+//! registry then seeds it (the home share is an ORDINARY share, GDL-038), and
+//! the node's `home` claim is renewed, as it is every 10 s while the node runs,
+//! before the node prints `registry ready (home served: …)`. The iroh peer
+//! endpoint binds with the node's directory identity and its `endpoint.key`,
+//! and accepts inbound peer links
 //! (prints `peer <endpoint-id> <ip:port>` — the dial target for a `--peer`
 //! flag on another node, the same at every start), and each `--peer` target
 //! is dialed and the home share converged. Then it serves the app-data
@@ -87,7 +89,7 @@ use glade_node::iroh_carrier::{PeerEndpoint, PeerEntry};
 use glade_node::lifecycle::{conclude, node_plan, Console, NodeStart, StdConsole};
 use glade_node::registry::{RegistryApi, StoreApi, HOME};
 use glade_node::server::Server;
-use glade_node::sysdir::{boot, now_ms, Profile};
+use glade_node::sysdir::{boot, Profile};
 use glade_node::transport::Door;
 use sdax_tokio::{PlanStart, TokioRuntime};
 use tokio::net::TcpListener;
@@ -180,8 +182,6 @@ async fn run() -> std::io::Result<()> {
         if node.registry.policy_quarantined() {
             println!("{GRANTS_UNAVAILABLE}");
         }
-        let serves_home = node.registry.who_serves(HOME, now_ms()).is_some();
-        println!("registry ready (home served: {serves_home})");
         // ---- app registration (GDL-037): <app>.glade loaded as data --------
         // Ordinary attributed appends under this node's chain, diffed against
         // the fold (idempotent), then persisted like any other record write.
@@ -224,13 +224,16 @@ async fn run() -> std::io::Result<()> {
 
     // ---- peer fabric (booted forms only; the legacy form never binds it) ----
     // Adopt the boot instance (seeds the served store; the boot registry stays
-    // the chain authority for this node's own directory writes — claims.rs),
-    // bind iroh with the DIRECTORY identity, run the accept loop, converge
-    // with each `--peer` target, then start SERVING the declared workspaces:
-    // mint WorkspaceEntry + ServeClaim and renew while serving (audit F1).
+    // the chain authority for this node's own directory writes — claims.rs —
+    // and the `home` claim is renewed from here on), bind iroh with the
+    // DIRECTORY identity, run the accept loop, converge with each `--peer`
+    // target, then start SERVING the declared workspaces: mint WorkspaceEntry +
+    // ServeClaim and renew while serving (audit F1).
     if let Some((node, workspaces)) = booted {
         let (identity, key) = (node.identity()?, node.endpoint_key());
         server.adopt_boot(node).await?;
+        let serves_home = server.serves(HOME).await.is_some();
+        println!("registry ready (home served: {serves_home})");
         let entries: Vec<Option<PeerEntry>> = peers.iter().map(|p| PeerEntry::parse(p)).collect();
         let configured = entries.iter().flatten().map(PeerEntry::key);
         let door = Arc::new(Door::new(configured, |line: &str| eprintln!("{line}")));
