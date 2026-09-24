@@ -293,6 +293,11 @@ Rule these before Phase 2. Step 1.1 records the answers.
    - then Phase 3;
    - Phase 4 alongside, in its own repositories.
 
+**Ruled, owner, 2026-09-24 ("all recommended"):** 1 (A), always on, with no negotiation; 2 `Heads{streams: []}`,
+then the `Error`, and the absent route likewise, with `UnknownShare`; 3 and 4 as recommended; 5 `from` stays
+unread; 6 glade-gwz's run ids are fixed here, as Step 4.2; 7 1.1 at once, Phase 2 before 4.3's websocket
+enforcement, then Phase 3, and Phase 4 alongside in its own repositories.
+
 ## 6. The session contract
 
 Step 1.1 writes these rules, as ruled, into `glade/dev-docs/GladeSubstrateV1.md`
