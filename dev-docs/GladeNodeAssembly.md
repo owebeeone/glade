@@ -775,7 +775,9 @@ at `:19`); slice profile SP-T1 to SP-T3 and SP-P1; and three findings the lane
 owner relayed from Step 4.1's note (`GladeNodeSigning.md` D5, D11, F2).
 
 **Stopped before code.** Three of the brief's stop conditions hold, so this
-section is the step's whole output. Nothing below is built.
+section was the step's whole output, and nothing below was built when it
+stopped. One piece has landed since, on the lane owner's word: see "Part 1
+(landed)", below.
 
 1. No route revokes a seeded grant (precondition 1).
 2. The verb vocabulary and the principal vocabulary are undecided. The check
@@ -789,6 +791,52 @@ section is the step's whole output. Nothing below is built.
 What follows is what 4.3 builds once the owner rules, and what each ruling
 decides. The questions come last, each with a recommendation.
 
+### Part 1 (landed): client writes to `home` refused
+
+Built on 2026-09-24, on the lane owner's word, against glade `d838bd0`. It
+answers question 6, and it is the first piece of part 1. Ruling H-R3 already
+covers it, and it depends on nothing undecided.
+
+- **What changed** (`node/src/server.rs`, the `Frame::Ops` arm).
+  - A client's op on `home` is refused before any of it is kept. It is not
+    appended, not fanned out, and not counted in the heads the client has
+    announced.
+  - The session gets the node's usual answer to a refused op: an `Error` naming
+    the share and the stream, here with the code `Unauthorized`
+    (`home_refused`).
+  - The frame's other ops are handled as before.
+  - The node's own home records still reach the served store through
+    `claims::publish`.
+- **The only client write path.** `Ops` is the one frame through which a
+  client appends. A Hello's principal and a `workspace.create` are both
+  written by the node, under its own origin.
+- **Tests** (`server.rs`).
+  - `a_client_op_on_home_is_refused_and_never_stored` sends a forged grant on
+    `home/dir.grants`. On the old code it failed: "the client's op on home was
+    stored: [("home", "dir.grants", [])]".
+  - `a_client_op_on_any_other_share_still_lands` sends one frame with an op on
+    `sh` and one on `home-notes`. Both are stored, and no error comes back.
+    It passed before and after: it guards the refusal's scope.
+- **The default-path change.** A client's op on `home` was appended to the
+  served store and fanned out to the share's subscribers. Now it is refused. No
+  shipped client sends one (see "Client writes to `home` (H-R3)").
+- **Not in it.** No grant is checked. There is no `Origin` check and no
+  switch. Peers still write `home`, through the push and the pull, until
+  4.1b: a named gap.
+- **Still waiting on the owner.** Questions 1 to 5, 7 and 8. They hold back the
+  rest of part 1 (the revocation route, the seed lines, the fixtures, the
+  warning, the format page) and all of part 2.
+- **Measured** on 2026-09-24:
+  - The gate passes all 8 components. There are 207 node tests on each path,
+    across 15 test binaries (205 before).
+  - rustfmt stays at its baselines: glade-node 337 hunks, glade-wire 43. None
+    of the new lines is a deviation.
+  - clippy stays at 11 warnings for glade-node and 7 for glade-wire.
+  - The fast loop runs 37 tests in 0.14-0.19 s wall, warm.
+  - Against the rebuilt default binary: grazel 26 + 3, glade-gwz 9 + 5,
+    glade-gyld 233 (1 ignored) + 31.
+- **Size.** 23 production lines and 109 test lines.
+
 ### The grant fold: the node's own registry
 
 Two folds hold `dir.grants` and `dir.revocations`.
@@ -796,11 +844,11 @@ Two folds hold `dir.grants` and `dir.revocations`.
 | Fold | Holds | Who can add a grant | Exists |
 | --- | --- | --- | --- |
 | the registry: records.json's fold, held by the adopted `DirState` (`claims.rs:54-77`) | this node's own appends only: its app files' seeds (`appdecl.rs:588-616`) and its mints. `Records::ingest` (`assembly.rs:590-600`), the one path that ingests a carried op, is called only by the journeys | this node, at registration and through `DirAuthority::accept` | after `adopt_boot`; never on the legacy form |
-| the served store's `home` share | the registry's records, seeded at adoption (`claims.rs:110-111`); every peer's pulled and pushed home records (`mesh.rs:258-265`, `:466-490`); any client's op on `home` (`server.rs:262-282`) | any peer, and any websocket client | always |
+| the served store's `home` share | the registry's records, seeded at adoption (`claims.rs:110-111`); every peer's pulled and pushed home records (`mesh.rs:258-265`, `:466-490`); until part 1 landed, any client's op on `home` too (`server.rs:262-282`) | any peer; until part 1 landed, any websocket client too | always |
 
 The check reads the registry. Until 4.1b signs directory records, a grant read
-from the served store could be written by any client or peer. Three things
-follow.
+from the served store could be written by any peer, and before part 1 landed,
+by any client. Three things follow.
 
 - A node's grants are its own operator's. A grant made on another node admits
   nothing here (node trust, SP-T1).
@@ -984,9 +1032,9 @@ Every `home` kind has a privileged effect:
 - bindings and services declare exchanges (`exchange.rs:66-81`);
 - principal and node records are identity.
 
-Today every client op is appended, `home` included (`server.rs:262-282`). With
-the fold read from the registry, a forged grant never reaches the check. A
-forged home record still reaches three things:
+Until part 1 landed, every client op was appended, `home` included
+(`server.rs:262-282`). With the fold read from the registry, a forged grant
+never reaches the check. A forged home record still reaches three things:
 
 - routing: a `ServeClaim` with a higher epoch redirects a share, because
   `who_serves` reads the served store;
@@ -1016,10 +1064,11 @@ forged home record still reaches three things:
   frame's other ops are handled as before.
 - The node's own records still reach the served store through
   `claims::publish` (`claims.rs:288-297`), which the change does not touch.
-- Size: about 15 lines and one test, written to fail first.
+- Size: estimated at about 15 lines and one test, written to fail first. It
+  landed as 23 lines and two tests.
 
-It is not built, because this step stopped. It depends on nothing undecided,
-so it can land alone, first.
+It depends on nothing undecided, and it has landed alone, first: see "Part 1
+(landed)".
 
 **Named gap:** a peer can still write `home`, through the push
 (`mesh.rs:258-265`) and the pull (`:466-490`), until 4.1b verifies directory
@@ -1083,9 +1132,9 @@ word is pending, because it changes the path the live desk uses.
 - The ruled route is E-share-1's `share.revoke`, owned by the glade-share
   family (`RulingWorksheet.md:492`; `dev-docs/glade/suppliers/glade-share.md:32`).
   The family is not built.
-- A client op on `home/dir.revocations` lands only in the served store. The
-  check does not read that store, and the `home` refusal above would refuse
-  the op anyway.
+- A client op on `home/dir.revocations` used to land only in the served
+  store, which the check does not read. Since part 1 landed, the `home`
+  refusal refuses it.
 
 The options. None is chosen here.
 
@@ -1258,10 +1307,10 @@ share, verbs}`.
 
 The 4.1 note recommends putting 4.3 after 4.1b (`GladeNodeSigning.md` D11:
 "4.3 should follow 4.1b, or its tests should name F2's bypass"), because
-clients and peers can forge `home` records.
+clients and peers could forge `home` records.
 
 - Refusing client writes to `home` closes the local half without signatures.
-  That is what lets 4.3 go before 4.1b.
+  That is what lets 4.3 go before 4.1b, and it has landed (part 1).
 - The peer half stays a named gap until 4.1b.
 - With the fold read from the registry, a forged grant cannot reach the check,
   even from a peer. A forged claim can still steer routing.
@@ -1273,7 +1322,7 @@ over the ~400-line production cap, so it splits in two.
 
 - **Part 1: the preconditions and the local bypass.** About 150 production
   lines and 250 test lines:
-  - the `home` refusal;
+  - the `home` refusal (landed);
   - the revocation route;
   - grazel-app's corrected lines, in both copies, with `revoke owner grazel`;
   - the two fixtures;
@@ -1370,7 +1419,7 @@ claimed.
    `Error{Unauthorized}`.
 6. **Client writes to `home`.** Recommend landing the refusal now, alone, as
    4.3's first commit. It is independent of questions 1 to 4, and no legitimate
-   client writes `home`.
+   client writes `home`. Landed: see "Part 1 (landed)".
 7. **`Origin`.** Recommend (a): accept no `Origin`, or a loopback one, and
    refuse the rest.
 8. **Order.** Recommend 4.3 before 4.1b once question 6 has landed, with the

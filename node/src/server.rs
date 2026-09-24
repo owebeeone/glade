@@ -19,6 +19,7 @@ use glade_wire::generated::{Error, ErrorCode, Head, Heads, Op, Ops, StreamHeads,
 use crate::echo::Echo;
 use crate::frame::Frame;
 use crate::mesh::Mesh;
+use crate::registry::HOME;
 use crate::router::{Router, SessionId};
 use crate::session::{error_frame, heads_map, missing_for};
 use crate::store::{Append, Store, StoreError};
@@ -128,6 +129,19 @@ pub(crate) async fn send(shared: &Arc<Shared>, sid: SessionId, frame: &Frame) {
     if let Some(tx) = tx {
         let _ = tx.send(frame.to_bytes());
     }
+}
+
+/// The answer to a client's op on the home share (ruling H-R3, plan Step 4.3):
+/// the node's answer to any refused op, an `Error` naming the share and the
+/// stream, here under the wire's `Unauthorized` code.
+fn home_refused(glade_id: &str) -> Frame {
+    Frame::Error(Error {
+        code: ErrorCode::Unauthorized,
+        message: format!("refused: only the node writes the {HOME} share (H-R3)"),
+        share: Some(HOME.into()),
+        glade_id: Some(glade_id.into()),
+        corr: None,
+    })
 }
 
 async fn handle(shared: Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
@@ -261,6 +275,15 @@ async fn handle(shared: Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
             }
             Frame::Ops(ops) => {
                 for op in ops.ops {
+                    // H-R3: a client submits intent, and appends no record with
+                    // a privileged effect. Every home record kind has one, and
+                    // the node writes its own (`claims::publish`), so a
+                    // client's op on home is refused before any of it is kept
+                    // (plan Step 4.3, part 1). The frame's other ops go on.
+                    if op.share == HOME {
+                        send(&shared, sid, &home_refused(&op.glade_id)).await;
+                        continue;
+                    }
                     let (share, glade_id, key) = (op.share.clone(), op.glade_id.clone(), op.key.clone());
                     client_heads
                         .entry((share.clone(), glade_id.clone(), key.clone()))
@@ -304,6 +327,8 @@ fn to_io(e: StoreError) -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry::{G_GRANTS, HOME};
+    use crate::sysdata::CapabilityGrant;
     use glade_wire::generated::{ExchangeReq, Op, Ops, Shape, Subscribe};
 
     fn op(origin: &str, seq: i64, payload: &[u8]) -> Op {
@@ -434,5 +459,112 @@ mod tests {
             Frame::Ops(o) => assert_eq!(o.ops[0].payload, b"public"),
             other => panic!("commons subscriber expected only the commons op, got {other:?}"),
         }
+    }
+
+    /// A node serving websockets on an OS-assigned port over a fresh store
+    /// named `name`: its shared state, to read back what it stored, and its
+    /// port.
+    async fn serving(name: &str) -> (Arc<Shared>, u16) {
+        let dir = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        let server = Server::open(&dir).unwrap();
+        let shared = server.shared.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(server.run(listener));
+        (shared, port)
+    }
+
+    /// Subscribe to `sh/g` and read up to its ack. A session handles its
+    /// frames in order, so every op sent before the subscribe has been handled
+    /// by then. Returns the errors that arrived before the ack.
+    async fn errors_before_ack(r: &mut ws::WsReader, w: &ws::WsWriter) -> Vec<Error> {
+        w.send_binary(&subscribe()).await.unwrap();
+        let mut errors = Vec::new();
+        loop {
+            match recv(r).await {
+                Frame::Error(e) => errors.push(e),
+                Frame::Heads(_) => return errors,
+                other => panic!("expected errors, then the ack, got {other:?}"),
+            }
+        }
+    }
+
+    /// Ruling H-R3 (plan Step 4.3, part 1): a client submits intent, and it
+    /// never appends a record with a privileged effect. Every kind the home
+    /// share holds has one: grants, claims, declarations, identity. A client's
+    /// op on `home`, here a forged grant, is refused with `Error{Unauthorized}`
+    /// naming the share and the stream, and it is never stored, so nothing
+    /// that reads the served store folds it. Proves the websocket client path
+    /// only: a peer's push and pull still ingest home ops until Step 4.1b
+    /// verifies directory records, and no grant is checked anywhere.
+    #[tokio::test]
+    async fn a_client_op_on_home_is_refused_and_never_stored() {
+        let (shared, port) = serving("glade-server-home-refused").await;
+        let (mut r, w) = ws::connect("127.0.0.1", port).await.unwrap();
+
+        let grant = CapabilityGrant {
+            principal: "mallory".into(),
+            share: "ws-razel".into(),
+            verbs: vec!["read.*".into()],
+        };
+        let forged = Op {
+            share: HOME.into(),
+            glade_id: G_GRANTS.into(),
+            shape: Shape::Log,
+            payload: cbor::encode(&grant.to_cbor()),
+            ..op("mallory", 0, b"")
+        };
+        w.send_binary(&ops_frame(forged)).await.unwrap();
+        let errors = errors_before_ack(&mut r, &w).await;
+
+        let st = shared.store.lock().await;
+        let home_zones: Vec<_> = st
+            .zones()
+            .into_iter()
+            .filter(|zone| zone.0 == HOME)
+            .collect();
+        assert!(
+            home_zones.is_empty(),
+            "the client's op on home was stored: {home_zones:?}"
+        );
+        assert_eq!(errors.len(), 1, "one refusal, for the one op: {errors:?}");
+        let refusal = &errors[0];
+        assert_eq!(refusal.code, ErrorCode::Unauthorized);
+        assert_eq!(refusal.share.as_deref(), Some(HOME));
+        assert_eq!(refusal.glade_id.as_deref(), Some(G_GRANTS));
+        assert_eq!(refusal.corr, None);
+    }
+
+    /// The refusal names the home share exactly, and no other. A client's ops
+    /// on an ordinary share, and on a share whose name only begins with
+    /// `home`, are stored as before, and the client gets no error. Proves the
+    /// append on the websocket client path only.
+    #[tokio::test]
+    async fn a_client_op_on_any_other_share_still_lands() {
+        let (shared, port) = serving("glade-server-other-share").await;
+        let (mut r, w) = ws::connect("127.0.0.1", port).await.unwrap();
+
+        let plain = op("w", 0, b"plain");
+        let lookalike = Op {
+            share: "home-notes".into(),
+            ..op("w", 0, b"lookalike")
+        };
+        let frame = Frame::Ops(Ops {
+            ops: vec![plain, lookalike],
+            pri: None,
+        });
+        w.send_binary(&frame.to_bytes()).await.unwrap();
+        let errors = errors_before_ack(&mut r, &w).await;
+
+        assert!(errors.is_empty(), "no op was refused: {errors:?}");
+        let st = shared.store.lock().await;
+        let stored = |share: &str| st.scan(share, "g", &[], "w", i64::MIN).len();
+        assert_eq!(stored("sh"), 1, "the op on an ordinary share is stored");
+        assert_eq!(
+            stored("home-notes"),
+            1,
+            "the op on a share named like home is stored"
+        );
     }
 }
