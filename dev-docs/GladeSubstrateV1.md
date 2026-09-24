@@ -413,6 +413,202 @@ to reconcile when the plan's Phase 2 lands, not yet changed):
   never blocks on the network": under answer 4 the next append on a chain after
   a refused op fails until a subscribe has caught the chain up.
 
+### Cross-node writes (W1–W8)
+
+**Ruled 2026-09-24; not built.** These rules place a client's write on a share
+that another node serves. The cross-node writes plan
+(`GladeCrossNodeWritesPlan.md`) builds the node's part after the first slice's
+Step 4.6, and the client-writes plan's Steps 3.1 and 3.3 build the clients'
+part of W5. Today such a write stays on the node the client reached: the `Ops`
+arm asks no route (`server.rs:280-337`), the forward only reads
+(`mesh.rs:395-426`), and the claim holder discards what the forward sends it
+(`:347`).
+
+**Sources.** The owner ruled the plan's eight questions "all recommended"
+(`GladeCrossNodeWritesPlan.md:267-273`; "ruling N" below), and recorded ruling
+4 on the client-writes plan too (`GladeClientWritesPlan.md:305-307`). The slice
+plan's order places the steps (root `dev-docs/GladeFirstSlicePlan.md:934`).
+Below, "the plan" is the cross-node writes plan; "answer N" and "CW 3.1" are
+the client-writes plan's. Paths are as in the session answers. Lines were read
+on 2026-09-24 while `node/` was being edited, so theirs may move.
+
+**Terms.** A holds the live `ServeClaim` for share S; B, linked to A, routes S
+`Forward(A)` (`mesh.rs:121-142`); client c is connected to B. The forward is
+the one stream per zone that B opens to A (`forward_interest`, `:360-376`). To
+place an op is to land it in a node's served store. These rules bring the
+forward under R1 to R3; other peer paths, exchanges and channels stay outside.
+
+**W1. Writes follow the read route** (ruling 5).
+
+- A client's op on a share other than `home` is placed where a subscribe to
+  its share is served, by the same C2 decision, asked once per share per
+  frame. `Local`: appended here (R1 to R3). `Forward(A)`: sent to A on the
+  zone's forward (W2, W3). `Absent`: answered `UnknownShare`, with the route's
+  reason and the op's hash as `corr`, and kept nowhere (W5). An op on `home`
+  is refused before any route, as today (H-R3).
+- A client may rely on one decision placing its reads and its writes. A node
+  with no mesh, and a share the directory never heard of, route `Local`
+  (`mesh.rs:122`, `:140`): the legacy form and unclaimed shares are unchanged.
+- Fails: a share the directory knows, with no live claim at B's clock, stops
+  taking writes that land there today (ruling 5 accepts the change). B routes
+  by its own replica of `home`, so until it hears that a claim moved, it sends
+  ops to a node that answers `UnknownShare` (W2).
+
+**W2. The holder decides** (rulings 2 and 6).
+
+- A takes an op from the forward through its client path (H-R3, the chain,
+  SWMR and shape checks, the append, the fan-out), with the forward's session
+  as the op's origin, so the fan-out skips the forward. It answers with R1's
+  status on the forward, after the fan-out it queued. It takes only the
+  forward's zone, and only while its fold names it S's holder: another zone's
+  op is `Protocol`, a `home` op `Unauthorized` (W8), and a node whose fold
+  names another holder answers `UnknownShare`, keeping nothing.
+- From Step X4.1 a write needs `write.append`, which a stored `write.*` admits
+  (root `dev-docs/GladeFirstSlicePlan.md:810`). A checks it on B's node id, by
+  default, and B's id needs `read.subscribe` too, for the forward. The
+  client's node checks it on its session's claimed principal, behind 4.3's
+  websocket switch, off by default. An op without it is `Unauthorized`.
+- A client may rely on one node judging each zone, once: its chain checks,
+  SWMR's writer, its shape and its grants. No node holds an op another refuses.
+- Fails: A takes B's word for the op and its writer: app ops are unsigned (D5,
+  `GladeNodeSigning.md:187-210`), and no client principal reaches A. After
+  X4.1, a holder that grants no write verb refuses every forwarded write, and
+  no shipped seed grants one. If A refuses the forward itself (4.3's refusal
+  form), B answers the zone's pending and later writes `Unauthorized` until a
+  forward opens again.
+
+**W3. The forwarding node relays, and holds only what the holder accepted**
+(rulings 2 and 3).
+
+- On A's `Ok`, B lands the op through its own verify path, fans it out to its
+  subscribers but the writer, adds it to the writer's heads (R3), and then
+  relays the `Ok`. On any other status, B relays it and keeps nothing.
+- A client may rely on B's other clients receiving its op only once A holds
+  it, and on B never holding an op of its that A refused.
+- Fails: where a zone split before these rules (the plan's §1), B's store can
+  refuse an op that A accepted. B then does not hold it, so it answers its own
+  store's code, not `Ok` (ruling 3). Nothing repairs the split (the plan's §7).
+
+**W4. What `Ok` promises on a forwarded share** (ruling 3; LBT-006).
+
+- R2 at A: in A's served store, not synced, and queued for every session then
+  subscribed to its zone at A but the forward that carried it, other nodes'
+  forwards included. And R2 at B, before B's `Ok`. Nothing about any other
+  node's store: a third node gets the op by its own forward, while that runs.
+- A client may rely on its op being held at A and at B, and queued for every
+  session subscribed to its zone at either; as in R2, not on its delivery.
+- Fails: R2's failures, at A and at B apart. B's loss heals when a forward
+  reopens, since A's gap carries the op back. A's does not: B's ack still
+  names the op, so the client's next op on that chain is refused as a gap,
+  relayed from A, and the chain stalls at A until the client sends the lost op
+  again (the plan's §7).
+
+**W5. `UnknownShare` on an op means "not placed"** (ruling 4).
+
+- B holds nothing of the op. Its route was `Absent`; its forward ended, or
+  waited 12 s, the exchange forward's bound (`exchange.rs:42-46`), with it
+  unanswered; or A, no longer the holder, answered it (W2). A holder from
+  before Step X3.1 discards what the forward sends (`mesh.rs:347`), so B
+  answers at 12 s.
+- On a subscribe `UnknownShare` stays a refusal (R6); on an op it is not one.
+  The client keeps the op and its chain's later ops, `append` goes on, and
+  answer 4's drop does not apply. It sends them again, in order, after its
+  next successful subscribe of the zone and on a backoff of 1 s doubling to
+  30 s (Step X3.3a). A TypeScript session that a binder owns is told, and the
+  client resends what it sent. A client may rely on a resend never being held
+  twice: a repeat that A holds is `Ok` (R1).
+- Fails: A may hold an op answered `UnknownShare`, if the forward ended or
+  timed out after A took it; only a resend tells. No node keeps an outbox
+  (GAP-11, `client-rs/src/client.rs:241-245`): unplaced ops live in the client
+  and end with it.
+
+**W6. Order** (ruling 7).
+
+- A zone's forwarded ops from one node ride its one forward in the order sent,
+  and A answers them in that order. A session's statuses keep its order within
+  a zone only; across zones, a local status may overtake a forwarded one.
+- A client may rely on `corr` (R1). An op sent twice goes to its one zone, so
+  its two statuses keep their order.
+- Fails: matching statuses across zones by their place mismatches them. Like
+  R4, W6 assumes a carrier that keeps the forward's frames in order: a chain's
+  op that overtook its predecessor would be refused as a gap.
+
+**W7. Shapes** (ruling 2). The four op shapes (`value`, `log`, `swmr` and
+`crdt`, `GladeShapeDispatch.md:15`) cross as ops. SWMR's one writer and a
+zone's shape are A's to decide, from the first op A holds of the zone
+(`store.rs:164-191`), so a client may rely on a SWMR zone having one writer
+across nodes (GSA-03, `GladeSwmrAdapter.md:46`). A `crdt` merge stays the
+clients' (GCA-07, `GladeCrdtAdapter.md:46`). `stream` has no op path
+(`GladeShapeDispatch.md:23-25`). Exchanges keep their own forward
+(`exchange.rs:207-228`), and live channels stay on their node
+(`server.rs:182-190`). Fails: a zone split before these rules stays split (W3).
+
+**W8. The forward carries app ops only** (ruling 2; H-R3). A refuses a `home`
+op on it `Unauthorized`. `home` records keep moving by the directory's pull
+and push (`mesh.rs:271-293`, `:432-490`), which slice Step 4.1b verifies. A
+client sees no change: its op on `home` is refused at its own node.
+
+**How they meet R1 to R8.** On a forwarded share an op's R1 status is A's,
+relayed by B unless B cannot hold what A took (W3); `UnknownShare` joins R1's
+codes as "not placed" (W5), and R1's order holds within a zone only (W6). R2's
+`Ok` also means that the claim holder holds the op, for a share another node
+serves (W4). R3 holds at B once B holds the op, after A's `Ok`. R4 and R5 hold
+at B, and Step X2.2 closes on the forward the race that the session answers'
+"Not covered" leaves to 4.3. Under R7 an op is accepted, refused, or not
+placed.
+
+**Not covered.** An op that the client sent before it learned that an earlier
+op of its chain was not placed can reach A past a gap, and be refused
+`Protocol`; neither plan says how the client keeps it. Nor does either say
+whether B lands an op that A accepts after B has answered it `UnknownShare` at
+12 s; the resend is `Ok` either way. Writes made before a share was claimed
+stay where they were made.
+
+**Where each rule comes from, and what pins it.** Each step writes its new
+tests red first.
+
+| Rule | Ruling | Steps | Tests the steps write |
+| --- | --- | --- | --- |
+| W1 | 5 | X2.3; X3.2 | `a_write_to_a_share_with_no_live_claim_is_not_placed`, `a_write_to_a_share_the_directory_never_heard_of_still_lands`; `a_write_on_b_reaches_a_and_every_subscriber` |
+| W2 | 2, 6; H-R3 | X2.1; X3.1; X4.1 | `the_acceptance_path_answers_a_batch_without_a_socket`; `a_forwarded_op_lands_at_the_claim_holder_and_is_answered`, `a_forwarded_op_off_its_zone_or_on_home_is_refused_and_not_stored`, `a_node_that_no_longer_holds_the_claim_takes_no_forwarded_write`; `a_forwarded_write_without_a_grant_is_refused_by_its_claimed_node_id` and its granted twin, `a_session_write_without_a_grant_is_refused_when_the_switch_is_on` and off, `a_revocation_ends_a_forwarded_write_stream` |
+| W3 | 2, 3 | X3.2 | `a_write_on_b_reaches_a_and_every_subscriber`, `a_write_the_holder_refuses_is_refused_at_b_and_kept_nowhere` |
+| W4 | 3 | X3.1; X3.2 | `a_forwarded_op_lands_at_the_claim_holder_and_is_answered`; `a_write_on_b_reaches_a_and_every_subscriber` (each op once in each store). None for durability, as for R2 |
+| W5 | 4 | X3.2; CW 3.1, 3.3; X4.2 | `writes_pending_when_the_forward_ends_are_answered_unknown_share`; Step X3.3a's pure tests, in CW 3.1 (not placed is not refused, a repeat's `Ok` settles it, a later refusal still drops the tail, the backoff's schedule), and X3.3b's, in CW 3.3 (`client-ts/test/answers.test.ts`); `a_forward_resumes_when_the_link_returns` |
+| W6 | 7 | X2.1; X3.2 | `the_acceptance_path_answers_a_batch_without_a_socket`, a batch in order. None pins the order on the forward, or across zones |
+| W7 | 2 | X3.2 | `a_write_on_b_reaches_a_and_every_subscriber` (`value`, `log`, `crdt`), `a_write_the_holder_refuses_is_refused_at_b_and_kept_nowhere` (a second SWMR writer; a `crdt` op on a `value` zone) |
+| W8 | 2; H-R3 | X3.1 | `a_forwarded_op_off_its_zone_or_on_home_is_refused_and_not_stored` |
+| R4, R5 on the forward | the plan's §1 | X2.2 | `no_op_of_a_zone_reaches_a_forwarding_node_before_its_ack`, `the_peer_ack_names_each_origin_head_with_its_hash` |
+
+Step X4.3's journey (`node/tests/cross_node_writes.rs`, new) runs W1 to W5 and
+W7 on two nodes and a third, through a stop and a restart of the holder.
+
+**What these rules contradict elsewhere in this document** (found by Step
+X1.1; lines are this document's; to reconcile when the node steps land, not
+yet changed):
+
+- R2's third point and last bullet (`:285-287`, `:295-297`): on a forwarded
+  share the op no longer stays at the node the client reached. W3 and W4
+  replace them, and the plan's Step X1.1 would have them point here.
+- R1 (`:259-269`) and the session answers' scope (`:248-249`): A answers a
+  forward's ops under R1 (W2); R1's order holds within a zone only (W6); and
+  an op's `UnknownShare` names no refusal (W5), so the client libraries' drop
+  (`:371-374`) does not apply to it.
+- §2's "appending never blocks on the network" (`:37-38`) and §5's
+  offline-first (`:167-168`): on a forwarded share a node places a write only
+  through the holder, and none while it is unreachable. The client still
+  appends without blocking.
+- §2's "never from coordination" and "leases/roles are optimizations, not
+  correctness mechanisms" (`:41-43`): a live claim, a lease, picks the one
+  node that admits a zone's writes, and fixes its writer and shape.
+- §6's "transport ordering is not load-bearing" (`:190-194`) and its resume in
+  "both directions" (`:201`): W6 needs the forward's frames in order, and on
+  the forward resume runs one way; nothing ships A an op it lacks (W4).
+
+Outside this document, root `dev-docs/glade/GladeAuthzModel.md:26` has a write
+executed by "the receiving replica", and working offline; on a forwarded share
+the holder executes it. Answer 4 (`GladeClientWritesPlan.md:276-282`) gains
+W5's exception, as its ruling records (`:305-307`).
+
 ## 7. Reassembler layer (delta-heavy surfaces)
 
 Share/reassembly logic MUST NOT live in UI consumers. For patch-shaped
