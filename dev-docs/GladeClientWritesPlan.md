@@ -302,6 +302,10 @@ enforcement, then Phase 3, and Phase 4 alongside in its own repositories.
 is answered `Retention`, not `Ok`, and a client treats it as settled, not as a refusal. Step 2.1 builds the
 node's half; Steps 3.1 and 3.3 the clients'.
 
+**Ruled, owner, 2026-09-24, from the cross-node writes plan (its answer 4):** `UnknownShare` answering an op means
+"not placed", not "refused": the client keeps the op and its chain, and sends them again. Steps 3.1 and 3.3
+build it (`GladeCrossNodeWritesPlan.md`).
+
 ## 6. The session contract
 
 Step 1.1 writes these rules, as ruled, into `glade/dev-docs/GladeSubstrateV1.md`

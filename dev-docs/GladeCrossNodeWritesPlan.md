@@ -264,6 +264,14 @@ network" (`:37-38`) and §5's offline-first (`:167-168`), and against
    question 4 is ruled first; the node steps after slice 4.6. The earliest they
    can go is after CW Phase 2 and slice 4.3 part 2, which edit the same functions.
 
+**Ruled, owner, 2026-09-24 ("all recommended"):** 1 yes, the end-to-end app has writers on two nodes on one
+share, so this plan is on the publish path; 2 option A, through the claim holder; 3 `Ok` means the claim holder
+and the node the client reached both hold the op; 4 `UnknownShare` on an op means "not placed", and the client
+keeps the op and its chain and sends them again (built into the client-writes plan's Steps 3.1 and 3.3); 5 writes
+follow the read route, refusal included; 6 the verb is `write.append`, granted by a stored `write.*`, checked at
+the claim holder against the forwarding node's id by default and at the client's node behind 4.3's switch; 7
+statuses keep their order within a zone only; 8 X1.1 now, the node steps after the first slice's 4.6.
+
 ## 5. Phases and steps
 
 **Rules for every step** (`GladeClientWritesPlan.md:352-363`): one commit per
