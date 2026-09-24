@@ -707,6 +707,17 @@ unchanged.
 - **Gate:** as for 3.3.
 - **Size:** ~120 production lines, ~170 test lines.
 - **Depends on:** 3.3, and 2.2's binary.
+- **Done, 2026-09-25,** glade `3ca7428`: R5-R7 in client-ts. `subscribeOutcome` resolves with
+  the ack's heads and their hashes, or the refusal and its reason (the next `Error` with no
+  `corr` for the zone); `subscribe` returns once the zone's replay is in and never rejects on
+  a refusal. A refused chain resumes, and W5's unplaced ops go again, at the end of the
+  replay. A frame the client cannot decode or take fails the waiting subscribes and is
+  logged, where it used to throw out of `onMessage`. client-ts 48 (was 36); glial 99, grip-share
+  19, demo 3, typechecks clean. The desk takes 3.3 and 3.4 together at a `pnpm install` in
+  gryth-ui. **For the owner's review, as built:** `subscribe` now rejects, where it hung, with
+  no socket open or when the connection ends or a frame cannot be taken before its replay
+  (glial's supplier kit reattaches; gryth-ui and the demo go offline); `subscribeOutcome`'s
+  shape; untakeable frames logged, not thrown; a replay counting ops a consumer threw on.
 
 ### Phase 4 — The suppliers use them
 
