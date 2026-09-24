@@ -648,6 +648,42 @@ mod tests {
         }
     }
 
+    /// Plan Step 4.2: each booted node binds its endpoint with its own
+    /// `endpoint.key`, and its binding, minted at boot, reaches the peer's
+    /// served store by the pull the HELLO opens. There it folds live for the
+    /// very key the peer's connection came from, which is what 4.2b's door
+    /// will read. It checks no refusal: 4.2a builds no door.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_peers_binding_arrives_by_the_pull_and_folds_live() {
+        use crate::transport::{Bound, TransportFold};
+        let boot_a = boot_at(fresh("tb-a-sys"), "gianni").unwrap();
+        let boot_b = boot_at(fresh("tb-b-sys"), "gianni").unwrap();
+        let (id_a, key_a) = (boot_a.identity().unwrap(), boot_a.endpoint_key());
+        let (id_b, key_b) = (boot_b.identity().unwrap(), boot_b.endpoint_key());
+        let a = Server::open(fresh("tb-a-store")).unwrap();
+        let b = Server::open(fresh("tb-b-store")).unwrap();
+        a.adopt_boot(boot_a).await.unwrap();
+        b.adopt_boot(boot_b).await.unwrap();
+        let ep_a = PeerEndpoint::bind_as(id_a, key_a).await.unwrap();
+        let ep_b = PeerEndpoint::bind_as(id_b, key_b).await.unwrap();
+        a.enable_mesh(ep_a).await.unwrap();
+        let addr_b = b.enable_mesh(ep_b).await.unwrap();
+        assert_eq!(*addr_b.endpoint_id.as_bytes(), key_b.endpoint_id);
+        a.connect_peer(&addr_b).await.unwrap();
+
+        let live = |node: [u8; 32], key: [u8; 32]| {
+            move |st: &Store| {
+                TransportFold::of_store(st).binds(&node, &key, now_ms()) == Bound::Live
+            }
+        };
+        let (b_at_a, a_at_b) = (
+            live(id_b.node_id, key_b.endpoint_id),
+            live(id_a.node_id, key_a.endpoint_id),
+        );
+        wait_for(&a, b_at_a, "B's binding at A").await;
+        wait_for(&b, a_at_b, "A's binding at B").await;
+    }
+
     // ---- the s-discovery golden path, end to end ---------------------------
 
     fn sub(share: &str, glade_id: &str) -> Vec<u8> {

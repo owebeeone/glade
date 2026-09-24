@@ -7,8 +7,9 @@
 //!
 //! Each test sets or removes the variable on the node it spawns, so it reads
 //! the same whichever way the suite runs (the node gate runs it both ways).
-//! The last test starts each root on an instance written before plan Step
-//! 4.1a changed the node id.
+//! The last tests start each root on an instance written before plan Step
+//! 4.1a changed the node id, and check plan Step 4.2's endpoint key: one id
+//! across starts, and a replaced key's binding revoked.
 //! Every file goes under a fresh directory in the system temp dir, and the node
 //! runs with `GLADE_HOME` and `HOME` pointed there: `~/.glade` is never touched.
 
@@ -25,6 +26,7 @@ use glade_node::registry::{BlobStore, Record, Registry, RegistryApi, StoreApi, H
 use glade_node::store::Store;
 use glade_node::sysdata::{NodeRecord, ServeClaim};
 use glade_node::sysdir::{boot_at, now_ms};
+use glade_node::transport::Bound;
 use glade_wire::cbor;
 use glade_wire::generated::Op;
 use sha2::{Digest, Sha256};
@@ -251,6 +253,81 @@ fn both_roots_boot_register_and_serve_alike() {
     assert_eq!(assembled[2], "registry ready (home served: true)");
     assert_eq!(assembled[3], "app x registered (+2 record(s), 0 unchanged)");
     assert_eq!(assembled[5], "workspace ws-x serving");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The endpoint id of a `peer <endpoint-id> <ip:port>` line among `lines`.
+fn endpoint_id(lines: &[String]) -> String {
+    let peer = lines.iter().find_map(|line| line.strip_prefix("peer "));
+    let peer = peer.unwrap_or_else(|| panic!("no `peer` line in {lines:?}"));
+    peer.split(' ').next().unwrap().to_string()
+}
+
+/// Plan Step 4.2 (the signing note's F1), on each root: a booted node's
+/// endpoint id, which its `peer` line prints, is the same at every start of
+/// one instance, and it is not the node id. Before, iroh drew a new endpoint
+/// key at every bind. It does not dial the endpoint.
+#[test]
+fn both_roots_keep_one_endpoint_id_across_restarts() {
+    let dir = scratch("endpoint-key");
+    let home = dir.join("glade-home");
+    for (root, name) in [(Root::HandWritten, "h"), (Root::Assembled, "a")] {
+        let args = ["--profile", "local", "--name", name, "0"];
+        let (first, _) = start_and_stop(&home, root, &args);
+        let (second, stderr) = start_and_stop(&home, root, &args);
+        let id = endpoint_id(&first);
+        assert_eq!(endpoint_id(&second), id, "{root:?}: {second:?}, {stderr}");
+        let node = second[1].strip_prefix("node ").unwrap();
+        assert_ne!(id, node, "{root:?}: the endpoint key is not the node key");
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Plan Step 4.2, on each root: an operator replaces the endpoint key by
+/// moving `endpoint.key` aside. The next start prints a new endpoint id and,
+/// after `node`, that it revoked the old key's binding; records.json then
+/// binds the new key and revokes the old one, both under the node's id.
+#[test]
+fn both_roots_revoke_a_replaced_endpoint_keys_binding() {
+    let dir = scratch("endpoint-replaced");
+    let home = dir.join("glade-home");
+    let expected = [
+        "instance",
+        "node",
+        "revoked",
+        "registry",
+        "peer",
+        "listening",
+    ];
+    for (root, name) in [(Root::HandWritten, "h"), (Root::Assembled, "a")] {
+        let args = ["--profile", "local", "--name", name, "0"];
+        let (first, _) = start_and_stop(&home, root, &args);
+        let instance = home.join("sys").join(name);
+        let key = instance.join("endpoint.key");
+        std::fs::rename(&key, instance.join("endpoint.key.old")).unwrap();
+        let (lines, stderr) = start_and_stop(&home, root, &args);
+        assert_eq!(kinds(&lines), expected, "{root:?}: {lines:?}, {stderr}");
+        assert_eq!(lines[2], "revoked 1 binding(s) of replaced endpoint key(s)");
+        let (old, new) = (endpoint_id(&first), endpoint_id(&lines));
+        assert_ne!(old, new, "{root:?}");
+
+        let node = lines[1].strip_prefix("node ").unwrap();
+        let saved = BlobStore::new(&instance).load().unwrap();
+        let (registry, quarantined) = Registry::from_snapshot(&saved);
+        assert_eq!(quarantined, 0);
+        let fold = registry.transport();
+        let raw = |hex: &str| -> [u8; 32] {
+            let byte = |at: usize| u8::from_str_radix(&hex[at..at + 2], 16).unwrap();
+            std::array::from_fn(|i| byte(2 * i))
+        };
+        let (node, old, new) = (raw(node), raw(&old), raw(&new));
+        assert_eq!(
+            fold.binds(&node, &old, now_ms()),
+            Bound::Revoked,
+            "{root:?}"
+        );
+        assert_eq!(fold.binds(&node, &new, now_ms()), Bound::Live, "{root:?}");
+    }
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

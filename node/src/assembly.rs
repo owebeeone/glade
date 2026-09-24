@@ -184,7 +184,7 @@ use crate::peer::NodeIdentity;
 use crate::registry::{
     MemStore, Record, Registry, RegistryApi, RegistryError, StoreApi, G_BINDINGS,
     G_BINDING_RETRACTIONS, G_CLAIMS, G_GRANTS, G_NODES, G_PRINCIPALS, G_REVOCATIONS, G_SERVICES,
-    G_WORKSPACES, HOME,
+    G_TRANSPORT_BINDINGS, G_TRANSPORT_REVOCATIONS, G_WORKSPACES, HOME,
 };
 use crate::signing::NodeSigner;
 use crate::sysdir::{now_ms, Boot, Profile};
@@ -452,7 +452,7 @@ impl<M: Module> Component<M> for CommandLine {
     }
 }
 
-/// The directory profile on its own: the home share and its nine record
+/// The directory profile on its own: the home share and its eleven record
 /// streams. Pure, with nothing injected, which is what breaks the
 /// Directory-Records constructor cycle
 /// (`dev-docs/arch1/InjectionGraphRefinement.md:35-40`): rules, then records,
@@ -461,7 +461,7 @@ impl<M: Module> Component<M> for CommandLine {
 #[shaku(interface = RecordProfile)]
 pub struct DirectoryRules;
 
-const DIRECTORY_STREAMS: [&str; 9] = [
+const DIRECTORY_STREAMS: [&str; 11] = [
     G_NODES,
     G_WORKSPACES,
     G_CLAIMS,
@@ -471,6 +471,8 @@ const DIRECTORY_STREAMS: [&str; 9] = [
     G_BINDING_RETRACTIONS,
     G_SERVICES,
     G_PRINCIPALS,
+    G_TRANSPORT_BINDINGS,
+    G_TRANSPORT_REVOCATIONS,
 ];
 
 impl RecordProfilePort for DirectoryRules {

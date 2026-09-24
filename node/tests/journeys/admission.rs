@@ -16,7 +16,7 @@ use crate::faults::LiveGrants;
 use crate::{pair, TestNode, T0, WS};
 
 /// Wrong scope: B's record host takes only what its directory profile hosts,
-/// the `home` share and its nine streams. An op carried on another share (a
+/// the `home` share and its eleven streams. An op carried on another share (a
 /// foreign namespace) or on a stream the profile does not host is refused
 /// before it is verified, and nothing is persisted, so B answers none until
 /// the op arrives in scope. The fakes prove nothing about a referral (the

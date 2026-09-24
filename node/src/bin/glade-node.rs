@@ -16,14 +16,17 @@
 //! overrides; `GLADE_HOME` overrides `$HOME/.glade`), runs the load-validation
 //! ladder (the first boot after plan Step 4.1a also sets aside, once, the
 //! records naming the node by its key's old id, and prints `set aside …` after
-//! `node`), materialises the RegistryApi fold, and writes its own presence —
+//! `node`), materialises the RegistryApi fold, and writes its own presence and
+//! the binding of its endpoint key (plan Step 4.2; a boot after the key was
+//! replaced revokes the old key's and prints `revoked …` after `node`) —
 //! the node serves itself from its own disk BEFORE any client connects (the
 //! s-boot trace). The registry then seeds the served store (the home share is
 //! an ORDINARY share, GDL-038), the iroh peer endpoint binds with the node's
-//! directory identity and accepts inbound peer links (prints
-//! `peer <endpoint-id> <ip:port>` — the dial target for a `--peer` flag on
-//! another node), and each `--peer` target is dialed and the home share
-//! converged. Then it serves the app-data carrier as before.
+//! directory identity and its `endpoint.key`, and accepts inbound peer links
+//! (prints `peer <endpoint-id> <ip:port>` — the dial target for a `--peer`
+//! flag on another node, the same at every start), and each `--peer` target
+//! is dialed and the home share converged. Then it serves the app-data
+//! carrier as before.
 //!
 //! Each `--app FILE.glade` is LOADED as data and REGISTERED (GDL-037): its
 //! declarations append as ordinary records, its ACL seeds compile to grant
@@ -151,6 +154,9 @@ async fn run() -> std::io::Result<()> {
         if let Some(aside) = &node.set_aside {
             println!("{aside}");
         }
+        if let Some(revoked) = node.rebound.line() {
+            println!("{revoked}");
+        }
         if node.rejected > 0 {
             println!("quarantined {} record(s) at load", node.rejected);
         }
@@ -196,9 +202,9 @@ async fn run() -> std::io::Result<()> {
     // with each `--peer` target, then start SERVING the declared workspaces:
     // mint WorkspaceEntry + ServeClaim and renew while serving (audit F1).
     if let Some((node, workspaces)) = booted {
-        let identity = node.identity()?;
+        let (identity, key) = (node.identity()?, node.endpoint_key());
         server.adopt_boot(node).await?;
-        let endpoint = PeerEndpoint::bind_with(identity).await?;
+        let endpoint = PeerEndpoint::bind_as(identity, key).await?;
         let addr = server.enable_mesh(endpoint).await?;
         println!("peer {} {}", addr.endpoint_id, addr.socket);
         for p in &peers {

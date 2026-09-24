@@ -8,6 +8,7 @@
 //! | file            | trust class                              | ships |
 //! |-----------------|------------------------------------------|-------|
 //! | `node.key`      | 1 — node secret (mode 0600)              | never |
+//! | `endpoint.key`  | 1 — iroh endpoint secret (mode 0600)     | never |
 //! | `records.json`  | 2 — signed replicated records (snapshot) | yes   |
 //! | `local.json`    | 3 — node-private assertions              | never |
 //! | `cache/`        | 4 — derived, rebuildable                 | never |
@@ -25,6 +26,11 @@
 //! structural: class-2 records carry no signatures until 4.1b, and the class-3
 //! self-signature is not checked until 4.1c. The permission check, the class-2
 //! chain verification, and the fail-closed load STRUCTURE are real.
+//!
+//! Plan Step 4.2: `endpoint.key` is the iroh endpoint's seed, kept apart from
+//! `node.key` so the identity survives the transport key's replacement. The
+//! boot binds it to the node by a signed record, and revokes the node's
+//! bindings of any key it replaced (`transport.rs`).
 
 use std::fmt;
 use std::fs;
@@ -40,6 +46,7 @@ use crate::registry::{BlobStore, Record, Registry, RegistryApi, StoreApi, HOME};
 use crate::signing;
 use crate::store::unused_path;
 use crate::sysdata::{NodeRecord, ServeClaim, SystemSnapshot};
+use crate::transport::{self, EndpointKey, Rebound};
 
 /// A launch profile — a default instance name + typical roles. A deployment
 /// label only; the protocol knows roles + operators, never a profile.
@@ -145,9 +152,14 @@ pub struct Boot {
     pub rejected: usize,
     /// What this boot set aside under the node's old id (plan Step 4.1a).
     pub set_aside: Option<SetAside>,
+    /// What this boot did to the node's transport bindings (plan Step 4.2).
+    pub rebound: Rebound,
     /// The class-1 node key, an Ed25519 seed — kept in memory ONLY to sign as
     /// this node ([`Boot::identity`]); never shipped, never in any snapshot.
     seed: [u8; 32],
+    /// The class-1 endpoint key (plan Step 4.2), which the iroh endpoint
+    /// binds with ([`Boot::endpoint_key`]).
+    endpoint: EndpointKey,
     _lock: InstanceLock,
 }
 
@@ -184,6 +196,12 @@ impl Boot {
         Ok(NodeIdentity::from_key(self.seed))
     }
 
+    /// The key this node's iroh endpoint binds with, the same at every boot
+    /// (plan Step 4.2), and bound to this node in its records.
+    pub fn endpoint_key(&self) -> EndpointKey {
+        self.endpoint
+    }
+
     /// The id this node's key had before plan Step 4.1a, `hex(sha256(key))`,
     /// which its older records name.
     pub(crate) fn legacy_id(&self) -> String {
@@ -210,8 +228,9 @@ pub fn boot_at(dir: PathBuf, operator: &str) -> io::Result<Boot> {
     fs::create_dir_all(dir.join("cache"))?; // class 4: cache/ present, never load-bearing
     let lock = InstanceLock::acquire(dir.join("instance.lock"))?;
 
-    // ---- class 1: node.key -> NodeId (ssh-discipline perms) ----------------
-    let seed = load_or_create_node_key(&dir)?;
+    // ---- class 1: node.key -> NodeId, endpoint.key (ssh-discipline perms) -
+    let seed = load_or_create_secret(&dir, "node.key")?;
+    let endpoint = EndpointKey::from_seed(load_or_create_secret(&dir, "endpoint.key")?);
     let node_id = node_id_of(&seed);
 
     // ---- class 2: records.json -> verify-as-ingest -> the fold -------------
@@ -242,6 +261,10 @@ pub fn boot_at(dir: PathBuf, operator: &str) -> io::Result<Boot> {
             .map_err(reg_io)?;
         changed = true;
     }
+    // The endpoint key bound to this node, and any key it replaced revoked
+    // (plan Step 4.2), in the same save.
+    let rebound = transport::bind_at_boot(&mut registry, &seed, &endpoint, now_ms())?;
+    changed |= rebound.minted || rebound.revoked > 0;
     if changed {
         store.save(&registry.snapshot())?; // rewritten tmp+rename
     }
@@ -254,23 +277,25 @@ pub fn boot_at(dir: PathBuf, operator: &str) -> io::Result<Boot> {
         store,
         rejected,
         set_aside,
+        rebound,
         seed,
+        endpoint,
         _lock: lock,
     })
 }
 
-/// Load `node.key` (refusing group/world-readable, the ssh discipline, and any
-/// length but the 32 bytes of an Ed25519 seed) or create it 0600 on first boot
-/// from the OS's randomness. Class-1 secret: never shipped, never in any
-/// snapshot.
-fn load_or_create_node_key(dir: &Path) -> io::Result<[u8; 32]> {
-    let path = dir.join("node.key");
+/// Load the class-1 secret `name`, `node.key` or `endpoint.key` (refusing
+/// group/world-readable, the ssh discipline, and any length but the 32 bytes
+/// of an Ed25519 seed), or create it 0600 on first boot from the OS's
+/// randomness. Never shipped, never in any snapshot.
+fn load_or_create_secret(dir: &Path, name: &str) -> io::Result<[u8; 32]> {
+    let path = dir.join(name);
     if path.exists() {
         platform::check_key_perms(&path)?;
         let mut held = Vec::new();
         fs::File::open(&path)?.read_to_end(&mut held)?;
         return held.as_slice().try_into().map_err(|_| {
-            let why = format!("node.key is {} bytes, not an Ed25519 seed's 32", held.len());
+            let why = format!("{name} is {} bytes, not an Ed25519 seed's 32", held.len());
             io::Error::new(io::ErrorKind::InvalidData, why)
         });
     }
@@ -366,10 +391,11 @@ mod platform {
     pub(super) fn check_key_perms(path: &Path) -> io::Result<()> {
         let mode = fs::metadata(path)?.permissions().mode();
         if mode & 0o077 != 0 {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!(
-                    "node.key is group/world-accessible (mode {:o}) — refusing",
+                    "{name} is group/world-accessible (mode {:o}) — refusing",
                     mode & 0o777
                 ),
             ));
@@ -643,6 +669,113 @@ mod tests {
         assert!(!lock.exists(), "a clean release removes the file");
     }
 
+    fn rebound(minted: bool, revoked: usize) -> Rebound {
+        Rebound { minted, revoked }
+    }
+
+    /// Plan Step 4.2 (F1): `endpoint.key` is a second 32-byte secret, whose
+    /// key is not the node's, loaded at every boot, so the endpoint id is the
+    /// same at each; a length other than 32 refuses the boot, naming the
+    /// file.
+    #[test]
+    fn the_endpoint_key_is_a_second_secret_kept_across_boots() {
+        let dir = fresh("endpoint-key");
+        let boot = boot_at(dir.clone(), "gianni").unwrap();
+        let key = boot.endpoint_key();
+        assert_ne!(transport::hex(&key.endpoint_id), boot.node_id);
+        let held: [u8; 32] = fs::read(dir.join("endpoint.key"))
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert_eq!(EndpointKey::from_seed(held).endpoint_id, key.endpoint_id);
+        drop(boot);
+        let again = boot_at(dir.clone(), "gianni").unwrap();
+        assert_eq!(again.endpoint_key().endpoint_id, key.endpoint_id);
+        drop(again);
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join("endpoint.key"));
+        file.and_then(|file| file.set_len(31)).unwrap();
+        let err = boot_at(dir, "gianni").map(|_| ()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().starts_with("endpoint.key is 31 bytes"),
+            "{err}"
+        );
+    }
+
+    /// Plan Step 4.2, section 5: the first boot binds the endpoint key in
+    /// records.json; the next writes nothing; a boot after `endpoint.key` was
+    /// moved aside binds the new key and revokes the old one; the old key
+    /// restored refuses the boot, and records.json is not written.
+    #[test]
+    fn a_boot_binds_its_endpoint_key_and_revokes_a_replaced_one() {
+        let dir = fresh("rebind");
+        let boot = boot_at(dir.clone(), "gianni").unwrap();
+        let node = boot.identity().unwrap().node_id;
+        let old = boot.endpoint_key().endpoint_id;
+        assert_eq!(boot.rebound, rebound(true, 0));
+        let fold = boot.registry.transport();
+        assert_eq!(fold.binds(&node, &old, now_ms()), transport::Bound::Live);
+        drop(boot);
+        let saved = fs::read(dir.join("records.json")).unwrap();
+        let again = boot_at(dir.clone(), "gianni").unwrap();
+        assert_eq!(again.rebound, rebound(false, 0));
+        drop(again);
+        assert_eq!(
+            fs::read(dir.join("records.json")).unwrap(),
+            saved,
+            "nothing written"
+        );
+
+        fs::rename(dir.join("endpoint.key"), dir.join("endpoint.key.old")).unwrap();
+        let replaced = boot_at(dir.clone(), "gianni").unwrap();
+        let new = replaced.endpoint_key().endpoint_id;
+        assert_ne!(new, old);
+        assert_eq!(replaced.rebound, rebound(true, 1));
+        let fold = replaced.registry.transport();
+        assert_eq!(fold.binds(&node, &old, now_ms()), transport::Bound::Revoked);
+        assert_eq!(fold.binds(&node, &new, now_ms()), transport::Bound::Live);
+        drop(replaced);
+
+        let saved = fs::read(dir.join("records.json")).unwrap();
+        fs::rename(dir.join("endpoint.key.old"), dir.join("endpoint.key")).unwrap();
+        let err = boot_at(dir.clone(), "gianni").map(|_| ()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(dir.join("records.json")).unwrap(), saved);
+    }
+
+    /// Plan Step 4.2, section 6: an instance written before the step has a
+    /// `node.key` and records.json but no `endpoint.key` and no binding. Its
+    /// next boot mints the key and exactly one binding, revokes nothing, and
+    /// sets nothing aside or re-mints presence.
+    #[test]
+    fn an_instance_from_before_the_step_binds_a_new_key_at_its_next_boot() {
+        let dir = fresh("before-4-2");
+        drop(boot_at(dir.clone(), "gianni").unwrap());
+        let store = BlobStore::new(&dir);
+        let mut snap = store.load().unwrap();
+        let transport_record = |bytes: &Vec<u8>| {
+            let glade_id = Op::from_cbor(&cbor::decode(bytes)).glade_id;
+            glade_id.starts_with("dir.transport-")
+        };
+        snap.records.retain(|bytes| !transport_record(bytes));
+        let mut store = store;
+        store
+            .save(&Registry::from_snapshot(&snap).0.snapshot())
+            .unwrap();
+        fs::remove_file(dir.join("endpoint.key")).unwrap();
+
+        let boot = boot_at(dir.clone(), "gianni").unwrap();
+        assert!(dir.join("endpoint.key").exists());
+        assert_eq!(boot.rebound, rebound(true, 0));
+        assert!(boot.set_aside.is_none());
+        assert_eq!(boot.nodes_of_ops(), 1);
+        let saved = BlobStore::new(&dir).load().unwrap();
+        let bindings = saved.records.iter().filter(|bytes| transport_record(bytes));
+        assert_eq!(bindings.count(), 1);
+    }
+
     /// One identity, two renderings: the peer-link NodeIdentity derived from
     /// node.key is the raw-bytes twin of the hex NodeId in directory records —
     /// the identity match claim routing (WD §4) stands on.
@@ -702,6 +835,24 @@ mod tests {
             let again = boot_at(dir, "gianni").unwrap();
             assert_eq!(again.node_id, node_id);
             assert_eq!(again.rejected, 0);
+        }
+
+        /// Plan Step 4.2: `endpoint.key` is created 0600, and a group-readable
+        /// one refuses the boot, naming the file, as `node.key` does.
+        #[test]
+        fn endpoint_key_is_0600_and_group_readable_is_refused() {
+            let dir = fresh("endpoint-perms");
+            drop(boot_at(dir.clone(), "gianni").unwrap());
+            let path = dir.join("endpoint.key");
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+            let err = boot_at(dir, "gianni").map(|_| ()).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+            assert!(
+                err.to_string().starts_with("endpoint.key is group"),
+                "{err}"
+            );
         }
 
         /// The instance lock's identity check (plan Step 4.4's question 3): a

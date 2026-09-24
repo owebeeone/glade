@@ -208,6 +208,55 @@ impl PrincipalRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Default)]
+pub struct NodeTransportBinding {
+    pub node: String,
+    pub endpoint_id: String,
+    pub valid_from: i64,
+    pub sig: Vec<u8>,
+}
+impl NodeTransportBinding {
+    pub fn to_cbor(&self) -> Cbor {
+        Cbor::Map(vec![
+            (1, Cbor::Text(self.node.clone())),
+            (2, Cbor::Text(self.endpoint_id.clone())),
+            (3, Cbor::Int(self.valid_from)),
+            (4, Cbor::Bytes(self.sig.clone())),
+        ])
+    }
+    pub fn from_cbor(c: &Cbor) -> Self {
+        Self {
+            node: c.get(1).text(),
+            endpoint_id: c.get(2).text(),
+            valid_from: c.get(3).int(),
+            sig: c.get(4).bytes(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct NodeTransportRevocation {
+    pub node: String,
+    pub endpoint_id: String,
+    pub sig: Vec<u8>,
+}
+impl NodeTransportRevocation {
+    pub fn to_cbor(&self) -> Cbor {
+        Cbor::Map(vec![
+            (1, Cbor::Text(self.node.clone())),
+            (2, Cbor::Text(self.endpoint_id.clone())),
+            (3, Cbor::Bytes(self.sig.clone())),
+        ])
+    }
+    pub fn from_cbor(c: &Cbor) -> Self {
+        Self {
+            node: c.get(1).text(),
+            endpoint_id: c.get(2).text(),
+            sig: c.get(3).bytes(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Default)]
 pub struct WorkspaceCreateReq {
     pub workspace: String,
     pub name: String,

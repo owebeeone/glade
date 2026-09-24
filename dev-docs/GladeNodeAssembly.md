@@ -2416,3 +2416,541 @@ tree:
   - `server.rs` +187/−9;
   - `mesh.rs` +22/−4;
 - `check.sh`: the ratchet, one line.
+
+## Transport binding and the door (plan Step 4.2)
+
+Design addition, 2026-09-24, written before the code against glade `e42824e`.
+The red runs and the measured figures are filled in afterwards. The spec is
+plan Step 4.2 with its line from the rulings of 2026-09-24 (a stable endpoint
+key first, the signing note's F1); the rulings `transport_key_binding =
+binding_record`, `scope_model = node_trust` and `relay_posture =
+community_dev_only`; `GladeNodeSigning.md` D2, D6, D7 and D8, all ruled as
+recommended; `dev-docs/IrohGladeMapping.md` §5.2 and §7.2 (`:245-282`,
+`:387-395`); and the slice profile's SP-R2 and §8 item 3, which leave the
+record's layout, stream, signed bytes and revocation to this step.
+
+Nothing changes in the wire IR, in `NodeHello` or in the ALPN. The node's own
+IR, `node/ir/sysdata.taut.py`, gains two record kinds.
+
+**The step is split in two.**
+
+- **4.2a, built with this note:** the stable endpoint key, the two record
+  kinds, their fold, minting at boot, and the clock rule (sections 1 to 6).
+- **4.2b, designed here and not built:** the door. That is the refusal at
+  accept, the HELLO check, the refusal lines and the `CarrierPort` accessor
+  (sections 7 and 8).
+
+Two things force the split.
+
+- **First contact needs the owner's word** (section 7). The plan and the
+  rulings point to configured peers. They do not say how the accepting side
+  is configured, or whether the door is closed by default. Today `--peer` is
+  dial-only and one-sided: Step 3.3's lifecycle and stop-signal tests link B
+  to A with `--peer` on A alone. Once the door is closed, B must know A
+  beforehand.
+- **Size.** The whole step comes to about 800 production lines and 1,800 in
+  all, above the brief's limits of about 450 and 1,100. 4.2a measured 483
+  production lines, 49 of them generated, and 519 of tests ("Measured",
+  below). 4.2b is about 300 production lines and 500 of tests. An iroh
+  `CarrierPort` adapter would add about 300 more of each (section 8).
+
+### 1. The endpoint key (F1)
+
+**Cause.** `bind_endpoint` (`iroh_carrier.rs:53-61`) gives iroh no secret key,
+so iroh draws a new one at every bind (iroh 1.2 `src/endpoint.rs:228`). So
+every start of a node has a new endpoint id, and nothing can name it: not a
+binding record, not 4.5's `--peer <endpoint-id>@…`, not a relay.
+
+**The key.**
+
+- `endpoint.key` is a second class-1 secret in the instance, beside
+  `node.key`. It holds exactly 32 bytes, an Ed25519 seed.
+- It is created mode 0600 from `signing::random_seed()`. The boot refuses it
+  if it is group- or world-accessible, as it refuses such a `node.key`. Off
+  Unix it gets default permissions and no check, as `node.key` does (F5).
+- It is minted once: at a new instance's first boot, and at an existing
+  instance's next boot on this build. Every later boot loads it. A length
+  other than 32 refuses the boot, before records.json is read.
+- Its Ed25519 public key is the endpoint id: iroh's
+  `SecretKey::from_bytes(seed).public()`, the key `signing::public_key`
+  computes from the same seed.
+- It is not derived from `node.key`. The ruling says "identity must survive a
+  transport key being replaced". A derived key could be replaced only with
+  the node key, and so with the identity.
+- It needs no recovery material. A lost `endpoint.key` means a new key and a
+  new binding under the same node id (section 5).
+- Both booted roots bind with it: `PeerEndpoint::bind_as(identity, key)`.
+  `bind` and `bind_with` still draw a fresh key. Only tests and the async
+  witness call them.
+- `transport::EndpointKey` keeps the seed private, and its `Debug` prints
+  only the endpoint id.
+
+### 2. The record kinds
+
+Both kinds ride `home`, in the node's own chain, one stream each.
+
+| Kind | Stream | Fields (taut number, type) | Signed by `node`, over |
+| --- | --- | --- | --- |
+| `NodeTransportBinding` | `dir.transport-bindings` | 1 `node` text, 2 `endpoint_id` text, 3 `valid_from` int, 4 `sig` bytes | `glade/v1/transport-binding\0`, then the canonical CBOR of fields 1 to 3 |
+| `NodeTransportRevocation` | `dir.transport-revocations` | 1 `node` text, 2 `endpoint_id` text, 3 `sig` bytes | `glade/v1/transport-revocation\0`, then the canonical CBOR of fields 1 and 2 |
+
+- A binding says "endpoint key E is transport for node N, from
+  `valid_from`". A revocation says "N no longer uses E".
+- `node` and `endpoint_id` are 64 lower-case hex digits. That is how the
+  directory writes every node id, and how iroh prints an endpoint id: the
+  `peer` line shows the same text.
+- `valid_from` is the minting node's wall clock in epoch milliseconds.
+  Section 4 says how a reader judges it.
+- `sig` is 64 bytes of pure Ed25519 by the node key, checked with
+  `verify_strict`.
+- `dir.bindings` is taken by app declarations (R9), hence the longer stream
+  names.
+
+**Why the record carries its own signature.** Until 4.1b, `home` records are
+unsigned, and any peer can write `home` (4.3's named gap). So a binding must
+prove itself. The node id is the node's public key (D2), so any reader checks
+a binding with no lookup, on first contact too. A binding carried out of band
+(section 7, option (c)) would be the same bytes.
+
+**Why a domain of its own, not `origin-op`.**
+
+- D7's `origin-op` signs an op's fields 1 to 10, with the record as the
+  payload. This signature sits inside the payload, so it cannot cover the op
+  that carries it.
+- A tag of its own means a binding's signature can never be read as an
+  op's, a HELLO's, an overlay's or a revocation's. The tags are ASCII and
+  end in a zero byte, and none of the five is a prefix of another.
+- `SignerPort`'s three purposes stay as they are, so no contract changes.
+  Like HELLO, bindings are signed and checked with the node's own functions,
+  not through the port.
+- When 4.1b lands, the op that carries a binding gets the `origin-op`
+  envelope, like every `home` record. The inner signature stays, so a
+  binding can still be checked apart from its chain.
+
+**Why a revocation is a kind of its own.** It is "the usual revocation-wins
+rule" of `IrohGladeMapping.md` §7.2, the one grants follow (`dir.grants` and
+`dir.revocations`). Each record keeps one meaning, and no later binding
+revives a revoked pair (section 3).
+
+### 3. The fold
+
+`transport::TransportFold` is folded out of any op-set: the registry's records,
+for the boot, or the served store's `home` share, which holds every peer's
+records too and which 4.2b's door reads.
+
+1. **A record counts, or it is ignored.** It counts only if all of these hold:
+   - its payload is the canonical encoding of its kind: exactly the fields
+     above, of those types;
+   - its two ids are 64 lower-case hex digits;
+   - `sig` verifies strictly under the named node for the kind's tag;
+   - it rides `home`, in that node's own chain (`op.origin == node`, the
+     ruling's "in the node's own chain").
+
+   Anything else is ignored and counted: a forgery, a malformed payload, a
+   record in another origin's chain. Payloads are read with a checked
+   decoder, because the wire codec's `decode` panics on bytes it cannot read
+   (F2). An ignored revocation revokes nothing: only the node itself can
+   withdraw its binding, or any peer could cut any node off.
+2. **Set union.** A pair (node, endpoint key) is bound when a counted binding
+   names it. Its date is the earliest `valid_from` among those bindings.
+3. **Revocation wins.** A counted revocation of a pair clears every binding
+   of that pair, earlier or later, for good, as a `CapabilityRevocation`
+   clears its (principal, share) (`registry.rs:495-516`). A node cannot take
+   a revoked key back; it mints a new one.
+4. **Arrival order never matters.** The fold is a pure function of the
+   op-set.
+5. **The answer.** For a pair, at a reader's clock (section 4), the fold
+   answers `Live`, `NotYet { valid_from }`, `Revoked`, `Unbound` or
+   `ClockUncertain`. It also lists the keys a node has bound and not
+   revoked, which the boot uses (section 5).
+
+### 4. The clock rule
+
+- `valid_from` is judged at each reader's clock when it reads. It never
+  enters the fold, as lease expiry does not (WD §2). A binding is live when
+  `valid_from <= now` and no revocation names its pair. A revocation does
+  not depend on time.
+- There is no skew margin. A binding dated after a reader's clock is
+  `NotYet` there, until the clock gets there. That is the closed direction:
+  a reader whose clock is behind refuses more, never less. So a clock that
+  has gone back is not treated as uncertain. It only makes the fold
+  stricter, and treating it as uncertain would shut a node out for as long
+  as its clock once ran ahead.
+- **Uncertain.** The node keeps no clock watermark: SP-C2's belongs to the
+  discovery kernel. So the only uncertainty the node can see is a clock it
+  cannot read, one earlier than 1970, where `now_ms` answers 0. Then the
+  fold answers `ClockUncertain` for every pair but a revoked one, and fails
+  closed:
+  - the boot mints no binding (a revocation needs no clock, and is still
+    minted);
+  - 4.2b's door admits nobody, configured peers included, and no HELLO
+    completes; each refusal names the reason.
+- **Not closed: a clock that runs ahead.** It makes a binding live before its
+  `valid_from`. In the slice every binding is dated when it is minted, so
+  this admits nothing its node did not sign. A binding dated ahead on
+  purpose, a planned rotation, would need SP-C2's watermark or another
+  trusted time. That is a named gap.
+
+### 5. Minting at boot
+
+The boot binds after presence, in its class-1 to class-2 step, and in the one
+save of records.json it already makes.
+
+1. If the fold holds a counted revocation of this node's current endpoint
+   key, the boot is refused (`InvalidData`) before records.json is written.
+   The message says to move `endpoint.key` aside to mint a new key. Only a
+   restored old key meets this.
+2. If no counted binding by this node names its current key, the boot
+   appends one, dated at its clock. If its clock cannot be read, it appends
+   none (section 4).
+3. For every other key this node has bound and not revoked, the boot appends
+   a revocation. So replacing a key is: stop the node, move `endpoint.key`
+   aside, start it. Both roots then print `revoked N binding(s) of replaced
+   endpoint key(s)` after `node`, and only then.
+4. At adoption the served store takes the new records with the rest
+   (`seed_registry`, `server.rs:103-113`), and peers pull them from there. No
+   node signs or revokes another node's binding.
+
+### 6. Compatibility
+
+- **The wire** does not change: no frame, no field, no ALPN. 4.2a changes
+  nothing a peer sees but two more streams in `home`.
+- **An older node** (4.1a's build, on `glade/node/2`) linked to this one takes
+  the new records into its served store like any `home` stream. It checks
+  their chains, serves them on to its own peers, and decodes neither kind,
+  because nothing it runs reads those streams: routing reads claims and
+  workspaces, exchanges read bindings and services, the Hello arm reads
+  principals. Its registry never takes a peer's records. A node older than
+  4.1a fails at connect, as it has since 4.1a.
+- **An older binary on an instance this build wrote**, a downgrade, keeps both
+  kinds in records.json. Its registry keeps every record whose chain checks,
+  and decodes neither kind. It never reads `endpoint.key`, and draws a fresh
+  endpoint key at each start, as before. Upgrading again finds the binding
+  and mints nothing. Nothing is lost either way.
+- **The owner's desk at its first restart on this build:**
+  - `endpoint.key` appears, 0600, beside `node.key` in `<data>/sys/sys/grazel/`;
+  - records.json gains one record, the binding, under the node's id, as seq
+    0 of `dir.transport-bindings`, beside the claim every start already
+    mints;
+  - the served store takes it at adoption;
+  - the `peer <endpoint-id> <addr>` line names the same endpoint id at every
+    restart from then on;
+  - no other line changes: nothing is set aside, and each app registers `+0`;
+  - nothing connects to the desk's endpoint, since grazel passes no `--peer`
+    (`grazel/src/lib.rs:240-255`), so nothing else changes. Nothing is lost.
+- **4.2b's door** would change nothing on the desk either, for the same
+  reason.
+
+### 7. First contact: a question for the owner
+
+**The fact.** A binding reaches a peer through the `home` pull that a
+completed HELLO opens (`mesh.rs:202-244`). So on first contact neither side
+holds the other's record. The plan's HELLO check ("the presented `node_id`
+bound to `remote_id()`") and its refusal at accept both need something else to
+stand in for the record, once.
+
+**What 4.1a's HELLO already proves** on every connection: the named node holds
+its key, and signed for this TLS session, between these two endpoint ids, in
+its role. So once a connection is admitted, the HELLO binds the node to the
+endpoint for that connection. What first contact needs is a rule for
+admitting an endpoint key that no record names yet.
+
+**The options.**
+
+- **(a) Configured peers.** The operator names the peer's endpoint key on
+  each side.
+  - On first contact a configured key stands in for the record: the door
+    admits it, and the HELLO binds the node id to it.
+  - The record then arrives by the pull, and it governs every later
+    connection. A revocation refuses the key even though it is configured.
+  - The accepting side must be configured too, in one of two forms:
+    - **(a1)** `--peer <id>@<addr>` on both sides, so each dials the other.
+      A `--peer` whose node is down holds the start until iroh gives up:
+      measured at 30.2 s on the hand-written root, which then prints `peer
+      …: timed out`. The roots dial before they serve;
+    - **(a2)** an admit-only entry, `--peer <endpoint-id>` with no address:
+      known, not dialed.
+  - Either way, a node's endpoint id must be known before its peer starts.
+    Since section 1, one first start prints it, and it never changes.
+- **(b) Trust on first use.** The accepting side admits any key that proves a
+  node key at HELLO, and pins what it learns. The door refuses only revoked
+  keys, and keys a record binds to another node. That is today's behaviour
+  plus revocation. Anyone who learns an endpoint id can connect and pull the
+  directory, which is the relay ruling's concern: on a public relay, endpoint
+  ids are "the only lock on the door".
+- **(c) The binding carried out of band.** The operator copies the peer's
+  signed binding, the record's own bytes, into the other node's
+  configuration, and the node takes it in before any connection. Then the
+  door and HELLO check a record even on first contact, and the configuration
+  names the node as well as the key. It needs an export command, an import
+  flag, a place in 4.5's configuration, and a relaxation of section 3's chain
+  rule, since a carried binding has no chain.
+
+**Introductions.** A binding that arrives in a configured peer's `home` share,
+a third node's record, names a key no configuration named. Under node trust it
+counts as known: the peer is trusted, and it can carry a binding but cannot
+forge one.
+
+**What the rulings point to.**
+
+- `scope_model`'s source, `IrohGladeMapping.md` §5.2, gives model N as
+  "accept by key against the known-node set", and says for the first slice
+  that "the fixed-peer configuration already is a node-trust set".
+- `relay_posture` says peers are "named directly", and asks for a door that
+  locks.
+- §7.2 says that until the record exists, "the only honest binding is the CLI
+  `--peer` flag".
+
+They point to (a). They do not say how the accepting side is configured, or
+whether the door is closed by default. Closing it breaks today's one-sided
+`--peer`.
+
+**Recommendation:** (a2); the door closed by default on every booted node;
+introductions count. No shipped flow uses peers (grazel passes no `--peer`),
+so closing by default changes only tests. The lifecycle and stop-signal tests
+would give the accepting node the dialer's key as an admit-only entry, having
+minted the dialer's key first.
+
+### 8. The door (4.2b, once section 7 is ruled)
+
+As recommended in section 7:
+
+- **Where.** iroh's `EndpointHooks::after_handshake` on the accepting side,
+  installed when a booted endpoint binds. It is the one hook iroh offers
+  after TLS, and it sees `remote_id()` (iroh 1.2 `src/endpoint/hooks.rs`).
+  Then the HELLO check runs on both sides, in `hello_accept` and
+  `hello_dial` (`peer.rs:184-241`), before a WELCOME is sent or taken.
+- **The view.** The door keeps its own copy of the served store's binding
+  records and the configured keys. The copy is loaded from the store before
+  the accept loop starts, and fed wherever a `home` record lands:
+  `ingest_and_fanout` (`mesh.rs:498-511`), which the pull, the push and
+  `publish` all use. The hook cannot read the store through `Shared`, which
+  holds the endpoint: iroh warns that a hook holding its endpoint is a
+  reference cycle.
+- **The policy for an endpoint key E**, at the reader's clock:
+
+  | What the fold and the configuration hold for E | At accept | At HELLO, node N |
+  | --- | --- | --- |
+  | the clock is uncertain | refused | refused |
+  | a revocation, and no live binding | refused | refused |
+  | a live binding (M, E) | admitted | admitted if N is M; else refused |
+  | only bindings dated after the clock | refused | refused |
+  | no record, E configured | admitted: first contact | admitted; the pull brings the record |
+  | no record, E not configured | refused | refused |
+
+- **A refusal** closes the connection with code 0 and an empty reason, so the
+  dialer learns nothing (the ruling of 2026-09-24), or the acceptor sends no
+  WELCOME. The refusing node prints one stderr line, `peer refused: endpoint
+  <E>: <reason>`. The reason is `clock uncertain`, `revoked by node <M>`,
+  `bound to node <M>, not <N>`, `bound from <valid_from>`, `unknown endpoint
+  key`, or the HELLO's own refusal. The accept loop's silent `Err(_) =>
+  continue` (`mesh.rs:180`) prints refusals.
+- **A live link whose key is revoked** is closed when the revocation lands,
+  through the same feed.
+- **Which endpoints get a door:** booted nodes, on both roots. `bind` and
+  `bind_with` keep none: they serve tests and the async witness, which boot
+  no instance.
+- **The accessor.** `CarrierLink` gains `fn remote_id(&self) ->
+  Option<TransportId>`, with `TransportId(pub Vec<u8>)`: the remote's
+  transport identity, 32 bytes for iroh, `None` for a carrier with no key
+  identity, as the client role's WebSocket has none. CA-005 joins the
+  conformance suite: a dialed link names the acceptor's identity, and an
+  accepted link names the dialer's. The contracts' policy lists the method,
+  and the contract's fixture and the node's three fakes implement it.
+- **The iroh adapter's links.** No `CarrierPort` adapter over iroh exists: the
+  assembly binds `PendingIrohAdapter` (`assembly.rs:703-717`), and the mesh
+  runs on `PeerEndpoint`. An adapter is about 300 lines. To meet CA-004 it
+  must track its links and take their handles out at close, because a
+  surviving `Connection` keeps the port bound (the async witness's
+  `peer_release.rs`). No consumer on either root would read it yet.
+  Recommend it as a step of its own, 4.2c, or with 4.5.
+- **A gap for later.** A HELLO over a `CarrierLink` would also need the TLS
+  exporter bytes (D6), which the port does not expose. That belongs to the
+  step that moves the mesh onto the port.
+- **Its tests**, each begun red:
+  - an unknown key is refused at accept, with its stderr line, and the
+    dialer gets no answer;
+  - a bound key is admitted;
+  - a key bound to another node is refused at HELLO;
+  - a revoked binding is refused once the fold has the revocation, and its
+    live link is closed;
+  - a configured key is admitted on first contact, and checked by its record
+    after that;
+  - an unreadable clock refuses everyone.
+
+### 9. Tests (4.2a), each begun red
+
+Each was run first against the code without its change, and the message is
+what that run printed. For the red runs of the library tests, the key was a
+fresh one at each boot, as iroh drew it before, and the fold and the boot's
+binding were stubs that folded and appended nothing.
+
+| Test | Proves | Red first |
+| --- | --- | --- |
+| `tests/assembled_path`: `both_roots_keep_one_endpoint_id_across_restarts` | on each root, a second start of one instance prints the same endpoint id on its `peer` line, and it is not the node id | on the old code: `HandWritten`, left `b48e1b17…`, right `38c056d6…` |
+| `tests/assembled_path`: `both_roots_revoke_a_replaced_endpoint_keys_binding` | on each root, a start after `endpoint.key` was moved aside prints a new endpoint id and, after `node`, `revoked 1 binding(s) of replaced endpoint key(s)`; records.json then revokes the old key and binds the new one | with the fresh key per boot: there was no `endpoint.key` to move, "No such file or directory" |
+| `sysdir`: `the_endpoint_key_is_a_second_secret_kept_across_boots` | `endpoint.key` holds 32 bytes, its key is not the node's, a second boot has the same key, and a 31-byte file refuses the boot, naming the file | the same: "No such file or directory" |
+| `sysdir::unix`: `endpoint_key_is_0600_and_group_readable_is_refused` | the file is created 0600, and at 0640 the boot is refused (`PermissionDenied`), naming the file | the same |
+| `sysdir`: `a_boot_binds_its_endpoint_key_and_revokes_a_replaced_one` | the first boot binds the key; the next writes nothing; a boot with a new key binds it and revokes the old one; the old key restored refuses the boot and records.json is not written | with the boot's binding stubbed: left `Rebound { minted: false, revoked: 0 }`, right `minted: true` |
+| `sysdir`: `an_instance_from_before_the_step_binds_a_new_key_at_its_next_boot` | an instance with no `endpoint.key` and no binding mints both at its next boot, one binding, no revocation, no set-aside, one presence | with the fresh key per boot: "No such file or directory" |
+| `transport`: `the_fold_is_a_set_union_and_a_revocation_wins_for_good` | the earliest date of a pair counts; a revocation clears its pair's bindings, earlier and later, and no other pair; the ops reversed give the same answers | with the fold stubbed: left `Unbound`, right `Live` |
+| `transport`: `a_binding_is_live_from_its_valid_from_at_the_readers_clock` | `NotYet` before `valid_from`, `Live` from it, `ClockUncertain` at 0 and below, `Revoked` whatever the clock | the same stub: left `Unbound`, right `NotYet { valid_from: 1000 }` |
+| `transport`: `a_record_that_does_not_prove_itself_binds_nothing` | nine records that prove nothing (a flipped signature byte, another key's signature, another origin's chain, a non-canonical payload, an upper-case id, a torn payload, bytes that are not CBOR, a revocation on the bindings stream, a revocation signed by another node) are each ignored and counted, none panics, and the genuine binding stays live beside them | the same stub: `ignored`, left `0`, right `9` |
+| `transport`: `a_boot_binds_its_key_once_and_revokes_a_replaced_one` | the boot rule over a registry, and the refusal of a revoked key with nothing appended | with the boot's binding stubbed: left `minted: false`, right `minted: true` |
+| `transport`: `a_boot_on_an_unreadable_clock_binds_nothing_and_still_revokes` | at clock 0 no binding is minted and the replaced key is still revoked | the same stub: left `revoked: 0`, right `revoked: 1` |
+| `mesh`: `a_peers_binding_arrives_by_the_pull_and_folds_live` | over real iroh, each node's binding reaches the other's served store by the pull, and folds live there for the key the connection came from | with the boot's binding stubbed: "timed out waiting for B's binding at A" |
+| `tests/assembly`: `the_directory_profile_hosts_every_directory_record_kind_and_nothing_else`, extended | the directory profile hosts both new streams | before `DirectoryRules` named them: "dir.transport-bindings" |
+| `transport`: `each_record_is_signed_in_its_own_domain_over_its_own_fields` | both signatures, checked against bytes built by hand: pure Ed25519 over the tag, then the canonical CBOR of the fields, and in no other domain | none: it pins the layout it was written with |
+| `signing`: `no_tag_is_a_prefix_of_another` | the five tags are ASCII, end in a zero byte, and none is a prefix of another | none: it guards the table |
+
+What they do not prove: that another language's Ed25519 agrees with the two
+tags (the `proof_family` corpus has no vectors yet); a crash between the key
+file and the save of records.json (the next boot binds the key it finds);
+Windows and Linux, which the lane owner runs on dabeest and the Pi; anything
+about refusal, since 4.2a has no door.
+
+### Named gaps (4.2a)
+
+- No door yet. HELLO still admits any key that proves a node key, so the relay
+  ruling's rule stands: endpoint ids stay on our own machines until 4.2b.
+- A clock that runs ahead makes a binding live before its `valid_from`
+  (section 4). The node keeps no clock watermark.
+- Off Unix, `endpoint.key` gets default permissions and no check, as
+  `node.key` does (F5).
+- The two tags have no vectors in the `proof_family` corpus.
+- A peer can still write `home` until 4.1b. The fold ignores a forged binding,
+  but a malformed record on another `home` stream still panics its readers
+  (F2), unchanged.
+- Nothing reports the fold's `ignored` count yet. 4.2b's door is its first
+  reader.
+- The `peer` line prints the endpoint id, now the same at every start, to
+  stdout, which grazel forwards. 4.5 takes endpoint ids out of logs.
+
+### Default-path changes (4.2a)
+
+1. A booted node creates `endpoint.key`, 0600, at its first start on this
+   build, and its iroh endpoint binds with it. The endpoint id on the `peer`
+   line is the same at every start. Before, it was new at every start.
+2. The boot appends a signed `NodeTransportBinding` when its current key has
+   none, once per key, and a `NodeTransportRevocation` for each key it
+   replaced. Only a replacement prints a line: `revoked N binding(s) of
+   replaced endpoint key(s)`.
+3. A boot whose `endpoint.key` this node has revoked is refused (`InvalidData`),
+   and so is an `endpoint.key` that is not 32 bytes, or that is group- or
+   world-accessible on Unix, as for `node.key`.
+4. The served store's `home` holds two more streams, which peers pull.
+
+Nothing on the wire changes, and an ordinary start prints the lines it printed
+before.
+
+### Questions for the owner
+
+1. **First contact** (section 7). Recommend (a2): an admit-only `--peer
+   <endpoint-id>`, the door closed by default on booted nodes, and
+   introductions counting. The alternatives are (a1), symmetric dialing, which
+   costs a 30 s start when the peer is down; (b), trust on first use, which
+   leaves the door open; and (c), carried bindings, which need an export
+   command and an import flag. 4.2b waits on this answer.
+2. **The two signing domains**, `glade/v1/transport-binding\0` and
+   `glade/v1/transport-revocation\0`, outside `SignerPort`'s purposes.
+   Recommend keeping them. The other choice is `origin-op` over the same
+   bytes, with a binding's signature kept apart from an op's only by the
+   shape of what it signs.
+3. **The clock rule** (section 4): uncertain means unreadable, and no skew
+   margin. Recommend keeping it. The other choice is a watermark (the node's
+   newest own `valid_from`), which adds no safety, since a clock that went
+   back only refuses more, and can shut a node out for as long as its clock
+   once ran ahead.
+4. **A revoked key refuses the boot** rather than being replaced
+   automatically. Recommend keeping it: a restored old key is an operator's
+   mistake to see, not to paper over.
+5. **The iroh `CarrierPort` adapter** with its link tracking (section 8).
+   Recommend a step of its own, 4.2c, or with 4.5. 4.2b adds only the
+   accessor and its conformance probe.
+
+### Measured
+
+2026-09-24, Apple M3 Pro, Rust 1.96.0, on the final tree:
+
+- **The gate** (`glade/node/check.sh`) passes all 8 components, in 68 s from
+  an empty target. There are 246 node tests on each path, across 15 test
+  binaries, where there were 232. The 14 new ones are those of section 9 but
+  the extended profile test.
+- **rustfmt**: glade-node has 318 hunks, its baseline, and none in a line this
+  step wrote. `transport.rs` is new and formatted whole; the new tests in
+  `sysdir.rs`, `mesh.rs` and `tests/assembled_path.rs` were formatted as
+  rustfmt lays them out, and no older line was touched. glade-wire stays at
+  43.
+- **clippy**: glade-node 11 warnings and glade-wire 7, at baseline. The fold's
+  pair type first drew a `type_complexity` warning, removed by naming it.
+- **The contracts** do not change in 4.2a. `glade/contracts/check.sh` passes
+  on its own (87 tests).
+- **The regeneration.** The generator at taut `7a5f616` reproduces HEAD's
+  `sysdata.rs` byte for byte (`cmp`). After the IR change, from `taut/`:
+
+  ```text
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src /opt/homebrew/bin/python3 -m taut.cli gen \
+      ../glade/node/ir/sysdata.taut.py -o $S/gen-after -l rust --api-only --legacy-codec
+  cp $S/gen-after/rust/api.rs ../glade/node/src/sysdata.rs
+  ```
+
+  `cmp` shows `sysdata.rs` is exactly what the generator wrote. The diff is
+  +49 lines, the two structs and their codecs, and nothing else moves.
+- **Time**: the eleven new library tests of `transport`, `signing` and
+  `sysdir` take 0.04-0.05 s together; the two-node test 0.04 s; the two
+  process tests 1.19-1.22 s, for eight starts of the node. Three warm runs
+  each.
+- **Option (a1)'s cost**: HEAD's binary, with one `--peer` whose node is down,
+  printed `listening` after 30.2 s, and `peer …: timed out`.
+- **The rehearsal.** HEAD's binary (`e42824e`, built to a scratch path) ran
+  twice on a scratch instance with the desk's two app files, as grazel starts
+  it (`--profile local --name grazel`). Its endpoint id differed between the
+  two starts, and there was no `endpoint.key`. Then this build ran twice on
+  that instance:
+
+  ```text
+  node e8d8b8ec…
+  registry ready (home served: true)
+  app grazel registered (+0 record(s), 11 unchanged)
+  app gyld registered (+0 record(s), 11 unchanged)
+  peer 5c153822… 127.0.0.1:56131
+  workspace ws-razel serving
+  workspace ws-razel serving
+  listening 59041
+  ```
+
+  The lines were HEAD's, with the same node id. `endpoint.key` appeared: 32
+  bytes, mode 0600. records.json gained the one binding, beside the claim
+  that every start mints. The second start printed the same endpoint id and
+  added no binding.
+- **Downstream**, against the rebuilt default binary
+  (`glade/node/target/debug/glade-node`), each Rust suite with a scratch
+  target:
+  - client-rs: 9 + 3;
+  - client-ts: 19;
+  - grip-share: 19;
+  - grazel: 26 + 3;
+  - glade-gwz: 9 + 6;
+  - glade-gyld: 233 (1 ignored) + 31.
+
+  All are at baseline.
+- **The async witness**, which calls `PeerEndpoint::bind_with`, type-checks
+  against this tree (`cargo check --workspace --all-targets`). That ran on a
+  scratch copy, because the witness's lockfile predates 4.1a's two crates and
+  `--locked` refuses it at HEAD too.
+- **Platform branches**: no new one. The only change inside a platform module
+  is the Unix permission refusal naming its file.
+
+**Size**, in lines added and removed in `.rs` files, doc comments included:
+
+- production: +523/−40, net +483;
+  - 49 of them are the generated `sysdata.rs`;
+  - `transport.rs` +341, new;
+  - `sysdir.rs` +36/−10;
+  - `iroh_carrier.rs` +26/−11;
+  - `signing.rs` +24/−5;
+  - `registry.rs` +19/−2;
+  - the roots: `bin/glade-node.rs` +13/−7, `lifecycle.rs` +9/−2;
+  - `assembly.rs` +5/−3, `lib.rs` +1;
+- tests: +524/−5, net +519;
+- beside them, the IR +23 (`sysdata.taut.py`).

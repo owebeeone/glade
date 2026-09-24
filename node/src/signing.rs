@@ -28,9 +28,12 @@ pub fn tag(purpose: Purpose) -> &'static [u8] {
     }
 }
 
-fn signed_bytes(purpose: Purpose, message: &[u8]) -> Vec<u8> {
-    [tag(purpose), message].concat()
-}
+/// The domains of the transport-key binding (plan Step 4.2), outside the
+/// port's three purposes: a binding's signature covers the record, not an
+/// op, so it is not `OriginOp`'s. Like HELLO, they are signed and checked by
+/// the node's own functions, not through `SignerPort`.
+pub const TRANSPORT_BINDING: &[u8] = b"glade/v1/transport-binding\0";
+pub const TRANSPORT_REVOCATION: &[u8] = b"glade/v1/transport-revocation\0";
 
 /// 32 bytes from the operating system's randomness, the seed of a new key:
 /// `getrandom(2)` on Linux, `getentropy` on macOS, `ProcessPrng` on Windows.
@@ -47,8 +50,14 @@ pub fn public_key(seed: &[u8; 32]) -> NodeId {
 
 /// The signature of the key `seed` expands to on `message`, for `purpose`.
 pub fn sign(seed: &[u8; 32], purpose: Purpose, message: &[u8]) -> [u8; 64] {
+    sign_in(seed, tag(purpose), message)
+}
+
+/// The signature of the key `seed` expands to on `domain`, a tag, followed
+/// by `message`.
+pub fn sign_in(seed: &[u8; 32], domain: &[u8], message: &[u8]) -> [u8; 64] {
     let key = SigningKey::from_bytes(seed);
-    key.sign(&signed_bytes(purpose, message)).to_bytes()
+    key.sign(&[domain, message].concat()).to_bytes()
 }
 
 /// Whether `signature` is `signer`'s on `message` for `purpose`, the id being
@@ -61,10 +70,20 @@ pub fn verify(
     message: &[u8],
     signature: &[u8],
 ) -> SignatureStatus {
+    verify_in(signer, tag(purpose), message, signature)
+}
+
+/// [`verify`] for a signature made in `domain`, a tag, by [`sign_in`].
+pub fn verify_in(
+    signer: &NodeId,
+    domain: &[u8],
+    message: &[u8],
+    signature: &[u8],
+) -> SignatureStatus {
     let key = VerifyingKey::from_bytes(signer).ok();
     let signature = Signature::from_slice(signature).ok();
     let valid = key.zip(signature).is_some_and(|(key, signature)| {
-        let bytes = signed_bytes(purpose, message);
+        let bytes = [domain, message].concat();
         key.verify_strict(&bytes, &signature).is_ok()
     });
     if valid {
@@ -161,6 +180,22 @@ mod tests {
         );
     }
 
+    /// D7's rule, with plan Step 4.2's two domains: every tag is ASCII and
+    /// ends in a zero byte, and no tag is a prefix of another, so no
+    /// signature crosses domains. It guards the table; it has no red form.
+    #[test]
+    fn no_tag_is_a_prefix_of_another() {
+        let purposes = [Purpose::PeerHello, Purpose::OriginOp, Purpose::LocalOverlay];
+        let mut tags: Vec<&[u8]> = purposes.into_iter().map(tag).collect();
+        tags.extend([TRANSPORT_BINDING, TRANSPORT_REVOCATION]);
+        for (i, a) in tags.iter().enumerate() {
+            assert!(a.is_ascii() && a.ends_with(b"\0"), "{a:?}");
+            for b in &tags[i + 1..] {
+                assert!(!a.starts_with(b) && !b.starts_with(a), "{a:?} {b:?}");
+            }
+        }
+    }
+
     /// Strict verification (D1). The identity point is a public key of small
     /// order: with R the identity and S zero, its "signature" holds for every
     /// message under the lax check, so a HELLO naming that id would pass on
@@ -173,7 +208,7 @@ mod tests {
         let mut forged = [0u8; 64];
         forged[0] = 1;
         let lax = VerifyingKey::from_bytes(&weak).unwrap();
-        let message = signed_bytes(Purpose::PeerHello, b"any transcript");
+        let message = [tag(Purpose::PeerHello), &b"any transcript"[..]].concat();
         let forged_signature = Signature::from_bytes(&forged);
         assert!(
             lax.verify(&message, &forged_signature).is_ok(),

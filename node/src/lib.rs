@@ -26,6 +26,7 @@ pub mod store;
 pub mod sysdata;
 pub mod sysdir;
 mod tasks;
+pub mod transport;
 pub mod ws;
 
 // Re-export the wire CBOR runtime as `crate::cbor` so the taut-generated

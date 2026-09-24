@@ -11,16 +11,19 @@
 //! Ed25519 public key is the node id (plan Step 4.1a), and each HELLO is signed
 //! for the connection it rides: this module reads both endpoint ids and 32
 //! bytes exported from the connection's TLS session, and hands them to
-//! `peer::hello_*` as the [`Channel`].
+//! `peer::hello_*` as the [`Channel`]. A booted node's endpoint key is its
+//! `endpoint.key`, the same at every start (plan Step 4.2), which a record in
+//! its chain binds to the node (`transport.rs`).
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 
 use iroh::endpoint::presets;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
-use iroh::{Endpoint, EndpointAddr, EndpointId, TransportAddr};
+use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr};
 
 use crate::peer::{hello_accept, hello_dial, Channel, NodeIdentity, PeerHello};
+use crate::transport::EndpointKey;
 
 /// ALPN for the glade node<->node protocol 2 (`peer::PROTOCOL`, plan Step
 /// 4.1a), whose HELLO is signed: a node of protocol 1 fails at connect, not
@@ -48,10 +51,12 @@ fn channel(conn: &Connection, dialer: EndpointId, acceptor: EndpointId) -> io::R
     })
 }
 
-/// The one endpoint recipe both constructors share: localhost, `presets::Minimal`
-/// (relay + discovery disabled), the glade ALPN.
-async fn bind_endpoint() -> io::Result<Endpoint> {
+/// The one endpoint recipe every constructor shares: localhost,
+/// `presets::Minimal` (relay + discovery disabled), the glade ALPN, and the
+/// endpoint key `key`.
+async fn bind_endpoint(key: EndpointKey) -> io::Result<Endpoint> {
     Endpoint::builder(presets::Minimal)
+        .secret_key(SecretKey::from_bytes(&key.seed()))
         .alpns(vec![ALPN.to_vec()])
         .bind_addr((Ipv4Addr::LOCALHOST, 0))
         .map_err(other)?
@@ -111,13 +116,23 @@ impl PeerEndpoint {
         PeerEndpoint::bind_with(identity).await
     }
 
-    /// Bind with an EXPLICIT glade identity (a booted node passes the identity
-    /// derived from its `node.key`, `sysdir::Boot::identity`). The iroh key
-    /// stays transport-only; the glade node_id spoken on the HELLO seam is then
-    /// the same identity the directory's records attribute — which is what lets
-    /// a folded `ServeClaim.node` match a live peer link.
+    /// Bind with an EXPLICIT glade identity and a fresh endpoint key, which
+    /// dies with the endpoint: for tests and the async witness, which boot no
+    /// instance. A booted node binds with its own key ([`PeerEndpoint::bind_as`]).
+    /// The iroh key stays transport-only; the glade node_id spoken on the HELLO
+    /// seam is the identity the directory's records attribute — which is what
+    /// lets a folded `ServeClaim.node` match a live peer link.
     pub async fn bind_with(identity: NodeIdentity) -> io::Result<PeerEndpoint> {
-        let endpoint = bind_endpoint().await?;
+        let key = EndpointKey::from_seed(crate::signing::random_seed()?);
+        PeerEndpoint::bind_as(identity, key).await
+    }
+
+    /// Bind as a booted node: its identity, from `node.key`
+    /// (`sysdir::Boot::identity`), and its endpoint key, `endpoint.key`
+    /// (`sysdir::Boot::endpoint_key`), so its endpoint id is the same at every
+    /// start (plan Step 4.2) and its binding record names it.
+    pub async fn bind_as(identity: NodeIdentity, key: EndpointKey) -> io::Result<PeerEndpoint> {
+        let endpoint = bind_endpoint(key).await?;
         Ok(PeerEndpoint { endpoint, identity })
     }
 

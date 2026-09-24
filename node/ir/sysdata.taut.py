@@ -125,6 +125,29 @@ SCHEMA = schema(
     Msg("PrincipalRecord",
         F("principal", 1, STR)),
 
+    # ---- the transport-key binding (plan Step 4.2) --------------------------
+    # The ruling transport_key_binding = binding_record: "endpoint key E is
+    # transport for node N", a record in N's own chain on
+    # dir.transport-bindings. `node` and `endpoint_id` are 64 lower-case hex
+    # digits (the directory's node ids; iroh prints endpoint ids the same
+    # way). `valid_from` is N's wall clock at the mint, epoch ms, judged at
+    # each reader's clock and never folded. `sig` is N's Ed25519 signature
+    # over the tag `glade/v1/transport-binding\0` then the canonical CBOR of
+    # fields 1-3, so a binding proves itself with no lookup: the node id is
+    # the key. Folded set-union; a revocation of the pair wins, for good.
+    Msg("NodeTransportBinding",
+        F("node", 1, STR),
+        F("endpoint_id", 2, STR),
+        F("valid_from", 3, INT),
+        F("sig", 4, BYTES)),
+    # N no longer uses E: on dir.transport-revocations, in N's own chain,
+    # signed over `glade/v1/transport-revocation\0` then the canonical CBOR
+    # of fields 1-2. It clears every binding of the pair, earlier or later.
+    Msg("NodeTransportRevocation",
+        F("node", 1, STR),
+        F("endpoint_id", 2, STR),
+        F("sig", 3, BYTES)),
+
     # ---- the create ceremony (GLP-0006 P0.S2 — audit F2, s-create D1–D3) ---
     # Rides ExchangeReq.payload on the reserved built-in `workspace.create`
     # surface, handled by the NODE (never a supplier): creation PRECEDES

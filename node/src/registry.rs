@@ -29,9 +29,10 @@ use glade_wire::generated::{Head, Op, Shape, StreamHeads};
 
 use crate::chain::op_hash;
 use crate::sysdata::{
-    BindingDecl, BindingRetraction, CapabilityGrant, CapabilityRevocation, NodeRecord, PrincipalRecord,
-    ServeClaim, ServiceDefinition, SystemSnapshot, WorkspaceEntry,
+    BindingDecl, BindingRetraction, CapabilityGrant, CapabilityRevocation, NodeRecord, NodeTransportBinding,
+    NodeTransportRevocation, PrincipalRecord, ServeClaim, ServiceDefinition, SystemSnapshot, WorkspaceEntry,
 };
+use crate::transport::TransportFold;
 
 /// The home share — the user-scale system declaration space (WD §2). All
 /// directory records live here.
@@ -54,6 +55,10 @@ pub const G_BINDING_RETRACTIONS: &str = "dir.binding-retractions";
 // Principals minimal (GLP-0006 P0.S7; the stream GDL-038 names): identity as
 // data — session Hellos auto-append unknown principals; nothing enforced.
 pub const G_PRINCIPALS: &str = "dir.principals";
+// The transport-key binding (plan Step 4.2): a node's iroh endpoint keys,
+// bound and revoked in its own chain (`transport.rs`).
+pub const G_TRANSPORT_BINDINGS: &str = "dir.transport-bindings";
+pub const G_TRANSPORT_REVOCATIONS: &str = "dir.transport-revocations";
 
 /// One home-share record (WD §2). Each variant folds by its own semantics; the
 /// enum is the append surface so `append` stays typed and the glade-id/shape
@@ -69,6 +74,8 @@ pub enum Record {
     Retract(BindingRetraction),
     Service(ServiceDefinition),
     Principal(PrincipalRecord),
+    Transport(NodeTransportBinding),
+    TransportRevoke(NodeTransportRevocation),
 }
 
 impl Record {
@@ -84,6 +91,8 @@ impl Record {
             Record::Retract(_) => G_BINDING_RETRACTIONS,
             Record::Service(_) => G_SERVICES,
             Record::Principal(_) => G_PRINCIPALS,
+            Record::Transport(_) => G_TRANSPORT_BINDINGS,
+            Record::TransportRevoke(_) => G_TRANSPORT_REVOCATIONS,
         }
     }
 
@@ -110,6 +119,8 @@ impl Record {
             Record::Retract(r) => r.to_cbor(),
             Record::Service(r) => r.to_cbor(),
             Record::Principal(r) => r.to_cbor(),
+            Record::Transport(r) => r.to_cbor(),
+            Record::TransportRevoke(r) => r.to_cbor(),
         };
         cbor::encode(&c)
     }
@@ -430,6 +441,12 @@ impl Registry {
             .map(|o| o.lamport + 1)
             .max()
             .unwrap_or(0)
+    }
+
+    /// The transport-binding fold of this registry's records (plan Step 4.2):
+    /// which endpoint keys its nodes have bound and revoked.
+    pub fn transport(&self) -> TransportFold {
+        TransportFold::over(&self.ops)
     }
 
     /// Is a byte-identical record already in the fold? The diff basis for

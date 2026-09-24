@@ -50,6 +50,7 @@ use crate::server::{accept_clients, Server, Shared};
 use crate::signing::NodeSigner;
 use crate::sysdir::{boot_at, instance_dir, Boot, Profile};
 use crate::tasks::{self, Inbox};
+use crate::transport::EndpointKey;
 
 /// The node names, in one place, so a test and the plan cannot disagree
 /// about a spelling: `ReleaseOrder::before` answers `false` for a typo.
@@ -164,6 +165,7 @@ struct Booted {
     dir: PathBuf,
     node_id: String,
     identity: NodeIdentity,
+    endpoint: EndpointKey,
 }
 
 impl Instance {
@@ -180,6 +182,7 @@ impl Instance {
             dir: boot.dir.clone(),
             node_id: boot.node_id.clone(),
             identity: boot.identity()?,
+            endpoint: boot.endpoint_key(),
         };
         start
             .console
@@ -187,6 +190,9 @@ impl Instance {
         start.console.out(&format!("node {}", boot.node_id));
         if let Some(aside) = &boot.set_aside {
             start.console.out(&aside.to_string());
+        }
+        if let Some(revoked) = boot.rebound.line() {
+            start.console.out(&revoked);
         }
         if boot.rejected > 0 {
             start
@@ -485,11 +491,12 @@ pub fn node_plan() -> Plan<(), NodeStart> {
         .needs((instance, storage))
         .acquire(
             |cx: Cx<Acquire>, (instance, _storage): (Arc<Instance>, Arc<Storage>)| async move {
-                let Some(identity) = instance.booted.as_ref().map(|booted| booted.identity) else {
+                let Some(booted) = instance.booted.as_ref() else {
                     return Ok(cx.hold_value(EndpointSlot::empty()));
                 };
+                let (identity, key) = (booted.identity, booted.endpoint);
                 cx.hold(move || async move {
-                    PeerEndpoint::bind_with(identity)
+                    PeerEndpoint::bind_as(identity, key)
                         .await
                         .map(EndpointSlot::new)
                 })
