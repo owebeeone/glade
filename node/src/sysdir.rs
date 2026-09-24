@@ -629,8 +629,14 @@ mod tests {
         let lock = dir.join("instance.lock");
         fs::write(&lock, "4242").unwrap();
         let boot = boot_at(dir.clone(), "gianni").unwrap();
-        let pid = std::process::id().to_string();
-        assert_eq!(fs::read_to_string(&lock).unwrap(), pid, "the holder's pid");
+        // A Unix lock is advisory, so anyone can read the pid while it is
+        // held (gryth-ui's gyld-ui.py does). A Windows lock (LockFileEx over
+        // the whole file) refuses other handles' reads until it is released,
+        // so there the pid is readable only by the holder.
+        if cfg!(unix) {
+            let pid = std::process::id().to_string();
+            assert_eq!(fs::read_to_string(&lock).unwrap(), pid, "the holder's pid");
+        }
         let err = boot_at(dir.clone(), "gianni").map(|_| ()).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
         drop(boot);
