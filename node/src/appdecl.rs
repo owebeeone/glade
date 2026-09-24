@@ -70,6 +70,7 @@ use std::path::Path;
 use glade_wire::cbor;
 use glade_wire::generated::Op;
 
+use crate::envelope;
 use crate::registry::{BindingFold, Record, RegistryApi, RegistryError};
 use crate::sysdata::{
     BindingDecl, BindingRetraction, CapabilityGrant, CapabilityRevocation, ServiceDefinition,
@@ -663,7 +664,9 @@ pub fn register(
 
     // Everything else, as before R9: the existing record set, as
     // (glade_id, payload bytes), is the diff basis.
-    let existing: Vec<(String, Vec<u8>)> = ops.into_iter().map(|op| (op.glade_id, op.payload)).collect();
+    // The record each op carries, not its envelope (plan Step 4.1b).
+    let record = |op: Op| (op.glade_id, envelope::record_bytes(&op.payload));
+    let existing: Vec<(String, Vec<u8>)> = ops.into_iter().map(record).collect();
     let records = decl
         .services
         .iter()

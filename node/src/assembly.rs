@@ -182,14 +182,11 @@ use glade_wire::generated::Op;
 use shaku::{module, Component, HasComponent, Module, ModuleBuildContext};
 
 use crate::appdecl::{register, AppDecl, Registered};
+use crate::envelope;
 use crate::grants::PolicyView;
 use crate::iroh_carrier::IrohCarrier;
 use crate::peer::NodeIdentity;
-use crate::registry::{
-    MemStore, Record, Registry, RegistryApi, RegistryError, StoreApi, G_BINDINGS,
-    G_BINDING_RETRACTIONS, G_CLAIMS, G_GRANTS, G_NODES, G_PRINCIPALS, G_REVOCATIONS, G_SERVICES,
-    G_TRANSPORT_BINDINGS, G_TRANSPORT_REVOCATIONS, G_WORKSPACES, HOME,
-};
+use crate::registry::{MemStore, Record, Registry, RegistryApi, RegistryError, StoreApi, HOME};
 use crate::signing::NodeSigner;
 use crate::sysdir::{now_ms, Boot, Profile};
 use crate::transport::EndpointKey;
@@ -463,27 +460,14 @@ impl<M: Module> Component<M> for CommandLine {
 }
 
 /// The directory profile on its own: the home share and its eleven record
-/// streams. Pure, with nothing injected, which is what breaks the
-/// Directory-Records constructor cycle
+/// streams, the ones whose kinds a signed `home` record is checked against
+/// (`envelope.rs`, plan Step 4.1b). Pure, with nothing injected, which is
+/// what breaks the Directory-Records constructor cycle
 /// (`dev-docs/arch1/InjectionGraphRefinement.md:35-40`): rules, then records,
 /// then the directory.
 #[derive(Component)]
 #[shaku(interface = RecordProfile)]
 pub struct DirectoryRules;
-
-const DIRECTORY_STREAMS: [&str; 11] = [
-    G_NODES,
-    G_WORKSPACES,
-    G_CLAIMS,
-    G_GRANTS,
-    G_REVOCATIONS,
-    G_BINDINGS,
-    G_BINDING_RETRACTIONS,
-    G_SERVICES,
-    G_PRINCIPALS,
-    G_TRANSPORT_BINDINGS,
-    G_TRANSPORT_REVOCATIONS,
-];
 
 impl RecordProfilePort for DirectoryRules {
     fn share(&self) -> &str {
@@ -491,7 +475,7 @@ impl RecordProfilePort for DirectoryRules {
     }
 
     fn hosts(&self, glade_id: &str) -> bool {
-        DIRECTORY_STREAMS.contains(&glade_id)
+        envelope::directory_stream(glade_id)
     }
 }
 
@@ -763,7 +747,9 @@ impl<M: Module> Component<M> for PolicyView {
 /// (plan Step 4.1a, `signing.rs`), the key being the identity the composition
 /// root lends as this component's parameters. Lent none, as in the legacy
 /// form, it holds no key and refuses both ways (SI-003), and its id is all
-/// zeros. No consumer resolves it before plan Step 4.1b.
+/// zeros. No consumer resolves it yet: plan Step 4.1b signs and checks
+/// `home` records with the node's own functions, and D9's known set (4.1b's
+/// part 2) is to be its first.
 impl<M: Module> Component<M> for NodeSigner {
     type Interface = dyn Signer;
     type Parameters = Option<NodeIdentity>;

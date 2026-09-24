@@ -257,6 +257,26 @@ impl NodeTransportRevocation {
 }
 
 #[derive(Clone, Debug, PartialEq, Default)]
+pub struct SignedRecord {
+    pub record: Vec<u8>,
+    pub sig: Vec<u8>,
+}
+impl SignedRecord {
+    pub fn to_cbor(&self) -> Cbor {
+        Cbor::Map(vec![
+            (1, Cbor::Bytes(self.record.clone())),
+            (2, Cbor::Bytes(self.sig.clone())),
+        ])
+    }
+    pub fn from_cbor(c: &Cbor) -> Self {
+        Self {
+            record: c.get(1).bytes(),
+            sig: c.get(2).bytes(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Default)]
 pub struct WorkspaceCreateReq {
     pub workspace: String,
     pub name: String,

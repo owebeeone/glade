@@ -245,6 +245,9 @@ impl Storage {
             (None, None) => std::env::temp_dir().join("glade-node-bin"),
         };
         let server = Server::open(&dir)?;
+        if let Some(aside) = server.set_aside().await {
+            start.console.out(&aside);
+        }
         if start.settings.enforce_client_grants {
             server.enforce_client_grants();
             start.console.out(CLIENT_GRANTS_ENFORCED);

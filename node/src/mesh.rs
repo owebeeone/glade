@@ -28,6 +28,7 @@ use tokio::sync::Mutex;
 use glade_grant_api::{GrantPort, Holder};
 use glade_wire::generated::{ErrorCode, Head, Heads, Op, Ops, Priority, StreamHeads, Subscribe};
 
+use crate::envelope;
 use crate::frame::Frame;
 use crate::grants::{refusal, READ_SUBSCRIBE};
 use crate::iroh_carrier::{PeerAddr, PeerEndpoint, PeerLink};
@@ -586,7 +587,7 @@ pub fn who_serves(store: &Store, share: &str, now_ms: i64) -> Option<String> {
     let mut best: Option<crate::sysdata::ServeClaim> = None;
     for (origin, _) in store.heads(HOME, crate::registry::G_CLAIMS, &[]) {
         for op in store.scan(HOME, crate::registry::G_CLAIMS, &[], &origin, i64::MIN) {
-            let c = crate::sysdata::ServeClaim::from_cbor(&glade_wire::cbor::decode(&op.payload));
+            let c = envelope::record(&op, crate::sysdata::ServeClaim::from_cbor);
             if c.share == share && c.lease_expiry_ms > now_ms && best.as_ref().map_or(true, |b| c.epoch > b.epoch) {
                 best = Some(c);
             }
@@ -602,14 +603,14 @@ pub fn who_serves(store: &Store, share: &str, now_ms: i64) -> Option<String> {
 pub fn directory_knows(store: &Store, share: &str) -> bool {
     for (origin, _) in store.heads(HOME, crate::registry::G_WORKSPACES, &[]) {
         for op in store.scan(HOME, crate::registry::G_WORKSPACES, &[], &origin, i64::MIN) {
-            if crate::sysdata::WorkspaceEntry::from_cbor(&glade_wire::cbor::decode(&op.payload)).workspace == share {
+            if envelope::record(&op, crate::sysdata::WorkspaceEntry::from_cbor).workspace == share {
                 return true;
             }
         }
     }
     for (origin, _) in store.heads(HOME, crate::registry::G_CLAIMS, &[]) {
         for op in store.scan(HOME, crate::registry::G_CLAIMS, &[], &origin, i64::MIN) {
-            if crate::sysdata::ServeClaim::from_cbor(&glade_wire::cbor::decode(&op.payload)).share == share {
+            if envelope::record(&op, crate::sysdata::ServeClaim::from_cbor).share == share {
                 return true;
             }
         }
@@ -621,7 +622,7 @@ pub fn directory_knows(store: &Store, share: &str) -> bool {
 mod tests {
     use super::*;
     use crate::claims::testing;
-    use crate::registry::{Record, RegistryApi};
+    use crate::registry::{Record, RegistryApi, G_CLAIMS};
     use crate::sysdata::{CapabilityGrant, CapabilityRevocation, ServeClaim, WorkspaceEntry};
     use crate::sysdir::{boot_at, now_ms};
     use std::path::PathBuf;
@@ -754,6 +755,110 @@ mod tests {
         wait_for(&b, a_at_b, "A's binding at B").await;
     }
 
+    /// Plan Step 4.1b, F2 closed for a peer's push: A pushes B a claim on
+    /// `ws-razel` at a higher epoch than B's own, which would route B's
+    /// share to A, in forms A did not sign: bare, under A's id, and sealed by
+    /// another key. B takes neither: when A's genuine marker, pushed after
+    /// them in the same frame, has landed, B still routes `ws-razel` to
+    /// itself and holds A's claims chain as it was. The same claim, sealed by
+    /// A, then lands in the slot they would have taken.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_claim_a_peer_did_not_sign_is_refused_where_it_is_pushed() {
+        let boot_a = boot_at(fresh("forged-a-sys"), "gianni").unwrap();
+        let mut boot_b = boot_at(fresh("forged-b-sys"), "gianni").unwrap();
+        let (a_id, b_id) = (boot_a.node_id.clone(), boot_b.node_id.clone());
+        let claim = |node: &str, epoch| {
+            let (node, share) = (node.to_string(), "ws-razel".to_string());
+            let lease_expiry_ms = now_ms() + 30_000;
+            Record::Serve(ServeClaim {
+                node,
+                share,
+                lease_expiry_ms,
+                epoch,
+            })
+        };
+        boot_b.registry.append(claim(&b_id, 1), &b_id).unwrap();
+        let a = Server::open(fresh("forged-a-store")).unwrap();
+        let b = Server::open(fresh("forged-b-store")).unwrap();
+        a.seed_registry(&boot_a.registry.snapshot()).await;
+        b.seed_registry(&boot_b.registry.snapshot()).await;
+        let ep_a = PeerEndpoint::bind_with(boot_a.identity().unwrap())
+            .await
+            .unwrap();
+        let ep_b = PeerEndpoint::bind_with(boot_b.identity().unwrap())
+            .await
+            .unwrap();
+        a.enable_mesh(ep_a).await.unwrap();
+        let addr_b = b.enable_mesh(ep_b).await.unwrap();
+        a.connect_peer(&addr_b).await.unwrap();
+        let held = |node: String| move |st: &Store| st.scan(HOME, G_CLAIMS, &[], &node, -1).len();
+        wait_for(
+            &b,
+            |st| held(a_id.clone())(st) == 1,
+            "B to hold A's home claim",
+        )
+        .await;
+
+        let mut a_records = boot_a.registry.clone();
+        let genuine = a_records.append_returning(claim(&a_id, 99), &a_id).unwrap();
+        let bare = Op {
+            payload: crate::envelope::record_bytes(&genuine.payload),
+            ..genuine.clone()
+        };
+        let other = crate::peer::NodeIdentity::from_key([26; 32]);
+        let forged = Op {
+            payload: crate::envelope::seal(&other, &bare),
+            ..genuine.clone()
+        };
+        let marker = Record::Principal(crate::sysdata::PrincipalRecord {
+            principal: "marker".into(),
+        });
+        let marker = a_records.append_returning(marker, &a_id).unwrap();
+        let conn = a
+            .shared
+            .mesh
+            .get()
+            .unwrap()
+            .links
+            .lock()
+            .await
+            .get(&b_id)
+            .cloned()
+            .unwrap();
+        let push = |ops: Vec<Op>| {
+            let conn = conn.clone();
+            async move {
+                use tokio::io::AsyncWriteExt;
+                let (mut send, _recv) = conn.open_bi().await.unwrap();
+                write_frame(&mut send, &Frame::Ops(Ops { ops, pri: None }))
+                    .await
+                    .unwrap();
+                send.shutdown().await.unwrap();
+            }
+        };
+        push(vec![bare, forged, marker]).await;
+        let principals = |st: &Store| {
+            st.scan(HOME, crate::registry::G_PRINCIPALS, &[], &a_id, -1)
+                .len()
+        };
+        wait_for(&b, |st| principals(st) == 1, "A's marker at B").await;
+        {
+            let st = b.shared.store.lock().await;
+            assert_eq!(who_serves(&st, "ws-razel", now_ms()), Some(b_id.clone()));
+            assert_eq!(held(a_id.clone())(&st), 1, "A's claims chain as it was");
+        }
+        push(vec![genuine.clone()]).await;
+        wait_for(
+            &b,
+            |st| held(a_id.clone())(st) == 2,
+            "A's signed claim at B",
+        )
+        .await;
+        let st = b.shared.store.lock().await;
+        assert_eq!(st.scan(HOME, G_CLAIMS, &[], &a_id, 0), [genuine]);
+        assert_eq!(who_serves(&st, "ws-razel", now_ms()), Some(a_id.clone()));
+    }
+
     // ---- the door (plan Step 4.2b), over real iroh ---------------------------
 
     const A_SEED: [u8; 32] = [21; 32];
@@ -801,9 +906,10 @@ mod tests {
         (server, lines, addr)
     }
 
-    /// The node `seed`'s record, first on its chain.
+    /// The node `seed`'s record, first on its chain, sealed by it (plan Step
+    /// 4.1b).
     fn signed(seed: [u8; 32], record: Record) -> Op {
-        crate::transport::testing::op_of(&seed, record, 0)
+        crate::envelope::testing::sealed(seed, record)
     }
 
     async fn links(server: &Server) -> usize {
@@ -1167,7 +1273,7 @@ mod tests {
             if let Frame::Ops(ops) = next_frame(&mut rc, "workspace entries").await {
                 for op in ops.ops {
                     assert_eq!(op.origin, b_id, "entries carry their writing origin");
-                    names.push(crate::sysdata::WorkspaceEntry::from_cbor(&glade_wire::cbor::decode(&op.payload)).workspace);
+                    names.push(envelope::record(&op, crate::sysdata::WorkspaceEntry::from_cbor).workspace);
                 }
             }
         }

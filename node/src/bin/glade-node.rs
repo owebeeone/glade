@@ -14,14 +14,16 @@
 //! reads every `--app` file, then boots the system-data instance (GDL-036): acquires
 //! `~/.glade/sys/<name>/` (the profile picks the default name; `--name`
 //! overrides; `GLADE_HOME` overrides `$HOME/.glade`), runs the load-validation
-//! ladder (the first boot after plan Step 4.1a also sets aside, once, the
-//! records naming the node by its key's old id, and prints `set aside …` after
+//! ladder (the first boot after plan Step 4.1b also sets aside, once, the
+//! unsigned records written before it, and prints `set aside …` after
 //! `node`), materialises the RegistryApi fold, and writes its own presence and
 //! the binding of its endpoint key (plan Step 4.2; a boot after the key was
 //! replaced revokes the old key's and prints `revoked …` after `node`) —
 //! the node serves itself from its own disk BEFORE any client connects (the
-//! s-boot trace). The registry then seeds the served store (the home share is
-//! an ORDINARY share, GDL-038), the iroh peer endpoint binds with the node's
+//! s-boot trace). The served store opens, setting aside any `home` journal
+//! that does not verify (plan Step 4.1b; one more `set aside …` line). The
+//! registry then seeds it (the home share is an ORDINARY share, GDL-038), the
+//! iroh peer endpoint binds with the node's
 //! directory identity and its `endpoint.key`, and accepts inbound peer links
 //! (prints `peer <endpoint-id> <ip:port>` — the dial target for a `--peer`
 //! flag on another node, the same at every start), and each `--peer` target
@@ -212,6 +214,9 @@ async fn run() -> std::io::Result<()> {
     });
 
     let server = Server::open(&dir)?;
+    if let Some(aside) = server.set_aside().await {
+        println!("{aside}");
+    }
     if enforce_client_grants {
         server.enforce_client_grants();
         println!("{CLIENT_GRANTS_ENFORCED}");

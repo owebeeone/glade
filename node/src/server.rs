@@ -138,6 +138,13 @@ impl Server {
         appended
     }
 
+    /// What the served store's `open` set aside, as the line both roots
+    /// print: its `home` journals that did not verify (plan Step 4.1b).
+    pub async fn set_aside(&self) -> Option<String> {
+        let store = self.shared.store.lock().await;
+        store.set_aside().map(ToString::to_string)
+    }
+
     /// Accept connections until the listener errors.
     pub async fn run(self, listener: TcpListener) -> std::io::Result<()> {
         accept_clients(&self.shared, &listener).await
@@ -705,9 +712,9 @@ mod tests {
     /// op on `home`, here a forged grant, is refused with `Error{Unauthorized}`
     /// naming the share, the stream and, as its `corr`, the op's hash (R1),
     /// and it is never stored, so nothing that reads the served store folds
-    /// it. Proves the websocket client path only: a peer's push and pull
-    /// still ingest home ops until Step 4.1b verifies directory records, and
-    /// no grant is checked anywhere.
+    /// it. Proves the websocket client path only: a peer's push and pull take
+    /// a home op only if it verifies (plan Step 4.1b), and no grant is
+    /// checked anywhere.
     #[tokio::test]
     async fn a_client_op_on_home_is_refused_and_never_stored() {
         let (shared, port) = serving("glade-server-home-refused").await;

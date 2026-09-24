@@ -3720,3 +3720,471 @@ in 4.5b, where the adapter first faces other machines.
   - the node +202/−11: `iroh_carrier.rs` +190, the registration test +9/−9,
     `tests/assembly/conformance.rs`'s header +3/−2;
   - the contract's CA-005 probe +12/−11.
+
+## Home records signed (plan Step 4.1b)
+
+Design addition, 2026-09-25, written before the code against glade `4586e1b`.
+The red runs and the measured figures are filled in afterwards. The spec is
+plan Step 4.1b, split from 4.1 by the owner's ruling of 2026-09-24, and
+`glade/dev-docs/GladeNodeSigning.md`, every decision ruled as recommended:
+chiefly D4 (the envelope), D5 (the node signs every `home` record), D7 (the
+`origin-op` tag), D8 (existing stores) and D9 (*deferred*), with D11's 4.1b
+row and the findings F2, F3 and F4. The earlier steps it builds on: 4.1a (the
+key, the id, `NodeSigner`), 4.2a (the transport records), 4.3 part 1 (client
+writes to `home` refused) and 4.4 (durable acceptance).
+
+Nothing changes in the wire IR. The node's own IR, `node/ir/sysdata.taut.py`,
+gains one message. The ALPN moves to `glade/node/3` (section 7).
+
+**The step is split in two.**
+
+- **Part 1, built with this note:** the envelope, sealing at append, the check
+  at every `home` ingest, D8's set-aside and re-mint, the folds and the ALPN
+  (sections 1 to 7).
+- **Part 2, D9's *deferred* path:** designed here (section 8), not built. As
+  ruled, it defers every record of a node this node has not met. The door's
+  introductions, ruled a day later for 4.2b, assumed such records arrive.
+  Question 1 asks which reading governs.
+
+### 1. The envelope
+
+- One new message in the node's IR: `SignedRecord{1 record: bytes, 2 sig:
+  bytes}`, regenerated with `--legacy-codec` (`GladeProgramStatus.md:29`).
+- Every `home` op's payload is the canonical CBOR of one. `record` is the
+  canonical CBOR of the record the op's stream holds, which before this step
+  was the payload itself.
+- `sig` is the origin's Ed25519 signature, 64 bytes, pure, over
+  `glade/v1/origin-op\0` then the canonical CBOR of the op's fields 1 to 10
+  with `record` as the payload (D7). So it covers the chain position
+  (`origin`, `seq`, `prev`), the stream and the rest of the op.
+- It is checked with `verify_strict`, the key being the origin. The id is the
+  key (D2), so the check needs no lookup.
+- The op hash covers the envelope, so a chain commits to its signatures, and
+  `prev` names the previous op, envelope and all.
+- Field 1 is bytes, where every record kind's field 1 is text. So an unsigned
+  record is told from an envelope before anything decodes it (D4). The wire
+  codec's decoders panic on a type they do not expect, so an envelope is read,
+  and the record inside it checked against its stream's kind, with a checked
+  decoder (`envelope::parse`, which the transport fold now shares).
+- **Which records:** every op on `home`, from every origin, on each of the
+  directory's eleven streams. That is the nine kinds D5 names and 4.2a's two
+  transport kinds. No other share: app ops stay unsigned (D5, a 5.1 gap).
+- Sealing and checking use the node's own functions (`signing::sign` and
+  `signing::verify`, through `NodeIdentity`), as HELLO and the transport
+  records do. `SignerPort` gets its consumer in part 2.
+
+### 2. Sealing: the node signs its own records (D5)
+
+- A booted node's `Registry` holds the node's identity
+  (`Registry::from_snapshot_as`). Each append is sealed as it is built: the
+  record is encoded, the op is built with it as the payload, and the payload
+  is replaced by the envelope before the op is hashed into its chain.
+- A sealed registry appends only under its own node id. Any other origin is
+  refused (`RegistryError::NotOurs`).
+- Every record the node writes goes through it: presence, the home claim, the
+  transport binding and its revocations at boot; each app file's registration,
+  on both roots; claims, renewals and principals as the node runs.
+- An unsealed registry (`Registry::new`, `Registry::from_snapshot`) appends
+  bare records, as before. Only tests and the journeys' in-memory record host
+  use one.
+- Idempotent minting diffs records, not envelopes: `Registry::contains`,
+  `appdecl::register` and the binding fold's `declared_by` compare the record
+  inside. An envelope differs at every append, since its signature covers
+  `seq` and `prev`.
+
+### 3. What a `home` record needs before it is taken
+
+One function, `envelope::verify`, checks a `home` op wherever one is taken in.
+Its rules, in order:
+
+1. **An envelope:** canonical, with a 64-byte signature. Anything else is
+   *unsigned*.
+2. **The directory's form:** no zone key, shape `log`, no refs, as the
+   registry writes every record.
+3. **Its predecessor** (B5, F3): seq 0 names none, and every later seq names
+   one.
+4. **A directory stream:** one of the eleven the directory profile hosts
+   (`assembly::DirectoryRules`).
+5. **Its stream's kind:** the record is exactly that kind's canonical CBOR,
+   fields 1 to n of the declared types. So no fold meets a record it cannot
+   decode (F2's panic), whoever signed it.
+6. **A node id as origin:** 64 lower-case hex digits.
+7. **The signature**, strictly valid under the origin's key.
+
+The chain rules hold as before: contiguous seqs, `prev` equal to the
+predecessor's hash, a fork refused with its proof. The served store also
+requires a `home` chain to begin at seq 0, as the registry does: an op whose
+predecessor it has not seen cannot have that predecessor checked (B5).
+
+Where the check runs (D11's list):
+
+| Where | Before this step | After |
+| --- | --- | --- |
+| records.json at boot (`sysdir::boot_at`) | chain checks | an unsigned record is set aside (D8, section 4). Every other record must verify, or it is quarantined with its chain's suffix, as a chain break is. A quarantined grant or revocation leaves the grant fold unreadable (AZ-11) |
+| the registry's `ingest` (the record host's; the journeys) | chain checks | a sealed registry verifies each op first |
+| the served store's `append` | chain checks, `prev` optional | a `home` op must verify before anything new of it is kept. A byte-identical repeat is taken as held without a check: it was checked when it landed |
+| the served store's `open` | journals replayed unchecked | each `home` journal is checked as if its ops were appended one by one. One that does not verify is set aside whole (section 4) |
+| the pull at connect, a peer's push, the seeding at adoption, the node's own publish | `Store::append` | the same, so each is checked |
+
+A refused op is not stored, fanned out or fed to the door. On the peer paths it
+is dropped, as a chain break is today. Part 2 counts it and reports it.
+
+### 4. Existing stores (D8)
+
+Every store written before this step holds unsigned `home` records. The owner's
+desk holds nothing else: 4.1a re-minted everything under the new id, unsigned.
+At the first start on this build, the node sets them aside and mints again.
+
+**records.json.** At boot, every record whose payload is not an envelope is
+written, byte for byte, to a new `records.legacy-<date>.json`, by 4.1a's
+mechanism:
+
+- the file is a `SystemSnapshot` of those records, with no heads, dated UTC;
+- it is created new and synced before records.json is saved without them;
+- it never replaces a file: `-2`, `-3` and so on are added to a name in use;
+- a crash between the two writes repeats the set-aside at the next boot, into
+  a second file, so nothing is lost.
+
+The records are never folded (B5: kept as history, never governing). The boot
+prints `set aside N unsigned record(s) in records.legacy-<date>.json` after
+`node`, where 4.1a printed its own line.
+
+This takes in 4.1a's pass. Records under the key's old id are unsigned too, so
+they go the same way, and the old id's special case is removed: the boot's
+`legacy_id`, and the served store's `set_aside` of one origin at adoption.
+
+**The served store.** At open, each `home` journal,
+`cache/store/<hex(home)>/<hex(origin)>.log`, is checked as section 3 says: this
+node's own, and any copy of a peer's.
+
+- A journal holding any op that does not verify is renamed, whole, to
+  `<name>.log.legacy-<date>`, which `open` never replays and which never
+  replaces a file.
+- The node then prints `set aside K journal(s) of the served store's home
+  share (N record(s)) that do not verify, renamed *.legacy-<date>`, after the
+  `app` lines.
+- App data is untouched: only the `home` share's directory is checked.
+
+**Then the node mints again**, as at 4.1a's first start:
+
+- its presence and the home claim;
+- the binding of the endpoint key it already has. The old binding is set
+  aside, so nothing is revoked;
+- every app's registration, `+N record(s)`;
+- at adoption, the seed of the served store with all of these, signed;
+- each served workspace's claim, at epoch 1, since the old claims are aside;
+- principals, as sessions say Hello again.
+
+`node.key` and `endpoint.key` stay, so the node id and the endpoint id do not
+change. A second start sets nothing aside and registers `+0`.
+
+### 5. The transport records (4.2a)
+
+- A binding or a revocation rides an envelope like every `home` record: its
+  op is sealed by its node, in that node's chain.
+- It keeps its own signature, in its own domain, so a binding can still be
+  checked apart from its chain (4.2a's section 2).
+- The transport fold reads the record inside the envelope and judges it as
+  before: canonical, its ids in hex, its own signature, in its node's own
+  chain.
+- The fold reads verified op-sets, the registry's and the served store's, so
+  the envelope's check is already made. The door is fed only what lands in
+  the served store.
+
+### 6. What the folds read afterwards
+
+- Every fold reads the record inside the envelope, through one helper,
+  `envelope::record`. A bare payload, which only an unsealed registry holds,
+  reads as itself.
+- **The grant fold** (`Registry::policy`, plan Step 4.3) reads the registry:
+  this node's own grants and revocations, from its app files' `seed` and
+  `revoke` lines, now signed. Nothing changes in what it answers, and no
+  peer's record reaches it.
+- **The served store's folds** are routing (`who_serves`, `directory_knows`),
+  exchange declarations (`declared_exchange` and the binding fold), principals
+  (`knows_principal`), epoch fencing (`max_claim_epoch`) and the door. The
+  store now holds only records that verified: each signed by its origin, in
+  that origin's chain, and of its stream's kind.
+- So F2 is closed for peers. No peer can forge another node's claim, and no
+  record in the store panics a fold. The named gap "a peer can write `home`
+  until 4.1b" closes as far as forgery goes. Which nodes may write is part 2.
+
+### 7. Compatibility
+
+- **The wire:** no frame or field changes. The ALPN moves to `glade/node/3`,
+  and `peer::PROTOCOL` to 3. D4 requires that old and new nodes do not sync: a
+  4.1a to 4.3 node decodes a `home` payload as a record and panics on an
+  envelope, and this build refuses its unsigned records. So, as at 4.1a (D6),
+  they fail at connect, not mid-sync.
+- **Clients:** none reads or writes `home` (D4's search; 4.3 part 1 refuses
+  client writes). A session that subscribes to a `home` stream, as the node's
+  own tests do, receives envelopes.
+- **A downgrade:** an older binary cannot start on an instance this build has
+  written. At boot it decodes a record (`has_node`), meets an envelope and
+  panics, before it writes anything. Going back needs records.json and the
+  served store's `home` journals moved aside.
+- **The owner's desk** at its next restart: section 4's two lines, `+N` for
+  each app, `ws-razel` at epoch 1. "Measured" has the replay.
+
+### 8. D9: *deferred* (part 2, designed, not built)
+
+D9 as ruled: a record whose verifier is unavailable is never persisted or
+folded; it is retried next round and reported as *deferred*. Under D2(A) the
+verifier is unavailable when "the origin is not a node this node knows", and a
+node knows "itself and the nodes it has authenticated at HELLO".
+
+- **Who is known:** the node, and each node whose HELLO it has verified since
+  it started. The node's `SignerPort` adapter keeps the set. The mesh builds a
+  `NodeSigner` from its endpoint's identity, and `run_link` records each peer
+  its HELLO proved (`NodeSigner::authenticated`, which 4.1a built for this).
+  Its `verify` answers `Unavailable` for any other node (SI-002).
+- **Where:** the two peer paths that carry `home` records, the pull at connect
+  and a peer's push.
+  - Not at boot or at open. What the node holds was admitted when it arrived,
+    and section 4 checks it again at open.
+  - Admitting it again would drop every peer's records at each restart until
+    that peer links again. Epoch fencing would then bump over nothing
+    (`max_claim_epoch`), and a share whose holder is offline would route
+    `Local` instead of `Absent`.
+- **What:** before the store sees a `home` op from a peer, its origin must be
+  known.
+  - If it is not, the op is not stored, fanned out or fed to the door. Nor is
+    any later op of its chain (stream, origin) on that stream, since each
+    chains on it. The chain counts as *deferred*.
+  - A known origin's op that the store refuses counts as *refused*, and its
+    chain's later ops are skipped the same way.
+- **The round** is one stream: a pull, or one push. The next pull, at the next
+  connect, asks again, since the heads the node announces lack what it
+  deferred.
+- **The report**, at each stream's end, one line per chain, on stderr through
+  the door's reporter, so the assembled root puts it on its console:
+  - `deferred N home record(s) of node <origin> on <stream> from peer <peer>:
+    not a node this node knows`;
+  - `refused N home record(s) of node <origin> on <stream> from peer <peer>:
+    <reason>`.
+- **Boot** defers nothing, so prints no `deferred` line: records.json holds
+  the node's own records, and an unreadable key refuses the start (D9).
+- `SyncOutcome` gains `deferred`, beside `applied` and `rejected`, and the
+  library's sync driver, `pull_sync`, takes the same rule.
+- **Size:** about 100 production lines and 200 of tests.
+- **What it does to introductions** (question 1). A configured peer's
+  directory can no longer carry a third node's records here, its binding
+  included. The door's rule that such bindings count (4.2b's ruling) keeps its
+  code, and never fires for a node this node has not met.
+
+### 9. Tests (part 1), each begun red
+
+Each was run against the code with the part it guards switched off, by one
+edit in a scratch copy of the tree; the message is what that run printed.
+
+| Test | Proves | Red first |
+| --- | --- | --- |
+| `envelope`: `a_sealed_record_verifies_and_each_flaw_is_refused` | a sealed op verifies, and each of section 3's rules, broken once, refuses for its own reason: a bare record and a non-canonical envelope (`Unsigned`), a zone key (`Form`), seq 1 with no `prev` (`Prev`), another stream (`Stream`), a claim on `dir.nodes` (`Kind`), an upper-case origin (`Origin`), a flipped signature byte, another key's signature and another seq (`Signature`) | with `verify` answering `Ok`: "a bare record", left `Ok(())`, right `Err(Unsigned)` |
+| `envelope`: `the_signature_is_pure_ed25519_over_the_tag_then_the_op_with_its_record` | D7's encoding, built by hand: pure Ed25519 by the origin's key over `glade/v1/origin-op\0` then the op's ten fields with the record as payload | with `seal` signing the record alone: `assertion failed: key.verify_strict(&signed, &sig).is_ok()` |
+| `envelope`: `each_directory_kind_passes_its_own_check_and_a_misshapen_one_fails` | each of the eleven streams takes its kind as the generated codec encodes it, and not with a byte left over; a claim is no node record; verbs are text | with the kind check accepting anything: "dir.nodes: a byte left over" |
+| `envelope`: `the_checked_decoder_reads_the_codecs_bytes_and_refuses_the_rest` | the checked decoder reads what the codec writes and answers `None`, never a panic, for a torn item, a byte left over, a float, a text map key, nesting past two and a count past the bytes | with bytes left over accepted: left `Some(Map(…))`, right `None` |
+| `registry`: `a_sealed_registry_signs_its_appends_and_takes_only_what_verifies` | a sealed registry's append verifies and diffs as the record; an append under another origin is `NotOurs`; a bare and a forged op are refused `Unverified`, where an unsealed registry takes a bare one; a sealed reload quarantines nothing | with the seal skipped at append: "the appended op verifies", left `Err(Unsigned)`, right `Ok(())` |
+| `store`: `a_home_op_lands_only_signed_and_from_seq_0` | the served store refuses a bare and a forged `home` op and keeps nothing; a signed one lands and its repeat is a duplicate; a chain begun above seq 0 is a gap; an app op lands bare (D5) | with no check at append: "expected Unsigned, got Ok(Appended)" |
+| `store`: `open_sets_aside_a_home_journal_that_does_not_verify` | `open` renames an unsigned `home` journal to `<name>.legacy-<date>` and replays a signed one and an app journal; it reports what it set aside; a second `open` sets nothing aside | with no check at open: "the unsigned journal set aside" (none reported) |
+| `sysdir`: `a_first_boot_sets_the_unsigned_records_aside_once_and_mints_them_signed` | an unsigned instance (presence, home claim, binding and a grant under the node's id, and a record under the pre-4.1a id) is set aside byte for byte beside an older file it does not overwrite; the node mints presence and the same key's binding again; every record verifies and names the node; a second boot writes nothing | with the set-aside stubbed out: "the unsigned records set aside" |
+| `sysdir`: `a_record_whose_signature_fails_at_load_is_quarantined_and_closes_the_grant_fold` | a signed revocation with a byte of its record changed is quarantined, not set aside as unsigned, and leaves the grant fold unreadable | with the sealed load not verifying: `rejected`, left `0`, right `1` |
+| `claims`: `adoption_after_the_unsigned_home_journal_is_set_aside_serves_signed` (replaces 4.1a's adoption test) | an unsigned instance's served store: its journal set aside at open, so adoption seeds signed records alone: the dropped binding routes nothing, `alice` is minted again, `ws-x` is claimed at epoch 1, every `home` record verifies, app data stays, the old journal is kept | with no check at open: "the unsigned journal set aside"; and with that line not asked: "the dropped binding routes no exchange" |
+| `mesh`: `a_claim_a_peer_did_not_sign_is_refused_where_it_is_pushed` | over real iroh: a peer's push of a higher-epoch claim it did not sign, bare or sealed by another key, is refused, so B still routes its share to itself; the same claim sealed by the peer then lands in that slot | with no check at append: left `Some(<A's id>)`, right `Some(<B's id>)` |
+| `tests/assembled_path`: `both_roots_set_an_unsigned_instance_aside_and_serve_signed` (replaces 4.1a's transition test) | on each root, as processes: the same id, both `set aside` lines, `+2 record(s)`, every record in records.json and the served store verifies, `ws-x` at epoch 1; a second start sets nothing aside and registers `+0` | with both set-asides off: the kinds `["instance", "node", "quarantined", …]` where `["instance", "node", "set", …]` were expected: every unsigned record quarantined, none set aside |
+| `iroh_carrier`: `a_protocol_2_node_fails_at_connect` (was protocol 1) | an endpoint offering only `glade/node/2`, as every build from 4.1a to 4.3 does, fails at connect either way | with the ALPN back at 2: "a protocol-2 dialer connected" |
+
+Changed to carry signed records, and passing: `sysdir`'s
+`boot_takes_a_record_held_twice_as_one_and_keeps_the_rest_of_its_chain` (a
+peer's signed chain), `peer`'s
+`serve_sync_leaves_out_a_zone_the_claimed_holder_may_not_read` (a signed
+`home` record), `mesh`'s door tests (sealed transport records), and the
+exchange tests' registries (sealed). Every other test runs unchanged, the
+two-node ones now over signed records end to end.
+
+What they do not prove: Windows and Linux, which the lane owner runs on
+dabeest and the Pi; that another language's Ed25519 agrees with the tag (no
+`proof_family` vectors yet); a crash between the legacy file and records.json
+(4.1a's mechanism, unchanged); a relay; three nodes.
+
+### Named gaps (4.1b part 1)
+
+- **D9 is not built** (part 2). Until it is, a record from any node whose
+  signature verifies is taken from a linked peer, a third node's included.
+- **F4, measured.** Every start checks every `home` record twice, records.json
+  and the journal: about 0.6 ms a record in a debug build, which the desk
+  runs. See question 3.
+- **A push that reaches a peer before the pull at connect.** A `home` chain now
+  starts at seq 0, so such a push is refused as a gap, and so is each later
+  push on that chain, until the next pull. Before, it was taken, and the
+  pull's older ops were then taken as seen and not held. The ruled pull-on-gap
+  step heals it.
+- **Completeness.** A signature proves a record, not that none is missing: a
+  trailing record deleted from records.json or a journal goes unseen, as
+  before. An envelope stripped from a record in records.json reads as unsigned
+  history, not as tampering.
+- **A downgrade** cannot start (section 7).
+- App ops stay unsigned (D5; a 5.1 gap). No `proof_family` vectors for the
+  tag. `NodeSigner` still has no consumer. The legacy files are never read or
+  pruned. Equivocation proofs of `home` ops recorded before the step are
+  unsigned evidence, kept and never folded.
+- Each `home` record is about 70 bytes larger (the envelope and its
+  signature): a renewal's op grows from about 224 bytes to about 294.
+
+### Default-path changes (4.1b part 1)
+
+1. The node signs every `home` record it writes, and every `home` op's
+   payload is a `SignedRecord`.
+2. A `home` op is taken only if it verifies: at boot's load of records.json,
+   at the served store's append (the pull, a push, the seed, the node's own
+   publish) and at its open. A `home` chain starts at seq 0, on one of the
+   directory's eleven streams, each record of its stream's kind.
+3. The first start on this build sets aside records.json's unsigned records
+   and prints `set aside N unsigned record(s) in records.legacy-<date>.json`
+   after `node`; renames every `home` journal that does not verify to
+   `*.legacy-<date>` and prints `set aside K journal(s) of the served store's
+   home share (N record(s)) that do not verify, renamed *.legacy-<date>` after
+   the `app` lines; and mints again: presence, the home claim, the endpoint
+   key's binding, the registrations (`+N`), claims at epoch 1, principals as
+   sessions say Hello.
+4. The ALPN is `glade/node/3`, and `peer::PROTOCOL` 3.
+5. The legacy form prints the served store's line too, should its store hold
+   a `home` journal that does not verify.
+6. An older binary panics at start on an instance this build has written.
+7. Each start costs about 0.6 ms more for each `home` record it holds, in a
+   debug build (question 3).
+
+**What the owner's desk sees at its next restart**, from the replay below: the
+same node id and endpoint id; the two `set aside` lines; `app grazel
+registered (+12 record(s), 0 unchanged)` and `app gyld registered (+10
+record(s), 2 unchanged)`; `ws-razel` served at epoch 1; each tab's principal
+minted again at its next Hello. App data is untouched, and no shipped client
+reads `home`, so the UI works as before. The next restart prints the old
+lines.
+
+### Questions for the owner (4.1b)
+
+1. **Who counts as known** (part 2; section 8). As ruled, a node takes a peer's
+   `home` records only from itself and the nodes whose HELLO it has verified
+   since it started; any other node's are deferred at every pull. Then a
+   configured peer's directory cannot carry a third node's records, bindings
+   included, and the door's introductions (4.2b's ruling) never fire for a
+   node not met. The options:
+   - (a) as ruled: nodes met. Only nodes that passed this node's door write
+     its directory. Nothing the slice runs needs a third node.
+   - (b) node trust: any origin whose signature verifies, carried by a met
+     peer. Introductions work; but any key holder whose records reach a
+     trusted peer can write this node's directory, such as a claim at a
+     higher epoch that routes a share away (F2, now needing only a free key).
+     This is what part 1 does until part 2 lands.
+   - (c) met or introduced: a node counts as known once a met peer carries its
+     self-proving binding (4.2a's inner signature); its other records land at
+     the next pull.
+
+   Recommend (a) for the slice, and revisit with account-root certification
+   (D3's gap), where a certificate, not a peer, would introduce a node.
+2. **What a node holds is not admitted again** (part 2; section 8). At boot and
+   at open, records are checked (section 4), not held to D9's known set: D9
+   governs arrivals. Recommend keeping this. The other reading would drop
+   every peer's records at each restart until the peer links again, and epoch
+   fencing would bump over nothing.
+3. **The cost on the desk's debug build** (F4, measured). A check costs about
+   0.29 ms in a debug build, and each start checks each `home` record twice,
+   so a desk restart costs about 5 s more for each day of uptime since the
+   upgrade, and about 36 s after a week. With `opt-level = 3` for
+   `curve25519-dalek`, `ed25519-dalek` and `sha2` in dev builds
+   (`[profile.dev.package.<crate>]` in `node/Cargo.toml`, six lines), a check
+   measured 46 µs: about 6 s after a week. The options: (a) accept, as F4 was
+   ruled; (b) the profile override, now; (c) AZ-12's checkpoints, F4's ruled
+   remedy. Recommend (b) with part 1's landing, and (c) later.
+4. **Built in part 1, for review; each recommended as built:**
+   - the ALPN and `PROTOCOL` at 3, which D4's "old and new nodes must not
+     sync" requires;
+   - 4.1a's old-id set-aside taken into this one (those records are unsigned),
+     with `Boot::legacy_id` and `Store::set_aside(origin)` removed;
+   - the served store takes only the directory's eleven streams, each as its
+     kind, and a `home` chain from seq 0;
+   - at load, an unsigned record is history (set aside, B5) and a signed one
+     that fails is quarantined (AZ-11 for grants and revocations);
+   - the second pair of legacy files is kept, never read, and pruned by hand,
+     as 4.1a's ruling has it.
+
+### Measured (4.1b part 1)
+
+2026-09-25, Apple M3 Pro, Rust 1.96.0, on the final tree:
+
+- **The gate** (`glade/node/check.sh`) passes all 8 components. There are 291
+  node tests on each path, across 15 test binaries, where there were 282: the
+  nine new tests of section 9, whose other four rows replace or rename a test.
+  The contracts gate passes, unchanged.
+- **rustfmt**: glade-node 300 hunks, 7 below the old baseline of 307, which
+  is lowered to 300 in `check.sh`. The 7 went from lines this step rewrote,
+  the decode sites in `registry.rs`, `exchange.rs`, `mesh.rs` and `appdecl.rs`.
+  `envelope.rs` is new and formatted whole; no line this step wrote is a
+  deviation. glade-wire 43.
+- **clippy**: glade-node 11 warnings, glade-wire 7, at baseline.
+- **The regeneration.** The generator at taut `7a5f616` reproduces HEAD's
+  `sysdata.rs` byte for byte (`cmp`). After the IR change, regenerated with
+  `--legacy-codec` as 4.2a ran it, `sysdata.rs` is exactly what the generator
+  wrote: +20 lines, the one struct and its codec.
+- **Verification cost**, in a debug build: sealing 0.23 ms a record, a check
+  0.28–0.29 ms; a boot over 5,000 signed renewals 1.51 s, and the served
+  store's open over the same 1.47 s. With the three crates at `opt-level = 3`:
+  34 µs, 46 µs, 0.27 s and 0.26 s.
+- **The first start at the desk's scale.** On a stand-in holding 60,001
+  unsigned records (about a week of renewals; records.json 13.4 MB), this
+  build's first start reached `listening` in 0.41 s: the set-aside reads no
+  signature, and the journal fails at its first op. records.json fell to 7.7
+  KB beside a 13.4 MB legacy file. The next start took 0.055 s.
+- **The replay** (the brief's D8 rehearsal). A stand-in instance in a scratch
+  home, started from `glade-wz/grazel` as grazel starts the node (`--profile
+  local --name grazel --app apps/grazel-app.glade --app apps/gyld-app.glade
+  0`). Today's default binary (glade `4586e1b`, inode 400818912) ran twice: a
+  tab's Hello (`tab-a`) and 22 s the first time, `tab-b` and 3 s the second.
+  The instance then held 31 unsigned records in records.json and the same 31
+  in its `home` journal: 15 bindings, 5 claims, 3 grants, the node, 2
+  principals, the revocation, 2 services, the binding and the workspace. This
+  build's first start printed:
+
+  ```text
+  instance $R/home/sys/grazel
+  node ee048e608c9c949ebcdd1a0dc7aaf34a65657ba647c4b251b205dc02b3e60234
+  set aside 31 unsigned record(s) in records.legacy-2026-09-24.json
+  registry ready (home served: true)
+  app grazel registered (+12 record(s), 0 unchanged)
+  app gyld registered (+10 record(s), 2 unchanged)
+  set aside 1 journal(s) of the served store's home share (31 record(s)) that do not verify, renamed *.legacy-2026-09-24
+  peer c9d8ab137022e62175180efeff619aaa3edef19188878aee53f1e9160e391d25 127.0.0.1:63584
+  workspace ws-razel serving
+  workspace ws-razel serving
+  listening 60070
+  ```
+
+  The node id and the endpoint id are today's; nothing was printed on
+  stderr. records.json then held 28 signed records, and the `home` journal
+  the same 28 beside `<journal>.log.legacy-2026-09-24` with the 31 old ones.
+  `tab-a`'s Hello minted its principal again, signed. A second start printed
+  today's lines (`+0 record(s), 12 unchanged` for each app) and set nothing
+  aside. Today's binary, started on the upgraded instance, exited 101 at boot
+  (`panicked at … wire-rs/src/cbor.rs:50:13: not text`) and wrote nothing but
+  `instance.lock`; this build then started cleanly again. The date is UTC's,
+  a day behind the desk's clock in the morning. The first of this build's
+  starts took 2.1 s, the first run of a new binary file on macOS; on a fresh
+  copy of the same state it took 62–64 ms.
+- **Downstream**, against today's default binary (inode 400818912, not
+  rebuilt), through the shims, each Rust suite with a scratch target deleted
+  after it: client-rs 25 + 10, client-ts 48, grip-share 19, grazel 29 + 3,
+  glade-gyld 233 (1 ignored) + 33, glade-gwz 9 + 7. All at baseline.
+
+**Size**, in lines added and removed in `.rs` files, doc comments included:
+
+- production: +603/−220, net +383;
+  - `envelope.rs` +262, new (the checked decoder moved in from
+    `transport.rs`, which is +11/−58);
+  - `store.rs` +124/−24, `registry.rs` +83/−22, `sysdir.rs` +34/−48,
+    `sysdata.rs` +20 (generated), `peer.rs` +13/−20, `assembly.rs` +9/−23,
+    `bin/glade-node.rs` +9/−4, `claims.rs` +8/−11, `server.rs` +7,
+    `appdecl.rs` +4/−1, `iroh_carrier.rs` +4/−4, `mesh.rs` +4/−3,
+    `lifecycle.rs` +3, `session.rs` +3, `exchange.rs` +2/−1, `signing.rs`
+    +2/−1, `lib.rs` +1;
+- tests: +878/−173, net +705;
+- beside them, the IR +13 (`sysdata.taut.py`) and `check.sh`'s baseline.

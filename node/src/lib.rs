@@ -11,6 +11,7 @@ pub mod assembly;
 pub mod chain;
 pub mod claims;
 pub mod echo;
+pub mod envelope;
 pub mod exchange;
 pub mod frame;
 pub mod grants;

@@ -13,7 +13,7 @@
 //! | `local.json`    | 3 — node-private assertions              | never |
 //! | `cache/`        | 4 — derived, rebuildable                 | never |
 //! | `instance.lock` | — single-writer lock                     | never |
-//! | `records.legacy-<date>.json` | — set aside, never read (4.1a)  | never |
+//! | `records.legacy-<date>.json` | — set aside, never read (4.1a, 4.1b) | never |
 //!
 //! Boot = sync from a carrier named "the disk", in class order: node.key perms
 //! → NodeId; records.json verify-as-ingest (the same chain checks as the wire
@@ -21,11 +21,13 @@
 //! discard-and-refold. Nothing above [`StoreApi`] knows files exist.
 //!
 //! Plan Step 4.1a: `node.key` is an Ed25519 seed and the NodeId is its public
-//! key (`GladeNodeSigning.md` D2). A boot that finds this node's records under
-//! the id the key had before, `sha256(node.key)`, sets them aside once. Still
-//! structural: class-2 records carry no signatures until 4.1b, and the class-3
-//! self-signature is not checked until 4.1c. The permission check, the class-2
-//! chain verification, and the fail-closed load STRUCTURE are real.
+//! key (`GladeNodeSigning.md` D2). Plan Step 4.1b: every class-2 record is
+//! signed by its origin (`envelope.rs`), and the registry is sealed as this
+//! node, so it signs what it appends and loads only records that verify. A
+//! boot that finds unsigned records, written before the step, sets them
+//! aside once (D8); among them are any under the id the key had before
+//! 4.1a, `sha256(node.key)`. The class-3 self-signature is not checked until
+//! 4.1c.
 //!
 //! Plan Step 4.2: `endpoint.key` is the iroh endpoint's seed, kept apart from
 //! `node.key` so the identity survives the transport key's replacement. The
@@ -39,8 +41,8 @@ use std::path::{Path, PathBuf};
 
 use glade_wire::cbor;
 use glade_wire::generated::Op;
-use sha2::{Digest, Sha256};
 
+use crate::envelope;
 use crate::peer::NodeIdentity;
 use crate::registry::{BlobStore, Record, Registry, RegistryApi, StoreApi, HOME};
 use crate::signing;
@@ -150,7 +152,7 @@ pub struct Boot {
     pub store: BlobStore,
     /// records quarantined by verify-as-ingest (load evidence).
     pub rejected: usize,
-    /// What this boot set aside under the node's old id (plan Step 4.1a).
+    /// The unsigned records this boot set aside (plan Step 4.1b).
     pub set_aside: Option<SetAside>,
     /// What this boot did to the node's transport bindings (plan Step 4.2).
     pub rebound: Rebound,
@@ -163,14 +165,14 @@ pub struct Boot {
     _lock: InstanceLock,
 }
 
-/// What a boot set aside (plan Step 4.1a; `GladeNodeSigning.md` D8 (a)): this
-/// node's records under the id its key had before the step,
-/// `hex(sha256(node.key))`, written to a new `records.legacy-<date>.json` in
-/// the instance and never folded. The first boot after the step does it once.
+/// What a boot set aside (plan Step 4.1b; `GladeNodeSigning.md` D8 (a)): the
+/// unsigned records in records.json, which every node wrote before the step,
+/// written to a new `records.legacy-<date>.json` in the instance and never
+/// folded. The first boot after the step does it once. It takes in plan Step
+/// 4.1a's set-aside of the records under the key's old id: they are unsigned.
 #[derive(Debug)]
 pub struct SetAside {
     pub records: usize,
-    pub old_id: String,
     pub file: PathBuf,
 }
 
@@ -178,11 +180,8 @@ pub struct SetAside {
 impl fmt::Display for SetAside {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = self.file.file_name().unwrap_or_default().to_string_lossy();
-        let (records, old_id) = (self.records, &self.old_id);
-        write!(
-            f,
-            "set aside {records} record(s) of old node id {old_id} in {name}"
-        )
+        let records = self.records;
+        write!(f, "set aside {records} unsigned record(s) in {name}")
     }
 }
 
@@ -200,12 +199,6 @@ impl Boot {
     /// (plan Step 4.2), and bound to this node in its records.
     pub fn endpoint_key(&self) -> EndpointKey {
         self.endpoint
-    }
-
-    /// The id this node's key had before plan Step 4.1a, `hex(sha256(key))`,
-    /// which its older records name.
-    pub(crate) fn legacy_id(&self) -> String {
-        legacy_id_of(&self.seed)
     }
 }
 
@@ -234,11 +227,13 @@ pub fn boot_at(dir: PathBuf, operator: &str) -> io::Result<Boot> {
     let node_id = node_id_of(&seed);
 
     // ---- class 2: records.json -> verify-as-ingest -> the fold -------------
-    // The records under the key's old id leave the snapshot first, once.
+    // Unsigned records leave the snapshot first, once (plan Step 4.1b); the
+    // registry, sealed as this node, then takes only records that verify.
     let mut store = BlobStore::new(&dir);
     let mut snap = store.load()?;
-    let set_aside = set_aside(&dir, &mut snap, &legacy_id_of(&seed))?;
-    let (mut registry, rejected) = Registry::from_snapshot(&snap);
+    let set_aside = set_aside(&dir, &mut snap)?;
+    let identity = NodeIdentity::from_key(seed);
+    let (mut registry, rejected) = Registry::from_snapshot_as(&snap, identity);
 
     // ---- class 3: local.json (node-self-signature, fail-closed) ------------
     load_local_json(&dir); // structural in M-LIMP; failures discard to defaults
@@ -304,14 +299,15 @@ fn load_or_create_secret(dir: &Path, name: &str) -> io::Result<[u8; 32]> {
     Ok(seed)
 }
 
-/// Plan Step 4.1a (`GladeNodeSigning.md` D8 (a), for the id change): take this
-/// node's records under `old_id` out of `snap`, and write them, byte for byte,
-/// to a new `records.legacy-<date>.json` in `dir`, synced with its directory
-/// entry before records.json is saved without them. A crash between the two
-/// repeats this at the next boot, into a second file: nothing is lost.
-fn set_aside(dir: &Path, snap: &mut SystemSnapshot, old_id: &str) -> io::Result<Option<SetAside>> {
-    let ours = |bytes: &Vec<u8>| Op::from_cbor(&cbor::decode(bytes)).origin == old_id;
-    let (old, kept): (Vec<_>, Vec<_>) = snap.records.drain(..).partition(ours);
+/// Plan Step 4.1b (`GladeNodeSigning.md` D8 (a)): take the unsigned records,
+/// whose payload is no envelope, out of `snap`, and write them, byte for
+/// byte, to a new `records.legacy-<date>.json` in `dir`, synced with its
+/// directory entry before records.json is saved without them. A crash between
+/// the two repeats this at the next boot, into a second file: nothing is lost.
+fn set_aside(dir: &Path, snap: &mut SystemSnapshot) -> io::Result<Option<SetAside>> {
+    let unsigned =
+        |bytes: &Vec<u8>| !envelope::is_envelope(&Op::from_cbor(&cbor::decode(bytes)).payload);
+    let (old, kept): (Vec<_>, Vec<_>) = snap.records.drain(..).partition(unsigned);
     snap.records = kept;
     if old.is_empty() {
         return Ok(None);
@@ -326,15 +322,11 @@ fn set_aside(dir: &Path, snap: &mut SystemSnapshot, old_id: &str) -> io::Result<
     out.write_all(&cbor::encode(&legacy.to_cbor()))?;
     out.sync_all()?;
     crate::registry::entry_sync::sync(dir)?;
-    let old_id = old_id.into();
-    Ok(Some(SetAside {
-        records,
-        old_id,
-        file,
-    }))
+    Ok(Some(SetAside { records, file }))
 }
 
-/// Today's UTC date, `YYYY-MM-DD`, which names what plan Step 4.1a sets aside.
+/// Today's UTC date, `YYYY-MM-DD`, which names what plan Steps 4.1a and 4.1b
+/// set aside.
 pub(crate) fn today() -> String {
     date_of(now_ms())
 }
@@ -366,12 +358,6 @@ pub fn now_ms() -> i64 {
 /// identity loss, never forgery.
 fn node_id_of(seed: &[u8; 32]) -> String {
     hex(&signing::public_key(seed))
-}
-
-/// The id the same key had before plan Step 4.1a, `hex(sha256(key))`, which
-/// the node's older records name.
-fn legacy_id_of(seed: &[u8; 32]) -> String {
-    hex(&Sha256::digest(seed))
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -514,20 +500,23 @@ mod tests {
     /// 2026-09-24): boot takes the repeat as a duplicate, quarantines nothing,
     /// and folds the rest of that origin's chain; the next save writes the
     /// record once. Until the ruling the repeat was a fork, and boot set it
-    /// aside with every later record of the chain.
+    /// aside with every later record of the chain. The records are another
+    /// node's, signed by it (plan Step 4.1b), so boot keeps them.
     #[test]
     fn boot_takes_a_record_held_twice_as_one_and_keeps_the_rest_of_its_chain() {
         let dir = fresh("duplicate");
-        let mut peer = Registry::new();
+        let peer_key = NodeIdentity::from_key([5; 32]);
+        let peer_id = hex(&peer_key.node_id);
+        let mut peer = Registry::sealed(peer_key);
         for lease_expiry_ms in [1_000, 2_000, 5_000] {
             let share = "ws-x".into();
             let claim = ServeClaim {
-                node: "peer".into(),
+                node: peer_id.clone(),
                 share,
                 lease_expiry_ms,
                 epoch: 1,
             };
-            peer.append(Record::Serve(claim), "peer").unwrap();
+            peer.append(Record::Serve(claim), &peer_id).unwrap();
         }
         let mut snap = peer.snapshot();
         let repeat = snap.records[1].clone();
@@ -536,8 +525,9 @@ mod tests {
 
         let boot = boot_at(dir.clone(), "gianni").unwrap();
         assert_eq!(boot.rejected, 0, "nothing quarantined");
+        assert!(boot.set_aside.is_none(), "nothing unsigned");
         let serves = boot.registry.who_serves("ws-x", 3_000);
-        assert_eq!(serves, Some("peer".into()), "the third claim folds");
+        assert_eq!(serves, Some(peer_id), "the third claim folds");
         let saved = BlobStore::new(&dir).load().unwrap();
         let held = saved
             .records
@@ -547,60 +537,133 @@ mod tests {
         assert_eq!(held, 1, "and is saved once");
     }
 
-    /// Plan Step 4.1a (D8 (a), for the id change): an instance written before
-    /// the step names its node `hex(sha256(node.key))`, as the records.json
-    /// written here does. The first boot on the new id writes those records,
-    /// byte for byte, to a new `records.legacy-<date>.json`, beside an older
-    /// file of that name, which it does not overwrite. records.json keeps
-    /// another origin's record and gains the new presence, and the operator
-    /// has one node, not two. A second boot sets nothing aside. It does not
-    /// reach the served store (`claims.rs` does), or a crash between the writes.
+    /// Plan Step 4.1b (`GladeNodeSigning.md` D8 (a)): an instance written
+    /// before the step holds its records unsigned: here its presence, its
+    /// home claim, its endpoint key's binding and a grant, under its id, and
+    /// a record under the id its key had before plan Step 4.1a, which 4.1a's
+    /// own set-aside would have taken. The first boot on this build writes
+    /// every one, byte for byte, to a new `records.legacy-<date>.json`
+    /// beside an older file of that name, which it does not overwrite. It
+    /// mints its presence and the binding of the same endpoint key again,
+    /// revoking nothing; each record in records.json then verifies, and names
+    /// only the node. A second boot sets nothing aside and writes nothing.
+    /// It does not reach the served store (`store.rs` and `claims.rs` do), or
+    /// a crash between the writes.
     #[test]
-    fn a_first_boot_on_the_new_id_sets_the_old_records_aside_once() {
-        let dir = fresh("legacy");
-        let seed = boot_at(dir.clone(), "gianni").unwrap().seed;
-        let old = legacy_id_of(&seed);
+    fn a_first_boot_sets_the_unsigned_records_aside_once_and_mints_them_signed() {
+        use sha2::{Digest, Sha256};
+        let dir = fresh("unsigned");
+        let first = boot_at(dir.clone(), "gianni").unwrap();
+        let (seed, node, endpoint) = (first.seed, first.node_id.clone(), first.endpoint_key());
+        drop(first);
+        let old = hex(&Sha256::digest(seed));
         let mut before = Registry::new();
-        let presence = NodeRecord {
-            node_id: old.clone(),
-            operator: "gianni".into(),
+        let presence = |node_id: &str| {
+            let (node_id, operator) = (node_id.into(), "gianni".into());
+            Record::Node(NodeRecord { node_id, operator })
         };
-        before.append(Record::Node(presence), &old).unwrap();
-        let claim = |node: &str, share: &str| {
-            Record::Serve(ServeClaim {
-                node: node.into(),
-                share: share.into(),
-                lease_expiry_ms: 1,
-                epoch: 1,
-            })
+        before.append(presence(&old), &old).unwrap();
+        before.append(presence(&node), &node).unwrap();
+        let claim = ServeClaim {
+            node: node.clone(),
+            share: HOME.into(),
+            lease_expiry_ms: 1,
+            epoch: 1,
         };
-        before.append(claim(&old, HOME), &old).unwrap();
-        before.append(claim("peer", "ws-p"), "peer").unwrap();
+        before.append(Record::Serve(claim), &node).unwrap();
+        let binding = transport::sign_binding(&seed, &endpoint.endpoint_id, 1);
+        before.append(Record::Transport(binding), &node).unwrap();
+        let grant = crate::sysdata::CapabilityGrant {
+            principal: "owner".into(),
+            share: "ws-x".into(),
+            verbs: vec!["read.*".into()],
+        };
+        before.append(Record::Grant(grant), &node).unwrap();
         let written = before.snapshot();
         BlobStore::new(&dir).save(&written).unwrap();
         let taken = dir.join(format!("records.legacy-{}.json", date_of(now_ms())));
         fs::write(&taken, "an older file").unwrap();
 
         let boot = boot_at(dir.clone(), "gianni").unwrap();
-        let aside = boot.set_aside.as_ref().expect("the old records set aside");
-        assert_eq!((aside.records, &aside.old_id), (2, &old));
+        let aside = boot
+            .set_aside
+            .as_ref()
+            .expect("the unsigned records set aside");
+        assert_eq!(aside.records, 5);
         assert_ne!(aside.file, taken);
-        let older = fs::read(&taken).unwrap();
-        assert_eq!(older, b"an older file", "not overwritten");
+        assert_eq!(
+            fs::read(&taken).unwrap(),
+            b"an older file",
+            "not overwritten"
+        );
         let held = SystemSnapshot::from_cbor(&cbor::decode(&fs::read(&aside.file).unwrap()));
-        assert_eq!(held.records, written.records[..2], "byte for byte");
-        assert_eq!(boot.registry.nodes_of("gianni"), vec![boot.node_id.clone()]);
-        let saved = BlobStore::new(&dir).load().unwrap();
-        let origins: Vec<String> = saved
+        assert_eq!(held.records, written.records, "byte for byte");
+        assert_eq!((boot.rejected, boot.rebound), (0, rebound(true, 0)));
+        assert_eq!(boot.registry.nodes_of("gianni"), vec![node.clone()]);
+        let fold = boot.registry.transport();
+        let bound = fold.binds(&signing::public_key(&seed), &endpoint.endpoint_id, now_ms());
+        assert_eq!(bound, transport::Bound::Live, "the same key, bound again");
+        let saved: Vec<Op> = BlobStore::new(&dir)
+            .load()
+            .unwrap()
             .records
             .iter()
-            .map(|bytes| Op::from_cbor(&cbor::decode(bytes)).origin)
+            .map(|bytes| Op::from_cbor(&cbor::decode(bytes)))
             .collect();
-        assert!(!origins.contains(&old), "records.json holds none of them");
-        let peer = "peer".to_string();
-        assert!(origins.contains(&peer), "and keeps the peer's");
+        assert!(saved.iter().all(|op| op.origin == node), "only the node");
+        assert!(
+            saved.iter().all(|op| envelope::verify(op).is_ok()),
+            "all signed"
+        );
         drop(boot);
-        assert!(boot_at(dir, "gianni").unwrap().set_aside.is_none(), "once");
+        let records = fs::read(dir.join("records.json")).unwrap();
+        let again = boot_at(dir.clone(), "gianni").unwrap();
+        assert!(again.set_aside.is_none(), "once");
+        drop(again);
+        assert_eq!(
+            fs::read(dir.join("records.json")).unwrap(),
+            records,
+            "nothing written"
+        );
+    }
+
+    /// Plan Step 4.1b: a signed record whose signature fails at load, here a
+    /// revocation with a byte of its record changed, is quarantined with its
+    /// chain's suffix, as a chain break is, not set aside as unsigned; and a
+    /// grant or revocation quarantined so leaves the grant fold unreadable
+    /// (AZ-11), where the untouched instance's fold reads.
+    #[test]
+    fn a_record_whose_signature_fails_at_load_is_quarantined_and_closes_the_grant_fold() {
+        let dir = fresh("forged");
+        let boot = boot_at(dir.clone(), "gianni").unwrap();
+        let node = boot.node_id.clone();
+        let mut registry = boot.registry.clone();
+        drop(boot);
+        let revocation = crate::sysdata::CapabilityRevocation {
+            principal: "eve".into(),
+            share: "ws-x".into(),
+        };
+        registry.append(Record::Revoke(revocation), &node).unwrap();
+        let mut snap = registry.snapshot();
+        BlobStore::new(&dir).save(&snap).unwrap();
+        let clean = boot_at(dir.clone(), "gianni").unwrap();
+        assert!(clean.registry.policy().is_some());
+        drop(clean);
+        let at = snap.records.len() - 1;
+        let mut op = Op::from_cbor(&cbor::decode(&snap.records[at]));
+        let e = op.payload.iter().position(|b| *b == b'e').unwrap();
+        op.payload[e] = b'm';
+        snap.records[at] = cbor::encode(&op.to_cbor());
+        BlobStore::new(&dir).save(&snap).unwrap();
+
+        let boot = boot_at(dir, "gianni").unwrap();
+        assert!(
+            boot.set_aside.is_none(),
+            "signed, so not set aside as unsigned"
+        );
+        assert_eq!(boot.rejected, 1);
+        assert!(boot.registry.policy_quarantined());
+        assert_eq!(boot.registry.policy(), None);
     }
 
     /// The legacy file's date: the UTC calendar date of an epoch-ms instant,

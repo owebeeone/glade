@@ -25,6 +25,7 @@ use glade_grant_api::{GrantPort, Holder};
 use glade_wire::generated::{ExchangeReq, ExchangeRes, Heads, StreamHeads};
 
 use crate::echo::Echo;
+use crate::envelope;
 use crate::frame::Frame;
 use crate::grants::refusal;
 use crate::mesh::{route_subscribe, Route};
@@ -68,7 +69,7 @@ fn res_err(corr: &str, error: &str) -> Frame {
 pub fn declared_exchange(store: &Store, glade_id: &str) -> bool {
     for (origin, _) in store.heads(HOME, G_SERVICES, &[]) {
         for op in store.scan(HOME, G_SERVICES, &[], &origin, i64::MIN) {
-            if ServiceDefinition::from_cbor(&glade_wire::cbor::decode(&op.payload)).glade_id == glade_id {
+            if envelope::record(&op, ServiceDefinition::from_cbor).glade_id == glade_id {
                 return true;
             }
         }
@@ -354,8 +355,8 @@ mod tests {
             "glade-app v0\napp demo\nservice demo d.ops\n",
         )
         .unwrap();
-        let mut reg = Registry::new();
-        appdecl::register(&decl, &mut reg, "n1").unwrap();
+        let (mut reg, n1) = sealed();
+        appdecl::register(&decl, &mut reg, &n1).unwrap();
 
         let server = Server::open(fresh("local-store")).unwrap();
         server.seed_registry(&reg.snapshot()).await;
@@ -421,6 +422,14 @@ mod tests {
         }
     }
 
+    /// A registry sealed as a test node, and the node's id, its origin, so
+    /// the served store takes what it appends (plan Step 4.1b).
+    fn sealed() -> (Registry, String) {
+        let identity = crate::peer::NodeIdentity::from_key([41; 32]);
+        let origin = crate::transport::hex(&identity.node_id);
+        (Registry::sealed(identity), origin)
+    }
+
     /// The served store holding a registry's records, as `seed_registry` lands them.
     fn store_of(reg: &Registry, name: &str) -> Store {
         let mut st = Store::open(fresh(name)).unwrap();
@@ -447,15 +456,15 @@ mod tests {
     /// and a newer `exchange` declaration makes it routable again.
     #[test]
     fn a_declared_exchange_binding_is_read_through_the_fold() {
-        let mut reg = Registry::new();
-        reg.append(binding("demo", "d.x", "exchange"), "n1").unwrap();
+        let (mut reg, n1) = sealed();
+        reg.append(binding("demo", "d.x", "exchange"), &n1).unwrap();
         assert!(declared_exchange(&store_of(&reg, "fold-1"), "d.x"));
-        reg.append(binding("demo", "d.x", "value"), "n1").unwrap();
+        reg.append(binding("demo", "d.x", "value"), &n1).unwrap();
         assert!(!declared_exchange(&store_of(&reg, "fold-2"), "d.x"), "the newest declaration is not an exchange");
-        reg.append(binding("demo", "d.x", "exchange"), "n1").unwrap();
+        reg.append(binding("demo", "d.x", "exchange"), &n1).unwrap();
         assert!(declared_exchange(&store_of(&reg, "fold-3"), "d.x"));
         let retract = BindingRetraction { app: "demo".into(), glade_id: "d.x".into() };
-        reg.append(Record::Retract(retract), "n1").unwrap();
+        reg.append(Record::Retract(retract), &n1).unwrap();
         assert!(!declared_exchange(&store_of(&reg, "fold-4"), "d.x"), "a newest retraction takes it down");
     }
 
@@ -505,7 +514,7 @@ mod tests {
         let mut max = 0;
         for (origin, _) in st.heads(HOME, crate::registry::G_CLAIMS, &[]) {
             for op in st.scan(HOME, crate::registry::G_CLAIMS, &[], &origin, i64::MIN) {
-                let c = ServeClaim::from_cbor(&glade_wire::cbor::decode(&op.payload));
+                let c = envelope::record(&op, ServeClaim::from_cbor);
                 if c.share == share && c.epoch > max {
                     max = c.epoch;
                 }
@@ -793,7 +802,7 @@ mod tests {
             if let Frame::Ops(ops) = next_frame(&mut rc, "BindingDecl records").await {
                 for op in ops.ops {
                     assert_eq!(op.origin, b_id, "declarations ride the registrant's chain");
-                    bindings.push(BindingDecl::from_cbor(&glade_wire::cbor::decode(&op.payload)).glade_id);
+                    bindings.push(envelope::record(&op, BindingDecl::from_cbor).glade_id);
                 }
             }
         }
@@ -811,7 +820,7 @@ mod tests {
         while grants.len() < 3 {
             if let Frame::Ops(ops) = next_frame(&mut rc, "seeded grant records").await {
                 for op in ops.ops {
-                    let g = CapabilityGrant::from_cbor(&glade_wire::cbor::decode(&op.payload));
+                    let g = envelope::record(&op, CapabilityGrant::from_cbor);
                     grants.push((g.principal, g.share, g.verbs.join(",")));
                 }
             }

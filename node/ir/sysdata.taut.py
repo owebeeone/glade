@@ -148,6 +148,19 @@ SCHEMA = schema(
         F("endpoint_id", 2, STR),
         F("sig", 3, BYTES)),
 
+    # ---- the signed envelope (plan Step 4.1b) --------------------------------
+    # GladeNodeSigning.md D4 (c): every home-share op's payload is one of
+    # these, sealed by the op's origin. `record` is the canonical CBOR of the
+    # record the op's stream holds (one of the kinds above). `sig` is the
+    # origin's Ed25519 signature, 64 bytes, over the tag `glade/v1/origin-op\0`
+    # then the canonical CBOR of the op's fields 1-10 with `record` as the
+    # payload (D7), so it covers the chain position; the origin is the node id,
+    # which is its key. Field 1 is bytes where every record kind's field 1 is
+    # text, so an unsigned record is told from an envelope before decoding.
+    Msg("SignedRecord",
+        F("record", 1, BYTES),
+        F("sig", 2, BYTES)),
+
     # ---- the create ceremony (GLP-0006 P0.S2 — audit F2, s-create D1–D3) ---
     # Rides ExchangeReq.payload on the reserved built-in `workspace.create`
     # surface, handled by the NODE (never a supplier): creation PRECEDES

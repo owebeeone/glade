@@ -35,9 +35,10 @@ use crate::store::{EquivProof, Store, StoreError};
 use crate::transport::Door;
 
 /// Wire protocol version spoken on the peer link: 2 from plan Step 4.1a, whose
-/// HELLO is signed. The carrier's ALPN names it too, so a node that speaks 1
-/// fails at connect.
-pub const PROTOCOL: i64 = 2;
+/// HELLO is signed, and 3 from plan Step 4.1b, whose `home` records are
+/// signed envelopes that an older node cannot read. The carrier's ALPN names
+/// it too, so a node of an older protocol fails at connect.
+pub const PROTOCOL: i64 = 3;
 
 // ---- framed IO ------------------------------------------------------------
 
@@ -273,13 +274,6 @@ where
 /// to sync. Resume is free: the receiver's HEADS advance as ops land.
 pub const OPS_PER_CHUNK: usize = 64;
 
-/// Per-op origin-signature verification seam (GQ-9). STUBBED: called before an
-/// op can land, but currently accepts. Real ed25519 over the op's canonical
-/// bytes drops in here — closing the one-op tamper window (GladePeerSyncNotes §6).
-pub fn verify_origin_sig(_op: &Op) -> bool {
-    true
-}
-
 /// A `(share, glade_id, key, origin)` chain — the per-(origin, zone) unit (D8).
 pub type ChainKey = (String, String, Vec<u8>, String);
 
@@ -293,8 +287,9 @@ pub struct SyncOutcome {
     /// Ops that landed (appended or idempotent duplicate).
     pub applied: usize,
     /// (origin, zone) chains whose suffix was rejected FROM THIS PEER — chain
-    /// break, gap, or bad signature. Nothing that peer sent after the break is
-    /// kept; the caller re-fetches these chains elsewhere (resume is exact).
+    /// break, gap, or a `home` op that does not verify (plan Step 4.1b).
+    /// Nothing that peer sent after the break is kept; the caller re-fetches
+    /// these chains elsewhere (resume is exact).
     pub rejected: Vec<ChainKey>,
     /// Equivocation proofs newly recorded while ingesting this stream — a signed
     /// fork by the ORIGIN (SY4), not the carrier's fault.
@@ -350,10 +345,11 @@ where
 
 /// Dialer side of a pull (the s-sync initiator): announce our HEADS, then ingest
 /// the peer's gap stream, VERIFYING EACH OP AS IT LANDS (`store.append` =
-/// prev-hash continuity + seq monotonic + equivocation, plus the origin-sig
-/// seam). On a chain-check failure the whole suffix of that (origin, zone) chain
-/// from this peer is dropped and reported for re-fetch; equivocation records a
-/// proof. Ends at the peer's stream close.
+/// prev-hash continuity + seq monotonic + equivocation, and a `home` op's
+/// origin signature, plan Step 4.1b; app ops carry none, D5). On a
+/// chain-check failure the whole suffix of that (origin, zone) chain from this
+/// peer is dropped and reported for re-fetch; equivocation records a proof.
+/// Ends at the peer's stream close.
 pub async fn pull_sync<R, W>(r: &mut R, w: &mut W, store: &mut Store) -> io::Result<SyncOutcome>
 where
     R: AsyncRead + Unpin,
@@ -374,14 +370,11 @@ where
             if out.rejected.contains(&ck) {
                 continue; // suffix of an already-broken chain from this peer
             }
-            if !verify_origin_sig(&op) {
-                out.rejected.push(ck);
-                continue;
-            }
             match store.append(op) {
                 Ok(_) => out.applied += 1,
                 Err(StoreError::ChainBreak { .. })
                 | Err(StoreError::Gap { .. })
+                | Err(StoreError::Unverified { .. })
                 | Err(StoreError::InvalidSwmrPayload { .. })
                 | Err(StoreError::SwmrWriterConflict { .. })
                 | Err(StoreError::ShapeConflict { .. }) => out.rejected.push(ck),
@@ -697,22 +690,26 @@ mod sync_tests {
 
     /// Plan Step 4.3: the responder offers `home` and each zone its holder may
     /// read, and leaves every other zone out whole. The holder is granted
-    /// `sh`; the store also holds `other` and `home`.
+    /// `sh`; the store also holds `other`, and `home` with a signed record
+    /// (plan Step 4.1b).
     #[tokio::test]
     async fn serve_sync_leaves_out_a_zone_the_claimed_holder_may_not_read() {
         let mut server = Store::open(fresh("grant-srv")).unwrap();
         chained(&mut server, "a", b"", 2);
-        for (share, n) in [("other", 3), (HOME, 1)] {
-            let mut prev = None;
-            for seq in 0..n {
-                let o = Op {
-                    share: share.into(),
-                    ..op("b", seq, b"", prev.clone(), b"x")
-                };
-                server.append(o.clone()).unwrap();
-                prev = Some(crate::chain::op_hash(&o).to_vec());
-            }
+        let mut prev = None;
+        for seq in 0..3 {
+            let o = Op {
+                share: "other".into(),
+                ..op("b", seq, b"", prev.clone(), b"x")
+            };
+            server.append(o.clone()).unwrap();
+            prev = Some(crate::chain::op_hash(&o).to_vec());
         }
+        let b = crate::registry::Record::Principal(crate::sysdata::PrincipalRecord {
+            principal: "b".into(),
+        });
+        let home = crate::envelope::testing::sealed([2; 32], b);
+        server.append(home.clone()).unwrap();
         let mut client = Store::open(fresh("grant-cli")).unwrap();
         let (ca, cb) = tokio::io::duplex(64 * 1024);
         let (mut ar, mut aw) = split(ca);
@@ -728,7 +725,9 @@ mod sync_tests {
         );
         assert_eq!(out.applied, 3);
         assert_eq!(client.scan("sh", "g", b"", "a", -1).len(), 2);
-        assert_eq!(client.scan(HOME, "g", b"", "b", -1).len(), 1);
+        let (glade_id, origin) = (&home.glade_id, &home.origin);
+        let held = client.scan(HOME, glade_id, b"", origin, -1);
+        assert_eq!(held, std::slice::from_ref(&home));
         assert!(
             client.scan("other", "g", b"", "b", -1).is_empty(),
             "a zone its holder may not read"

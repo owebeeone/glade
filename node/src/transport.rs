@@ -15,6 +15,7 @@ use glade_signer_api::SignatureStatus;
 use glade_wire::cbor::{self, Cbor};
 use glade_wire::generated::Op;
 
+use crate::envelope;
 use crate::registry::{Record, Registry, G_TRANSPORT_BINDINGS, G_TRANSPORT_REVOCATIONS, HOME};
 use crate::signing::{self, TRANSPORT_BINDING, TRANSPORT_REVOCATION};
 use crate::store::Store;
@@ -59,7 +60,7 @@ pub fn hex(key: &[u8; 32]) -> String {
 }
 
 /// The key `text` writes, if it is exactly 64 lower-case hex digits.
-fn key_of(text: &str) -> Option<[u8; 32]> {
+pub(crate) fn key_of(text: &str) -> Option<[u8; 32]> {
     let digit = |c: u8| match c {
         b'0'..=b'9' => Some(c - b'0'),
         b'a'..=b'f' => Some(c - b'a' + 10),
@@ -414,12 +415,17 @@ pub(crate) fn bind_at_boot(
 }
 
 /// The pair a transport record proves, and a binding's date (`None` for a
-/// revocation): only if its payload is its kind's canonical encoding, its
+/// revocation): only if its record is its kind's canonical encoding, its
 /// ids are 64 lower-case hex digits, its signature verifies strictly under
 /// its node for its kind's domain, and it rides `home` in that node's own
-/// chain.
+/// chain. The record is the one the op's envelope carries (plan Step 4.1b),
+/// which the store or the registry checked as the op landed; this signature
+/// is the record's own.
 fn proven(op: &Op) -> Option<(Pair, Option<i64>)> {
-    let fields = flat_map(&op.payload)?;
+    let record = envelope::record_bytes(&op.payload);
+    let Some(Cbor::Map(fields)) = envelope::parse(&record) else {
+        return None;
+    };
     let kind = (op.glade_id.as_str(), fields.as_slice());
     let (node, endpoint_id, valid_from, sig, domain) = match kind {
         (
@@ -432,65 +438,12 @@ fn proven(op: &Op) -> Option<(Pair, Option<i64>)> {
         ) => (node, endpoint_id, None, sig, TRANSPORT_REVOCATION),
         _ => return None,
     };
-    let canonical = cbor::encode(&Cbor::Map(fields.clone())) == op.payload;
+    let canonical = cbor::encode(&Cbor::Map(fields.clone())) == record;
     let pair = (key_of(endpoint_id)?, key_of(node)?);
     let signed = message(node, endpoint_id, valid_from);
     let valid = signing::verify_in(&pair.1, domain, &signed, sig) == SignatureStatus::Valid;
     let chain = op.share == HOME && op.origin == *node;
     (canonical && valid && chain).then_some((pair, valid_from))
-}
-
-/// The payload's flat CBOR map of integer keys to ints, byte strings and
-/// text, or `None`. The wire codec's `decode` panics on bytes it cannot read,
-/// and until plan Step 4.1b any peer can write `home` (F2).
-fn flat_map(bytes: &[u8]) -> Option<Vec<(i64, Cbor)>> {
-    let mut at = 0;
-    let (5, len) = head(bytes, &mut at)? else {
-        return None;
-    };
-    let mut entries = Vec::new();
-    for _ in 0..len {
-        let ((0, key), (major, n)) = (head(bytes, &mut at)?, head(bytes, &mut at)?) else {
-            return None;
-        };
-        let value = match major {
-            0 => Cbor::Int(i64::try_from(n).ok()?),
-            1 => Cbor::Int(-1 - i64::try_from(n).ok()?),
-            2 | 3 => {
-                let end = at.checked_add(usize::try_from(n).ok()?)?;
-                let raw = bytes.get(at..end)?.to_vec();
-                at = end;
-                if major == 2 {
-                    Cbor::Bytes(raw)
-                } else {
-                    Cbor::Text(String::from_utf8(raw).ok()?)
-                }
-            }
-            _ => return None,
-        };
-        entries.push((i64::try_from(key).ok()?, value));
-    }
-    (at == bytes.len()).then_some(entries)
-}
-
-/// One CBOR item's head at `*at`: its major type and its argument.
-fn head(bytes: &[u8], at: &mut usize) -> Option<(u8, u64)> {
-    let first = *bytes.get(*at)?;
-    *at += 1;
-    let width = match first & 0x1f {
-        n @ 0..=23 => return Some((first >> 5, u64::from(n))),
-        24 => 1,
-        25 => 2,
-        26 => 4,
-        27 => 8,
-        _ => return None,
-    };
-    let raw = bytes.get(*at..*at + width)?;
-    *at += width;
-    Some((
-        first >> 5,
-        raw.iter().fold(0u64, |n, b| (n << 8) | u64::from(*b)),
-    ))
 }
 
 // Records and doors for other modules' tests. A braced module, so the

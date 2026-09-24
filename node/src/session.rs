@@ -105,6 +105,9 @@ pub fn error_frame(err: &StoreError, op: &Op) -> Frame {
         StoreError::ShapeConflict { expected, got } => {
             (ErrorCode::Protocol, format!("shape conflict: expected {expected:?}, got {got:?}"))
         }
+        StoreError::Unverified { origin, seq, why } => {
+            (ErrorCode::Unauthorized, format!("({origin},{seq}) does not verify: {why}"))
+        }
         StoreError::Io(e) => (ErrorCode::Internal, format!("io: {e}")),
     };
     op_status(op, code, message)

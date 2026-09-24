@@ -113,7 +113,8 @@ impl NodeSigner {
     }
 
     /// Record `node` as authenticated, its HELLO having verified on a link:
-    /// from now on its signatures are checked. Plan Step 4.1b calls it.
+    /// from now on its signatures are checked. Plan Step 4.1b's part 2, D9's
+    /// known set, is to call it.
     pub fn authenticated(&self, node: NodeId) {
         let mut known = self
             .authenticated

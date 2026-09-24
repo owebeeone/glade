@@ -38,10 +38,10 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr};
 use crate::peer::{hello_accept, hello_dial, Channel, NodeIdentity, PeerHello};
 use crate::transport::{Door, EndpointKey};
 
-/// ALPN for the glade node<->node protocol 2 (`peer::PROTOCOL`, plan Step
-/// 4.1a), whose HELLO is signed: a node of protocol 1 fails at connect, not
-/// mid-sync.
-pub const ALPN: &[u8] = b"glade/node/2";
+/// ALPN for the glade node<->node protocol 3 (`peer::PROTOCOL`, plan Step
+/// 4.1b), whose `home` records are signed envelopes and whose HELLO is signed
+/// (4.1a): a node of protocol 1 or 2 fails at connect, not mid-sync.
+pub const ALPN: &[u8] = b"glade/node/3";
 
 fn other<E: Into<Box<dyn std::error::Error + Send + Sync>>>(e: E) -> io::Error {
     io::Error::new(io::ErrorKind::Other, e)
@@ -786,15 +786,16 @@ mod tests {
         endpoint.close().await;
     }
 
-    /// Plan Step 4.1a: the ALPN names protocol 2, so a node of protocol 1, an
-    /// endpoint offering only `glade/node/1`, fails at connect in either
+    /// Plan Steps 4.1a and 4.1b: the ALPN names the protocol, 3 since 4.1b,
+    /// so a node of protocol 2, an endpoint offering only `glade/node/2` as
+    /// every build from 4.1a to 4.3 does, fails at connect in either
     /// direction, before any HELLO is sent.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_protocol_1_node_fails_at_connect() {
+    async fn a_protocol_2_node_fails_at_connect() {
         let bound = std::time::Duration::from_secs(10);
-        let v1: &[u8] = b"glade/node/1";
+        let v2: &[u8] = b"glade/node/2";
         let old = Endpoint::builder(presets::Minimal)
-            .alpns(vec![v1.to_vec()])
+            .alpns(vec![v2.to_vec()])
             .portmapper_config(PortmapperConfig::Disabled)
             .clear_ip_transports()
             .bind_addr((Ipv4Addr::LOCALHOST, 0))
@@ -816,9 +817,9 @@ mod tests {
 
         let at_new = new.addr().unwrap();
         let ea = EndpointAddr::from_parts(at_new.endpoint_id, [TransportAddr::Ip(at_new.socket)]);
-        let dialed = tokio::time::timeout(bound, old.connect(ea, v1)).await;
+        let dialed = tokio::time::timeout(bound, old.connect(ea, v2)).await;
         let refused = dialed.expect("bounded").is_err();
-        assert!(refused, "a protocol-1 dialer connected");
+        assert!(refused, "a protocol-2 dialer connected");
 
         let sockets = old.bound_sockets();
         let port = sockets.iter().find(|s| s.is_ipv4()).unwrap().port();
@@ -829,7 +830,7 @@ mod tests {
         };
         let dialed = tokio::time::timeout(bound, new.dial(&at_old)).await;
         let refused = dialed.expect("bounded").is_err();
-        assert!(refused, "it accepted a protocol-2 dialer");
+        assert!(refused, "it accepted a protocol-3 dialer");
     }
 
     /// Full s-sync over REAL iroh QUIC: the acceptor serves a store with a

@@ -9,6 +9,11 @@
 //! per-`(share, origin)` — it is just an op log, regrouped into chains on `open`
 //! by replaying each op's own `(share, glade_id, key, origin)`. Chain-hash /
 //! equivocation verification (P1.S4) is per-chain.
+//!
+//! The `home` share is the directory's, and its ops are signed (plan Step
+//! 4.1b): one lands only if it verifies (`envelope.rs`), and its chain starts
+//! at seq 0. `open` checks each `home` journal the same way, and sets aside
+//! one that does not verify.
 
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
@@ -20,6 +25,9 @@ use glade_wire::generated::{Head, Op, Shape, StreamHeads};
 use glade_wire::swmr::{decode_swmr, SwmrPayloadError};
 
 use crate::chain::op_hash;
+use crate::envelope::{self, Refused};
+use crate::registry::HOME;
+use crate::sysdir::today;
 
 /// Outcome of an append.
 #[derive(Debug, PartialEq)]
@@ -67,6 +75,9 @@ pub enum StoreError {
     SwmrWriterConflict { expected: String, got: String },
     /// SWMR and a multi-writer fold MUST NOT share one zone-surface.
     ShapeConflict { expected: Shape, got: Shape },
+    /// A `home` op that does not verify (plan Step 4.1b): unsigned, forged,
+    /// or not the directory's form or kind.
+    Unverified { origin: String, seq: i64, why: Refused },
     Io(std::io::Error),
 }
 
@@ -92,6 +103,29 @@ pub struct Store {
     /// Recorded equivocation proofs (persisted under `<root>/proofs/`), in
     /// detection order. A fork is data with a signature on it — kept, not lost.
     proofs: Vec<EquivProof>,
+    /// What `open` set aside: the `home` journals that did not verify.
+    aside: Option<SetAside>,
+}
+
+/// The `home` journals `open` set aside (plan Step 4.1b; `GladeNodeSigning.md`
+/// D8): each renamed, whole, to `<name>.legacy-<date>`, which `open` never
+/// replays, because an op in it did not verify.
+#[derive(Debug, PartialEq)]
+pub struct SetAside {
+    pub journals: usize,
+    pub records: usize,
+    pub date: String,
+}
+
+/// The line both composition roots print once the served store is open.
+impl std::fmt::Display for SetAside {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (journals, records, date) = (self.journals, self.records, &self.date);
+        write!(
+            f,
+            "set aside {journals} journal(s) of the served store's home share ({records} record(s)) that do not verify, renamed *.legacy-{date}"
+        )
+    }
 }
 
 impl Store {
@@ -99,9 +133,19 @@ impl Store {
     /// journal is per-`(share, origin)` file; each op is regrouped into its
     /// chain `(share, glade_id, key, origin)` from its own fields, so one file
     /// can feed several zone-chains. File order preserves per-chain seq order.
+    ///
+    /// A `home` journal is replayed only if it verifies as its ops would if
+    /// appended one by one (plan Step 4.1b). One that does not, such as any
+    /// journal written before the step, is renamed aside whole, and
+    /// [`Store::set_aside`] reports it.
     pub fn open(root: impl Into<PathBuf>) -> Result<Store, StoreError> {
         let root = root.into();
         let mut logs: BTreeMap<ChainId, Vec<Op>> = BTreeMap::new();
+        let mut aside = SetAside {
+            journals: 0,
+            records: 0,
+            date: today(),
+        };
         if root.exists() {
             for share_ent in fs::read_dir(&root)? {
                 let share_ent = share_ent?;
@@ -114,11 +158,23 @@ impl Store {
                 if share_ent.file_name() == "proofs" {
                     continue;
                 }
+                let home = share_ent.file_name().to_string_lossy() == hex(HOME);
                 for log_ent in fs::read_dir(share_ent.path())? {
                     let log_ent = log_ent?;
                     let fname = log_ent.file_name().to_string_lossy().to_string();
                     if fname.ends_with(".log") {
-                        for op in read_log(&log_ent.path())? {
+                        let ops = read_log(&log_ent.path())?;
+                        if home && !verifies(&ops) {
+                            let legacy = format!("{fname}.legacy-{}", aside.date);
+                            fs::rename(
+                                log_ent.path(),
+                                unused_path(&share_ent.path(), &legacy, ""),
+                            )?;
+                            aside.journals += 1;
+                            aside.records += ops.len();
+                            continue;
+                        }
+                        for op in ops {
                             logs.entry(chain_of(&op)).or_default().push(op);
                         }
                     }
@@ -126,7 +182,18 @@ impl Store {
             }
         }
         let proofs = read_proofs(&proofs_path(&root))?;
-        Ok(Store { root, logs, proofs })
+        let aside = (aside.journals > 0).then_some(aside);
+        Ok(Store {
+            root,
+            logs,
+            proofs,
+            aside,
+        })
+    }
+
+    /// The `home` journals `open` set aside, if any.
+    pub fn set_aside(&self) -> Option<&SetAside> {
+        self.aside.as_ref()
     }
 
     /// Append `op` to its `(share, glade_id, key, origin)` chain, with per-chain
@@ -138,12 +205,24 @@ impl Store {
     ///   predecessor's hash (else **chain break**); absent `prev` is accepted
     ///   unverified (M-LIMP lenient — honest clients always set it).
     /// - otherwise a forward **gap**.
+    ///
+    /// A `home` op must verify before anything new of it is kept, and its
+    /// chain starts at seq 0 (plan Step 4.1b). A byte-identical repeat was
+    /// checked when it first landed.
     pub fn append(&mut self, op: Op) -> Result<Append, StoreError> {
         self.validate_surface_contract(&op)?;
         let chain = chain_of(&op);
         // Classify against the current tail without holding a borrow of `logs`
         // across the proof write / push (equivocation records into `proofs`).
-        match classify(self.logs.get(&chain), &op) {
+        let home = op.share == HOME;
+        let verdict = match home {
+            true => classify_home(self.logs.get(&chain), &op),
+            false => classify(self.logs.get(&chain), &op),
+        };
+        if home {
+            checked(&verdict, &op)?;
+        }
+        match verdict {
             Verdict::Duplicate => Ok(Append::Duplicate),
             Verdict::BelowRetained => Ok(Append::BelowRetained),
             Verdict::Gap { expected, got } => Err(StoreError::Gap { expected, got }),
@@ -266,27 +345,6 @@ impl Store {
             .filter_map(|((_, _, _, origin), log)| log.last().map(|o| (origin.clone(), o.seq)))
             .collect()
     }
-
-    /// Take `origin`'s chains on `share` out of the store, and rename their
-    /// journal to `<journal>.legacy-<date>`, which `open` never replays and no
-    /// later call replaces. Plan Step 4.1a sets a node's `home` records under
-    /// its old id aside so. Returns how many ops left the store.
-    pub fn set_aside(&mut self, share: &str, origin: &str, date: &str) -> std::io::Result<usize> {
-        let mut left = 0;
-        self.logs.retain(|(s, _, _, o), log| {
-            let aside = s == share && o == origin;
-            if aside {
-                left += log.len();
-            }
-            !aside
-        });
-        let (dir, name) = (self.root.join(hex(share)), format!("{}.log", hex(origin)));
-        if dir.join(&name).exists() {
-            let to = unused_path(&dir, &format!("{name}.legacy-{date}"), "");
-            fs::rename(dir.join(&name), to)?;
-        }
-        Ok(left)
-    }
 }
 
 /// The first of `<stem><ext>`, `<stem>-2<ext>`, `<stem>-3<ext>` and so on in
@@ -316,6 +374,44 @@ enum Verdict {
     /// An op already sits at this `(origin, seq)` with a different hash — a fork.
     /// Carries the stored op so the proof can be assembled.
     Equivocation(Op),
+}
+
+/// [`classify`], with the `home` share's rule that a chain starts at seq 0
+/// (plan Step 4.1b): an op whose predecessor is not held cannot have it
+/// checked (B5).
+fn classify_home(log: Option<&Vec<Op>>, op: &Op) -> Verdict {
+    if log.is_none_or(|log| log.is_empty()) && op.seq != 0 {
+        return Verdict::Gap {
+            expected: 0,
+            got: op.seq,
+        };
+    }
+    classify(log, op)
+}
+
+/// A `home` op that would be kept, or would convict its origin of a fork,
+/// must verify (plan Step 4.1b).
+fn checked(verdict: &Verdict, op: &Op) -> Result<(), StoreError> {
+    if !matches!(verdict, Verdict::Appended | Verdict::Equivocation(_)) {
+        return Ok(());
+    }
+    envelope::verify(op).map_err(|why| {
+        let (origin, seq) = (op.origin.clone(), op.seq);
+        StoreError::Unverified { origin, seq, why }
+    })
+}
+
+/// Whether a `home` journal's ops verify, each as [`Store::append`] would
+/// take it after the ones before it: appended to its chain, and checked.
+fn verifies(ops: &[Op]) -> bool {
+    let mut chains: BTreeMap<ChainId, Vec<Op>> = BTreeMap::new();
+    ops.iter().all(|op| {
+        let chain = chains.entry(chain_of(op)).or_default();
+        let verdict = classify_home(Some(&*chain), op);
+        let taken = matches!(verdict, Verdict::Appended) && checked(&verdict, op).is_ok();
+        chain.push(op.clone());
+        taken
+    })
 }
 
 fn classify(log: Option<&Vec<Op>>, op: &Op) -> Verdict {
@@ -417,6 +513,20 @@ fn hex(s: &str) -> String {
     s.bytes().map(|b| format!("{:02x}", b)).collect()
 }
 
+// A journal written as a node wrote it before plan Step 4.1b, for other
+// modules' tests. A braced module, so the condition encloses the whole
+// section.
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::*;
+
+    /// Append `op` to its journal under `root` with no check, as the store's
+    /// append did before plan Step 4.1b.
+    pub(crate) fn journal(root: &Path, op: &Op) {
+        append_to_log(root, op).expect("the journal takes the op");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,6 +560,99 @@ mod tests {
             payload: encode_swmr(action, body),
             ..op("sh", origin, seq, b"")
         }
+    }
+
+    /// A sealed record on `home`, the first of its stream in the chain of
+    /// the node whose key is `seed`.
+    fn sealed(seed: u8, principal: &str) -> Op {
+        let record = crate::registry::Record::Principal(crate::sysdata::PrincipalRecord {
+            principal: principal.into(),
+        });
+        crate::envelope::testing::sealed([seed; 32], record)
+    }
+
+    /// Plan Step 4.1b: the served store takes a `home` op only if it
+    /// verifies, from its chain's seq 0. A bare record and a forged envelope
+    /// are refused and not kept; a signed one lands, and its repeat is a
+    /// duplicate; one that would begin a chain above seq 0 is a gap. An app
+    /// op is taken bare, as before (D5).
+    #[test]
+    fn a_home_op_lands_only_signed_and_from_seq_0() {
+        let mut s = Store::open(fresh("home-signed")).unwrap();
+        let signed = sealed(3, "alice");
+        let bare = Op {
+            payload: envelope::record_bytes(&signed.payload),
+            ..signed.clone()
+        };
+        let mut forged = signed.clone();
+        let last = forged.payload.len() - 1;
+        forged.payload[last] ^= 1;
+        let mut refused = |op: Op, want: Refused| match s.append(op) {
+            Err(StoreError::Unverified { why, .. }) => assert_eq!(why, want),
+            other => panic!("expected {want:?}, got {other:?}"),
+        };
+        refused(bare, Refused::Unsigned);
+        refused(forged, Refused::Signature);
+        assert_eq!(s.all_heads(), vec![], "nothing kept");
+        assert_eq!(s.append(signed.clone()).unwrap(), Append::Appended);
+        assert_eq!(s.append(signed).unwrap(), Append::Duplicate);
+        let late = sealed(4, "bob");
+        let late = Op {
+            seq: 3,
+            prev: Some(vec![0; 32]),
+            ..late
+        };
+        assert!(matches!(
+            s.append(late),
+            Err(StoreError::Gap {
+                expected: 0,
+                got: 3
+            })
+        ));
+        assert_eq!(
+            s.append(op("sh", "a", 1, b"app")).unwrap(),
+            Append::Appended
+        );
+    }
+
+    /// Plan Step 4.1b (D8): `open` sets aside, whole, a `home` journal that
+    /// does not verify, here one a node wrote before the step, renaming it to
+    /// `<name>.legacy-<date>`, and replays the rest: another node's signed
+    /// journal and an app share's journal, whose bare ops it never checks.
+    /// It reports what it set aside; a second `open` sets nothing aside.
+    #[test]
+    fn open_sets_aside_a_home_journal_that_does_not_verify() {
+        let root = fresh("home-aside");
+        let signed = sealed(5, "carol");
+        let unsigned = Op {
+            payload: envelope::record_bytes(&signed.payload),
+            origin: "0b".repeat(32),
+            ..signed.clone()
+        };
+        for op in [&unsigned, &signed, &op("sh", "a", 1, b"app")] {
+            append_to_log(&root, op).unwrap();
+        }
+        let s = Store::open(&root).unwrap();
+        let aside = s.set_aside().expect("the unsigned journal set aside");
+        assert_eq!((aside.journals, aside.records), (1, 1));
+        let origin = &unsigned.origin;
+        assert!(
+            s.scan(HOME, &signed.glade_id, &[], origin, -1).is_empty(),
+            "not replayed"
+        );
+        let kept = s.scan(HOME, &signed.glade_id, &[], &signed.origin, -1);
+        assert_eq!(kept, std::slice::from_ref(&signed));
+        assert_eq!(
+            s.scan("sh", "g", &[], "a", -1).len(),
+            1,
+            "app data untouched"
+        );
+        let journal = root.join(hex(HOME)).join(format!("{}.log", hex(origin)));
+        assert!(!journal.exists());
+        let legacy = format!("{}.legacy-{}", journal.display(), today());
+        assert!(Path::new(&legacy).exists(), "kept, renamed");
+        drop(s);
+        assert!(Store::open(&root).unwrap().set_aside().is_none(), "once");
     }
 
     #[test]

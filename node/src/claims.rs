@@ -31,14 +31,14 @@ use std::time::Duration;
 
 use tokio::sync::{Mutex, MutexGuard};
 
-use glade_wire::cbor;
 use glade_wire::generated::Op;
 
+use crate::envelope;
 use crate::registry::{Record, Registry, RegistryApi, G_CLAIMS, G_PRINCIPALS, HOME};
 use crate::server::{refresh_policy, Server, Shared};
 use crate::store::Store;
 use crate::sysdata::{PrincipalRecord, ServeClaim, WorkspaceCreateReq, WorkspaceCreateRes, WorkspaceEntry};
-use crate::sysdir::{now_ms, today, Boot};
+use crate::sysdir::{now_ms, Boot};
 use crate::tasks::Site;
 
 /// Default serve-lease TTL — matches the 30s the traces and tests use.
@@ -113,17 +113,14 @@ impl Server {
     /// TTL and renewal cadence (tests shorten them to observe renewal live).
     /// Returns how many ops the seed newly appended. Call once, before serving.
     ///
-    /// First, plan Step 4.1a: the replica's copies of this node's `home`
-    /// records under its old id are set aside, as boot set records.json's
-    /// aside, so the replica folds one id for this node, as the registry does.
+    /// The replica holds none of this node's `home` records from before plan
+    /// Step 4.1b, unsigned: its `open` set those aside (as it did plan Step
+    /// 4.1a's, under the node's old id), as boot set records.json's aside, so
+    /// the seed lands the registry's signed records on empty chains.
     ///
     /// The registry's grant fold becomes the one the serve paths check (plan
     /// Step 4.3): until adoption they had none, and refused.
     pub async fn adopt_boot_tuned(&self, boot: Boot, lease_ms: i64, renew_ms: u64) -> io::Result<usize> {
-        {
-            let mut store = self.shared.store.lock().await;
-            store.set_aside(HOME, &boot.legacy_id(), &today())?;
-        }
         let seeded = self.seed_registry(&boot.registry.snapshot()).await;
         let policy = boot.registry.policy();
         let state = DirState {
@@ -252,7 +249,7 @@ pub(crate) async fn note_principal(shared: &Arc<Shared>, principal: &str) {
 fn knows_principal(store: &Store, principal: &str) -> bool {
     for (origin, _) in store.heads(HOME, G_PRINCIPALS, &[]) {
         for op in store.scan(HOME, G_PRINCIPALS, &[], &origin, i64::MIN) {
-            if PrincipalRecord::from_cbor(&cbor::decode(&op.payload)).principal == principal {
+            if envelope::record(&op, PrincipalRecord::from_cbor).principal == principal {
                 return true;
             }
         }
@@ -318,7 +315,7 @@ fn max_claim_epoch(store: &Store, share: &str) -> i64 {
     let mut max = 0;
     for (origin, _) in store.heads(HOME, G_CLAIMS, &[]) {
         for op in store.scan(HOME, G_CLAIMS, &[], &origin, i64::MIN) {
-            let c = ServeClaim::from_cbor(&cbor::decode(&op.payload));
+            let c = envelope::record(&op, ServeClaim::from_cbor);
             if c.share == share && c.epoch > max {
                 max = c.epoch;
             }
@@ -365,6 +362,7 @@ pub(crate) mod testing {
 mod tests {
     use super::*;
     use crate::iroh_carrier::PeerEndpoint;
+    use glade_wire::cbor;
     use crate::mesh::who_serves;
     use crate::sysdir::boot_at;
     use std::future::Future;
@@ -393,7 +391,7 @@ mod tests {
         let mut max = i64::MIN;
         for (origin, _) in store.heads(HOME, G_CLAIMS, &[]) {
             for op in store.scan(HOME, G_CLAIMS, &[], &origin, i64::MIN) {
-                let c = ServeClaim::from_cbor(&cbor::decode(&op.payload));
+                let c = envelope::record(&op, ServeClaim::from_cbor);
                 if c.share == share && c.node == node && c.lease_expiry_ms > max {
                     max = c.lease_expiry_ms;
                 }
@@ -433,7 +431,7 @@ mod tests {
         let mut n = 0;
         for (origin, _) in store.heads(HOME, glade_id, &[]) {
             for op in store.scan(HOME, glade_id, &[], &origin, i64::MIN) {
-                n += usize::from(pick(&op.payload));
+                n += usize::from(pick(&envelope::record_bytes(&op.payload)));
             }
         }
         n
@@ -457,10 +455,10 @@ mod tests {
             .collect()
     }
 
-    /// How many of `ops` are on `glade_id` with a payload `pick` accepts.
+    /// How many of `ops` are on `glade_id` with a record `pick` accepts.
     fn count(ops: &[Op], glade_id: &str, pick: impl Fn(&[u8]) -> bool) -> usize {
         ops.iter()
-            .filter(|op| op.glade_id == glade_id && pick(&op.payload))
+            .filter(|op| op.glade_id == glade_id && pick(&envelope::record_bytes(&op.payload)))
             .count()
     }
 
@@ -598,23 +596,22 @@ mod tests {
         assert_eq!(served, saved, "and does after the next renewal");
     }
 
-    /// Plan Step 4.1a: an instance whose records.json and served store hold
-    /// its `home` records under its old id, `hex(sha256(node.key))`, as the
-    /// node wrote them before the step (written here through the same
-    /// registry and store code): an exchange binding its app file has since
-    /// dropped, the principal `alice`, and a live claim on `ws-x` at epoch 3,
-    /// beside a client's app data on `ws-x`. Adoption sets the old id's `home`
-    /// journal aside, so the served store folds the new id's records only:
-    /// the dropped binding routes no exchange, `alice` is minted again under
-    /// the new id, `ws-x` is claimed at epoch 1, and `who_serves` answers the
-    /// new id from the served store and from the registry. The app data
-    /// stays. It does not reach a peer, which can serve the old records back
-    /// until plan Step 4.1b refuses unsigned ones.
+    /// Plan Step 4.1b (D8): an instance whose records.json and served store
+    /// hold its `home` records unsigned, as every node wrote them before the
+    /// step (here by an unsealed registry, and into the journal unchecked): an
+    /// exchange binding its app file has since dropped, the principal `alice`,
+    /// and a live claim on `ws-x` at epoch 3, beside a client's app data on
+    /// `ws-x`. The served store's `open` sets the node's `home` journal
+    /// aside, as boot sets records.json's records aside, so adoption seeds
+    /// signed records alone: the dropped binding routes no exchange, `alice`
+    /// is minted again, `ws-x` is claimed at epoch 1, and `who_serves`
+    /// answers the node from both stores. Every `home` record held verifies,
+    /// the app data stays, and the old journal is kept beside the new one.
     #[tokio::test]
-    async fn adoption_sets_the_old_ids_home_records_aside() {
+    async fn adoption_after_the_unsigned_home_journal_is_set_aside_serves_signed() {
         use crate::registry::StoreApi;
-        let (sys, at) = (fresh("legacy-sys"), fresh("legacy-store"));
-        let old = boot_at(sys.clone(), "gianni").unwrap().legacy_id();
+        let (sys, at) = (fresh("unsigned-sys"), fresh("unsigned-store"));
+        let node = boot_at(sys.clone(), "gianni").unwrap().node_id;
         let mut before = Registry::new();
         let dropped = crate::sysdata::BindingDecl {
             app: "x".into(),
@@ -624,24 +621,23 @@ mod tests {
             zone: "commons".into(),
             retention: "latest".into(),
         };
-        before.append(Record::Binding(dropped), &old).unwrap();
+        before.append(Record::Binding(dropped), &node).unwrap();
         let alice = PrincipalRecord {
             principal: "alice".into(),
         };
-        before.append(Record::Principal(alice), &old).unwrap();
+        before.append(Record::Principal(alice), &node).unwrap();
         let live = ServeClaim {
-            node: old.clone(),
+            node: node.clone(),
             share: "ws-x".into(),
             lease_expiry_ms: now_ms() + 60_000,
             epoch: 3,
         };
-        before.append(Record::Serve(live), &old).unwrap();
+        before.append(Record::Serve(live), &node).unwrap();
         crate::registry::BlobStore::new(&sys)
             .save(&before.snapshot())
             .unwrap();
-        let mut served = Store::open(&at).unwrap();
         for bytes in &before.snapshot().records {
-            served.append(Op::from_cbor(&cbor::decode(bytes))).unwrap();
+            crate::store::testing::journal(&at, &Op::from_cbor(&cbor::decode(bytes)));
         }
         let note = Op {
             share: "ws-x".into(),
@@ -650,12 +646,21 @@ mod tests {
             payload: b"kept".to_vec(),
             ..Op::default()
         };
-        served.append(note).unwrap();
-        drop(served);
+        crate::store::testing::journal(&at, &note);
 
         let boot = boot_at(sys, "gianni").unwrap();
-        let new = boot.node_id.clone();
+        assert_eq!(boot.set_aside.as_ref().map(|aside| aside.records), Some(3));
         let server = Server::open(&at).unwrap();
+        let aside = server
+            .set_aside()
+            .await
+            .expect("the unsigned journal set aside");
+        assert!(
+            aside.starts_with(
+                "set aside 1 journal(s) of the served store's home share (3 record(s))"
+            ),
+            "{aside}"
+        );
         let adopted = server.adopt_boot_tuned(boot, LEASE_TTL_MS, 3_600_000);
         adopted.await.unwrap();
         let shared = server.shared.clone();
@@ -665,29 +670,35 @@ mod tests {
         let st = shared.store.lock().await;
         let routes = crate::exchange::declared_exchange(&st, "x.gone");
         assert!(!routes, "the dropped binding routes no exchange");
-        let minted = st.scan(HOME, G_PRINCIPALS, &[], &new, i64::MIN);
-        assert_eq!(minted.len(), 1, "alice, minted again under the new id");
-        let claims = st.scan(HOME, G_CLAIMS, &[], &new, i64::MIN);
+        let minted = st.scan(HOME, G_PRINCIPALS, &[], &node, i64::MIN);
+        assert_eq!(minted.len(), 1, "alice, minted again");
+        let claims = st.scan(HOME, G_CLAIMS, &[], &node, i64::MIN);
         let epochs: Vec<i64> = claims
             .iter()
-            .map(|op| ServeClaim::from_cbor(&cbor::decode(&op.payload)).epoch)
+            .map(|op| envelope::record(op, ServeClaim::from_cbor).epoch)
             .collect();
         assert_eq!(epochs, [1, 1], "the home claim, then ws-x's, at epoch 1");
-        assert_eq!(who_serves(&st, "ws-x", now_ms()), Some(new.clone()));
-        let chains = st.heads(HOME, G_CLAIMS, &[]);
-        let only_new = chains.iter().all(|(origin, _)| *origin == new);
-        assert!(only_new, "{chains:?}");
+        assert_eq!(who_serves(&st, "ws-x", now_ms()), Some(node.clone()));
+        for (share, glade_id, key) in st.zones().into_iter().filter(|(share, ..)| share == HOME) {
+            for (origin, _) in st.heads(&share, &glade_id, &key) {
+                for op in st.scan(&share, &glade_id, &key, &origin, i64::MIN) {
+                    assert_eq!(envelope::verify(&op), Ok(()), "{glade_id} {origin}");
+                }
+            }
+        }
         let notes = st.scan("ws-x", "notes", &[], "client", -1);
         assert_eq!(notes.len(), 1, "app data stays");
         drop(st);
         let dir = shared.dir.get().unwrap().inner.lock().await;
-        assert_eq!(dir.boot.registry.who_serves("ws-x", now_ms()), Some(new));
+        assert_eq!(
+            dir.boot.registry.who_serves("ws-x", now_ms()),
+            Some(node.clone())
+        );
         let hexed = |s: &str| s.bytes().map(|b| format!("{b:02x}")).collect::<String>();
-        let journal = at.join(hexed(HOME)).join(format!("{}.log", hexed(&old)));
-        assert!(!journal.exists(), "the old journal is no longer replayed");
+        let journal = at.join(hexed(HOME)).join(format!("{}.log", hexed(&node)));
         let legacy = format!("{}.legacy-{}", journal.display(), crate::sysdir::today());
         let kept = std::path::Path::new(&legacy).exists();
-        assert!(kept, "it is kept beside it");
+        assert!(kept, "the old journal is kept beside the new one");
     }
 
     /// F1 live, two booted nodes over real iroh: B starts serving a workspace
@@ -731,7 +742,7 @@ mod tests {
                 let mut hosts = Vec::new();
                 for (origin, _) in st.heads(HOME, crate::registry::G_WORKSPACES, &[]) {
                     for op in st.scan(HOME, crate::registry::G_WORKSPACES, &[], &origin, i64::MIN) {
-                        let e = WorkspaceEntry::from_cbor(&cbor::decode(&op.payload));
+                        let e = envelope::record(&op, WorkspaceEntry::from_cbor);
                         if e.workspace == "ws-live" {
                             hosts = e.eligible_hosts.clone();
                         }
@@ -815,7 +826,7 @@ mod tests {
             let mut n = 0;
             for (origin, _) in st.heads(HOME, G_PRINCIPALS, &[]) {
                 for op in st.scan(HOME, G_PRINCIPALS, &[], &origin, i64::MIN) {
-                    if PrincipalRecord::from_cbor(&cbor::decode(&op.payload)).principal == principal {
+                    if envelope::record(&op, PrincipalRecord::from_cbor).principal == principal {
                         n += 1;
                     }
                 }
@@ -837,7 +848,7 @@ mod tests {
             Frame::Ops(ops) => {
                 assert_eq!(ops.ops.len(), 1);
                 assert_eq!(ops.ops[0].origin, node_id, "attributed to the witnessing node's chain");
-                assert_eq!(PrincipalRecord::from_cbor(&cbor::decode(&ops.ops[0].payload)).principal, "alice");
+                assert_eq!(envelope::record(&ops.ops[0], PrincipalRecord::from_cbor).principal, "alice");
             }
             other => panic!("expected the principal record, got {other:?}"),
         }
@@ -852,7 +863,7 @@ mod tests {
         assert!(matches!(next(&mut r4, "bob welcome").await, Frame::Welcome(_)));
         match next(&mut r2, "the bob record, live").await {
             Frame::Ops(ops) => {
-                assert_eq!(PrincipalRecord::from_cbor(&cbor::decode(&ops.ops[0].payload)).principal, "bob");
+                assert_eq!(envelope::record(&ops.ops[0], PrincipalRecord::from_cbor).principal, "bob");
             }
             other => panic!("expected the live principal record, got {other:?}"),
         }

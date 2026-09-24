@@ -28,12 +28,14 @@ use glade_wire::cbor;
 use glade_wire::generated::{Head, Op, Shape, StreamHeads};
 
 use crate::chain::op_hash;
+use crate::envelope::{self, Refused};
 use crate::grants::Policy;
+use crate::peer::NodeIdentity;
 use crate::sysdata::{
     BindingDecl, BindingRetraction, CapabilityGrant, CapabilityRevocation, NodeRecord, NodeTransportBinding,
     NodeTransportRevocation, PrincipalRecord, ServeClaim, ServiceDefinition, SystemSnapshot, WorkspaceEntry,
 };
-use crate::transport::TransportFold;
+use crate::transport::{self, TransportFold};
 
 /// The home share — the user-scale system declaration space (WD §2). All
 /// directory records live here.
@@ -133,11 +135,16 @@ impl Record {
 /// the fold; the fold stays a pure function of the valid op-set.
 /// `Equivocation` is a different op at a position the chain already holds, a
 /// fork; the same op again is no error but [`Ingested::Duplicate`].
+/// `Unverified` is an op a sealed registry was handed that does not verify
+/// (plan Step 4.1b), and `NotOurs` an append a sealed registry was asked to
+/// make under another node's origin.
 #[derive(Debug, PartialEq)]
 pub enum RegistryError {
     Gap { expected: i64, got: i64 },
     ChainBreak { origin: String, seq: i64 },
     Equivocation { origin: String, seq: i64 },
+    Unverified { origin: String, why: Refused },
+    NotOurs { origin: String },
 }
 
 /// Where an ingested op landed: appended to its chain, or already held there
@@ -293,6 +300,11 @@ pub trait RegistryApi {
 /// appends applied in memory. Same per-origin chain discipline as the wire
 /// store, so the disk gets no more trust than any peer. A clone is the staged
 /// copy [`Registry::accept`] changes before anything is saved.
+///
+/// A booted node's registry is sealed (plan Step 4.1b): it appends as the
+/// node alone, each record in a signed envelope (`envelope.rs`), and takes in
+/// only ops that verify. An unsealed one keeps bare records, as tests and the
+/// journeys' in-memory record host use it.
 #[derive(Clone, Default)]
 pub struct Registry {
     /// The valid op-set, in ingest order. The fold is a pure function of this.
@@ -304,12 +316,23 @@ pub struct Registry {
     /// revocation ([`Registry::from_snapshot`]), so its grant fold cannot be
     /// read ([`Registry::policy`]).
     policy_quarantined: bool,
+    /// The node this registry appends as and seals for, when it is sealed.
+    seal: Option<NodeIdentity>,
 }
 
 impl Registry {
     /// A fresh, empty registry.
     pub fn new() -> Registry {
         Registry::default()
+    }
+
+    /// A fresh, empty registry sealed as `identity` (plan Step 4.1b).
+    pub fn sealed(identity: NodeIdentity) -> Registry {
+        let seal = Some(identity);
+        Registry {
+            seal,
+            ..Registry::default()
+        }
     }
 
     /// Materialise a registry from a snapshot — verify-as-ingest per class-2
@@ -321,7 +344,18 @@ impl Registry {
     /// A quarantined grant or revocation leaves the grant fold unreadable
     /// ([`Registry::policy`]).
     pub fn from_snapshot(snap: &SystemSnapshot) -> (Registry, usize) {
-        let mut reg = Registry::new();
+        Registry::new().load(snap)
+    }
+
+    /// [`Registry::from_snapshot`], sealed as `identity` (plan Step 4.1b), as
+    /// a booted node loads records.json: a record that does not verify is
+    /// quarantined, as a chain break is.
+    pub fn from_snapshot_as(snap: &SystemSnapshot, identity: NodeIdentity) -> (Registry, usize) {
+        Registry::sealed(identity).load(snap)
+    }
+
+    fn load(self, snap: &SystemSnapshot) -> (Registry, usize) {
+        let mut reg = self;
         let mut rejected = 0usize;
         // Track chains whose tail is poisoned so the suffix is dropped too.
         let mut poisoned: BTreeMap<(String, String), bool> = BTreeMap::new();
@@ -357,11 +391,11 @@ impl Registry {
         }
         let mut policy = Policy::default();
         for o in self.fold_iter(G_GRANTS) {
-            let grant = CapabilityGrant::from_cbor(&cbor::decode(&o.payload));
+            let grant = envelope::record(o, CapabilityGrant::from_cbor);
             policy.grant(&grant.principal, &grant.share, grant.verbs);
         }
         for o in self.fold_iter(G_REVOCATIONS) {
-            let revocation = CapabilityRevocation::from_cbor(&cbor::decode(&o.payload));
+            let revocation = envelope::record(o, CapabilityRevocation::from_cbor);
             policy.revoke(&revocation.principal, &revocation.share);
         }
         Some(policy)
@@ -377,8 +411,21 @@ impl Registry {
     /// verify path for both live appends and disk load, and for the ops the
     /// assembly's record host is handed, `assembly::Records::ingest`). An op
     /// the chain already holds, byte for byte, is a duplicate: taken as held,
-    /// and nothing changes (plan Step 4.4; owner, 2026-09-24).
+    /// and nothing changes (plan Step 4.4; owner, 2026-09-24). A sealed
+    /// registry takes an op only if it verifies (plan Step 4.1b).
     pub(crate) fn ingest(&mut self, op: Op) -> Result<Ingested, RegistryError> {
+        if self.seal.is_some() {
+            if let Err(why) = envelope::verify(&op) {
+                let origin = op.origin;
+                return Err(RegistryError::Unverified { origin, why });
+            }
+        }
+        self.link(op)
+    }
+
+    /// The chain checks of [`Registry::ingest`], for an op verified there or
+    /// built here.
+    fn link(&mut self, op: Op) -> Result<Ingested, RegistryError> {
         let chain = (op.glade_id.clone(), op.origin.clone());
         if let Some(&(last_seq, last_hash)) = self.tips.get(&chain) {
             if op.seq <= last_seq {
@@ -425,7 +472,7 @@ impl Registry {
     pub fn has_node(&self, node_id: &str) -> bool {
         self.fold_iter(G_NODES)
             .into_iter()
-            .any(|o| NodeRecord::from_cbor(&cbor::decode(&o.payload)).node_id == node_id)
+            .any(|o| envelope::record(o, NodeRecord::from_cbor).node_id == node_id)
     }
 
     /// Decoded records of one kind, in deterministic (origin, seq) order —
@@ -438,8 +485,15 @@ impl Registry {
 
     /// Append `rec` under `origin`'s chain and hand back the built op — the
     /// runtime directory-write path (`claims.rs`) seeds/fans/pushes the SAME
-    /// bytes it persisted; `RegistryApi::append` delegates here.
+    /// bytes it persisted; `RegistryApi::append` delegates here. A sealed
+    /// registry appends under its own node's origin alone, and seals the
+    /// record once the op is built (plan Step 4.1b).
     pub fn append_returning(&mut self, rec: Record, origin: &str) -> Result<Op, RegistryError> {
+        let ours = self.seal.map(|me| transport::hex(&me.node_id));
+        if ours.is_some_and(|ours| ours != origin) {
+            let origin = origin.into();
+            return Err(RegistryError::NotOurs { origin });
+        }
         let glade_id = rec.glade_id();
         let chain = (glade_id.to_string(), origin.to_string());
         let (seq, prev) = match self.tips.get(&chain) {
@@ -450,7 +504,7 @@ impl Registry {
         // lamport is one clock over both (see `next_binding_lamport`); every
         // other kind keeps its chain seq.
         let lamport = if Record::is_binding_family(glade_id) { self.next_binding_lamport() } else { seq };
-        let op = Op {
+        let mut op = Op {
             share: HOME.into(),
             glade_id: glade_id.into(),
             key: vec![],
@@ -462,7 +516,10 @@ impl Registry {
             shape: Shape::Log,
             payload: rec.encode(),
         };
-        self.ingest(op.clone())?;
+        if let Some(me) = &self.seal {
+            op.payload = envelope::seal(me, &op);
+        }
+        self.link(op.clone())?;
         Ok(op)
     }
 
@@ -488,9 +545,12 @@ impl Registry {
     }
 
     /// Is a byte-identical record already in the fold? The diff basis for
-    /// idempotent minting — the same rule `appdecl::register` applies.
-    pub fn contains(&self, glade_id: &str, payload: &[u8]) -> bool {
-        self.ops.iter().any(|o| o.glade_id == glade_id && o.payload == payload)
+    /// idempotent minting — the same rule `appdecl::register` applies. It
+    /// compares the record an op carries, never its envelope, which differs
+    /// at every append (plan Step 4.1b).
+    pub fn contains(&self, glade_id: &str, record: &[u8]) -> bool {
+        let held = |o: &Op| o.glade_id == glade_id && envelope::record_bytes(&o.payload) == record;
+        self.ops.iter().any(held)
     }
 
     /// Durable acceptance (slice profile SP-L1, plan Step 4.4): `change` runs
@@ -526,7 +586,7 @@ impl RegistryApi for Registry {
     fn who_serves(&self, workspace: &str, now_ms: i64) -> Option<String> {
         self.fold_iter(G_CLAIMS)
             .into_iter()
-            .map(|o| ServeClaim::from_cbor(&cbor::decode(&o.payload)))
+            .map(|o| envelope::record(o, ServeClaim::from_cbor))
             .filter(|c| c.share == workspace && c.lease_expiry_ms > now_ms) // read-time expiry
             .max_by_key(|c| c.epoch) // highest live epoch wins
             .map(|c| c.node)
@@ -536,7 +596,7 @@ impl RegistryApi for Registry {
         // LWW-per-workspace: the latest (origin, seq) WorkspaceEntry wins.
         let mut latest: Option<WorkspaceEntry> = None;
         for o in self.fold_iter(G_WORKSPACES) {
-            let e = WorkspaceEntry::from_cbor(&cbor::decode(&o.payload));
+            let e = envelope::record(o, WorkspaceEntry::from_cbor);
             if e.workspace == share {
                 latest = Some(e);
             }
@@ -553,7 +613,7 @@ impl RegistryApi for Registry {
         let revoked = self
             .fold_iter(G_REVOCATIONS)
             .into_iter()
-            .map(|o| CapabilityRevocation::from_cbor(&cbor::decode(&o.payload)))
+            .map(|o| envelope::record(o, CapabilityRevocation::from_cbor))
             .any(|r| r.principal == principal && r.share == share);
         if revoked {
             return vec![];
@@ -561,7 +621,7 @@ impl RegistryApi for Registry {
         let mut verbs: Vec<String> = self
             .fold_iter(G_GRANTS)
             .into_iter()
-            .map(|o| CapabilityGrant::from_cbor(&cbor::decode(&o.payload)))
+            .map(|o| envelope::record(o, CapabilityGrant::from_cbor))
             .filter(|g| g.principal == principal && g.share == share)
             .flat_map(|g| g.verbs)
             .collect();
@@ -578,7 +638,7 @@ impl RegistryApi for Registry {
         let mut nodes: Vec<String> = self
             .fold_iter(G_NODES)
             .into_iter()
-            .map(|o| NodeRecord::from_cbor(&cbor::decode(&o.payload)))
+            .map(|o| envelope::record(o, NodeRecord::from_cbor))
             .filter(|n| n.operator == operator)
             .map(|n| n.node_id)
             .collect();
@@ -633,7 +693,7 @@ struct Stamp {
 }
 
 /// The newest record for one `(app, glade_id)`: a declaration, with its
-/// stored payload bytes, or `None` for a retraction.
+/// record's bytes as stored, or `None` for a retraction.
 #[derive(Clone, Debug)]
 struct Newest {
     stamp: Stamp,
@@ -664,11 +724,12 @@ impl BindingFold {
         for op in ops {
             let (app, glade_id, decl) = match op.glade_id.as_str() {
                 G_BINDINGS => {
-                    let b = BindingDecl::from_cbor(&cbor::decode(&op.payload));
-                    (b.app.clone(), b.glade_id.clone(), Some((b, op.payload.clone())))
+                    let b = envelope::record(op, BindingDecl::from_cbor);
+                    let record = envelope::record_bytes(&op.payload);
+                    (b.app.clone(), b.glade_id.clone(), Some((b, record)))
                 }
                 G_BINDING_RETRACTIONS => {
-                    let r = BindingRetraction::from_cbor(&cbor::decode(&op.payload));
+                    let r = envelope::record(op, BindingRetraction::from_cbor);
                     (r.app, r.glade_id, None)
                 }
                 _ => continue,
@@ -706,7 +767,7 @@ impl BindingFold {
         by_id.into_values().map(|(_, decl)| decl.clone()).collect()
     }
 
-    /// The declarations live for `app`, by glade id, with the payload bytes
+    /// The declarations live for `app`, by glade id, with the record's bytes
     /// stored for each: what `register` diffs that app's file against.
     pub fn declared_by(&self, app: &str) -> BTreeMap<String, Vec<u8>> {
         self.newest
@@ -923,6 +984,63 @@ mod tests {
         };
         assert_eq!(fork, Err(equivocation));
         assert_eq!(r.snapshot(), held);
+    }
+
+    /// Plan Step 4.1b: a sealed registry appends each record in an envelope
+    /// its node signed, which verifies, and diffs the record, not the
+    /// envelope; it refuses to append under another origin; and it takes in
+    /// only ops that verify, where an unsealed one takes a bare record. A
+    /// reload of its snapshot, sealed, quarantines nothing.
+    #[test]
+    fn a_sealed_registry_signs_its_appends_and_takes_only_what_verifies() {
+        let identity = NodeIdentity::from_key([12; 32]);
+        let me = transport::hex(&identity.node_id);
+        let mut r = Registry::sealed(identity);
+        let op = r.append_returning(claim(&me, "ws", 1_000, 1), &me).unwrap();
+        assert_eq!(envelope::verify(&op), Ok(()), "the appended op verifies");
+        assert!(r.contains(G_CLAIMS, &claim(&me, "ws", 1_000, 1).encode()));
+        let theirs = r.append(claim("peer", "ws", 1_000, 2), "peer");
+        assert_eq!(
+            theirs,
+            Err(RegistryError::NotOurs {
+                origin: "peer".into()
+            })
+        );
+
+        let bare = Op {
+            seq: 1,
+            prev: Some(op_hash(&op).to_vec()),
+            payload: claim(&me, "ws", 2_000, 1).encode(),
+            ..op.clone()
+        };
+        let unsigned = RegistryError::Unverified {
+            origin: me.clone(),
+            why: Refused::Unsigned,
+        };
+        assert_eq!(r.ingest(bare.clone()), Err(unsigned));
+        let other = NodeIdentity::from_key([13; 32]);
+        let forged = Op {
+            payload: envelope::seal(&other, &bare),
+            ..bare.clone()
+        };
+        let bad = RegistryError::Unverified {
+            origin: me.clone(),
+            why: Refused::Signature,
+        };
+        assert_eq!(r.ingest(forged), Err(bad));
+        let first = Op {
+            payload: claim(&me, "ws", 1_000, 1).encode(),
+            ..op
+        };
+        assert_eq!(
+            Registry::new().ingest(first),
+            Ok(Ingested::Appended),
+            "unsealed"
+        );
+
+        let (again, rejected) = Registry::from_snapshot_as(&r.snapshot(), identity);
+        assert_eq!(rejected, 0);
+        assert_eq!(again.snapshot(), r.snapshot());
     }
 
     fn decl(app: &str, glade_id: &str, shape: &str) -> Record {
