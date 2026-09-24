@@ -14,14 +14,14 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
 
 use glade_wire::cbor;
-use glade_wire::generated::{Error, ErrorCode, Head, Heads, Op, Ops, StreamHeads, Welcome};
+use glade_wire::generated::{ErrorCode, Op, Ops, Welcome};
 
 use crate::echo::Echo;
 use crate::frame::Frame;
 use crate::mesh::Mesh;
 use crate::registry::HOME;
 use crate::router::{Router, SessionId};
-use crate::session::{error_frame, heads_map, missing_for, op_status};
+use crate::session::{ack, error_frame, missing_for, op_status, refused_subscribe};
 use crate::store::{Append, Store, StoreError};
 use crate::sysdata::SystemSnapshot;
 use crate::tasks::{Owners, Site, Tasks};
@@ -29,6 +29,12 @@ use crate::ws::{self, Msg};
 
 pub(crate) struct Shared {
     pub(crate) store: Mutex<Store>,
+    /// The cut (GladeSubstrateV1 §6, R4): every fan-out holds it from its
+    /// append until its ops are queued, and a subscribe holds it while it
+    /// registers the session and queues its ack and gap. So each op of a zone
+    /// reaches a subscriber once, after the ack. It is taken before the
+    /// store's, the router's or the session table's lock, never after them.
+    pub(crate) cut: Mutex<()>,
     pub(crate) router: Mutex<Router>,
     pub(crate) out: Mutex<BTreeMap<SessionId, mpsc::UnboundedSender<Vec<u8>>>>,
     pub(crate) next: AtomicU64,
@@ -67,6 +73,7 @@ impl Server {
         Ok(Server {
             shared: Arc::new(Shared {
                 store: Mutex::new(store),
+                cut: Mutex::new(()),
                 router: Mutex::new(Router::new()),
                 out: Mutex::new(BTreeMap::new()),
                 next: AtomicU64::new(1),
@@ -191,10 +198,13 @@ async fn handle(shared: Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
                 crate::exchange::handle_response(&shared, res).await;
             }
             Frame::Hello(h) => {
+                // R4: announced heads are taken on the client's word and, as
+                // a held op's seq does (R3), they only raise the session's.
                 for sh in &h.heads {
-                    let m = client_heads.entry((sh.share.clone(), sh.glade_id.clone(), sh.key.clone())).or_default();
+                    let zone = (sh.share.clone(), sh.glade_id.clone(), sh.key.clone());
+                    let m = client_heads.entry(zone).or_default();
                     for hd in &sh.heads {
-                        m.insert(hd.origin.clone(), hd.seq);
+                        raise(m, &hd.origin, hd.seq);
                     }
                 }
                 // Principals minimal (P0.S7): a Hello naming a principal BINDS
@@ -227,41 +237,40 @@ async fn handle(shared: Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
                     crate::mesh::Route::Absent(reason) => {
                         // The trace's STATUS step (E5): absence is data with a
                         // reason, never silence — and the session stays usable.
-                        let status = Frame::Error(Error {
-                            code: ErrorCode::UnknownShare,
-                            message: reason,
-                            share: Some(s.share.clone()),
-                            glade_id: Some(s.glade_id.clone()),
-                            corr: None,
-                        });
-                        send(&shared, sid, &status).await;
+                        // R6: a `Heads` naming no zone comes first, so a client
+                        // waiting on its ack resolves (plan Step 2.2, F3).
+                        let code = ErrorCode::UnknownShare;
+                        for frame in refused_subscribe(code, reason, &s.share, &s.glade_id) {
+                            send(&shared, sid, &frame).await;
+                        }
                     }
                     route => {
                         // Local AND Forward both register + ack + ship the gap
                         // from the LOCAL replica (the replica serves the reads);
                         // Forward additionally routes the interest to the
                         // claim holder, whose ops arrive and fan out here.
-                        shared.router.lock().await.subscribe(sid, &s.share, &s.glade_id, &key);
-                        let their = client_heads.get(&(s.share.clone(), s.glade_id.clone(), key.clone())).cloned().unwrap_or_default();
-                        let (server_heads, gap) = {
-                            let st = shared.store.lock().await;
-                            (heads_map(&st, &s.share, &s.glade_id, &key), missing_for(&st, &s.share, &s.glade_id, &key, &their))
-                        };
-                        let ack = Frame::Heads(Heads {
-                            streams: vec![StreamHeads {
-                                share: s.share.clone(),
-                                glade_id: s.glade_id.clone(),
-                                key: key.clone(),
-                                heads: server_heads
-                                    .iter()
-                                    .map(|(o, sq)| Head { origin: o.clone(), seq: *sq, hash: None })
-                                    .collect(),
-                            }],
-                        });
-                        send(&shared, sid, &ack).await;
+                        // R4: all under the cut, which every fan-out holds from
+                        // its append until its ops are queued, so each op of
+                        // the zone reaches this session once, after the ack.
+                        let zone = (s.share.clone(), s.glade_id.clone(), key.clone());
+                        let their = client_heads.get(&zone).cloned().unwrap_or_default();
+                        let cut = shared.cut.lock().await;
+                        let mut router = shared.router.lock().await;
+                        router.subscribe(sid, &s.share, &s.glade_id, &key);
+                        drop(router);
+                        let st = shared.store.lock().await;
+                        let heads = ack(&st, &s.share, &s.glade_id, &key);
+                        let gap = missing_for(&st, &s.share, &s.glade_id, &key, &their);
+                        drop(st);
+                        send(&shared, sid, &heads).await;
                         if !gap.is_empty() {
-                            send(&shared, sid, &Frame::Ops(Ops { ops: gap, pri: None })).await;
+                            let ops = Frame::Ops(Ops {
+                                ops: gap,
+                                pri: None,
+                            });
+                            send(&shared, sid, &ops).await;
                         }
+                        drop(cut);
                         if let crate::mesh::Route::Forward(peer) = route {
                             crate::mesh::forward_interest(&shared, peer, s.share.clone(), s.glade_id.clone(), key.clone()).await;
                         }
@@ -284,6 +293,9 @@ async fn handle(shared: Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
                         send(&shared, sid, &home_refused(&op)).await;
                         continue;
                     }
+                    // R4: the cut is held from the append until the fan-out
+                    // is queued (plan Step 2.2).
+                    let cut = shared.cut.lock().await;
                     let res = shared.store.lock().await.append(op.clone());
                     let status = match res {
                         Ok(Append::Appended) => {
@@ -319,6 +331,7 @@ async fn handle(shared: Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
                         }
                         Err(e) => error_frame(&e, &op),
                     };
+                    drop(cut);
                     send(&shared, sid, &status).await;
                 }
             }
@@ -340,12 +353,14 @@ async fn handle(shared: Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
 /// fall, so a repeat of a lower seq leaves them where they are.
 fn hold(heads: &mut BTreeMap<(String, String, Vec<u8>), BTreeMap<String, i64>>, op: &Op) {
     let zone = (op.share.clone(), op.glade_id.clone(), op.key.clone());
-    let head = heads
-        .entry(zone)
-        .or_default()
-        .entry(op.origin.clone())
-        .or_insert(op.seq);
-    *head = (*head).max(op.seq);
+    raise(heads.entry(zone).or_default(), &op.origin, op.seq);
+}
+
+/// A session's head for `origin` in one zone rises to `seq` and never falls,
+/// whether a held op (R3) or a `Hello` (R4) names it.
+fn raise(heads: &mut BTreeMap<String, i64>, origin: &str, seq: i64) {
+    let head = heads.entry(origin.into()).or_insert(seq);
+    *head = (*head).max(seq);
 }
 
 fn to_io(e: StoreError) -> std::io::Error {
@@ -360,7 +375,9 @@ mod tests {
     use super::*;
     use crate::registry::{G_GRANTS, HOME};
     use crate::sysdata::CapabilityGrant;
-    use glade_wire::generated::{ExchangeReq, Op, Ops, Shape, Subscribe};
+    use glade_wire::generated::{
+        Error, ExchangeReq, Head, Heads, Hello, Op, Ops, Shape, StreamHeads, Subscribe,
+    };
 
     fn op(origin: &str, seq: i64, payload: &[u8]) -> Op {
         Op {
@@ -551,11 +568,16 @@ mod tests {
     /// before the ack.
     async fn errors_before_ack(r: &mut ws::WsReader, w: &ws::WsWriter) -> Vec<Error> {
         w.send_binary(&subscribe()).await.unwrap();
+        errors_and_ack(r).await.0
+    }
+
+    /// The `Error` frames up to the next ack, and the ack.
+    async fn errors_and_ack(r: &mut ws::WsReader) -> (Vec<Error>, Heads) {
         let mut errors = Vec::new();
         loop {
             match recv(r).await {
                 Frame::Error(e) => errors.push(e),
-                Frame::Heads(_) => return errors,
+                Frame::Heads(ack) => return (errors, ack),
                 other => panic!("expected errors, then the ack, got {other:?}"),
             }
         }
@@ -698,10 +720,16 @@ mod tests {
     }
 
     /// Subscribe to `sh/g`: the statuses that arrived before its ack, and the
-    /// gap after it. A second subscribe, to a zone with no ops, bounds the
-    /// gap, since its ack follows the gap on the session's one queue.
+    /// gap after it.
     async fn statuses_and_gap(r: &mut ws::WsReader, w: &ws::WsWriter) -> (Vec<Error>, Vec<Op>) {
         let statuses = errors_before_ack(r, w).await;
+        (statuses, ops_until_bound(r, w).await)
+    }
+
+    /// The ops that reach the session before the ack of a subscribe to a zone
+    /// with no ops, which bounds them, since the session's frames leave in the
+    /// order they are queued.
+    async fn ops_until_bound(r: &mut ws::WsReader, w: &ws::WsWriter) -> Vec<Op> {
         let bound = Subscribe {
             share: "sh".into(),
             glade_id: "bound".into(),
@@ -711,12 +739,12 @@ mod tests {
         w.send_binary(&Frame::Subscribe(bound).to_bytes())
             .await
             .unwrap();
-        let mut gap = Vec::new();
+        let mut ops = Vec::new();
         loop {
-            match next(r, "the gap, then the bound's ack").await {
-                Frame::Ops(o) => gap.extend(o.ops),
-                Frame::Heads(_) => return (statuses, gap),
-                other => panic!("expected the gap, then an ack, got {other:?}"),
+            match next(r, "ops, then the bound's ack").await {
+                Frame::Ops(o) => ops.extend(o.ops),
+                Frame::Heads(_) => return ops,
+                other => panic!("expected ops, then an ack, got {other:?}"),
             }
         }
     }
@@ -809,6 +837,171 @@ mod tests {
             seqs,
             [5],
             "the op below the chain's first held seq is not stored"
+        );
+    }
+
+    /// R4 (client-writes plan Step 2.2): the ack is a cut. No op of a zone
+    /// reaches a session before the ack of its subscribe, and each op the node
+    /// holds reaches it once after the ack, in the gap or live. The test stops
+    /// the subscriber where the subscribe arm used to race a writer. It holds
+    /// the router's lock, which the arm takes to register the session, and the
+    /// store's lock while that is free, so the writer's op waits ahead of the
+    /// subscriber's gap: tokio's `Mutex` grants a lock in the order it was
+    /// asked for. The test never waits for a lock while it holds one, so no
+    /// order of the node's locks can deadlock it, and on the node as built any
+    /// order of the two sessions gives the same answer. The pauses only give
+    /// each frame time to reach its lock.
+    #[tokio::test]
+    async fn no_op_of_a_zone_reaches_a_subscriber_before_its_ack() {
+        let (shared, port) = serving("glade-server-cut").await;
+        let (mut r_sub, w_sub) = ws::connect("127.0.0.1", port).await.unwrap();
+        let (_r_writer, w_writer) = ws::connect("127.0.0.1", port).await.unwrap();
+        let pause = || tokio::time::sleep(std::time::Duration::from_millis(50));
+
+        let router = shared.router.lock().await;
+        w_sub.send_binary(&subscribe()).await.unwrap();
+        pause().await; // the subscribe waits for the router's lock
+        let store = shared.store.try_lock().ok();
+        let live = op("w", 0, b"live");
+        w_writer
+            .send_binary(&ops_frame(live.clone()))
+            .await
+            .unwrap();
+        pause().await; // the op waits for a lock
+        drop(router);
+        pause().await; // the subscriber registers, then waits for a lock
+        drop(store);
+
+        let first = next(&mut r_sub, "the subscriber's first frame").await;
+        assert!(
+            matches!(first, Frame::Heads(_)),
+            "an op reached the subscriber before its ack: {first:?}"
+        );
+        match next(&mut r_sub, "the op, after the ack").await {
+            Frame::Ops(o) => assert_eq!(o.ops, std::slice::from_ref(&live)),
+            other => panic!("expected the op after the ack, got {other:?}"),
+        }
+        let again = ops_until_bound(&mut r_sub, &w_sub).await;
+        assert!(
+            again.is_empty(),
+            "the op reached the subscriber twice: {again:?}"
+        );
+    }
+
+    /// R5 (client-writes plan Step 2.2): the ack names each origin's head in
+    /// the zone by seq and hash. `Head.hash` is the 32 bytes of the op at that
+    /// seq, the hash that R1's `corr` spells in hex. A keyed zone's ack names
+    /// its key, and an empty zone's ack names the zone and no origin.
+    #[tokio::test]
+    async fn the_ack_names_each_origin_head_with_its_hash() {
+        let (_shared, port) = serving("glade-server-ack-hashes").await;
+        let (mut r, w) = ws::connect("127.0.0.1", port).await.unwrap();
+
+        let a0 = op("a", 0, b"a zero");
+        let a1 = Op {
+            prev: Some(crate::chain::op_hash(&a0).to_vec()),
+            ..op("a", 1, b"a one")
+        };
+        let b0 = op("b", 0, b"b zero");
+        let keyed = keyed_op("a", 0, b"k", b"keyed");
+        let ops = vec![a0, a1.clone(), b0.clone(), keyed.clone()];
+        w.send_binary(&Frame::Ops(Ops { ops, pri: None }).to_bytes())
+            .await
+            .unwrap();
+        let head = |o: &Op| Head {
+            origin: o.origin.clone(),
+            seq: o.seq,
+            hash: Some(crate::chain::op_hash(o).to_vec()),
+        };
+        let zone = |glade_id: &str, key: &[u8], heads: Vec<Head>| Heads {
+            streams: vec![StreamHeads {
+                share: "sh".into(),
+                glade_id: glade_id.into(),
+                key: key.to_vec(),
+                heads,
+            }],
+        };
+
+        w.send_binary(&subscribe()).await.unwrap();
+        let (statuses, ack) = errors_and_ack(&mut r).await;
+        assert_eq!(ack, zone("g", b"", vec![head(&a1), head(&b0)]));
+        assert_eq!(
+            statuses[1].corr,
+            Some(corr(&a1)),
+            "the head's hash is a1's corr"
+        );
+        w.send_binary(&subscribe_key(Some(b"k".to_vec())))
+            .await
+            .unwrap();
+        assert_eq!(
+            errors_and_ack(&mut r).await.1,
+            zone("g", b"k", vec![head(&keyed)])
+        );
+        let empty = Subscribe {
+            share: "sh".into(),
+            glade_id: "empty".into(),
+            key: None,
+            from: None,
+        };
+        w.send_binary(&Frame::Subscribe(empty).to_bytes())
+            .await
+            .unwrap();
+        assert_eq!(errors_and_ack(&mut r).await.1, zone("empty", b"", vec![]));
+    }
+
+    /// R4 with R3 (owner, on Step 2.1's second question): the session's heads
+    /// never fall. A `Hello` that announces a lower seq than the session holds
+    /// leaves the higher one, so a later subscribe ships none of the session's
+    /// own ops back to it.
+    #[tokio::test]
+    async fn a_later_hello_never_lowers_the_sessions_heads() {
+        let (_shared, port) = serving("glade-server-hello-heads").await;
+        let (mut r, w) = ws::connect("127.0.0.1", port).await.unwrap();
+
+        let zero = op("w", 0, b"zero");
+        let one = Op {
+            prev: Some(crate::chain::op_hash(&zero).to_vec()),
+            ..op("w", 1, b"one")
+        };
+        let frame = Frame::Ops(Ops {
+            ops: vec![zero, one],
+            pri: None,
+        });
+        w.send_binary(&frame.to_bytes()).await.unwrap();
+        let lower = StreamHeads {
+            share: "sh".into(),
+            glade_id: "g".into(),
+            key: vec![],
+            heads: vec![Head {
+                origin: "w".into(),
+                seq: 0,
+                hash: None,
+            }],
+        };
+        let hello = Hello {
+            session: "s".into(),
+            protocol: 1,
+            principal: None,
+            capability: None,
+            heads: vec![lower],
+        };
+        w.send_binary(&Frame::Hello(hello).to_bytes())
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            match next(&mut r, "an op's status").await {
+                Frame::Error(e) => assert_eq!(e.code, ErrorCode::Ok),
+                other => panic!("expected the ops' statuses, got {other:?}"),
+            }
+        }
+        let welcome = next(&mut r, "the Welcome").await;
+        assert!(matches!(welcome, Frame::Welcome(_)), "{welcome:?}");
+
+        let (statuses, gap) = statuses_and_gap(&mut r, &w).await;
+        assert!(statuses.is_empty(), "{statuses:?}");
+        assert!(
+            gap.is_empty(),
+            "the session's own op came back after a Hello announced a lower seq: {gap:?}"
         );
     }
 }

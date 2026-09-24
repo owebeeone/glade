@@ -492,8 +492,12 @@ async fn pull_home(shared: &Arc<Shared>, mut send: SendStream, mut recv: RecvStr
 /// Land one peer-ingested op in the local replica (same chain checks as any
 /// append) and fan it out to the local subscribers of its zone. Rejected or
 /// duplicate ops fan out to no one — the fold only ever sees the valid set.
+/// The cut is held from the append until the fan-out is queued, so a local
+/// subscriber gets the op once, after its ack (R4, client-writes plan Step
+/// 2.2).
 pub(crate) async fn ingest_and_fanout(shared: &Arc<Shared>, from: SessionId, op: Op) {
     let (share, glade_id, key) = (op.share.clone(), op.glade_id.clone(), op.key.clone());
+    let _cut = shared.cut.lock().await;
     let res = shared.store.lock().await.append(op.clone());
     if matches!(res, Ok(Append::Appended)) {
         let targets = shared.router.lock().await.route(from, &share, &glade_id, &key);
@@ -685,8 +689,8 @@ mod tests {
     /// registered; (b) phase C — subscribing that workspace's share routes the
     /// interest via the folded ServeClaim to B, the ops arrive, converge into
     /// A's replica, and keep flowing live; (c) phase E — a share whose only
-    /// claim is lapsed at the reader's clock answers with STATUS data, bounded,
-    /// and the session stays usable.
+    /// claim is lapsed at the reader's clock answers with an ack that names no
+    /// zone, then STATUS data, bounded, and the session stays usable.
     #[tokio::test(flavor = "multi_thread")]
     async fn s_discovery_golden_path_end_to_end() {
         // Node B (workspace host): registers ws-razel + its live claim; the
@@ -792,17 +796,35 @@ mod tests {
         }
 
         // ---- (c) phase E: no live claim -> STATUS data, bounded -------------
+        // R6 (client-writes plan Step 2.2): a refused subscribe gets an ack
+        // that names no zone, then the reason, so a client waiting on its ack
+        // resolves instead of hanging (the plan's F3).
         wc.send_binary(&sub("ws-attic", "ws.tree")).await.unwrap();
+        match next_frame(&mut rc, "ws-attic's refusal ack").await {
+            Frame::Heads(h) => assert!(
+                h.streams.is_empty(),
+                "the refusal's ack names no zone: {h:?}"
+            ),
+            other => panic!("expected an ack that names no zone, got {other:?}"),
+        }
         match next_frame(&mut rc, "ws-attic status").await {
             Frame::Error(e) => {
                 assert_eq!(e.code, glade_wire::generated::ErrorCode::UnknownShare);
                 assert_eq!(e.share.as_deref(), Some("ws-attic"));
+                assert_eq!(e.glade_id.as_deref(), Some("ws.tree"));
+                assert_eq!(e.corr, None, "a refused subscribe names no op");
                 assert!(e.message.contains("no live ServeClaim"), "the reason rides the status: {}", e.message);
             }
             other => panic!("expected STATUS (Error frame), got {other:?}"),
         }
-        // absence is data, not a dead session: the next ask still answers.
+        // absence is data, not a dead session: the next ask still answers,
+        // with an ack that names its zone.
         wc.send_binary(&sub(HOME, crate::registry::G_CLAIMS)).await.unwrap();
-        assert!(matches!(next_frame(&mut rc, "post-absence ack").await, Frame::Heads(_)));
+        match next_frame(&mut rc, "post-absence ack").await {
+            Frame::Heads(h) => {
+                assert_eq!(h.streams.len(), 1, "an accepted ack names its zone: {h:?}")
+            }
+            other => panic!("expected the post-absence ack, got {other:?}"),
+        }
     }
 }

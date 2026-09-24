@@ -221,18 +221,31 @@ impl Store {
     pub fn all_heads(&self) -> Vec<StreamHeads> {
         self.zones()
             .into_iter()
-            .map(|(share, glade_id, key)| {
-                let heads = self
-                    .logs
-                    .iter()
-                    .filter(|((s, g, k, _), _)| *s == share && *g == glade_id && *k == key)
-                    .filter_map(|((_, _, _, origin), log)| {
-                        log.last().map(|o| Head { origin: origin.clone(), seq: o.seq, hash: Some(op_hash(o).to_vec()) })
-                    })
-                    .collect();
-                StreamHeads { share, glade_id, key, heads }
-            })
+            .map(|(share, glade_id, key)| self.zone_heads(&share, &glade_id, &key))
             .collect()
+    }
+
+    /// One zone's version vector: each origin's last seq, with the hash of its
+    /// op there. The subscribe ack names it (GladeSubstrateV1 §6, R5).
+    pub fn zone_heads(&self, share: &str, glade_id: &str, key: &[u8]) -> StreamHeads {
+        let heads = self
+            .logs
+            .iter()
+            .filter(|((s, g, k, _), _)| s == share && g == glade_id && k.as_slice() == key)
+            .filter_map(|((_, _, _, origin), log)| {
+                log.last().map(|o| Head {
+                    origin: origin.clone(),
+                    seq: o.seq,
+                    hash: Some(op_hash(o).to_vec()),
+                })
+            })
+            .collect();
+        StreamHeads {
+            share: share.into(),
+            glade_id: glade_id.into(),
+            key: key.to_vec(),
+            heads,
+        }
     }
 
     /// Ops for a chain `(share, glade_id, key, origin)` with `seq > from_seq`, in

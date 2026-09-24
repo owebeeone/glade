@@ -2142,7 +2142,7 @@ client-ts's suites, grip-share and the demo load, and gryth-ui's vendored copy.
 **Not changed.** The peer paths answer nothing. The `Hello` arm still replaces
 the heads a session announces, and the subscribe arm is untouched: both belong
 to R4, in Step 2.2. The store lock is still released between an append and its
-fan-out (2.2 holds it).
+fan-out (2.2 holds a lock of its own, `cut`, across both; see Step 2.2).
 
 **Tests**, in `server.rs` unless named. Each, new or updated, was run first
 against the code without the change, and the last column gives what that run
@@ -2208,6 +2208,13 @@ show that each pins its own clause.
 4. **The rustfmt ratchet.** It drops from 325 to 322 in `check.sh`, as 4.4,
    the hardening and 4.1a lowered it. Recommend keeping it at 322.
 
+**Owner, 2026-09-24, on these questions** (2.1 landed as glade `bc606f4`): 1
+keep `Append::BelowRetained`; 2 yes, Step 2.2 makes the `Hello` arm keep the
+highest seq, with a test red first (done: see Step 2.2); 3 the owner updates
+`GladeSubstrateV1.md` when 2.2 lands, marking R1 to R6 built and reconciling
+Step 1.1's list; 4 keep 322, lowered again only if a rewrite removes more
+hunks.
+
 **Measured**, on 2026-09-24, on an Apple M3 Pro with Rust 1.96.0, on the final
 tree:
 
@@ -2245,4 +2252,167 @@ tree:
   - `server.rs` +228/−15;
   - `session.rs` +12/−3;
   - `exchange.rs` +17/−1;
+- `check.sh`: the ratchet, one line.
+
+### Step 2.2: the ack is a cut, with hashes, and one refusal form
+
+Written before the code against glade `bc606f4`, where 2.1 landed. The red runs
+and the measured figures are filled in afterwards. The spec is plan Step 2.2
+(R4 to R6), and the owner's answer to 2.1's second question: the `Hello` arm
+keeps the highest seq too.
+
+**What changes.**
+
+- **One lock for the cut.** `Shared` gains `cut`, a `Mutex<()>`. Every fan-out
+  path holds it from its append until its ops are queued: the `Ops` arm, and
+  `mesh::ingest_and_fanout`, which carries the peer push and pull, the forward
+  and `claims::publish`. The subscribe arm holds it while it registers the
+  session, reads the zone's heads and gap, and queues the ack and the gap. So
+  an op of the zone either lands before the cut, and is in the gap, or after
+  it, and is fanned out to the registered session. Either way it arrives once,
+  after the ack (R4). Before, the arm registered the session, then read the
+  gap, and every fan-out path appended, let the store's lock go, and only then
+  routed. So an op could reach a subscriber before its ack, or arrive twice.
+- **Why not the store's lock, as the plan says.** The hardening's
+  `a_renewal_racing_a_serve_reaches_the_served_store_in_chain_order`
+  (`claims.rs`) holds the router's lock, and then takes the store's to read
+  what the serve it stopped has landed. If `ingest_and_fanout` held the store's
+  lock until its fan-out was queued, that serve would wait for the router's
+  lock while holding the store's, and the test would hang. The plan's lock
+  argument covers the production sites, not that test. A lock of its own
+  keeps the argument and the test. The order is `cut`, then the store's, the
+  router's or the session table's, never the reverse, and the directory's
+  before `cut` (`publish`). The store's lock is held no longer than before, so
+  a route decision or an exchange lookup does not wait behind a fan-out.
+- **The ack (R5).** `Store::zone_heads` is the per-zone half of `all_heads`,
+  which now calls it. It gives each origin's last seq, and in `Head.hash` the
+  32 bytes of that op's hash, the hash R1's `corr` spells in hex.
+  `session::ack` puts it in the `Heads` frame. An empty zone's ack still names
+  the zone and no origin.
+- **The refusal (R6).** `session::refused_subscribe(code, reason, share,
+  glade_id)` builds the two frames: `Heads{streams: []}`, then an `Error` with
+  the subscribe's share and stream, the code and the reason, and no `corr`. The
+  absent route sends them with `UnknownShare`. The session is not subscribed,
+  as before. Step 4.3's grant refusal can call the same helper with
+  `Unauthorized`.
+- **The `Hello` arm** raises a zone's heads to what the `Hello` announces and
+  never lowers them, as a held op does under R3. Before, it replaced them, so a
+  later `Hello` naming a lower seq made the gap ship the session's own ops back
+  to it.
+
+**Not changed.** The peer subscribe (`serve_peer_subscribe`) still registers
+before it reads its gap and does not take the cut: the plan leaves that race
+to Step 4.3's peer check. Its ack still carries no hashes, and nothing reads it
+(`run_forward` takes only `Ops`). A declared exchange's attach ack is
+unchanged.
+
+**Tests**, in `server.rs` unless named. Each was run first against glade
+`bc606f4`, and the last column gives what that run printed.
+
+| Test | Proves | Red first |
+| --- | --- | --- |
+| `no_op_of_a_zone_reaches_a_subscriber_before_its_ack` | a writer's op, sent while a subscribe is between its registration and its gap, reaches the subscriber once, after its ack | "an op reached the subscriber before its ack", with the op: 10 runs of 10 |
+| `the_ack_names_each_origin_head_with_its_hash` | the ack of `sh/g` names `a` at seq 1 and `b` at seq 0, each with its op's 32-byte hash, which is the hex of R1's `corr`; a keyed zone's ack names its key; an empty zone's names the zone and no origin | `hash: None` for both heads |
+| `a_later_hello_never_lowers_the_sessions_heads` | after the session's `(w, 0)` and `(w, 1)` are held, a `Hello` announcing `w` at 0 leaves the head at 1, so a subscribe ships nothing back | "the session's own op came back after a Hello announced a lower seq", with its `(w, 1)` |
+| `s_discovery_golden_path_end_to_end` (`mesh.rs`), phase E turned round | a subscribe to `ws-attic` gets `Heads{streams: []}`, then `Error{UnknownShare}` naming the share and the stream with no `corr`; the next subscribe's ack names its zone | "expected an ack that names no zone, got Error(… UnknownShare …)" |
+
+The plan's form of the first test holds only the store's lock. It is not red
+on `bc606f4`: the subscribe arm takes the store's lock for its
+declared-exchange check before it registers, so a subscriber waiting on that
+lock has not registered, and the writer's fan-out misses it. Run 10 times as a
+throwaway test, it passed 10 times. So the test holds the router's lock too,
+and takes the store's with `try_lock`: it never waits for a lock while holding
+one, and cannot deadlock the node, whatever the node's lock order. On the new
+code no interleaving of the two sessions changes its answer. With its three
+50 ms pauses cut to 0 ms, so that the frames reach their locks in whatever
+order they will, it passed 50 runs of 50.
+
+The lock claim above was also run. With the store's lock held through
+`ingest_and_fanout`'s fan-out, as the plan has it,
+`a_renewal_racing_a_serve_reaches_the_served_store_in_chain_order` hung until
+a 30 s alarm killed it. With `cut` it passes, unchanged.
+
+**Default-path changes** (the plan's §9, items 3 and 4).
+
+1. A subscribe to an absent share gets `Heads{streams: []}`, 4 bytes, before
+   its `Error{UnknownShare}`. A shipped client's `subscribe()` now resolves
+   there, as an empty zone, where it waited for the next `Heads` and then
+   resolved the wrong call (F3). So glade-gyld's `resume` and gryth-ui's
+   `startGlade`, which 4.3's note found awaiting each subscribe with no
+   deadline ("The refusal on the wire", above), go on where they would have
+   hung. A share is absent only when the directory knows it and no live claim
+   or reachable holder serves it.
+2. An ack carries each origin's head hash: 33 more bytes per origin (a 34-byte
+   byte string where a 1-byte null was).
+3. No op of a zone reaches a session before its ack, and none reaches it
+   twice. Before, an op could come live before the ack, or both live and in
+   the gap.
+4. Each fan-out holds `cut` from its append until its ops are queued: one
+   route and one queue push per subscriber. A subscribe holds it while it
+   registers, reads its heads and gap, and queues both, the gap's encoding
+   included. Every fan-out on the node waits for a subscribe in progress, and
+   a subscribe for a fan-out in progress.
+5. A `Hello` no longer lowers a head the session holds.
+
+**Named gaps.**
+
+- The peer subscribe keeps F2's race, as the plan says: a forwarded interest
+  can get a live op before its ack, or twice. With `cut` in place, closing it
+  is a few lines in `serve_peer_subscribe`, for Step 4.3's peer check.
+- The peer ack carries no hashes, and no reader wants them yet.
+- What `cut` costs is not measured. A subscribe with a large gap holds it
+  while the gap is read and encoded, and appends on every zone wait meanwhile.
+- R4 holds only while a session's frames leave in the order they are queued,
+  as the substrate says: today's websocket and first-in, first-out outbound.
+- A `Hello`'s heads are still taken on the client's word (R4's failure mode).
+
+**Questions for the owner.**
+
+1. **`cut`, not the store's lock.** Recommend keeping it. It has the plan's
+   shape, one lock that serializes fan-outs and subscribes, keeps the
+   hardening test unchanged, and holds the store's lock no longer than before.
+   The other choice is the plan's store lock. The hardening test would then
+   have to check where the serve stopped with `try_lock` rather than by
+   reading the store, and that test is outside this step's list.
+2. **The cut test's form.** Recommend keeping it, with the router's lock held,
+   since the plan's form passes on the old code. It needs its pauses only to
+   show the red.
+
+**Measured**, on 2026-09-24, on an Apple M3 Pro with Rust 1.96.0, on the final
+tree:
+
+- **The gate** (`glade/node/check.sh`) passes all 8 components, in 56 s. There
+  are 232 node tests on each path, across 15 test binaries, where there were
+  229. The 3 new ones are the three new `server.rs` tests.
+- **rustfmt**: glade-node has 318 hunks, 4 below the baseline of 322. The
+  rewrite removed four old ones: three in `server.rs` (the `Hello` arm's zone
+  line, and the subscribe arm's registration and heads lines) and one in
+  `store.rs` (`all_heads`). No new line is a deviation. The baseline is
+  lowered to 318 in `check.sh`, as the owner allowed. glade-wire stays at 43.
+- **clippy**: glade-node 11 warnings and glade-wire 7, both at baseline, at
+  the same sites.
+- **Time**: `server::` and `session::` run 13 tests in 0.17 s, warm, where 10
+  took 0.01 s. The cut test's three 50 ms pauses are the difference. The lib
+  suite takes 0.47 s.
+- **Downstream**, against the rebuilt default binary, each Rust suite with a
+  scratch target:
+  - client-rs: 9 + 3;
+  - client-ts: 19;
+  - grip-share: 19;
+  - grazel: 26 + 3;
+  - glade-gwz: 9 + 6;
+  - glade-gyld: 233 (1 ignored) + 31.
+
+  All passed unchanged, each at its baseline.
+
+**Size**, in lines added and removed in `.rs` files, doc comments included:
+
+- production: +110/−49, net +61;
+  - `server.rs` +52/−37;
+  - `session.rs` +30/−1;
+  - `store.rs` +24/−11 (`all_heads` calls `zone_heads`);
+  - `mesh.rs` +4;
+- tests: +209/−13;
+  - `server.rs` +187/−9;
+  - `mesh.rs` +22/−4;
 - `check.sh`: the ratchet, one line.

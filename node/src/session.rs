@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use glade_wire::generated::{Error, ErrorCode, Op};
+use glade_wire::generated::{Error, ErrorCode, Heads as WireHeads, Op};
 
 use crate::chain::op_hash;
 use crate::frame::Frame;
@@ -31,6 +31,35 @@ pub fn missing_for(store: &Store, share: &str, glade_id: &str, key: &[u8], their
         out.extend(store.scan(share, glade_id, key, &origin, from));
     }
     out
+}
+
+/// The ack of an accepted subscribe (GladeSubstrateV1 §6, R5): the zone, with
+/// each origin's head by seq and hash. An empty zone's ack names the zone and
+/// no origin.
+pub fn ack(store: &Store, share: &str, glade_id: &str, key: &[u8]) -> Frame {
+    Frame::Heads(WireHeads {
+        streams: vec![store.zone_heads(share, glade_id, key)],
+    })
+}
+
+/// A refused subscribe's two frames (R6): a `Heads` that names no zone, so a
+/// client waiting on an ack resolves and can tell it from an accepted one,
+/// then the reason, which names no op.
+pub fn refused_subscribe(
+    code: ErrorCode,
+    message: String,
+    share: &str,
+    glade_id: &str,
+) -> [Frame; 2] {
+    let reason = Error {
+        code,
+        message,
+        share: Some(share.into()),
+        glade_id: Some(glade_id.into()),
+        corr: None,
+    };
+    let names_no_zone = WireHeads { streams: vec![] };
+    [Frame::Heads(names_no_zone), Frame::Error(reason)]
 }
 
 /// The status of one client op (GladeSubstrateV1 §6, R1): an `Error` frame
