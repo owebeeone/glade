@@ -33,6 +33,11 @@ export class Equivocation extends Error {}
 export class ChainBreak extends Error {}
 export class Gap extends Error {}
 
+/** A zone (share, glade_id, key), keyed as its chains' keys begin. */
+export function zoneKey(share: string, gladeId: string, key: Uint8Array): string {
+  return `${share}\x00${gladeId}\x00${hex(key)}`;
+}
+
 export class Store {
   // chainKey "share\x00gladeId\x00keyHex\x00origin" -> ordered ops
   private logs = new Map<string, Op[]>();
@@ -43,7 +48,7 @@ export class Store {
   }
 
   private chainKey(share: string, gladeId: string, key: Uint8Array, origin: string): string {
-    return `${share}\x00${gladeId}\x00${hex(key)}\x00${origin}`;
+    return `${zoneKey(share, gladeId, key)}\x00${origin}`;
   }
 
   /** Append with per-chain checks (mirrors the rust store). */
@@ -68,6 +73,21 @@ export class Store {
     log.push(op);
     this.logs.set(k, log);
     return "appended";
+  }
+
+  /** Drop a chain's ops from `seq` on: a refused op and its tail
+   *  (GladeSubstrateV1 §6, the client libraries). */
+  dropFrom(share: string, gladeId: string, key: Uint8Array, origin: string, seq: number): void {
+    const k = this.chainKey(share, gladeId, key, origin);
+    const log = this.logs.get(k) ?? [];
+    const at = log.findIndex((o) => o.seq >= seq);
+    if (at < 0) {
+      return;
+    }
+    log.splice(at);
+    if (log.length === 0) {
+      this.logs.delete(k);
+    }
   }
 
   /** Ops for a chain (share, glade_id, key, origin) with seq > fromSeq, in order. */

@@ -11,6 +11,8 @@ import { dirname, join } from "node:path";
 
 import { loadSchema } from "../src/taut/schema.ts";
 import { GladeClient } from "../src/client.ts";
+import { UnresumedChain } from "../src/session.ts";
+import type { OpOutcome } from "../src/answers.ts";
 import { hex, utf8 } from "../src/bytes.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -126,6 +128,68 @@ test("two CRDT writers exchange causal operations through the rust node", async 
 
     alice.close();
     bob.close();
+  } finally {
+    child.kill();
+  }
+});
+
+// Op outcomes (client-writes plan Step 3.3; GladeSubstrateV1 §6, R1 and R7):
+// the node answers every op, and the client tells accepted from refused.
+
+test("an accepted append is ok", async () => {
+  const { port, child } = await startNode();
+  try {
+    const c = new GladeClient(schema, "accepted");
+    await c.connect(`ws://127.0.0.1:${port}`);
+    const outcome = await c.appendOutcome("sh", "g", "value", utf8("one"));
+    assert.equal(outcome.ok, true);
+    assert.equal(outcome.code, "ok");
+    c.close();
+  } finally {
+    child.kill();
+  }
+});
+
+test("a repeated append is ok", async () => {
+  const { port, child } = await startNode();
+  try {
+    const c = new GladeClient(schema, "repeated");
+    await c.connect(`ws://127.0.0.1:${port}`);
+    const first = await c.appendOutcome("sh", "g", "value", utf8("one"));
+    const [again] = await c.sendOpsOutcome([first.op]);
+    assert.equal(again.ok, true);
+    assert.equal(again.code, "ok");
+    c.close();
+  } finally {
+    child.kill();
+  }
+});
+
+test("a refused append stops its chain", async () => {
+  const { port, child } = await startNode();
+  const url = `ws://127.0.0.1:${port}`;
+  try {
+    // Two clients share an origin, so the second one's first append forks the
+    // chain the first one began.
+    const first = new GladeClient(schema, "twin");
+    const second = new GladeClient(schema, "twin");
+    await first.connect(url);
+    await second.connect(url);
+    assert.equal((await first.appendOutcome("sh", "g", "value", utf8("first"))).ok, true);
+    const refused = new Promise<OpOutcome>((resolve) => second.onRefused(resolve));
+    second.append("sh", "g", "value", utf8("second"));
+    assert.equal((await refused).code, "equivocation");
+    // Answer 4: the refused op is dropped, and its chain takes no append ...
+    assert.deepEqual(second.session.dump(), []);
+    assert.throws(() => second.append("sh", "g", "value", utf8("third")), UnresumedChain);
+    // ... until a subscribe of its zone: the replay brings the node's op 0.
+    await second.subscribe("sh", "g");
+    await until(() => second.session.dump().length === 1);
+    const resumed = await second.appendOutcome("sh", "g", "value", utf8("third"));
+    assert.equal(resumed.ok, true);
+    assert.equal(resumed.op.seq, 1);
+    first.close();
+    second.close();
   } finally {
     child.kill();
   }

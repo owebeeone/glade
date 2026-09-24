@@ -5,7 +5,7 @@
 
 import { foldLog, foldValue, type FoldOp } from "./fold.ts";
 import { opHash } from "./hash.ts";
-import { Store, type Op } from "./store.ts";
+import { Store, zoneKey, type Op } from "./store.ts";
 import type { SchemaIndex } from "./taut/schema.ts";
 import { requireFoldShape, requireOpShape } from "./shapes.ts";
 import { decodeSwmrAction } from "./swmr.ts";
@@ -13,10 +13,16 @@ import { decodeSwmrAction } from "./swmr.ts";
 // Op is part of the Session API surface (append/applyRemote/dump) — re-export it.
 export type { Op } from "./store.ts";
 
+/** An append on a chain that lost a refused op, before a subscribe of its zone
+ *  has resumed it (GladeSubstrateV1 §6, the client libraries). */
+export class UnresumedChain extends Error {}
+
 export class Session {
   private lamport = 0;
   private store: Store;
   private schema: SchemaIndex;
+  /** Zones whose own chain lost a refused op, until a subscribe resumes them. */
+  private unresumed = new Set<string>();
   readonly origin: string;
 
   constructor(schema: SchemaIndex, origin: string, store?: Store) {
@@ -31,6 +37,10 @@ export class Session {
     // Resolve capability before advancing lamport or touching the store.
     const opShape = requireOpShape(shape, "append");
     if (opShape === "swmr") decodeSwmrAction(payload);
+    // The session never builds on a refused op.
+    if (this.unresumed.has(zoneKey(share, gladeId, key))) {
+      throw new UnresumedChain(`(${share}, ${gladeId}) lost a refused op: subscribe its zone to resume it`);
+    }
     const ownLog = this.store.scan(share, gladeId, key, this.origin, -Infinity);
     const last = ownLog[ownLog.length - 1];
     this.lamport += 1;
@@ -67,6 +77,22 @@ export class Session {
         // frame for equivocation; here convergence simply ignores bad ops.
       }
     }
+  }
+
+  /** A refused own op goes, with every later op of its chain, so the session
+   *  never folds them; the chain takes no append until `resume`. Another
+   *  origin's op is left alone. */
+  refuse(op: Op): void {
+    if (op.origin !== this.origin) {
+      return;
+    }
+    this.store.dropFrom(op.share, op.glade_id, op.key, op.origin, op.seq);
+    this.unresumed.add(zoneKey(op.share, op.glade_id, op.key));
+  }
+
+  /** A subscribe of the zone has caught its chain up: appends go on. */
+  resume(share: string, gladeId: string, key: Uint8Array = new Uint8Array()): void {
+    this.unresumed.delete(zoneKey(share, gladeId, key));
   }
 
   /** Materialize a bound surface by folding its zone-surface ops (default commons). */

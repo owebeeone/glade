@@ -1,14 +1,21 @@
 // WS destination (P2.S4) — connects a Session to a glade node over a websocket
 // using Node's built-in WebSocket. Frames are `[FrameType tag][CBOR body]`
 // (the frozen wire). Inbound Ops fold into the session; Subscribe is acked by a
-// Heads frame. Carrier detail only — the convergence lives in the Session.
+// Heads frame, and each op sent is answered by an Error frame naming it by hash
+// (answers.ts). Carrier detail only — the convergence lives in the Session.
 
 import { Session } from "./session.ts";
 import * as codec from "./taut/codec.ts";
 import type { SchemaIndex } from "./taut/schema.ts";
-import type { Op } from "./store.ts";
+import { zoneKey, type Op } from "./store.ts";
 import { requireOpShape } from "./shapes.ts";
 import { decodeSwmrAction } from "./swmr.ts";
+import { Answers, type OpOutcome } from "./answers.ts";
+import { hex } from "./bytes.ts";
+import { opHash } from "./hash.ts";
+
+// The node's answer to an op is part of the client API surface — re-export it.
+export type { OpOutcome } from "./answers.ts";
 
 const TAG = {
   Hello: 0, Welcome: 1, Subscribe: 2, Unsubscribe: 3, Ops: 4, Heads: 5,
@@ -28,6 +35,16 @@ function frame(schema: SchemaIndex, tag: number, message: string, value: unknown
   out[0] = tag;
   out.set(body, 1);
   return out;
+}
+
+/** Every op must be one this client carries, before any of them is sent. */
+function requireShippable(ops: Op[], operation: string): void {
+  for (const op of ops) {
+    const shape = requireOpShape(op.shape, operation);
+    if (shape === "swmr") {
+      decodeSwmrAction(op.payload);
+    }
+  }
 }
 
 /** An inbound directed request routed to this session as the attached provider —
@@ -73,6 +90,14 @@ export class GladeClient {
   /** A caller-initiated `close()` must NOT look like a link drop (no reattach). */
   private closing = false;
 
+  // The node answers every op this client sends (GladeSubstrateV1 §6, R1):
+  // the ops wait here by hash, and refusals and unplaced ops are told.
+  private answers = new Answers();
+  private refusedListeners = new Set<(outcome: OpOutcome) => void>();
+  private unplacedListeners = new Set<(outcome: OpOutcome) => void>();
+  /** Each zone's next resend of its unplaced ops (W5). */
+  private resendTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
   constructor(schema: SchemaIndex, origin: string, session?: Session) {
     this.schema = schema;
     this.session = session ?? new Session(schema, origin);
@@ -87,6 +112,9 @@ export class GladeClient {
       ws.onerror = () => reject(new Error("websocket error"));
       ws.onmessage = (ev: MessageEvent) => this.onMessage(new Uint8Array(ev.data as ArrayBuffer));
       ws.onclose = () => {
+        if (this.ws === ws) {
+          this.ended();
+        }
         // A link drop (node death, network loss) — fire drop listeners so a
         // supplier reattaches. A deliberate `close()` is not a drop.
         if (!this.closing) for (const h of [...this.dropHandlers]) h();
@@ -111,7 +139,20 @@ export class GladeClient {
       else this.session.applyRemote(ops);
       for (const h of [...this.opsListeners]) h(ops);
     } else if (tag === TAG.Heads) {
+      // An accepted subscribe's ack names its zone, a refused one's none (R6).
+      // The zone's chain resumes after a refusal, and its unplaced ops go
+      // again (answer 4, W5): Step 3.4 moves both to the end of the replay.
+      for (const s of value.streams as Array<{ share: string; glade_id: string; key: Uint8Array }>) {
+        this.session.resume(s.share, s.glade_id, s.key);
+        this.resend(zoneKey(s.share, s.glade_id, s.key));
+      }
       this.subAcks.shift()?.();
+    } else if (tag === TAG.Error) {
+      // An op's status names it by hash (R1). An Error with no corr is a
+      // refused subscribe's reason (R6), which Step 3.4 reads.
+      if (value.corr !== null) {
+        this.onStatus(value.corr as string, value.code as string, value.message as string);
+      }
     } else if (tag === TAG.Welcome) {
       this.welcomeAcks.shift()?.();
     } else if (tag === TAG.ExchangeReq) {
@@ -164,17 +205,52 @@ export class GladeClient {
   /** Append a local op in a zone (default commons) and ship it to the node. */
   append(share: string, gladeId: string, shape: string, payload: Uint8Array, key?: Uint8Array): Op {
     const op = this.session.append(share, gladeId, shape, payload, key);
-    this.send(frame(this.schema, TAG.Ops, "Ops", { ops: [op], pri: null }));
+    this.ship([op]);
     return op;
   }
 
   /** Ship already-built ops to the node (the binder appends; the client carries). */
   sendOps(ops: Op[]): void {
-    for (const op of ops) {
-      const shape = requireOpShape(op.shape, "sendOps");
-      if (shape === "swmr") decodeSwmrAction(op.payload);
-    }
-    this.send(frame(this.schema, TAG.Ops, "Ops", { ops, pri: null }));
+    requireShippable(ops, "sendOps");
+    this.ship(ops);
+  }
+
+  /** `append`, resolving with the node's answer as data (R1, R7). It fails at
+   *  once, and appends nothing, when no socket is open. */
+  async appendOutcome(share: string, gladeId: string, shape: string, payload: Uint8Array, key?: Uint8Array): Promise<OpOutcome> {
+    this.requireOpen();
+    const op = this.session.append(share, gladeId, shape, payload, key);
+    return new Promise((resolve) => this.ship([op], [resolve]));
+  }
+
+  /** `sendOps`, resolving with the node's answer to each op, in order (R1,
+   *  R7). It fails at once when no socket is open. */
+  async sendOpsOutcome(ops: Op[]): Promise<OpOutcome[]> {
+    this.requireOpen();
+    requireShippable(ops, "sendOpsOutcome");
+    const waiters: Array<(outcome: OpOutcome) => void> = [];
+    const outcomes = ops.map((_, i) => new Promise<OpOutcome>((resolve) => {
+      waiters[i] = resolve;
+    }));
+    this.ship(ops, waiters);
+    return Promise.all(outcomes);
+  }
+
+  /** Report every refusal of an op this client sent; returns an unsubscribe.
+   *  A session the client owns also drops the op and its chain's later ops,
+   *  while a session a binder owns (the `onOps` field set) is only told. With
+   *  no listener, a refusal goes to `console.warn`. */
+  onRefused(handler: (outcome: OpOutcome) => void): () => void {
+    this.refusedListeners.add(handler);
+    return () => this.refusedListeners.delete(handler);
+  }
+
+  /** Report, once, each op the node could not place (W5): the client keeps
+   *  it and its chain, and sends them again. Returns an unsubscribe. With no
+   *  listener, it goes to `console.warn`. */
+  onUnplaced(handler: (outcome: OpOutcome) => void): () => void {
+    this.unplacedListeners.add(handler);
+    return () => this.unplacedListeners.delete(handler);
   }
 
   /** Register an additional inbound-ops listener (fan-out); returns an
@@ -233,5 +309,94 @@ export class GladeClient {
 
   private send(bytes: Uint8Array): void {
     this.ws?.send(bytes);
+  }
+
+  private isOpen(): boolean {
+    return this.ws?.readyState === WebSocket.OPEN;
+  }
+
+  private requireOpen(): void {
+    if (!this.isOpen()) {
+      throw new Error("glade client: not connected");
+    }
+  }
+
+  /** Send ops in one frame, and keep each until its status names it (R1). An
+   *  op sent with no socket open reaches no node, so it is not kept. */
+  private ship(ops: Op[], waiters: Array<(outcome: OpOutcome) => void> = []): void {
+    const open = this.isOpen();
+    this.send(frame(this.schema, TAG.Ops, "Ops", { ops, pri: null }));
+    if (!open) {
+      return;
+    }
+    ops.forEach((op, i) => this.answers.sent(op, hex(opHash(this.schema, op as never)), waiters[i]));
+  }
+
+  /** One op's status (R1): a refusal is told, and a session the client owns
+   *  drops the op and its chain's tail (answer 4); an op not placed is told
+   *  once, and kept to send again (W5). */
+  private onStatus(corr: string, code: string, message: string): void {
+    const answered = this.answers.status(corr, code, message);
+    if (!answered) {
+      return;
+    }
+    if (answered.refused) {
+      if (!this.onOps) {
+        this.session.refuse(answered.outcome.op);
+      }
+      this.tell(this.refusedListeners, answered.outcome, "refused");
+    }
+    if (answered.unplaced) {
+      this.tell(this.unplacedListeners, answered.outcome, "not placed, and kept to send again");
+    }
+    this.pace(answered.zone);
+  }
+
+  /** To the listeners, or with none, to the console: the desk then shows it
+   *  without a change of its own. */
+  private tell(listeners: Set<(outcome: OpOutcome) => void>, o: OpOutcome, what: string): void {
+    if (listeners.size === 0) {
+      console.warn(`[glade] op ${what}: ${o.code} (${o.op.share}, ${o.op.glade_id}, ${o.op.origin}, seq ${o.op.seq}): ${o.message}`);
+      return;
+    }
+    for (const h of [...listeners]) {
+      h(o);
+    }
+  }
+
+  /** Send a zone's unplaced ops again, in their chains' order (W5). */
+  private resend(zone: string): void {
+    const ops = this.answers.unplacedIn(zone);
+    if (ops.length > 0 && this.isOpen()) {
+      this.ship(ops);
+    }
+  }
+
+  /** While a zone has unplaced ops, a timer sends them again on W5's backoff;
+   *  once none remain, it stops. */
+  private pace(zone: string): void {
+    const timer = this.resendTimers.get(zone);
+    if (this.answers.unplacedIn(zone).length === 0) {
+      clearTimeout(timer);
+      this.resendTimers.delete(zone);
+    } else if (timer === undefined) {
+      this.resendTimers.set(zone, setTimeout(() => {
+        this.resendTimers.delete(zone);
+        if (this.isOpen()) {
+          this.resend(zone);
+          this.pace(zone);
+        }
+      }, this.answers.nextResend(zone)));
+    }
+  }
+
+  /** The connection ended: its waiting ops' fates are unknown (R7), and no
+   *  resend runs until an ack on a new one (W5). */
+  private ended(): void {
+    this.answers.ended();
+    for (const t of this.resendTimers.values()) {
+      clearTimeout(t);
+    }
+    this.resendTimers.clear();
   }
 }
