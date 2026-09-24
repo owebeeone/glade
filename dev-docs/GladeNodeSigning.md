@@ -1,6 +1,7 @@
 # Node signing — the decisions Step 4.1 needs
 
-Decision note, 2026-09-24, for the owner. Read-only: no code was changed, built or
+Decision note, 2026-09-24, for the owner. **Ruled 2026-09-24: every decision as recommended
+("all recommended").** Read-only: no code was changed, built or
 committed. Step 4.1 of `dev-docs/GladeFirstSlicePlan.md` ("Genuine signing and the key",
 `:725-742`) cannot start until these choices are made; the slice profile
 (`dev-docs/glade/GladeFirstSliceProfile.md`, SP-P3 to SP-P5, §8 items 3–7) records them as
@@ -79,7 +80,7 @@ and sdax did. Also add confinement rows (`check.sh:65-77`) `node ed25519-dalek g
 `contracts ed25519-dalek -`, keeping the ports algorithm-free
 (`glade/contracts/signer-api/src/lib.rs:50-54`).
 
-**Recommend (b).** **Ruling:** open.
+**Recommend (b).** **Ruling:** as recommended (owner, 2026-09-24).
 
 ## D2. Node identity, and how a verifier finds a node's key
 
@@ -110,7 +111,7 @@ not proof of possession" (`:274-275`).
 Knock-on: `SignerPort::NodeId` stays `[u8; 32]`; its doc changes (`signer-api/src/lib.rs:13`).
 SI-002 wants an unknown signer to be `Unavailable` (`:136-164`); under A the adapter knows
 itself and the nodes it has authenticated at HELLO on configured links, the slice's operator
-trust. **Ruling:** open.
+trust. **Ruling:** as recommended (owner, 2026-09-24).
 
 ## D3. Which key signs for a node in the slice
 
@@ -121,7 +122,7 @@ custody, and the "merge/root transition" E-users-1 says must land first; princip
 by hand in the slice.
 
 **Recommend (a)**, recording B5's certification clause as a slice gap for 5.1. Under D2(A) a
-certificate added later names the same id: no second identity change. **Ruling:** open.
+certificate added later names the same id: no second identity change. **Ruling:** as recommended (owner, 2026-09-24).
 
 ## D4. Where an op's signature travels
 
@@ -181,7 +182,7 @@ The options:
   trusts whatever a trusted peer holds, under any origin.
 
 **Recommend (c)**, leaving (a) to the wire amendment that app-op signatures will need.
-**Ruling:** open.
+**Ruling:** as recommended (owner, 2026-09-24).
 
 ## D5. Who signs the ops that clients originate
 
@@ -206,7 +207,7 @@ Clients send finished ops under their own origins and the node stores them as th
   The node also refuses client writes to `home`, as H-R3 requires; no client writes it today.
 
 **Recommend (d).** App ops stay unsigned, a 5.1 gap: the one-op tamper window
-(`glade/dev-docs/GladePeerSyncNotes.md:77-84`) stays open for them. **Ruling:** open.
+(`glade/dev-docs/GladePeerSyncNotes.md:77-84`) stays open for them. **Ruling:** as recommended (owner, 2026-09-24).
 
 ## D6. What HELLO signs
 
@@ -236,7 +237,7 @@ statement; under (c) it waits for the wire change.
 
 **Recommend (b)**, with the ALPN moved to `glade/node/2` (`iroh_carrier.rs:24`) and
 `PROTOCOL` to 2 (`peer.rs:31`), so old and new nodes fail at connect, not mid-sync. `NodeHello`
-keeps its fields; `sig` carries 64 bytes. **Ruling:** open.
+keeps its fields; `sig` carries 64 bytes. **Ruling:** as recommended (owner, 2026-09-24).
 
 ## D7. Domain strings
 
@@ -260,7 +261,7 @@ Discovery must use the same origin-op tag, or the one adapter meant to "implemen
 run both suites" (`signer-api/src/lib.rs:7-11`) cannot exist. Its `Signer` takes raw bytes
 with no purpose (`glade-discover/crates/glade-discover-signature-api/src/lib.rs:33-42`), so
 its Ed25519 implementation prepends the tag. The families cannot be confused: discovery
-rejects all nine node kinds as malformed (profile `:88-90`). **Ruling:** open.
+rejects all nine node kinds as malformed (profile `:88-90`). **Ruling:** as recommended (owner, 2026-09-24).
 
 ## D8. Existing stores
 
@@ -297,7 +298,7 @@ epochs; keeps `node.key`, all app data and the UI.
 **Recommend (a), automatic:** at 4.1b's first boot, unsigned home records are written once
 to `records.legacy-<date>.json` and never folded; the served store's home copies go with them
 (its `open` replays the journal unchecked, `store.rs:98-126`, so 4.1b makes home ops verify
-there too); the node re-mints. The store half waits for 4.4. **Ruling:** open.
+there too); the node re-mints. The store half waits for 4.4. **Ruling:** as recommended (owner, 2026-09-24).
 
 ## D9. "Verifier unavailable"
 
@@ -316,7 +317,7 @@ node knows, or its own key cannot be read.
 (`glade-node.rs:149-151`), one stderr line per chain per round, and on the assembled path's
 console. An unreadable own key already refuses the start; HELLO closes the link. Discovery's
 kernel has no such result (profile SP-P5); its host withholds the op the same way.
-**Ruling:** open.
+**Ruling:** as recommended (owner, 2026-09-24).
 
 ## D10. Key custody
 
@@ -339,7 +340,7 @@ operator's first run of a one-shot command on the stopped instance,
 refuses a path inside `GLADE_HOME`, never overwrites, writes 0600, and says to move the file
 offline. Until then each boot warns and starts, so grazel is untouched.
 
-**Recommend (a).** **Ruling:** open.
+**Recommend (a).** **Ruling:** as recommended (owner, 2026-09-24).
 
 ## D11. Budget
 
@@ -353,7 +354,7 @@ does not fit. Estimates, tests included:
 | 4.1c — custody and overlay | recovery key and command; the local overlay's check (`sysdir.rs:265-271`) | ~250 | 4.1a, D10 |
 
 4.2 can start after 4.1a; 4.3 should follow 4.1b, or its tests should name F2's bypass.
-**Ruling:** open.
+**Ruling:** as recommended (owner, 2026-09-24).
 
 ## Findings beyond the questions
 

@@ -1425,3 +1425,8 @@ claimed.
 8. **Order.** Recommend 4.3 before 4.1b once question 6 has landed, with the
    peer half as a named gap. The alternative is the 4.1 note's order: 4.4,
    then 4.1b, then 4.3.
+
+**Ruled, owner, 2026-09-24 ("all recommended"):** 1 (a), the `revoke` line;
+2 (a), with the contract's sentence and pattern probe; 3 as recommended; 4 (c),
+the peer paths enforced by default and the websocket path behind a switch that
+is off by default; 5 (b); 6 landed; 7 (a); 8, 4.3 before 4.1b.
