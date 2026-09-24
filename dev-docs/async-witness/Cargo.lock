@@ -867,6 +867,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "glade-carrier-api"
+version = "0.0.0"
+
+[[package]]
+name = "glade-clock-api"
+version = "0.0.0"
+
+[[package]]
+name = "glade-grant-api"
+version = "0.0.0"
+
+[[package]]
 name = "glade-lifecycle-api"
 version = "0.0.0"
 
@@ -874,11 +886,22 @@ version = "0.0.0"
 name = "glade-node"
 version = "0.0.0"
 dependencies = [
+ "glade-carrier-api",
+ "glade-clock-api",
+ "glade-grant-api",
+ "glade-signer-api",
  "glade-wire",
  "iroh",
+ "sdax",
+ "sdax-tokio",
  "sha2 0.10.9",
+ "shaku",
  "tokio",
 ]
+
+[[package]]
+name = "glade-signer-api"
+version = "0.0.0"
 
 [[package]]
 name = "glade-wire"

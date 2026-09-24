@@ -35,6 +35,13 @@ for Phase 1's compile-fail fixtures is a target-table edit and changes neither
 resolution nor the lockfile; adding a new *dependency* is a dependency-posture
 change and needs the plan's §5 read again first.
 
+Update 2026-09-24: `glade-node`, a path dependency, gained the four Step 3.1
+port crates, `shaku` and the sdax crates at the first-slice plan's Steps 3.2
+and 3.3, which left this lockfile stale for `--locked`. It was refreshed with
+`cargo update -p glade-node --offline`: the four port crates were added and
+`glade-node`'s dependency list extended; no version already locked moved. Every
+measurement below predates the refresh.
+
 ## Pins
 
 `sdax`, `sdax-tokio` and `sdax-testkit` all come from Git at the **same** rev,
