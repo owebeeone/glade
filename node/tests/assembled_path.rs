@@ -7,9 +7,11 @@
 //!
 //! Each test sets or removes the variable on the node it spawns, so it reads
 //! the same whichever way the suite runs (the node gate runs it both ways).
-//! The last tests start each root on an instance written before plan Step
-//! 4.1a changed the node id, and check plan Step 4.2's endpoint key: one id
-//! across starts, and a replaced key's binding revoked.
+//! One test starts each root twice with an app file whose seed names a share
+//! no `workspace` line declares, the second time with a `revoke` line added
+//! (plan Step 4.3). The last tests start each root on an instance written
+//! before plan Step 4.1a changed the node id, and check plan Step 4.2's
+//! endpoint key: one id across starts, and a replaced key's binding revoked.
 //! Every file goes under a fresh directory in the system temp dir, and the node
 //! runs with `GLADE_HOME` and `HOME` pointed there: `~/.glade` is never touched.
 
@@ -274,6 +276,62 @@ fn both_roots_boot_register_and_serve_alike() {
     assert_eq!(assembled[2], "registry ready (home served: true)");
     assert_eq!(assembled[3], "app x registered (+2 record(s), 0 unchanged)");
     assert_eq!(assembled[5], "workspace ws-x serving");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Plan Step 4.3's part 1, on each root, over two starts of one instance. The
+/// first start warns on stderr, on its line, of the seed whose share no loaded
+/// `workspace` line declares, and registers it. For the second start the file
+/// gains `revoke owner x`: the one revocation registers, and records.json's
+/// fold then grants `owner` nothing on `x` and keeps its grant on `ws-x`.
+#[test]
+fn both_roots_warn_of_a_seeds_undeclared_share_and_register_a_revoke_line() {
+    let dir = scratch("revoke-line");
+    let home = dir.join("glade-home");
+    let app = dir.join("x.glade");
+    let seeds = "glade-app v1\napp x\n\
+                 seed owner ws-x read.*\n\
+                 seed owner x read.*,gwz.*\n\
+                 workspace ws-x notes\n";
+    let path = app.display().to_string();
+    let warned = format!(
+        "{path}: warning: line 4: no loaded `workspace` line declares the share `x`; the grant registers, \
+         but a seed names a workspace share (expected on a node that reads a share another node serves)"
+    );
+    let warnings = |stderr: &str| -> Vec<String> {
+        stderr
+            .lines()
+            .filter(|line| line.contains(": warning: "))
+            .map(str::to_owned)
+            .collect()
+    };
+    for (root, name) in [(Root::HandWritten, "h"), (Root::Assembled, "a")] {
+        let args = ["--profile", "local", "--name", name, "--app", &path, "0"];
+        std::fs::write(&app, seeds).unwrap();
+        let (lines, stderr) = start_and_stop(&home, root, &args);
+        assert_eq!(warnings(&stderr), [warned.as_str()], "{root:?}");
+        let registered = "app x registered (+3 record(s), 0 unchanged)".to_string();
+        assert!(lines.contains(&registered), "{root:?}: {lines:?}");
+
+        std::fs::write(&app, format!("{seeds}revoke owner x\n")).unwrap();
+        let (lines, stderr) = start_and_stop(&home, root, &args);
+        assert_eq!(
+            warnings(&stderr),
+            [warned.as_str()],
+            "{root:?}: the seed line stays"
+        );
+        let registered = "app x registered (+1 record(s), 3 unchanged)".to_string();
+        assert!(lines.contains(&registered), "{root:?}: {lines:?}, {stderr}");
+        let saved = BlobStore::new(home.join("sys").join(name)).load().unwrap();
+        let (registry, quarantined) = Registry::from_snapshot(&saved);
+        assert_eq!(quarantined, 0);
+        assert_eq!(
+            registry.grants_for("owner", "x"),
+            Vec::<String>::new(),
+            "{root:?}"
+        );
+        assert_eq!(registry.grants_for("owner", "ws-x"), ["read.*"], "{root:?}");
+    }
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

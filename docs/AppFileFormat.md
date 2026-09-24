@@ -1,9 +1,10 @@
 # The `<app>.glade` file format
 
 An `<app>.glade` file declares what an application puts on glade: the surfaces
-it shares, the services it answers, the access it starts with and the workspace
-share it serves from. A glade node loads the file when it starts and registers
-each declaration as an ordinary record. The file is data: nothing in it runs.
+it shares, the services it answers, the access it grants and withdraws, and the
+workspace share it serves from. A glade node loads the file when it starts and
+registers each declaration as an ordinary record. The file is data: nothing in
+it runs.
 
 This page is about the line-oriented `glade-app` app-declaration file, the
 `.glade` file a glade node loads; the brace-nested `.glade` files under
@@ -17,7 +18,10 @@ The page describes the format as today's node accepts it.
 - **share**: a replicated space, named by a token such as `ws-razel`.
 - **surface**: one typed thing shared on a share, named by its **glade id**,
   such as `term.log`.
-- **principal**: an identity that can be granted access, such as `owner`.
+- **principal**: who holds a grant, such as `owner`.
+- **verb**: what a grant allows on a share, such as `read.subscribe`.
+
+[Principals and verbs](#principals-and-verbs) defines both.
 
 ## An example
 
@@ -54,6 +58,7 @@ app <name>                  # exactly once, before any other declaration
 binding <glade_id> <shape> <authority> <zone> <retention> [ttl=<duration>] [shape-profile=<profile>]
 service <name> <exchange-glade-id>
 seed <principal> <share> <verb[,verb...]>
+revoke <principal> <share>
 workspace <share> <name>
 # a comment runs from `#` to the end of the line
 ```
@@ -169,21 +174,68 @@ request/response surface, `<exchange-glade-id>`, answered by the service
 `<name>`. Each request is answered by a single provider, the one attached on
 the node that serves the request's share: an exchange never fans out.
 
+`<name>` names the provider that answers the exchange, such as `grazel` in
+grazel-app.glade or `glade-gyld`, the supplier grazel starts, in
+gyld-app.glade. It is kept with the declaration as data, and nothing reads it:
+a request is routed by its share and the exchange's glade id alone, and the
+provider that answers is whichever one attached to the exchange there, under
+any name. `<name>` is not a principal and not a share, so no grant names it.
+
 ### `seed`: a starting grant
 
 `seed <principal> <share> <verb[,verb...]>` grants `<principal>` the listed
 verbs on `<share>`. Verbs are separated by commas with no spaces, and a verb may
-be a pattern such as `read.*`. At registration a seed becomes an ordinary grant
+be a pattern such as `read.*` ([Principals and verbs](#principals-and-verbs)
+says what each token means). At registration a seed becomes an ordinary grant
 record, and a revocation always wins over it, even when the file is loaded
-again. The node records grants but does not enforce them yet.
+again: see [`revoke`](#revoke-withdrawing-grants). The node records grants but
+does not enforce them yet.
 
 `<share>` is the workspace share the app's surfaces live on, the share a
 `workspace` line declares (`ws-notes` in the example above), not a share named
-after the app. The shipped `grazel-app.glade` does not follow this yet: its
-`seed owner grazel …` lines name the app. They are corrected together with the
-route that revokes a seeded grant, so that the grants they already made can be
-withdrawn (Step 4.3 of `dev-docs/GladeFirstSlicePlan.md` in the glade-wz
-workspace).
+after the app. The node checks the seeds of all the files it loads at a start
+together: a seed whose share no `workspace` line in any of them declares is
+reported on its line, as a warning, and its grant still registers. A file whose
+line 7 is `seed owner notes notes.*` is told:
+
+```text
+notes.glade: warning: line 7: no loaded `workspace` line declares the share `notes`; the grant registers, but a seed names a workspace share (expected on a node that reads a share another node serves)
+```
+
+The warning is expected on a node that reads a share another node serves: its
+seeds grant its own clients on that share, and it must not load the share's
+`workspace` line, which would make it claim the share.
+
+The shipped `grazel-app.glade` does not follow this yet: its
+`seed owner grazel …` lines name the app, and the node warns about both. They
+are corrected, with a `revoke owner grazel` line that withdraws the grants they
+made, once a node that reads `revoke` is deployed (Step 4.3 of
+`dev-docs/GladeFirstSlicePlan.md` in the glade-wz workspace).
+
+### `revoke`: withdrawing grants
+
+`revoke <principal> <share>` withdraws every grant `<principal>` holds on
+`<share>`, whatever its verbs and wherever it came from: a seed in this file or
+another, or a grant made any other way. At registration the line becomes an
+ordinary revocation record, and, as for a seed, loading the file again
+registers nothing new.
+
+- **A revocation wins for good.** A revocation of a principal on a share wins
+  over every grant of that pair, made before it or after it. A later `seed` of
+  the same principal and share still registers a grant, and the grant allows
+  nothing. No line undoes a revocation.
+- **Its share need not be a workspace share**, and the node does not warn about
+  it: a revocation names the share the grants it withdraws name, and
+  withdrawing grants on a share that nothing serves is one of its uses. For
+  example, `revoke owner grazel` withdraws the grants of the old
+  `seed owner grazel …` lines, which named the app rather than its workspace
+  share.
+- **It acts from the node's next start, on that node alone.** A node reads its
+  app files only when it starts, and a revocation, like a grant, counts only on
+  the node that registered it.
+- **An older node refuses the line.** A node built before `revoke` existed
+  refuses a file that carries it, with `` line N: unknown declaration `revoke` ``,
+  and does not start. Update the node before you add the line.
 
 ### `workspace`: the share this app serves from
 
@@ -297,6 +349,35 @@ retention `glade-app v1` does not accept, a warning naming what to write and
 `glade-app v1`, the version it changed in. A `glade-app v0` file is never
 refused for its retention.
 
+## Principals and verbs
+
+A `seed` line names a principal and the verbs it is granted, and a `revoke`
+line names a principal. The node records grants but does not enforce them yet.
+This section says what the tokens mean, which is what the node checks once it
+enforces them.
+
+**Principals.** A principal is one token, naming who holds a grant.
+
+| Principal | Meaning |
+| --- | --- |
+| `owner` | The node's owner, the person the node runs for. |
+| 64 lower-case hexadecimal digits | A node: the id a node prints when it starts, on its `node <id>` line. A grant to a node is how the node that serves a share lets another node read it. The id comes from the node's key, so a grant to it is written again if that node's key is replaced. |
+| any other token | Whoever a client names in its Hello. The node takes the name on the client's word: it does not yet check who the client is. |
+
+Once grants are enforced, a client whose Hello names a node's id, or names no
+principal at all, holds no grant.
+
+**Verbs.** A verb names what a grant allows on its share.
+
+| What is asked | Verb |
+| --- | --- |
+| reading a surface | `read.subscribe` |
+| a request on an exchange | the exchange's glade id, such as `gwz.ops` |
+
+A verb that ends in `.*` is a pattern: `p.*` allows every verb that begins
+with `p.`. So `read.*` allows `read.subscribe`, `gwz.*` allows `gwz.ops`, and
+`gyld.*` allows `gyld.ops`. Any other verb allows only itself.
+
 ## Changing or deleting a line
 
 A node reads its app files only when it starts, so an edit takes effect at the
@@ -337,7 +418,8 @@ before it writes anything, and the message names both files.
   lines: each of the app's `binding` declarations is retracted, and the file
   can then be left out. Nothing else is withdrawn: the exchange each of the
   app's `service` lines declared stays declared and routable, and the app's
-  workspace entry and seed grants stay (see [Other lines](#other-lines)).
+  workspace entry and seed grants stay (see [Other lines](#other-lines)); a
+  `revoke` line withdraws a seed's grant.
   Retiring the old name this way is how to rename an app without leaving its
   `binding` declarations live; the old name's `service` declarations stay.
 - **The node stores the retention in the contract's spelling.** Whichever
@@ -359,8 +441,12 @@ workspace), and whether a later format adds one is an open question.
   the share, because at start it serves the shares its loaded files declare,
   so it stops claiming it. The registered entry that names the node as an
   eligible host of the share stays.
-- Deleting a `seed` line does not withdraw the grant it made; revoking the
-  grant does, and a revocation always wins over a seed.
+- Deleting a `seed` line does not withdraw the grant it made. A `revoke` line
+  for its principal and share does (see
+  [`revoke`](#revoke-withdrawing-grants)), and a revocation always wins over a
+  seed.
+- Deleting a `revoke` line restores nothing: the revocation stays, so its
+  principal still holds no grant on its share.
 
 ## See also
 

@@ -780,7 +780,8 @@ owner relayed from Step 4.1's note (`GladeNodeSigning.md` D5, D11, F2).
 **Stopped before code.** Three of the brief's stop conditions hold, so this
 section was the step's whole output, and nothing below was built when it
 stopped. One piece has landed since, on the lane owner's word: see "Part 1
-(landed)", below.
+(landed)", below. The node side of the rest of part 1 followed, on the owner's
+rulings: see "Part 1, landing (i)".
 
 1. No route revokes a seeded grant (precondition 1).
 2. The verb vocabulary and the principal vocabulary are undecided. The check
@@ -839,6 +840,93 @@ covers it, and it depends on nothing undecided.
   - Against the rebuilt default binary: grazel 26 + 3, glade-gwz 9 + 5,
     glade-gyld 233 (1 ignored) + 31.
 - **Size.** 23 production lines and 109 test lines.
+
+### Part 1, landing (i): the `revoke` line, the seed warning and the page
+
+Built on 2026-09-25 against glade `0bef8cd`, on the owner's rulings of
+2026-09-24 (below, "Questions for the owner"). It is the node side of the rest
+of part 1. No app file changes in it. The owner's desk re-reads
+`grazel/apps/grazel-app.glade` at every restart, and a node built before this
+landing refuses a `revoke` line, so the corrected lines wait for landing (ii),
+once this build is the default binary.
+
+- **What changed** (`node/src/appdecl.rs`).
+  - `revoke <principal> <share>` is a directive. It parses to a
+    `CapabilityRevocation` (`AppDecl::revocations`), after `app`, with exactly
+    two tokens, and `register` appends it as an ordinary record on
+    `dir.revocations`, under the registrant's chain, after the seeds. It is
+    diffed like a seed: loaded again, it appends nothing.
+  - The fold needed no change. `grants_for` already answers no verb for a pair
+    that any revocation names, whichever came first (`registry.rs:512-533`).
+  - `load_all` checks the seeds of one start's files together (precondition
+    4). A seed whose share no `workspace` line in any of them declares is
+    warned on its line, after the file's own warnings. Both roots print what
+    `load_all` returns, so neither root changed. A `revoke` line is not
+    checked. Each seed's line is kept as parse data (`AppDecl::seed_lines`).
+  - The warning, as the node prints it:
+    `` <file>: warning: line N: no loaded `workspace` line declares the share `S`; the grant registers, but a seed names a workspace share (expected on a node that reads a share another node serves) ``.
+- **The page** (`docs/AppFileFormat.md`).
+  - `revoke` in the grammar, with its own section beside `seed`.
+  - A seed's share rule, with the warning.
+  - `service <name>`: a label kept as data, read by nothing.
+  - A section "Principals and verbs", with the ruled vocabulary.
+  - What deleting a `seed` line or a `revoke` line does.
+- **Tests**, each seen red in a scratch copy with the part it guards switched
+  off.
+  - `a_revoke_line_parses_to_the_pair_it_withdraws` (`appdecl.rs`). With the
+    `revoke` arm off, as at HEAD: "line 4: unknown declaration `revoke`".
+  - `a_revoke_line_withdraws_a_seeded_grant`. With the arm off: "line 5:
+    unknown declaration `revoke`". With `register` appending no revocation:
+    `left: (0, 2)`, `right: (1, 2)`.
+  - `a_seed_whose_share_no_loaded_workspace_declares_is_warned`. With the
+    check warning of nothing, the warnings are the `v0` header's alone.
+  - `both_roots_warn_of_a_seeds_undeclared_share_and_register_a_revoke_line`
+    (`tests/assembled_path.rs`): both roots, two starts of one instance. With
+    the check off, stderr has no warning line. With the registration off, the
+    second start prints `app x registered (+0 record(s), 3 unchanged)`. With
+    the arm off, the second start is refused:
+    `` x.glade: line 6: unknown declaration `revoke` ``.
+- **Default-path changes.** Two, both at start.
+  - A file that carries `revoke` loads and registers the revocation. Before,
+    the node refused it and did not start.
+  - A seed whose share no loaded `workspace` line declares prints a warning on
+    stderr. With today's files that is grazel-app.glade's two
+    `seed owner grazel …` lines, 50 and 51, on the desk and in every suite that
+    loads the file, and the fixtures' `seed owner gyld gyld.*` and
+    `seed owner gwz gwz.*`. The suites discard or inherit the node's stderr,
+    and none asserts on it.
+- **The desk's next restart**, replayed in a temp home with the hand-written
+  root and both files, as grazel starts the node:
+  - on today's files it prints the two warnings and registers nothing new
+    (`+0 record(s), 11 unchanged` and `+0 record(s), 12 unchanged`);
+  - the node binary before this landing refuses landing (ii)'s file:
+    `` apps/grazel-app.glade: line 56: unknown declaration `revoke` ``;
+  - this build, on landing (ii)'s files, registers two records, the grant of
+    `gwz.*` on `ws-razel` and the revocation
+    (`app grazel registered (+2 record(s), 10 unchanged)`). The fold then gives
+    `owner` nothing on `grazel`, and `gwz.*`, `gyld.*` and `read.*` on
+    `ws-razel`. The next start registers nothing.
+- **Landing (ii)**, once this build is the default binary.
+  - Both grazel-app.glade copies: the seeds name `ws-razel`, and
+    `revoke owner grazel` withdraws the old pair.
+  - The fixtures' seeds name `ws-razel`.
+  - The counts follow. grazel-app.glade registers 12 records: 7 bindings, a
+    service, 2 seeds, the revocation and the workspace. Its `read.*` grant on
+    `ws-razel` is byte-identical to gyld-app.glade's, so in one store it
+    registers once.
+  - The census test loads each shipped file as the node does, through
+    `load_all`.
+  - Dry-run in a scratch tree: the edited tests fail against today's files
+    and pass, 270 on each root, against landing (ii)'s.
+- **Measured** on 2026-09-25.
+  - The gate passes all 8 components, with 270 node tests on each path (266
+    before).
+  - rustfmt: glade-node 316 hunks, one below its baseline, which is lowered to
+    316; glade-wire 43.
+  - clippy stays at 11 warnings for glade-node and 7 for glade-wire.
+- **Size.** Production: 94 lines added and 15 removed in `appdecl.rs`; of the
+  added, 47 are code and 46 comment. Tests: 183 added and 4 removed. The page:
+  100 added and 14 removed.
 
 ### The grant fold: the node's own registry
 

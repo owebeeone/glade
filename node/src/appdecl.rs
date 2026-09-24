@@ -2,11 +2,12 @@
 //! declaration file, LOADED as runtime data, never a compiler front-end.
 //!
 //! The file is the legible app surface: its BindingDecls + ServiceDefinitions
-//! register as ordinary home-share records, and its ACL seeds COMPILE TO
-//! CapabilityGrant records — all appended under the REGISTRANT's chain, byte-
-//! identical to what dynamic configuration writes. There is no second,
-//! privileged "install" path: an app only ever CONTRIBUTES records, and base
-//! glade folds them without knowing any app (grazel is just the first).
+//! register as ordinary home-share records, its ACL seeds COMPILE TO
+//! CapabilityGrant records and its `revoke` lines to CapabilityRevocation
+//! records — all appended under the REGISTRANT's chain, byte-identical to
+//! what dynamic configuration writes. There is no second, privileged
+//! "install" path: an app only ever CONTRIBUTES records, and base glade folds
+//! them without knowing any app (grazel is just the first).
 //!
 //! Format (the smallest faithful serialization — line-oriented text, zero
 //! deps, diff-friendly; see `apps/grazel-app.glade` and
@@ -18,6 +19,7 @@
 //! binding <glade_id> <shape> <authority> <zone> <retention> [ttl=<duration>] [shape-profile=<profile>]
 //! service <name> <exchange-glade-id>
 //! seed <principal> <share> <verb[,verb...]>
+//! revoke <principal> <share>   # withdraws every grant of the pair, for good (plan Step 4.3)
 //! workspace <share> <name>     # a workspace share this app serves from
 //! ```
 //!
@@ -51,8 +53,15 @@
 //! app's declarations are never in scope; but a second file naming the same
 //! app would retract the first's bindings on every start, which is why
 //! [`load_all`] refuses a start whose files name one app twice. `service`,
-//! `seed` and `workspace` lines keep the plain diff: deleting one retracts
-//! nothing.
+//! `seed`, `revoke` and `workspace` lines keep the plain diff: deleting one
+//! retracts nothing. A seed's grant is withdrawn by a `revoke` line for its
+//! principal and share, which the fold lets win over every grant of that
+//! pair, made before it or after (`RegistryApi::grants_for`).
+//!
+//! A seed names the workspace share it grants on (ruled 2026-09-23), so
+//! [`load_all`] warns on a seed whose share no `workspace` line of that start
+//! declares (plan Step 4.3's precondition 4). A `revoke` line is never warned
+//! for its share: withdrawing a grant on a share nothing serves is its use.
 
 use std::fs;
 use std::io;
@@ -62,7 +71,10 @@ use glade_wire::cbor;
 use glade_wire::generated::Op;
 
 use crate::registry::{BindingFold, Record, RegistryApi, RegistryError};
-use crate::sysdata::{BindingDecl, BindingRetraction, CapabilityGrant, ServiceDefinition, WorkspaceEntry};
+use crate::sysdata::{
+    BindingDecl, BindingRetraction, CapabilityGrant, CapabilityRevocation, ServiceDefinition,
+    WorkspaceEntry,
+};
 
 mod tail;
 
@@ -152,6 +164,18 @@ const MISPLACED_V0: &str =
 /// header: the file cannot name the source yet.
 const EXTERNAL_WARNING: &str =
     "authority `external` names no source yet: the binding registers, and nothing acts on it";
+/// What a seed whose share no loaded `workspace` line declares is told, on
+/// its line ([`load_all`]; plan Step 4.3's precondition 4, SUR-P3-6): a seed
+/// names the workspace share it grants on. The grant still registers, and the
+/// warning is expected on a node that reads a share another node serves: it
+/// grants its own clients there, and a `workspace` line would make it claim
+/// the share.
+fn undeclared_seed_share(share: &str) -> String {
+    format!(
+        "no loaded `workspace` line declares the share `{share}`; the grant registers, but a seed \
+         names a workspace share (expected on a node that reads a share another node serves)"
+    )
+}
 /// The authority kinds (decl surface): the share is the source of record, or
 /// the share caches external truth.
 const AUTHORITIES: [&str; 2] = ["share", "external"];
@@ -175,11 +199,20 @@ pub struct AppDecl {
     pub tails: Vec<BindingTail>,
     pub services: Vec<ServiceDefinition>,
     pub seeds: Vec<CapabilityGrant>,
+    /// The line each seed is on, in the order of `seeds`. Parse data only:
+    /// [`load_all`] reads it to warn on a seed no loaded `workspace` line
+    /// declares the share of.
+    pub seed_lines: Vec<usize>,
+    /// The `revoke` lines (plan Step 4.3), each the pair it withdraws every
+    /// grant of.
+    pub revocations: Vec<CapabilityRevocation>,
     pub workspaces: Vec<WorkspaceDecl>,
     /// The non-fatal channel (R10(a)): line-numbered messages about a file
     /// that still loads. `parse` fills it in file order — a `v0` header's
-    /// warning, then each binding line's zone and retention checks — and
-    /// whoever loaded the file prints it (see [`AppDecl::warning_lines`]).
+    /// warning, then each binding line's zone and retention checks — then
+    /// [`load_all`] adds one per seed whose share no loaded `workspace` line
+    /// declares, and whoever loaded the file prints it (see
+    /// [`AppDecl::warning_lines`]).
     pub warnings: Vec<String>,
 }
 
@@ -373,6 +406,21 @@ pub fn parse(text: &str) -> Result<AppDecl, String> {
                     share: toks[2].into(),
                     verbs: toks[3].split(',').map(str::to_string).collect(),
                 });
+                decl.seed_lines.push(n);
+            }
+            "revoke" => {
+                if decl.app.is_empty() {
+                    return Err(format!(
+                        "line {n}: `app` must be declared before any revoke"
+                    ));
+                }
+                if toks.len() != 3 {
+                    return Err(format!("line {n}: `revoke <principal> <share>`"));
+                }
+                decl.revocations.push(CapabilityRevocation {
+                    principal: toks[1].into(),
+                    share: toks[2].into(),
+                });
             }
             "workspace" => {
                 if decl.app.is_empty() {
@@ -514,8 +562,13 @@ pub fn load(path: impl AsRef<Path>) -> io::Result<AppDecl> {
 /// the first's bindings, and the first the second's, on every start. The
 /// refusal is one line, prefixed with the later file's path as `load`
 /// prefixes its errors, naming the app and the earlier file's path.
+///
+/// The files that load are then checked together: a seed whose share no
+/// `workspace` line of any of them declares is warned on its line (plan Step
+/// 4.3's precondition 4), after the file's own warnings. The files are the
+/// start's, so a seed may rely on another file's `workspace` line.
 pub fn load_all<P: AsRef<Path>>(paths: &[P]) -> io::Result<Vec<AppDecl>> {
-    let decls: Vec<AppDecl> = paths.iter().map(load).collect::<io::Result<_>>()?;
+    let mut decls: Vec<AppDecl> = paths.iter().map(load).collect::<io::Result<_>>()?;
     for (later, decl) in decls.iter().enumerate() {
         if let Some(earlier) = decls[..later].iter().position(|d| d.app == decl.app) {
             return Err(io::Error::new(
@@ -529,7 +582,29 @@ pub fn load_all<P: AsRef<Path>>(paths: &[P]) -> io::Result<Vec<AppDecl>> {
             ));
         }
     }
+    warn_undeclared_seed_shares(&mut decls);
     Ok(decls)
+}
+
+/// Warn, on its line, each seed whose share no `workspace` line in `decls`
+/// declares: [`load_all`]'s check over the files of one start. The seed still
+/// registers; a `revoke` line is not checked.
+fn warn_undeclared_seed_shares(decls: &mut [AppDecl]) {
+    let declared: Vec<String> = decls
+        .iter()
+        .flat_map(|d| d.workspaces.iter().map(|w| w.share.clone()))
+        .collect();
+    for decl in decls.iter_mut() {
+        let undeclared = decl
+            .seeds
+            .iter()
+            .zip(&decl.seed_lines)
+            .filter(|(g, _)| !declared.contains(&g.share));
+        let told: Vec<String> = undeclared
+            .map(|(g, n)| format!("line {n}: {}", undeclared_seed_share(&g.share)))
+            .collect();
+        decl.warnings.extend(told);
+    }
 }
 
 /// What one registration did — load evidence, and the idempotence observable.
@@ -543,10 +618,11 @@ pub struct Registered {
 }
 
 /// REGISTER a parsed declaration: every binding/service becomes an ordinary
-/// record append, every ACL seed compiles to a CapabilityGrant record — all
-/// attributed to `origin` (the registrant's chain). Re-registration DIFFS
-/// against the existing fold: an identical record is never re-appended, so
-/// loading twice is a no-op and a later runtime revocation stays authoritative.
+/// record append, every ACL seed compiles to a CapabilityGrant record and
+/// every `revoke` line to a CapabilityRevocation record — all attributed to
+/// `origin` (the registrant's chain). Re-registration DIFFS against the
+/// existing fold: an identical record is never re-appended, so loading twice
+/// is a no-op and a later runtime revocation stays authoritative.
 ///
 /// Bindings diff against the `dir.bindings` fold (R9(a)), per
 /// `(app, glade_id)`, scoped to `decl.app`: a line whose declaration is live
@@ -593,6 +669,9 @@ pub fn register(
         .iter()
         .map(|s| Record::Service(s.clone()))
         .chain(decl.seeds.iter().map(|g| Record::Grant(g.clone())))
+        // a revoke line registers an ordinary revocation (plan Step 4.3),
+        // which the fold lets win over every grant of its pair
+        .chain(decl.revocations.iter().map(|r| Record::Revoke(r.clone())))
         // a declared workspace registers as an ordinary WorkspaceEntry with
         // the REGISTRANT as the eligible host — the node loading the file is
         // the node that serves it (audit F1: production minting).
@@ -624,7 +703,8 @@ mod tests {
     use glade_wire::generated::Shape;
 
     use crate::registry::{
-        BindingFold, Record, Registry, RegistryApi, G_BINDINGS, G_BINDING_RETRACTIONS, G_GRANTS, G_SERVICES, HOME,
+        BindingFold, Record, Registry, RegistryApi, G_BINDINGS, G_BINDING_RETRACTIONS, G_GRANTS, G_REVOCATIONS,
+        G_SERVICES, HOME,
     };
     use crate::sysdata::CapabilityRevocation;
 
@@ -1541,5 +1621,125 @@ mod tests {
         let version = env!("CARGO_PKG_VERSION");
         let this_build = flip_decided(version, V1_WARNING_RELEASE, V1_TOKEN_CHECKS_REFUSE);
         assert_eq!(this_build, Ok(()));
+    }
+
+    // ---- Step 4.3: the revoke line, and a seed's share --------------------
+
+    /// A `revoke` line names the pair it withdraws every grant of, a
+    /// principal and a share, with no verbs. A line with a token missing or
+    /// extra is refused with the template, and one before `app` is refused as
+    /// every declaration is.
+    #[test]
+    fn a_revoke_line_parses_to_the_pair_it_withdraws() {
+        let decl = parse(&v1_file("seed owner ws-a read.*\nrevoke owner grazel")).unwrap();
+        let pair = CapabilityRevocation {
+            principal: "owner".into(),
+            share: "grazel".into(),
+        };
+        assert_eq!(decl.revocations, [pair]);
+        assert_eq!(decl.seed_lines, [3]);
+        assert_eq!(decl.warnings, Vec::<String>::new());
+        for line in ["revoke owner", "revoke owner grazel read.*"] {
+            assert_eq!(
+                parse(&v1_file(line)).unwrap_err(),
+                "line 3: `revoke <principal> <share>`"
+            );
+        }
+        assert_eq!(
+            parse("glade-app v1\nrevoke owner grazel\napp x\n").unwrap_err(),
+            "line 2: `app` must be declared before any revoke"
+        );
+    }
+
+    /// The route that withdraws a seeded grant (plan Step 4.3, question 1
+    /// (a)). At the next start a `revoke` line registers an ordinary
+    /// revocation under the registrant's chain, and the fold then answers no
+    /// verb for its pair, though the seed line stays. Loaded again it appends
+    /// nothing. It wins for good: a seed of the pair added later registers,
+    /// and grants nothing. Another share's grant stands.
+    #[test]
+    fn a_revoke_line_withdraws_a_seeded_grant() {
+        let seeds = "seed alice ws-a read.*,gwz.*\nseed alice ws-b read.*";
+        let mut reg = Registry::new();
+        assert_eq!(counts(&parse(&v1_file(seeds)).unwrap(), &mut reg), (2, 0));
+        assert_eq!(reg.grants_for("alice", "ws-a"), ["gwz.*", "read.*"]);
+
+        let revoked = parse(&v1_file(&format!("{seeds}\nrevoke alice ws-a"))).unwrap();
+        let (mut reg, _) = Registry::from_snapshot(&reg.snapshot());
+        assert_eq!(counts(&revoked, &mut reg), (1, 2));
+        assert_eq!(reg.grants_for("alice", "ws-a"), Vec::<String>::new());
+        assert_eq!(reg.grants_for("alice", "ws-b"), ["read.*"]);
+        let ops = ops_of(&reg);
+        let op = ops
+            .iter()
+            .find(|o| o.glade_id == G_REVOCATIONS)
+            .expect("a revocation record");
+        assert_eq!(
+            (op.share.as_str(), op.origin.as_str(), op.seq),
+            (HOME, "node-1", 0)
+        );
+        let pair = CapabilityRevocation {
+            principal: "alice".into(),
+            share: "ws-a".into(),
+        };
+        assert_eq!(
+            CapabilityRevocation::from_cbor(&cbor::decode(&op.payload)),
+            pair
+        );
+        assert_eq!(
+            counts(&revoked, &mut reg),
+            (0, 3),
+            "loaded again, it appends nothing"
+        );
+
+        let reseeded = parse(&v1_file(&format!(
+            "{seeds}\nseed alice ws-a write.*\nrevoke alice ws-a"
+        )))
+        .unwrap();
+        assert_eq!(counts(&reseeded, &mut reg), (1, 3));
+        assert_eq!(
+            reg.grants_for("alice", "ws-a"),
+            Vec::<String>::new(),
+            "the revocation wins for good"
+        );
+    }
+
+    /// Plan Step 4.3's precondition 4: a seed whose share no `workspace` line
+    /// of the start declares is warned on its line, after the file's own
+    /// warnings, and still parses. The start's files are checked together, so
+    /// another file's `workspace` line declares a seed's share. A `revoke`
+    /// line's share is never checked.
+    #[test]
+    fn a_seed_whose_share_no_loaded_workspace_declares_is_warned() {
+        let checked = |texts: &[&str]| -> Vec<Vec<String>> {
+            let mut decls: Vec<AppDecl> = texts.iter().map(|t| parse(t).unwrap()).collect();
+            warn_undeclared_seed_shares(&mut decls);
+            decls.into_iter().map(|d| d.warnings).collect()
+        };
+        let told = |n: usize, share: &str| format!("line {n}: {}", undeclared_seed_share(share));
+
+        let one = "glade-app v0\napp x\nseed owner ws-a read.*\nseed owner grazel read.*,gwz.*\nworkspace ws-a a\n";
+        assert_eq!(
+            checked(&[one]),
+            [vec![V0_HEADER_AT_1.to_string(), told(4, "grazel")]]
+        );
+
+        // A reading node's file, which declares no workspace: warned alone,
+        // and not beside the file that declares the share, in either order.
+        let reader = "glade-app v1\napp r\nseed owner ws-a read.*\n";
+        let server = "glade-app v1\napp s\nworkspace ws-a a\n";
+        assert_eq!(checked(&[reader]), [vec![told(3, "ws-a")]]);
+        assert_eq!(checked(&[reader, server]), [Vec::<String>::new(), vec![]]);
+        assert_eq!(checked(&[server, reader]), [Vec::<String>::new(), vec![]]);
+
+        assert_eq!(
+            checked(&[&v1_file("revoke owner grazel")]),
+            [Vec::<String>::new()]
+        );
+        assert_eq!(
+            undeclared_seed_share("grazel"),
+            "no loaded `workspace` line declares the share `grazel`; the grant registers, but a seed \
+             names a workspace share (expected on a node that reads a share another node serves)"
+        );
     }
 }
