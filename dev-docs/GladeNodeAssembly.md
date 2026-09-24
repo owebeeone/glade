@@ -3290,6 +3290,11 @@ ids, and records.json gained only the claim every start mints.
    when the adapter first faces other machines, with the door in front of it:
    the mesh's move, or 4.5.
 
+**Ruled, owner, 2026-09-25 ("all recommended"):** 1 the mesh moves onto the port
+in a step of its own after 4.5, the plan's Step 4.5b, placed before 4.6; 2 the
+adapter keeps `glade/carrier/1` and `gcl1`; 3 the first word's wait gets a bound
+in 4.5b, where the adapter first faces other machines.
+
 ### Measured (4.2c)
 
 2026-09-25, Apple M3 Pro, Rust 1.96.0, on the final tree:
