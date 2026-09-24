@@ -7,7 +7,11 @@
 //! - [`client::GladeClient`] — the connection + session: connect / hello /
 //!   subscribe / append / send_ops / exchange, the provider loop
 //!   (`on_exchange_req` + `respond_exchange`), fan-out `on_ops`, and reattach
-//!   (`on_drop` + `reconnect`).
+//!   (`on_drop` + `reconnect`). `append_outcome` / `send_ops_outcome` return
+//!   the node's answer to each op; `on_refused` reports every refusal, and
+//!   `on_unplaced` every op the node could not place.
+//! - [`answers::Answers`] — the sent ops, kept by hash until the node's status
+//!   names them (GladeSubstrateV1 §6, R1 and R7; W5's ops not placed).
 //! - [`supplier::Supplier`] — the thin authority helper (serve_exchange /
 //!   serve_share / reattach-on-drop) mirroring the glial kit.
 //! - [`session::Session`] — per-origin chain store + lww/log folds, the rust
@@ -15,11 +19,13 @@
 //!
 //! Conforms byte-for-byte to the wire codec + op-hash oracle (`glade-wire`).
 
+pub mod answers;
 pub mod client;
 pub mod hash;
 pub mod session;
 pub mod supplier;
 pub mod ws;
 
+pub use answers::{OpOutcome, OpStatus};
 pub use client::{ExchangeOutcome, GladeClient};
 pub use supplier::{Backoff, ShareController, Supplier, SupplierConfig, SupplierSurface};

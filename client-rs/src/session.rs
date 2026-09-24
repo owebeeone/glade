@@ -138,17 +138,27 @@ pub struct Session {
     pub origin: String,
     lamport: i64,
     store: Store,
+    /// Own chains stopped at a refused seq, until a subscribe acks their zone
+    /// (answer 4), by chain key.
+    unresumed: HashMap<String, i64>,
 }
 
 impl Session {
     pub fn new(origin: impl Into<String>) -> Self {
-        Session { origin: origin.into(), lamport: 0, store: Store::default() }
+        Session { origin: origin.into(), lamport: 0, store: Store::default(), unresumed: HashMap::new() }
     }
 
     /// Append a local op to this origin's chain within a zone (default commons)
-    /// and return it. The zone `key` selects the chain — its own seq/prev.
+    /// and return it. The zone `key` selects the chain — its own seq/prev. A
+    /// chain stopped by a refusal takes no op until it is resumed.
     pub fn append(&mut self, share: &str, glade_id: &str, shape: Shape, payload: Vec<u8>, key: Vec<u8>) -> io::Result<Op> {
         require_op(shape, &payload, "append")?;
+        if let Some(seq) = self.unresumed.get(&Store::chain_key(share, glade_id, &key, &self.origin)) {
+            return Err(io::Error::other(format!(
+                "the node refused seq {seq} of {share}/{glade_id} under {}: subscribe to the zone to resume the chain",
+                self.origin
+            )));
+        }
         let (seq, prev) = {
             let own = self.store.scan(share, glade_id, &key, &self.origin, i64::MIN);
             match own.last() {
@@ -176,6 +186,30 @@ impl Session {
         };
         self.store.append(op.clone());
         Ok(op)
+    }
+
+    /// Answer 4: the node refused an op of this session's own. Drop it and every
+    /// later op of its chain, and stop the chain until it is resumed. Nothing
+    /// changes when the session does not hold that op.
+    pub fn refused(&mut self, op: &Op) {
+        if op.origin != self.origin {
+            return;
+        }
+        let chain = Store::chain_key(&op.share, &op.glade_id, &op.key, &op.origin);
+        let Some(log) = self.store.logs.get_mut(&chain) else {
+            return;
+        };
+        let Some(at) = log.iter().position(|held| held == op) else {
+            return;
+        };
+        log.truncate(at);
+        self.unresumed.insert(chain, op.seq);
+    }
+
+    /// A subscribe ack named the zone, so its own chain goes on (answer 4).
+    /// Step 3.2 moves this to the end of the replay.
+    pub fn resumed(&mut self, share: &str, glade_id: &str, key: &[u8]) {
+        self.unresumed.remove(&Store::chain_key(share, glade_id, key, &self.origin));
     }
 
     /// Apply ops received from the node; advance the lamport clock.

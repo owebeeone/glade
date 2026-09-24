@@ -9,6 +9,8 @@
 //!   2. op append + fold visible to a rust subscriber (value lww + log order).
 //!   3. reattach after a NODE RESTART — kill the node, respawn on the same port
 //!      + store dir, and the supplier's serving resumes on the new connection.
+//!   4. op outcomes (client-writes plan Step 3.1): an accepted op, a repeat,
+//!      and a refused op, whose chain then stops.
 //!
 //! Requires the node binary; the harness builds it once if absent.
 
@@ -21,7 +23,8 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 
 use glade_client::supplier::{Supplier, SupplierConfig, SupplierSurface};
-use glade_client::{Backoff, GladeClient};
+use glade_client::{Backoff, GladeClient, OpOutcome};
+use glade_wire::generated::ErrorCode;
 
 // ---- harness: spawn the real glade-node binary ----------------------------
 
@@ -324,4 +327,88 @@ async fn reattaches_after_node_restart() {
     sub1.close().await;
     sub2.close().await;
     node2.kill().await.ok();
+}
+
+// ---- 4. op outcomes (client-writes plan Step 3.1) --------------------------
+
+/// A status is awaited for 5 s at most: R1 says one may never come.
+async fn within<T>(answer: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(Duration::from_secs(5), answer).await.expect("no answer from the node within 5 s")
+}
+
+/// R1: the node answers an op it appends `Ok`, and the chain goes on.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_accepted_append_is_ok() {
+    let tmp = Tmp::new("accepted");
+    let (mut node, port) = spawn_legacy(&tmp.path().join("store"), 0).await;
+    let client = GladeClient::new("w");
+    client.connect(&format!("ws://127.0.0.1:{port}")).await.unwrap();
+
+    let (op, outcome) = within(client.append_outcome("ws-app", "ws.state", "value", b"v0".to_vec(), None)).await.unwrap();
+    assert_eq!((op.seq, outcome), (0, OpOutcome::Accepted));
+    let (op, outcome) = within(client.append_outcome("ws-app", "ws.state", "value", b"v1".to_vec(), None)).await.unwrap();
+    assert_eq!((op.seq, outcome), (1, OpOutcome::Accepted));
+
+    client.close().await;
+    node.kill().await.ok();
+}
+
+/// R1: a repeat the node holds byte for byte is `Ok`, not a refusal, whether a
+/// second session of the origin makes it or the op is sent twice in a frame.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repeated_append_is_ok() {
+    let tmp = Tmp::new("repeated");
+    let (mut node, port) = spawn_legacy(&tmp.path().join("store"), 0).await;
+    let url = format!("ws://127.0.0.1:{port}");
+    let first = GladeClient::new("w");
+    first.connect(&url).await.unwrap();
+    let (op, outcome) = within(first.append_outcome("ws-app", "ws.state", "value", b"same".to_vec(), None)).await.unwrap();
+    assert_eq!(outcome, OpOutcome::Accepted);
+
+    let second = GladeClient::new("w");
+    second.connect(&url).await.unwrap();
+    let (again, outcome) = within(second.append_outcome("ws-app", "ws.state", "value", b"same".to_vec(), None)).await.unwrap();
+    assert_eq!(again, op, "the same op, byte for byte");
+    assert_eq!(outcome, OpOutcome::Accepted, "a repeat the node holds is Ok");
+    let outcomes = within(second.send_ops_outcome(vec![op.clone(), op.clone()])).await.unwrap();
+    assert_eq!(outcomes, vec![OpOutcome::Accepted, OpOutcome::Accepted], "one status per send");
+    let (next, outcome) = within(second.append_outcome("ws-app", "ws.state", "value", b"next".to_vec(), None)).await.unwrap();
+    assert_eq!((next.seq, outcome), (1, OpOutcome::Accepted), "the chain goes on");
+
+    first.close().await;
+    second.close().await;
+    node.kill().await.ok();
+}
+
+/// Answer 4: a client never builds on an op the node refused. Two clients
+/// write under one origin; the second one's seq 0 is refused, and its next
+/// append on that chain fails.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_append_stops_its_chain() {
+    let tmp = Tmp::new("refused");
+    let (mut node, port) = spawn_legacy(&tmp.path().join("store"), 0).await;
+    let url = format!("ws://127.0.0.1:{port}");
+    let first = GladeClient::new("w");
+    first.connect(&url).await.unwrap();
+    let (_, outcome) = within(first.append_outcome("ws-app", "ws.state", "value", b"first".to_vec(), None)).await.unwrap();
+    assert_eq!(outcome, OpOutcome::Accepted, "the node holds the first client's seq 0");
+
+    let second = GladeClient::new("w");
+    second.connect(&url).await.unwrap();
+    let mut refusals = second.on_refused().await;
+    second.append("ws-app", "ws.state", "value", b"second".to_vec(), None).await.unwrap();
+    let refusal = within(refusals.recv()).await.expect("a refusal");
+    assert_eq!((refusal.code, refusal.op.seq), (ErrorCode::Equivocation, 0), "{refusal:?}");
+    assert_eq!(second.fold_value("ws-app", "ws.state", None).await, None, "the session does not fold a refused op");
+    let next = second.append("ws-app", "ws.state", "value", b"third".to_vec(), None).await;
+    assert!(next.is_err(), "the next append on a refused chain must fail, got {next:?}");
+    // The zone's subscribe ack lets the chain go on. Whether the next op lands
+    // waits for the replay, Step 3.2's test.
+    second.subscribe("ws-app", "ws.state", None).await.unwrap();
+    let resumed = second.append("ws-app", "ws.state", "value", b"fourth".to_vec(), None).await;
+    assert!(resumed.is_ok(), "a subscribe ack lets the chain go on: {resumed:?}");
+
+    first.close().await;
+    second.close().await;
+    node.kill().await.ok();
 }

@@ -7,24 +7,33 @@
 //! `on_exchange_req` + `respond_exchange` (corr preserved 1:1). Inbound ops and
 //! exchange requests fan out to as many listeners as a session multiplexes
 //! (mpsc receivers); `on_drop` fires when the link ends so a supplier reattaches
-//! (never on a deliberate `close`). No node internals — the wire + tokio only.
+//! (never on a deliberate `close`). The node answers each op with a status
+//! (GladeSubstrateV1 §6, R1): `append_outcome` / `send_ops_outcome` return it
+//! as data, `on_refused` reports every refusal, and a refused op's chain stops
+//! until a subscribe (answer 4). An op not placed is kept and sent again, zone
+//! by zone, and `on_unplaced` reports it (W5). No node internals — the wire +
+//! tokio only.
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 
 use glade_wire::cbor::Cbor;
 use glade_wire::generated::{
-    ExchangeReq, ExchangeRes, FrameType, Hello, Ops, Subscribe,
+    ErrorCode, ExchangeReq, ExchangeRes, FrameType, Hello, Ops, Subscribe,
 };
 use glade_wire::{cbor, generated};
 
+use crate::answers::{zone_of, Answered, Answers, OpOutcome, OpStatus, Zone, WAITING_BOUND};
 use crate::session::{require_op, shape_of, Session};
 use crate::ws::{self, Msg, WsWriter};
+
+/// Who waits to hear what became of one sent op.
+type Waiter = oneshot::Sender<OpOutcome>;
 
 /// A provider's answer, as the requester sees it — the decoded `ExchangeRes`.
 #[derive(Clone, Debug, PartialEq)]
@@ -45,6 +54,17 @@ fn dropped() -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, "connection dropped")
 }
 
+fn not_connected() -> io::Error {
+    io::Error::new(io::ErrorKind::NotConnected, "not connected")
+}
+
+/// Tell an answered op's waiter, if it has one, what became of the op.
+fn tell(answered: Answered<Waiter>) {
+    if let Some(waiter) = answered.waiter {
+        let _ = waiter.send(answered.outcome);
+    }
+}
+
 struct Inner {
     origin: String,
     /// `host:port` of the last connect — reused by `reconnect` (reattach).
@@ -61,12 +81,17 @@ struct Inner {
     ops_senders: Mutex<Vec<mpsc::UnboundedSender<Vec<generated::Op>>>>,
     exreq_senders: Mutex<Vec<mpsc::UnboundedSender<ExchangeReq>>>,
     drop_senders: Mutex<Vec<mpsc::UnboundedSender<()>>>,
+    /// Sent ops by hash until their statuses come (R1), and the ops not placed
+    /// (W5). Taken after `session` when both are held.
+    answers: Mutex<Answers<Waiter>>,
+    refused_senders: Mutex<Vec<mpsc::UnboundedSender<OpStatus>>>,
+    unplaced_senders: Mutex<Vec<mpsc::UnboundedSender<OpStatus>>>,
     closing: AtomicBool,
 }
 
 impl Inner {
     /// Decode + dispatch one inbound frame (the read loop's body).
-    async fn dispatch(&self, bytes: &[u8]) {
+    async fn dispatch(self: &Arc<Self>, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
         }
@@ -84,8 +109,40 @@ impl Inner {
                 self.ops_senders.lock().await.retain(|s| s.send(ops.clone()).is_ok());
             }
             FrameType::Heads => {
+                // An ack names its zone (R5; one naming none is R6's refusal).
+                // A chain a refusal stopped there goes on, and the ops not
+                // placed there go again (answer 4, W5), before the subscribe
+                // returns, so its caller's next op follows them. Step 3.2
+                // moves both to the end of the replay.
+                let acked = generated::Heads::from_cbor(&body);
+                let mut again = Vec::new();
+                {
+                    let mut session = self.session.lock().await;
+                    let answers = self.answers.lock().await;
+                    for heads in &acked.streams {
+                        session.resumed(&heads.share, &heads.glade_id, &heads.key);
+                        let zone: Zone = (heads.share.clone(), heads.glade_id.clone(), heads.key.clone());
+                        again.extend(answers.unplaced_in(&zone));
+                    }
+                }
+                if !again.is_empty() {
+                    let waiters = again.iter().map(|_| None).collect();
+                    let _ = self.ship(again, waiters).await;
+                }
                 if let Some(tx) = self.sub_acks.lock().await.pop_front() {
                     let _ = tx.send(());
+                }
+            }
+            FrameType::Error => {
+                // R1: a status names its op by hash. An `Error` with no `corr`
+                // is a refused subscribe's reason (R6), which Step 3.2 reads.
+                let status = generated::Error::from_cbor(&body);
+                let answered = {
+                    let mut session = self.session.lock().await;
+                    self.answers.lock().await.status(&mut session, &status)
+                };
+                if let Some(answered) = answered {
+                    self.answer(answered).await;
                 }
             }
             FrameType::Welcome => {
@@ -105,7 +162,30 @@ impl Inner {
                     let _ = tx.send(ExchangeOutcome { ok: res.ok, payload: res.payload, error: res.error });
                 }
             }
-            _ => {} // Error / channel frames: ignored (echo/channel are P3)
+            _ => {} // channel frames: ignored (echo/channel are P3)
+        }
+    }
+
+    /// Report a refusal to `on_refused`, and an op not placed, once, to
+    /// `on_unplaced`; start the zone's resend timer while it has ops not
+    /// placed (W5); and tell the op's waiter.
+    async fn answer(self: &Arc<Self>, answered: Answered<Waiter>) {
+        let op = answered.op.clone();
+        match &answered.outcome {
+            OpOutcome::Refused { code, message } => {
+                let status = OpStatus { op: op.clone(), code: *code, message: message.clone() };
+                self.refused_senders.lock().await.retain(|s| s.send(status.clone()).is_ok());
+            }
+            OpOutcome::NotPlaced { message } if answered.newly_unplaced => {
+                let status = OpStatus { op: op.clone(), code: ErrorCode::UnknownShare, message: message.clone() };
+                self.unplaced_senders.lock().await.retain(|s| s.send(status.clone()).is_ok());
+            }
+            _ => {}
+        }
+        tell(answered);
+        let zone = zone_of(&op);
+        if let Some(timer) = self.answers.lock().await.start_resending(&zone) {
+            tokio::spawn(resend_loop(Arc::downgrade(self), zone, timer));
         }
     }
 
@@ -117,16 +197,72 @@ impl Inner {
         self.sub_acks.lock().await.clear();
         self.welcome_acks.lock().await.clear();
         self.ex_waiters.lock().await.clear();
+        self.end_answers().await;
         if !self.closing.load(Ordering::SeqCst) {
             self.drop_senders.lock().await.retain(|s| s.send(()).is_ok());
         }
+    }
+
+    /// R7: no status is coming for an op sent on a connection that ended.
+    async fn end_answers(&self) {
+        for answered in self.answers.lock().await.ended() {
+            tell(answered);
+        }
+    }
+
+    /// Send ops in one frame, each kept by its hash, with its waiter, until its
+    /// status comes (R1).
+    async fn ship(&self, ops: Vec<generated::Op>, waiters: Vec<Option<Waiter>>) -> io::Result<()> {
+        for op in &ops {
+            require_op(op.shape, &op.payload, "send_ops")?;
+        }
+        if self.writer.lock().await.is_none() {
+            return Err(not_connected());
+        }
+        {
+            let mut answers = self.answers.lock().await;
+            for (op, waiter) in ops.iter().zip(waiters) {
+                if let Some(gone) = answers.sent(op.clone(), waiter) {
+                    tell(gone);
+                }
+            }
+        }
+        self.send(frame(FrameType::Ops, Ops { ops, pri: None }.to_cbor())).await
     }
 
     async fn send(&self, bytes: Vec<u8>) -> io::Result<()> {
         let w = self.writer.lock().await.clone();
         match w {
             Some(w) => w.send_binary(&bytes).await,
-            None => Err(io::Error::new(io::ErrorKind::NotConnected, "not connected")),
+            None => Err(not_connected()),
+        }
+    }
+}
+
+/// W5: while a zone has ops not placed, send them again on the zone's
+/// backoff, 1 s doubling to 30 s. The timer stops once every op of the zone is
+/// placed, at the connection's end, or when the client is closed or gone.
+async fn resend_loop(inner: Weak<Inner>, zone: Zone, timer: u64) {
+    loop {
+        let wait = match inner.upgrade() {
+            Some(inner) => inner.answers.lock().await.next_resend(&zone),
+            None => {
+                return;
+            }
+        };
+        tokio::time::sleep(wait).await;
+        let Some(inner) = inner.upgrade() else {
+            return;
+        };
+        if inner.closing.load(Ordering::SeqCst) {
+            return;
+        }
+        let Some(again) = inner.answers.lock().await.resend_tick(&zone, timer) else {
+            return;
+        };
+        if !again.is_empty() {
+            let waiters = again.iter().map(|_| None).collect();
+            let _ = inner.ship(again, waiters).await;
         }
     }
 }
@@ -164,6 +300,9 @@ impl GladeClient {
                 ops_senders: Mutex::new(Vec::new()),
                 exreq_senders: Mutex::new(Vec::new()),
                 drop_senders: Mutex::new(Vec::new()),
+                answers: Mutex::new(Answers::new(WAITING_BOUND)),
+                refused_senders: Mutex::new(Vec::new()),
+                unplaced_senders: Mutex::new(Vec::new()),
                 closing: AtomicBool::new(false),
             }),
         }
@@ -195,10 +334,13 @@ impl GladeClient {
 
     async fn establish(&self, host: &str, port: u16) -> io::Result<()> {
         let (reader, writer) = ws::connect(host, port).await?;
-        *self.inner.writer.lock().await = Some(writer);
         if let Some(old) = self.inner.read_task.lock().await.take() {
             old.abort();
         }
+        // R7: nothing sent before this connection is answered on it.
+        *self.inner.writer.lock().await = None;
+        self.inner.end_answers().await;
+        *self.inner.writer.lock().await = Some(writer);
         let task = tokio::spawn(read_loop(self.inner.clone(), reader));
         *self.inner.read_task.lock().await = Some(task);
         Ok(())
@@ -243,26 +385,82 @@ impl GladeClient {
     /// WITHOUT advancing the chain: a supplier must not build phantom ops the
     /// node can't reconcile after a reattach (stage-1; the offline outbox is a
     /// separate rider, GAP-11). The next append after reconnect is contiguous.
+    /// Fails too on a chain a refusal stopped, until a subscribe of its zone.
     pub async fn append(&self, share: &str, glade_id: &str, shape: &str, payload: Vec<u8>, key: Option<&[u8]>) -> io::Result<generated::Op> {
+        self.append_op(share, glade_id, shape, payload, key, None).await
+    }
+
+    /// `append`, then the node's answer to the op, as data (R1, R7): `Unknown`
+    /// if the connection ends first. A node from before the client-writes
+    /// plan's Phase 2 sends no status, so against one this waits until the
+    /// connection ends, or until later sends pass the bound on those kept.
+    pub async fn append_outcome(&self, share: &str, glade_id: &str, shape: &str, payload: Vec<u8>, key: Option<&[u8]>) -> io::Result<(generated::Op, OpOutcome)> {
+        let (tx, rx) = oneshot::channel();
+        let op = self.append_op(share, glade_id, shape, payload, key, Some(tx)).await?;
+        Ok((op, rx.await.unwrap_or(OpOutcome::Unknown)))
+    }
+
+    async fn append_op(&self, share: &str, glade_id: &str, shape: &str, payload: Vec<u8>, key: Option<&[u8]>, waiter: Option<Waiter>) -> io::Result<generated::Op> {
         // Capability is resolved before connectivity checks, chain allocation,
         // or session mutation; unsupported names never become Value ops.
         let shape = shape_of(shape)?;
         require_op(shape, &payload, "append")?;
         if self.inner.writer.lock().await.is_none() {
-            return Err(io::Error::new(io::ErrorKind::NotConnected, "not connected"));
+            return Err(not_connected());
         }
         let k = key.map(|k| k.to_vec()).unwrap_or_default();
-        let op = self.inner.session.lock().await.append(share, glade_id, shape, payload, k)?;
+        let op = {
+            // Kept under the session's lock, so a status is never applied
+            // between the op's making and its keeping.
+            let mut session = self.inner.session.lock().await;
+            let op = session.append(share, glade_id, shape, payload, k)?;
+            if let Some(gone) = self.inner.answers.lock().await.sent(op.clone(), waiter) {
+                tell(gone);
+            }
+            op
+        };
         self.inner.send(frame(FrameType::Ops, Ops { ops: vec![op.clone()], pri: None }.to_cbor())).await?;
         Ok(op)
     }
 
     /// Ship already-built ops to the node (the caller owns the chain).
     pub async fn send_ops(&self, ops: Vec<generated::Op>) -> io::Result<()> {
-        for op in &ops {
-            require_op(op.shape, &op.payload, "send_ops")?;
+        let waiters = ops.iter().map(|_| None).collect();
+        self.inner.ship(ops, waiters).await
+    }
+
+    /// `send_ops`, then the node's answer to each op, in the order given.
+    pub async fn send_ops_outcome(&self, ops: Vec<generated::Op>) -> io::Result<Vec<OpOutcome>> {
+        let (waiters, answers): (Vec<_>, Vec<_>) = ops
+            .iter()
+            .map(|_| {
+                let (tx, rx) = oneshot::channel();
+                (Some(tx), rx)
+            })
+            .unzip();
+        self.inner.ship(ops, waiters).await?;
+        let mut outcomes = Vec::new();
+        for rx in answers {
+            outcomes.push(rx.await.unwrap_or(OpOutcome::Unknown));
         }
-        self.inner.send(frame(FrameType::Ops, Ops { ops, pri: None }.to_cbor())).await
+        Ok(outcomes)
+    }
+
+    /// A fresh receiver for the node's refusals of this client's ops: the op,
+    /// the code and the reason. An op the session made is already dropped,
+    /// with the rest of its chain, when its refusal arrives here.
+    pub async fn on_refused(&self) -> mpsc::UnboundedReceiver<OpStatus> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.inner.refused_senders.lock().await.push(tx);
+        rx
+    }
+
+    /// A fresh receiver for this client's ops the node could not place (W5),
+    /// each told once: the client keeps it and its chain, and sends them again.
+    pub async fn on_unplaced(&self) -> mpsc::UnboundedReceiver<OpStatus> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.inner.unplaced_senders.lock().await.push(tx);
+        rx
     }
 
     /// A directed request to a provider; resolves with its `ExchangeRes`
@@ -321,6 +519,7 @@ impl GladeClient {
             task.abort();
         }
         *self.inner.writer.lock().await = None;
+        self.inner.end_answers().await;
     }
 }
 
