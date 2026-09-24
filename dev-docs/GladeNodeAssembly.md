@@ -764,3 +764,615 @@ tree with the duplicate fixed:
   `tests/journeys/main.rs` into `node.rs`. The duplicate fix adds about 40
   lines of production code (`registry.rs`, `assembly.rs`) and about 55 of
   tests, and removes about 15 of test (the pin).
+
+## Grant check at the serve hop (plan Step 4.3)
+
+Design addition, 2026-09-24, written before any code against glade `18b8524`
+(the code as at `f5d055f`). The spec is plan Step 4.3 and its two RULED lines;
+the preconditions carried from SUR-P3-4 and SUR-P3-6
+(`dev-docs/glade/GladeDeclAmendment-RemPlan.md:121-133`, confirmed by the owner
+at `:19`); slice profile SP-T1 to SP-T3 and SP-P1; and three findings the lane
+owner relayed from Step 4.1's note (`GladeNodeSigning.md` D5, D11, F2).
+
+**Stopped before code.** Three of the brief's stop conditions hold, so this
+section is the step's whole output. Nothing below is built.
+
+1. No route revokes a seeded grant (precondition 1).
+2. The verb vocabulary and the principal vocabulary are undecided. The check
+   cannot be written without inventing both.
+3. Every client flow outside the directory would be refused: the Gyld desk,
+   glade/demo, and the glade-gwz and glade-gyld suites. No seed or documented
+   grant can allow them. The desk and the demo present a random principal per
+   tab, the suites' clients present none, and the demo's node has no grant
+   fold at all.
+
+What follows is what 4.3 builds once the owner rules, and what each ruling
+decides. The questions come last, each with a recommendation.
+
+### The grant fold: the node's own registry
+
+Two folds hold `dir.grants` and `dir.revocations`.
+
+| Fold | Holds | Who can add a grant | Exists |
+| --- | --- | --- | --- |
+| the registry: records.json's fold, held by the adopted `DirState` (`claims.rs:54-77`) | this node's own appends only: its app files' seeds (`appdecl.rs:588-616`) and its mints. `Records::ingest` (`assembly.rs:590-600`), the one path that ingests a carried op, is called only by the journeys | this node, at registration and through `DirAuthority::accept` | after `adopt_boot`; never on the legacy form |
+| the served store's `home` share | the registry's records, seeded at adoption (`claims.rs:110-111`); every peer's pulled and pushed home records (`mesh.rs:258-265`, `:466-490`); any client's op on `home` (`server.rs:262-282`) | any peer, and any websocket client | always |
+
+The check reads the registry. Until 4.1b signs directory records, a grant read
+from the served store could be written by any client or peer. Three things
+follow.
+
+- A node's grants are its own operator's. A grant made on another node admits
+  nothing here (node trust, SP-T1).
+- The legacy form, `glade-node <port> [store]` with no `--profile` or `--name`
+  (`bin/glade-node.rs:139-172`), boots no registry. It has no fold, so every
+  check answers `Unavailable`.
+- `GrantPort::check` is synchronous and must not block
+  (`contracts/grant-api/src/lib.rs:37-41`), but the registry sits behind
+  `DirState`'s async lock. So the adapter reads a policy view: the grants and
+  revocations, folded as `grants_for` folds them (`registry.rs:495-516`).
+  - The view is rebuilt after every accepted change that touches `dir.grants`
+    or `dir.revocations`, and it carries a generation number.
+  - One adapter serves both roots. The hand-written root reaches it through
+    `Shared`. The assembled root binds it in place of `PendingGrantFold`
+    (`assembly.rs:736-756`).
+
+### The four paths
+
+| Path | Where the check goes | Holder, as claimed | Verb (proposed; see "What is undecided") | On refusal |
+| --- | --- | --- | --- | --- |
+| `peer.rs` `serve_sync` (`:168-203`) | the zone loop (`:193`), the drop-in point its comment names (`:172-174`). The function gains the holder and a `&dyn GrantPort` | the dialer's node id from `hello_accept` (`:119-131`), accepted unverified (`verify_peer`, `:99-101`) | `read.subscribe` | the zone is left out: an absence, not a hole (`:172-174`) |
+| `mesh.rs` `serve_peer_subscribe` (`:299-352`) | before the subscriber is registered (`:309`) and before the heads and the gap (`:327-344`) | the link's node id. `run_link` has it (`:203-204`) but does not pass it to `handle_peer_stream` (`:217-227`, `:234-240`), so it is threaded through | `read.subscribe` | an `Error{Unauthorized}` frame, then the stream is finished. The forwarding node's `run_forward` (`:395-426`) reads to the end and its forward lapses (`:372-375`). Its local subscribers are fed nothing |
+| `exchange.rs` `serve_peer_exchange` (`:234-265`) | before `handle_request` (`:247`), for every share but `home`, so `workspace.create` (`:100-103`) stays exempt | the link's node id, threaded as above | the exchange's glade id, such as `gwz.ops` | `ExchangeRes{ok: false}` naming the refusal, corr intact: the path's existing failure form (`:53-60`) |
+| `server.rs` websocket subscribe (`:201-261`) | after the provider-attach branch (`:207-216`) and `route_subscribe` (`:217`); before `router.subscribe` (`:235`), the heads, the gap and a forward (`:256-258`) | the session's principal as its Hello claimed it (`:195-198`). A session that named none holds nothing | `read.subscribe` | see "The refusal on the wire" |
+
+Notes on the table:
+
+- `serve_sync` has no production caller. The mesh serves a peer's pull with
+  `serve_home`, which offers `home` only (`mesh.rs:432-458`). `serve_sync`
+  runs only in `peer.rs`'s and `iroh_carrier.rs`'s tests.
+- A forwarded subscribe is checked twice: at this node against this node's
+  fold, and at the claim holder against its own.
+- `home` is exempt on every path, because it is how grants arrive. Its pull at
+  connect, its pushes and its reads run as today.
+
+Content also leaves the node on three paths the plan does not list. This step
+would not gate them.
+
+- A provider attach. A session that subscribes to a declared exchange receives
+  every later request for it, and replaces the provider already attached
+  (`exchange.rs:87-93`). Who may answer an exchange is B1's provider
+  authentication.
+- The local exchange (`handle_request`'s local arm, `:116-131`). AZM §1 puts
+  effects under the authority's own check, when it executes them.
+- A client's append (`server.rs:262-282`). The ruling covers reads. `home` is
+  the exception; see "Client writes to `home`".
+
+### The refusal on the wire
+
+Both clients resolve `subscribe()` on the next `Heads` frame, first in first
+out, and ignore `Error` frames:
+
+- client-rs: `client.rs:86-90`, `:108`, `:228-239`;
+- client-ts: `client.ts:113-114`, `:155-163`.
+
+`Route::Absent` answers with an `Error` alone today (`server.rs:218-229`). A
+refusal sent that way leaves the `subscribe()` waiting for good, and the next
+`Heads` then resolves the wrong call. Two clients would hang:
+
+- glade-gyld's `resume` awaits each subscribe, with no deadline
+  (`supplier.rs:1261-1270`);
+- gryth-ui's `startGlade` awaits each subscribe in turn (`runtime.ts:163-166`).
+
+The options:
+
+- (a) `Error{Unauthorized}` alone. No heads leave the node, but both clients
+  hang.
+- (b) An empty `Heads` ack for the zone, with no origins, then
+  `Error{Unauthorized}`. Both clients resolve, and nothing leaks. A client that
+  does not read the error sees an empty zone.
+- (c) As (b), with both clients made to read `Error` frames. That changes two
+  repositories.
+
+Recommend (b). It needs no wire change: both frames exist, and
+`ErrorCode::Unauthorized` is already in the wire IR
+(`wire-rs/src/generated.rs:86`).
+
+### What is undecided: holders, principals, verbs
+
+- **Holders.**
+  - `CapabilityGrant.principal` is one string (`ir/sysdata.taut.py:60-63`).
+  - The ruling of 2026-09-23 makes a node's grant a record "whose principal is
+    the node id", and the directory writes a node id as 64 lower-case hex
+    digits (`mesh.rs:45-48`).
+  - `GrantPort` requires that "a `Node` never matches a `Principal`"
+    (`grant-api/src/lib.rs:33-35`).
+  - One string keeps the two apart only if the principal vocabulary reserves
+    the node form. One such rule: a 64-hex principal is a node, and a session
+    may not claim one. Nothing states a rule.
+- **Principals.** Every seed grants `owner`: grazel-app `:50-51`, gyld-app
+  `:63` and `:66`, and both fixtures. No client presents `owner` (see the flow
+  table). The page defines a principal only as "an identity that can be granted
+  access, such as `owner`" (`docs/AppFileFormat.md:20`).
+- **Verbs.**
+  - The seeds store patterns: `read.*`, `gwz.*` and `gyld.*`.
+  - The page says "a verb may be a pattern such as `read.*`" (`:175-176`), and
+    defines no verb.
+  - `GrantPort` matches exactly: "No verb implies another" (`lib.rs:33-34`).
+  - AZM §5 is a working draft. It has three wire verbs (`read.subscribe`,
+    `read.window`, `write.append`) and exchange verbs named by provider
+    (`gwz.status` and so on). The authority checks those exchange verbs. The
+    node cannot, because they ride inside an opaque payload.
+  - gyld-app's comment reads `gyld.*` as covering "every surface above"
+    (`:64-65`), which makes the verb a glade-id namespace.
+  - The exposure table records the conflict: "The verb taxonomies do not
+    agree, and the code implements neither"
+    (`dev-docs/glade/GladeMetadataExposureTable.md` §9, item 4).
+
+  So three things are open: the verb a read path asks for, the verb the
+  exchange path asks for, and whether a stored `read.*` admits either.
+
+### How a revocation reaches a live subscription
+
+This needs a revocation route (precondition 1). Given one:
+
+1. Every change to the registry goes through `DirAuthority::accept`
+   (`claims.rs:73-76`), or through registration at start. The route appends
+   through the same call.
+2. A save that touched `dir.grants` or `dir.revocations` rebuilds the policy
+   view and bumps its generation, before the change is published.
+3. For every admitted subscription the node keeps the holder and the zone:
+   - a client session: the router's entry, with the session's principal from
+     `Shared.principals`;
+   - a peer stream: the session id that `serve_peer_subscribe` registers
+     (`:306-309`), with the peer's node id.
+4. At each new generation, one pass under the router's lock checks every
+   admitted `(holder, share)` again.
+   - A refused client zone is unsubscribed (`router.rs:33-37`) and sent
+     `Error{Unauthorized}`. The session's other zones go on.
+   - A refused peer stream has its writer stopped and the stream finished, so
+     the forwarding node's forward lapses.
+5. The pass ends before the accepting call returns. So no op fanned out after
+   a revocation has been accepted reaches a revoked session.
+
+Ops delivered before stay delivered: revocation is forward-only (GDL-009, AZM
+§4), and the forwarding node keeps what it replicated. `GrantPort` already
+forbids answering from a decision cached across fold changes (`lib.rs:37-39`).
+Checking live streams at each generation applies that rule to a decision the
+node has already acted on (AZM §6).
+
+A route that acts only at start (options (a) and (b) under precondition 1)
+never meets a live stream in production: the restart has already ended every
+stream. The pass then runs only in tests, which append through `accept`. A
+runtime route would change that: E-share-1's `share.revoke`, or option (e).
+
+### A stale or unreadable fold
+
+- **Unreadable.** The check answers `Unavailable` and the node refuses, as for
+  no grant. There are two cases.
+  - No directory authority: the legacy form, or a booted node before
+    `adopt_boot`.
+  - A policy record set aside at load. `Registry::from_snapshot` drops a
+    rejected record and the rest of its chain, and counts it
+    (`registry.rs:304-325`). `Record::is_policy` (`:90-94`) was meant to make
+    policy fail closed at load (AZ-11), but nothing calls it. So today a
+    revocation set aside at load lets its grant stand. Proposed: after a boot
+    that set aside any `dir.grants` or `dir.revocations` record, every check
+    answers `Unavailable`, and the start says so.
+- **Stale.**
+  - The view is rebuilt under the directory's lock before a change is
+    published, so no check reads a view older than the last accepted change.
+  - What can go stale is a decision: taken before a change, and still serving
+    after it. The re-check pass closes that.
+  - A revocation made on another node never reaches this fold, because
+    registries take no peer's records. That is node trust, not staleness.
+- **The stale-fold test.** A stream is admitted, and then the fold becomes
+  unreadable: the view is marked unavailable, or the node restarts over a store
+  with a policy record set aside. The test asserts that the live stream ends and
+  that a new subscribe is refused. That is the fail direction.
+
+### Client writes to `home` (H-R3)
+
+H-R3 (`plan-docs/plans/GLP-0006-grazel-gryth-suppliers/RulingWorksheet.md:497`),
+in full: "A client submits intent. The authority validates, performs the
+effect, then appends the canonical result while preserving B3 context. Direct
+client appends are allowed only for record kinds with no privileged effect."
+Every `home` kind has a privileged effect:
+
+- grants and revocations admit;
+- workspace entries and claims route (`mesh.rs:121-142`, `:512-545`);
+- bindings and services declare exchanges (`exchange.rs:66-81`);
+- principal and node records are identity.
+
+Today every client op is appended, `home` included (`server.rs:262-282`). With
+the fold read from the registry, a forged grant never reaches the check. A
+forged home record still reaches three things:
+
+- routing: a `ServeClaim` with a higher epoch redirects a share, because
+  `who_serves` reads the served store;
+- declared exchanges: a `ServiceDefinition` makes any glade id an exchange,
+  which a session can then attach to;
+- every folder of that record kind: a malformed payload panics the decoders
+  (`GladeNodeSigning.md` F2).
+
+**No legitimate client writes `home`.**
+
+- The search covered glial, glade/client-ts, glade/client-rs, glade/demo,
+  glade-chat, glade/grip-share, grip-core, grip-react, grazel, glade-gyld,
+  glade-gwz and gryth-ui (`@grythjs/glade` and every plugin).
+- None of them appends on `home`, and none subscribes to it. So the re-ship of
+  `session.dump()` at connect cannot carry a home op (`demo/src/glade.ts:56-57`,
+  gryth-ui `runtime.ts:167-168`).
+- `workspace.create` is the one exchange on `home` (`exchange.rs:40`,
+  `:157-193`), and no client sends it.
+- The node's own tests send no op on `home` over a websocket. They only
+  subscribe to it.
+- The 4.1 note found the same (D4, D5).
+
+**The design.**
+
+- In the `Frame::Ops` arm, an op on `home` is not appended.
+- The session gets `Error{Unauthorized}` naming `home` and the glade id. The
+  frame's other ops are handled as before.
+- The node's own records still reach the served store through
+  `claims::publish` (`claims.rs:288-297`), which the change does not touch.
+- Size: about 15 lines and one test, written to fail first.
+
+It is not built, because this step stopped. It depends on nothing undecided,
+so it can land alone, first.
+
+**Named gap:** a peer can still write `home`, through the push
+(`mesh.rs:258-265`) and the pull (`:466-490`), until 4.1b verifies directory
+records.
+
+### The `Origin` header
+
+`ws::accept` (`ws.rs:94-118`) reads `Sec-WebSocket-Key` and nothing else. The
+node binds 127.0.0.1 (`bin/glade-node.rs:214`). But a browser lets any page open
+a websocket to any address, and only the server can refuse it, by its
+`Origin`. So any page open in the owner's browser can reach
+`ws://127.0.0.1:9099` and send a Hello naming any principal. With the check
+keyed on the claimed principal, that page holds the principal's grants.
+Against a web page the check is worth nothing.
+
+The browser clients today, and the `Origin` each presents:
+
+| Client | `Origin` |
+| --- | --- |
+| gryth-ui's Gyld target, dev (`gyld-ui.py start`, `pnpm dev:gyld`) | `http://localhost:5173` (`gyld-ui.py:159-162`). A second instance moves the port by an offset (`:191`) |
+| the same target, built, with grazel serving `dist-gyld` | `http://127.0.0.1:8080` (`grazel/src/main.rs:321-323`) |
+| gryth-ui's full desktop (`pnpm dev`) | `http://localhost:5173` |
+| glade/demo (`run_demo.py`) | `http://localhost:5175` (`run_demo.py:45`; `GLADE_VITE_PORT` moves it) |
+
+No non-browser client sends an `Origin`:
+
+- client-rs (`client-rs/src/ws.rs:48-55`);
+- the node's own test client (`node/src/ws.rs:121-128`);
+- Node 22's `WebSocket`, which client-ts uses in the grip-share and client-ts
+  suites. Measured on 2026-09-24: its upgrade request carries no `Origin`
+  header.
+
+The options:
+
+- (a) Accept a request with no `Origin`, or with a loopback one: `localhost`,
+  `127.0.0.1` or `[::1]`, any port, http or https. Refuse every other request
+  with HTTP 403, before the upgrade. This keeps every client above. It does not
+  stop a page served from another loopback port, or a local process.
+- (b) An allowlist from configuration (`--allow-origin`), which grazel and
+  `run_demo.py` pass. Tighter, but every launcher changes.
+- (c) A per-start token that grazel hands out through its same-origin
+  `/bootstrap.json`. The client presents it in the Hello's existing
+  `capability` field, which client-ts already sends as `null`
+  (`client.ts:143-150`). A foreign page cannot read the token. There is no wire
+  change, but grazel and both clients change.
+- (d) Nothing until session identity lands, recorded as a named gap.
+
+Recommend (a) now, and (c) with session identity. It is not built: the owner's
+word is pending, because it changes the path the live desk uses.
+
+### The preconditions
+
+**1. The revocation route: none exists.**
+
+- No production code appends a `CapabilityRevocation`. Only tests write the
+  kind (`appdecl.rs:782-797`, `registry.rs:699`, `tests/assembly/main.rs:403`).
+  The journeys' fake fold loads the contract's own `Revoke` record instead.
+- The app-file grammar has no revoke line (`appdecl.rs:364-376`). `glade-node`
+  has no revoke command (`bin/glade-node.rs:116-133`). No exchange mints a
+  revocation.
+- The ruled route is E-share-1's `share.revoke`, owned by the glade-share
+  family (`RulingWorksheet.md:492`; `dev-docs/glade/suppliers/glade-share.md:32`).
+  The family is not built.
+- A client op on `home/dir.revocations` lands only in the served store. The
+  check does not read that store, and the `home` refusal above would refuse
+  the op anyway.
+
+The options. None is chosen here.
+
+- **(a) An app-file line, `revoke <principal> <share>`.** At registration it
+  compiles to a `CapabilityRevocation` under the registrant's chain, and it is
+  diffed like a seed.
+  - Grants and revocations stay hand-made, in one reviewed place
+    (`identity_adapters = none_in_v1`).
+  - The corrected grazel-app.glade can carry `revoke owner grazel`. Every
+    instance that loads the file then withdraws the old grants at its next
+    start.
+  - Costs: it is a new directive in `glade-app v1`, and an older node refuses
+    it as an unknown declaration. A revocation covers a (principal, share)
+    pair and wins for good, so that pair can never be granted again
+    (`registry.rs:495-505`). It acts only at start.
+- **(b) A `glade-node revoke --principal P --share S` command.** It takes the
+  instance lock and appends to records.json. There is no format change, but
+  the node must be stopped, and no file records the revocation. It too acts
+  only at start.
+- **(c) An exchange on `home` that the node answers itself,** as it answers
+  `workspace.create`, gated by an admin verb. It needs the verb vocabulary and
+  an admin grant. E-share-1's glade-share owns this later.
+- **(d) Revocations read from the served store as well, but not grants.** A
+  forged revocation can only deny. But then any peer could deny anyone, and
+  without the `home` refusal so could any client.
+- **(e) (a), plus re-registration on a signal (`SIGHUP`).** The operator edits
+  the file and signals the node, and the revocation cuts live streams. It is a
+  new signal path on both roots.
+
+Recommend (a) for this step. Add (e) only if the slice must show a live cut in
+production.
+
+**2. The operands and the vocabulary.**
+
+- A seed's `<share>` was ruled on 2026-09-23 to be the workspace share. The
+  page states it (`AppFileFormat.md:180-186`).
+- `service <name>`: nothing reads `ServiceDefinition.name`
+  (`sysdata.rs:171-175`). Routing reads only the glade id
+  (`exchange.rs:66-73`).
+  - The shipped names are `grazel` (grazel-app `:43`) and `glade-gyld`
+    (gyld-app `:57`). The fixtures use `gwz` and `gyld`.
+  - Proposed page text: the name of the provider that answers the exchange,
+    kept as data. It is not a principal and not a share, and nothing routes or
+    checks by it. This needs the owner's word.
+- The verbs and the principals are undecided (see "What is undecided").
+
+**3. The shipped seed lines.**
+
+- grazel-app.glade `:50-51`, in both copies, become `seed owner ws-razel read.*`
+  and `seed owner ws-razel gwz.*`.
+  - They land with the route's withdrawal of the old pair: under (a), a
+    `revoke owner grazel` line.
+  - Not done: they wait for the route.
+- gyld-app.glade `:63` and `:66` already name `ws-razel`.
+- The fixtures name the app: `glade-gyld/tests/fixtures/gyld-test-app.glade:27`
+  (`seed owner gyld gyld.*`) and `glade-gwz/tests/fixtures/gwz-test-app.glade:18`
+  (`seed owner gwz gwz.*`). Each declares `workspace ws-razel` (`:30` and
+  `:21`).
+  - **They must change, to `ws-razel`, in the commit that adds precondition
+    4's warning.**
+  - The node's census test loads each of its five files alone, the two
+    fixtures included (`node/tests/shipped_app_files.rs:22-30`). It asserts
+    that each file loads with no warning, and with exactly one warning when
+    headed `glade-app v0` (`:61-90`).
+  - Their grants live only in the suites' temporary instances, so nothing
+    needs withdrawing.
+
+**4. The warning.**
+
+- At load, a seed whose share no loaded `workspace` line declares prints
+  `<file>: warning: line N: …` on the existing warning channel (R10(a)).
+- Step 2.7's criterion still holds only if grazel-app's corrected lines land in
+  the same commit. Its two current seeds would warn.
+- A reading node that seeds a grant for a share another node serves warns by
+  design: 4.6's node A, for example. The warning's text should say that this is
+  expected there.
+
+### Every flow the shipped apps and clients rely on
+
+"Refused" means refused once a fail-closed check is on for the path named.
+"Unaffected" means the flow uses no checked path, or only `home`.
+
+| Flow | What it presents | What it reads, and exchanges | Path | Grant after 4.3 | Outcome |
+| --- | --- | --- | --- | --- | --- |
+| **The Gyld desk**: gryth-ui's Gyld target (`pnpm dev:gyld` on 5173, or the build grazel serves on 8080), on grazel's node at 9099 | Hello principal `?principal=` or `?user=`. Otherwise a random six-character id per tab (`gryth-ui/packages/glade/src/runtime.ts:43-55`, `bootstrap-util.ts:27-30`). `gyld-ui.py` opens `http://localhost:5173/` with neither (`:159-162`) | subscribes on `ws-razel` to `gyld.streams`, `gyld.stream`, `gyld.decisions`, `gyld.lens` and `gyld.file` (keyed), `gyld.output` (by run) and `gyld.ask` (by conversation) (`plugins/gyld/src/ops/surfaces.ts:31-58`, `ops.ts:305`); exchanges `gyld.ops` (`ops.ts:284`) | websocket subscribe. The exchange is local and not gated | none. The seeds grant `owner` (gyld-app `:63`, `:66`), and no seed can name a random per-tab id. Only a page opened with `?principal=owner` would hold them | **refused**: every subscribe. The exchange still answers |
+| gryth-ui's full desktop (`pnpm dev`) | as the desk | adds `chat` (`chat.msgs` per group and `chat.groups`, `plugins/chat/src/groups.ts:22`) and `ws-razel/gwz.output` by run; exchanges `gwz.ops` | websocket subscribe | none | **refused** |
+| glade-gyld's supplier, spawned by grazel | Hello principal `grazel` (`grazel/src/lib.rs:296-300`) | attaches to `ws-razel/gyld.ops`, which is not a read. Before it publishes a build, or first writes a run's log, it subscribes to its own `ws-razel` chains to resume them (`glade-gyld/src/supplier.rs:1261-1270`, `:1312-1318`, `:1352`) | websocket subscribe (the resume) | none for `grazel` | **refused**: the resume. With an `Error`-only refusal, `resume` never returns and nothing is published |
+| glade-gwz's supplier, spawned by grazel | Hello principal `grazel` (`lib.rs:330-341`) | attaches to `ws-razel/gwz.ops`, writes `gwz.output`, reads nothing | attach, not gated | not needed | unaffected |
+| grazel's suite (26 + 3) | probe sessions with no Hello (`grazel/tests/integration.rs:316-320`, `:472-476`) | local exchanges on `gwz.ops` and `gyld.ops` | not gated | not needed | unaffected. A resume the gyld supplier starts in the background would be refused, but no assertion waits on one |
+| glade-gwz's suite (9 + 5) | `requester` and `subscriber` sessions with no principal (`glade-gwz/tests/integration.rs:327-341`) | `ws-razel/gwz.output`, by run | websocket subscribe | none. The fixture seeds `owner gwz`, and the sessions claim nothing | **refused**: `streaming_output_visible_to_subscriber` |
+| glade-gyld's suite (233 + 31) | `subscriber` sessions with no principal (11 subscribes, `glade-gyld/tests/integration.rs:973-3288`), and the supplier under test | `ws-razel`: `gyld.ask`, `gyld.output`, `gyld.streams` and others | websocket subscribe | none | **refused** |
+| **glade/demo** (`run_demo.py`) | runs the legacy form, `glade-node <port> <store>` (`run_demo.py:84-90`): no registry, so no fold. Hello principal `?user=`, otherwise the tab's id (`demo/src/glial.ts:77-81`, `glade.ts:44`) | `doc:<doc>`, both commons and `self:<user>`; `account:<user>` (`manifest.ts:69-77`); `chat` (`chat.ts:35`); `ws-razel/gwz.output` after a gwz run (`gwz.ts:169`) | websocket subscribe | none can exist: every check is `Unavailable` | **refused**: everything but `home` |
+| glade/grip-share's and glade/client-ts's suites; client-rs's suite | the legacy form (`grip-share/test/helpers.ts:54`, `client-ts/test/integration.test.ts:24`). client-rs's suite uses both forms (`client-rs/tests/integration.rs:101`, `:127`) | app shares | websocket subscribe | none | **refused** |
+| glial | a library. It runs no process and has no principal of its own. Its supplier says `Hello(principal)` when configured (`glial/src/supplier/index.ts:408-412`). Its tests use in-memory fakes and start no node (`glial/test/session.test.ts:6`, `supplier.test.ts:8`) | the embedding app's | — | — | as for the desk and the demo |
+| the peer mesh, `home`: the pull each way at connect, and the record push (`mesh.rs:432-458`, `:466-490`, `:277-293`) | the peer's node id | `home` only | exempt | not needed | unaffected |
+| the peer mesh, a forwarded subscribe or exchange between two booted nodes. Used by the node's own tests (`mesh.rs:690-807`, `exchange.rs:506-622`, `:638-783`) and by 4.5's and 4.6's crossing. No shipped app runs two nodes: grazel passes no `--peer` (`lib.rs:240-255`) | the dialer's node id, in hex | any routed share, such as `ws-razel` | peer subscribe, peer exchange | none exists. A seed naming the peer's id would allow it, if the principal vocabulary admits ids. Ids are per instance, so no shipped file can carry one | **refused**, until the serving node's operator grants the peer |
+| the peer mesh, a forwarded `workspace.create` (`exchange.rs:157-193`) | the dialer | `home` | exempt | not needed | unaffected |
+
+**The plan's leak tests.**
+
+- At the plan's revision (glade `559cb2c`), `mesh.rs:520-584` was
+  `two_booted_nodes_converge_home_share`. That test replicates only `home`, so
+  it is exempt and stays green.
+- The leak the plan means is phase (b) of `s_discovery_golden_path_end_to_end`:
+  a session on A subscribes to `ws-razel`, and B serves A without consulting a
+  grant. That phase was then at `:629-` and is now at `:690-807`.
+- The exchange leak is `grazel_attach_end_to_end`, phases (b) and (c), now at
+  `exchange.rs:638-783`.
+
+### The owner's existing instances
+
+This is read from the code and the history. The instance directories were not
+opened: `~/.gyld-ui` and `~/.glade` are out of bounds.
+
+Their stores hold these records on `home/dir.grants`, under the node's own
+chain, in records.json and in the served store:
+
+- `(owner, grazel, [read.*])` and `(owner, grazel, [gwz.*])`, from grazel-app,
+  unchanged since grazel `56d9a32` (2026-07-12);
+- `(owner, ws-razel, [read.*])` and `(owner, ws-razel, [gyld.*])`, from gyld-app
+  since grazel `832591f` (2026-09-13), if the gyld leg has run.
+
+They also hold one `dir.principals` record for every tab the desk has opened,
+since each tab's Hello names a new random principal (`claims.rs:213-236`).
+
+What an instance sees after it upgrades:
+
+- **To this step's tree:** nothing changes. Only this note was written.
+- **To part 1 as recommended** (route (a), the corrected lines, and `revoke
+  owner grazel`). At its first start, registration:
+  - appends `(owner, ws-razel, [gwz.*])`;
+  - finds `(owner, ws-razel, [read.*])` already held if the gyld leg ever ran,
+    and appends it if not;
+  - appends one `CapabilityRevocation{owner, grazel}`. That withdraws both old
+    grants at once. They stay in the store as history, and the fold answers
+    `Revoked` for them.
+
+  Nothing is served differently, because nothing reads the share `grazel`.
+- **To part 2, with the websocket path enforced.** The desk presents a random
+  principal and holds nothing, so every `gyld.*` subscribe is refused. The
+  supplier presents `grazel` and holds nothing, so its resume is refused. The
+  desk would show nothing. That is why question 4 recommends keeping this path
+  off by default until the desk presents a granted principal.
+
+### The node's own grant
+
+The ruling of 2026-09-23 makes it an ordinary `CapabilityGrant` whose principal
+is the node id. The fold is per node, so the serving node's own registry must
+hold it: B serves A only if B's registry holds `{principal: <A's id in hex>,
+share, verbs}`.
+
+- **Who creates it in tests.** The test appends the grant to B's registry
+  before adoption, as the mesh tests append claims today (`mesh.rs:696-723`).
+  Or it registers a test app file on B that holds `seed <A's id> ws-razel
+  read.*`. A mid-stream revocation goes through B's `DirAuthority::accept`,
+  the path a runtime route would take.
+- **Who creates it in 4.5's crossing.** B's operator writes the seed line in an
+  app file B loads. A prints its id at start (`node <id>`,
+  `bin/glade-node.rs:148`).
+  - This works only if the principal vocabulary admits a node id in a seed.
+  - After 4.1a the id is the node key's public key (`GladeNodeSigning.md` D2),
+    so the line is written after 4.1a, and written again if A's key is lost.
+- **A file for a reading node.** A seed and a `workspace` line can share one
+  file. A reading node must not load the serving node's `workspace` line, or it
+  claims the share itself, with a higher epoch (`claims.rs:157-162`). So node A
+  needs a file of its own, with seeds and no workspace line. Precondition 4's
+  warning fires there, as expected.
+
+### The order against 4.1b
+
+The 4.1 note recommends putting 4.3 after 4.1b (`GladeNodeSigning.md` D11:
+"4.3 should follow 4.1b, or its tests should name F2's bypass"), because
+clients and peers can forge `home` records.
+
+- Refusing client writes to `home` closes the local half without signatures.
+  That is what lets 4.3 go before 4.1b.
+- The peer half stays a named gap until 4.1b.
+- With the fold read from the registry, a forged grant cannot reach the check,
+  even from a peer. A forged claim can still steer routing.
+
+### What 4.3 builds once ruled
+
+The whole step comes to about 450 production lines and 750 test lines. That is
+over the ~400-line production cap, so it splits in two.
+
+- **Part 1: the preconditions and the local bypass.** About 150 production
+  lines and 250 test lines:
+  - the `home` refusal;
+  - the revocation route;
+  - grazel-app's corrected lines, in both copies, with `revoke owner grazel`;
+  - the two fixtures;
+  - precondition 4's warning;
+  - the format page: the route beside `seed`, and the definitions of `service
+    <name>`, the verbs and the principals.
+- **Part 2: the check.** About 300 production lines and 500 test lines:
+  - the policy view and its generation;
+  - the `GrantPort` adapter;
+  - the checks, on the paths the answer to question 4 enforces;
+  - the admission table and the re-check pass;
+  - the refusal forms.
+
+The tests. Each is written to fail first, and each name says the identity is
+claimed.
+
+- `a_peer_without_a_grant_is_refused_by_its_claimed_node_id`: the golden path's
+  phase (b), turned round. Its twin is
+  `a_peer_granted_by_its_claimed_node_id_is_served`.
+- `grazel_attach_end_to_end`, turned round: without A's grant, the forwarded
+  `ws.tree` subscribe and the forwarded `gwz.ops` exchange are refused. A twin
+  with the grant is served.
+- `a_revocation_ends_a_forwarded_stream_of_a_claimed_node_id`.
+- `a_session_claiming_no_principal_is_refused`, and
+  `a_session_claiming_a_granted_principal_is_served`.
+- `a_stale_fold_fails_closed`.
+- `a_client_op_on_home_is_refused`.
+- `a_revoke_line_withdraws_a_seeded_grant`.
+- The census test, extended for the warning.
+
+### Named gaps, whatever the rulings
+
+- Identities are claimed. A peer's node id comes from an unverified HELLO
+  until 4.1a and 4.2. A session's principal comes from its Hello, on the
+  client's word, until session identity lands.
+- A provider attach is not gated (B1), and a later attach replaces the earlier
+  provider.
+- `workspace.create` is exempt, as an exchange on `home`. Any session or peer
+  can create a workspace at any linked node.
+- A peer can write `home` until 4.1b.
+- Revocation is forward-only.
+- A grant is per node: one made on another node admits nothing here.
+- The directory still shows every share id, principal and grant to every
+  accepted peer and every client (the exposure table's §6.2). The ruling
+  exempts it.
+
+### Questions for the owner
+
+1. **The revocation route.** The options are (a) to (e) under precondition 1.
+   Recommend (a), the `revoke <principal> <share>` app-file line. Add (e) only
+   if the slice must show a live cut in production.
+2. **Verbs.**
+   - (a) The read paths ask `read.subscribe` (AZM §5's wire verb). The exchange
+     path asks the exchange's glade id. A stored verb `p.*` admits every verb
+     that begins `p.`, and any other stored verb admits only itself. So
+     `read.*` admits `read.subscribe`, `gwz.*` admits `gwz.ops`, and `gyld.*`
+     admits `gyld.ops`. `GrantPort`'s documentation gains one sentence and
+     GR-001 a pattern probe: a change under `glade/contracts`.
+   - (b) Exact verbs only, with the seeds rewritten to `read.subscribe`,
+     `gwz.ops` and `gyld.ops`. The contract stays as it is. The page's pattern
+     text goes, and every stored pattern grant goes inert.
+
+   Recommend (a). It keeps what the seeds, the page and AZM §5 already say.
+3. **Principals.** Recommend:
+   - a principal is a token;
+   - a token of 64 lower-case hex digits names a node, and its grants are node
+     grants (the ruling of 2026-09-23);
+   - a Hello that names such a token binds no principal;
+   - a session that names no principal holds nothing;
+   - `owner` is the owner.
+4. **The flows that would be refused.** The options:
+   - (a) Enforce behind a switch that is off by default, such as
+     `--enforce-grants`. Nothing shipped changes. 4.3's tests and 4.6's route
+     turn it on. It is not added without your word.
+   - (b) Give every flow a granted principal.
+     - `gyld-ui.py` opens the desk with `?principal=owner`, or
+       `/bootstrap.json` names the principal.
+     - The suppliers present `owner`, or grazel-app seeds `grazel`.
+     - The suites' clients send `hello(owner)`, and their fixtures seed `owner
+       ws-razel`.
+     - The legacy form gets a fold, or an exemption.
+
+     This touches gryth-ui, grazel, glade-gyld, glade-gwz, glade/demo,
+     grip-share, client-ts and client-rs.
+   - (c) Enforce the peer paths by default now, keyed on the claimed node id;
+     no shipped flow uses them. Enforce the websocket path under (a), until the
+     `Origin` check lands and the desk presents a granted principal.
+
+   Recommend (c). It turns both leak tests round and meets the ruling's
+   concern first (the exposure table's §6.1). A check keyed on a principal that
+   any web page can claim protects nothing yet, and turned on by default it
+   would cut the live desk.
+5. **The refusal on the wire.** Recommend (b): an empty `Heads`, then
+   `Error{Unauthorized}`.
+6. **Client writes to `home`.** Recommend landing the refusal now, alone, as
+   4.3's first commit. It is independent of questions 1 to 4, and no legitimate
+   client writes `home`.
+7. **`Origin`.** Recommend (a): accept no `Origin`, or a loopback one, and
+   refuse the rest.
+8. **Order.** Recommend 4.3 before 4.1b once question 6 has landed, with the
+   peer half as a named gap. The alternative is the 4.1 note's order: 4.4,
+   then 4.1b, then 4.3.
