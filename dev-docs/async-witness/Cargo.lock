@@ -886,6 +886,8 @@ version = "0.0.0"
 name = "glade-node"
 version = "0.0.0"
 dependencies = [
+ "ed25519-dalek",
+ "getrandom 0.4.3",
  "glade-carrier-api",
  "glade-clock-api",
  "glade-grant-api",
