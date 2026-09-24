@@ -5,10 +5,11 @@
 //! provider that replaces them, is `glade/dev-docs/GladeNodeAssembly.md`,
 //! "Journeys (plan Step 3.4)".
 //!
-//! Part (i), `delivery.rs`: publish, exact retry, lost acknowledgement.
-//! Nothing here opens a file or a socket, starts a runtime or sleeps:
-//! `fakes::run` polls every future, and the fake clock and each test's own
-//! steps are the whole schedule.
+//! Part (i), `delivery.rs`: publish, exact retry, lost acknowledgement. Part
+//! (ii), `leases.rs` and `admission.rs`: renewal, expiry, partial lookup, wrong
+//! scope, unknown or denied authority. Nothing here opens a file or a socket,
+//! starts a runtime or sleeps: `fakes::run` polls every future, and the fake
+//! clock and each test's own steps are the whole schedule.
 
 // Step 3.2's fakes, shared with `tests/assembly`: this binary uses some of them.
 #[allow(dead_code)]
@@ -18,6 +19,10 @@ mod fakes;
 // Part (i): this harness, the fakes it adds, and three journeys.
 mod delivery;
 mod faults;
+
+// Part (ii): five journeys.
+mod admission;
+mod leases;
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
