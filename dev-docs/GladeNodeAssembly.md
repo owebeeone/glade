@@ -4344,3 +4344,209 @@ link's close cuts short midway (its report is made, as for a round's end).
     +36/−2, of which 25 are `StoreError`'s text, which D9's report uses;
 - tests: +350/−12, net +338;
 - beside them, `check.sh`'s baseline.
+
+## Pull on a gap (the hardening's question 2)
+
+Design addition, 2026-09-25, against glade `7cd2311`. The red runs and the
+measured figures were filled in afterwards. The owner ruled the hardening's
+question 2 on 2026-09-24, "all recommended": option (b), "a node that refuses
+a pushed record as a gap pulls from the pusher at once, a small step of its own
+before 4.5" (`dev-docs/GladeFirstSlicePlan.md` at the glade-wz root). It closes
+two named gaps: the hardening's, where a peer that sees one of this node's
+chains out of order stalls on it until its next pull (fix 3), and 4.1b part
+1's, a push that reaches a peer before the pull at connect.
+
+Nothing changes in the wire, in any durable format, in the contracts or in the
+dependencies. The code is in `node/src/mesh.rs`, with one task site in
+`node/src/tasks.rs`.
+
+### 1. A gap, and what is not one
+
+- **A gap** is a pushed `home` op that the served store refuses with
+  `StoreError::Gap`. Either its seq is not one past the last its chain holds
+  here, or its chain holds nothing here and its seq is not 0 (4.1b's
+  `classify_home`).
+  - Its predecessor is missing here, and the pusher holds it: a node pushes a
+    record only once its own served store has taken it (`claims::publish`).
+- **Not a gap**, and so starting no pull:
+  - **A deferred chain** (D9): its origin is a node this node has not met. The
+    round keeps none of it, and the store never sees it. It waits for the next
+    pull at connect, as ruled.
+  - **A chain break**: the seq follows but the `prev` does not. A pull from
+    this node's heads would bring the same op, since the pusher answers by seq,
+    not by hash (`missing_for`), and it would break the same way.
+  - A record that does not verify, a fork, or a shape or writer conflict. A
+    pull changes none of them.
+- **Only a push starts a pull.** A pull asks from this node's heads, so what
+  it brings follows what is held. Its round notes no gap.
+
+### 2. The pull
+
+- A push's round (`handle_peer_stream`'s `Ops` arm, one `Round`) notes each
+  chain it cut short as a gap (`Gaps`): the chain's (stream, origin), the
+  highest seq of it that the push carried, and one refusal.
+- If no pull from that pusher runs, one starts at once: `pull_on_gap`.
+  - It is a task at a new site, `GapPull`, owned by `Sessions`, like the
+    link's other streams.
+  - It opens a new stream on the pusher's live link, found by its node id. It
+    sends this node's `home` heads and takes what comes back: `pull_home`, one
+    D9 round, as at connect.
+  - The pusher answers with `serve_home`, as it answers the pull at connect,
+    whatever its build. Receiver-side only.
+- A pull covers every gap noted before it began. The op of each such push was
+  in the pusher's store before it was pushed, so before the pusher answered.
+
+### 3. One pull at a time per pusher
+
+- **The table.** The mesh keeps, per pusher, a pull that runs and the gaps
+  noted since it began (`Mesh::gap_pulls`). A push refused as a gap while a
+  pull from its pusher runs is noted there, and starts nothing.
+- **A pull's end.** Each gap noted while it ran is judged against the store:
+  - one it healed is done;
+  - one still short is pulled for again, since its push may have come after
+    the pusher answered;
+  - a gap noted before the pull began, which the pull did not heal, is not
+    pulled for again. Another pull from the same heads would not heal it
+    either, and the pull's round has said why.
+- **The entry goes** when a pull ends with no gap noted, under the lock that
+  notes them. So a gap noted at that moment starts the next pull.
+- **The bound.** At most one pull runs from a pusher, and each pull after the
+  first follows a push refused while the one before ran. A burst of gaps costs
+  one pull, or two if a push in it came after the pusher's answer. The bound
+  is per pusher: n linked peers can run n pulls at once.
+- **Order.** A push's gaps are noted before its round's lines are reported,
+  and a new pull starts after them. Once a refusal is on the console, some
+  pull answers for it, and that pull's line comes after it.
+
+### 4. The report
+
+One line per pull, through the door's reporter, beside the rounds' lines:
+
+- `pulled N home record(s) from peer <peer> after G gap(s): <stream> of node
+  <origin> healed`.
+  - N is what the pull took, a duplicate included, as `SyncOutcome::applied`
+    counts. G is how many refusals it answers.
+  - Then each chain it was for: `healed` once the store holds it up to the
+    highest seq pushed, else `not healed`. Several are joined by `; `.
+- `a pull from peer <peer> after G gap(s) failed: <error>: <chains>`: no live
+  link, or the stream failed.
+- The pull's own round reports what it deferred or refused, before that line,
+  as the pull at connect does.
+
+### 5. App shares: not built
+
+The ruling names the `home` share. App shares get no pull on a gap, as decided
+here (question 1):
+
+- A push carries `home` alone. `push_home`'s one caller is `claims::publish`,
+  and the receiver's `Ops` arm takes `home` ops only.
+- App-share content moves by interest, one QUIC stream per zone. The claim
+  holder queues the ack, the resume gap and every live op of the zone on one
+  channel (`serve_peer_subscribe`), so they cannot arrive out of order.
+- `serve_home` serves `home` alone. An app share's pull is a subscribe, under
+  4.3's grant check.
+
+### 6. Tests, each begun red
+
+Built on 2026-09-25 against glade `7cd2311`. The first test was run against
+that commit's production code; the other two with the part each guards
+switched off, by one edit in a copy of the sources. The message is what each
+red run printed. `<B>` and `<C>` stand for the nodes' ids.
+
+| Test | Proves | Red first |
+| --- | --- | --- |
+| `mesh`: `a_renewal_pushed_ahead_of_the_one_before_it_heals_by_a_pull` | over real iroh, A behind a door, linked to B, which holds B's claim. B's renewal at seq 2, pushed ahead of the one at seq 1, is refused as a gap: `refused 1 home record(s) of node <B> on dir.claims from peer <B>: a gap: expected seq 1, got 2`. A pulls from B at once, and holds both: `pulled 2 home record(s) from peer <B> after 1 gap(s): dir.claims of node <B> healed`. The late push of seq 1 changes nothing, and the next renewal lands in order | against `7cd2311`'s production code: "timed out waiting for the chain to heal at A", after 6.3 s |
+| `mesh`: `a_burst_of_gaps_from_one_pusher_is_answered_by_one_pull` | B's store is held, so A's pull waits for B's answer. B pushes seq 4, 3 and 2, each refused as a gap while that one pull runs. Released, it heals all three, with `pulled 4 home record(s) from peer <B> after 3 gap(s): dir.claims of node <B> healed`, and ends; no other pull runs | with every gap starting its own pull: three lines `pulled 4 home record(s) from peer <B> after 1 gap(s): dir.claims of node <B> healed`, where one `after 3 gap(s)` was expected |
+| `mesh`: `a_deferred_chain_starts_no_pull` | B pushes two records of C, a node A has not met. A defers them, with one line, and no pull runs. B's renewal pushed ahead of the one before it then starts one, whose line names B's chain alone | with a deferred chain noted as a gap: the lines `deferred 2 home record(s) of node <C> on dir.principals from peer <B>: not a node this node knows` and `pulled 0 home record(s) from peer <B> after 1 gap(s): dir.principals of node <C> not healed`, where the first alone was expected |
+
+What they do not prove:
+
+- The second pull, for a gap refused while a pull ran whose push came after
+  the pusher's answer. No test can place a mint between the answer and the
+  pull's end without a hook (question 3).
+- A pull that fails, and the line's second form.
+- The race of 4.1b part 1's named gap. It is the same refusal, on a chain that
+  holds nothing yet (`expected seq 0`).
+- Windows and Linux; more than two nodes.
+
+### Named gaps
+
+- **A lost push** with no later push on its chain still waits for the next
+  pull at connect (4.4's ruling, "a lost push waits for the next pull"). A
+  later push on the chain now heals it: for a served share, the next renewal,
+  10 s on.
+- **A chain that cannot heal**, because this node refuses a record the pull
+  brings (one that does not verify, say), gets a pull for each push refused on
+  it, one at a time, with its lines each time.
+- **The bound is per pusher**, not per node: n linked peers can run n pulls at
+  once.
+- **A pull cancelled midway** leaves its pusher's entry in the table, and later
+  gaps from that pusher wait on a pull that is gone. Only the owner's stop
+  cancels one, and the node is then ending.
+- **A third node's chain** that the pusher holds is reported deferred at each
+  such pull, as at each connect (4.1b part 2's named gap).
+- **A chain break** on a push is not pulled for, nor is a record that does not
+  verify (section 1).
+
+### Default-path changes
+
+1. A node whose served store refuses a peer's pushed `home` record as a gap
+   pulls that peer's `home` share at once, from its heads, over the same link,
+   one pull at a time per peer. It reports a line per pull: `pulled N home
+   record(s) from peer <peer> after G gap(s): …`.
+2. Nothing a node sends changes. A node of an older build answers the pull as
+   it answers the one at connect.
+3. The desk sees nothing: it has no peer. Its restart prints the same lines
+   (Measured).
+
+### Questions for the owner
+
+1. **App shares** (section 5). Recommend no pull on a gap for them, as built.
+   They are never pushed, and their one path, a forwarded interest, is ordered
+   by construction. The other choice is a gap check on the forwarded stream
+   (`run_forward`, which drops a refused op today), ending the forward so that
+   the next subscribe resumes from its heads. That would be its own step, if a
+   gap is ever seen there.
+2. **A chain break on a push** (section 1). Recommend no pull, as built: a pull
+   from the same heads brings the same op. A break means the pusher's chain
+   forked or the op was altered on the way. The round's line reports it.
+3. **The second pull** (section 3). It is built, and no test covers it.
+   Without it, a gap whose push came after the pusher's answer waits for the
+   next push on its chain: 10 s for a renewal, one missed renewal inside a
+   30 s lease. Recommend keeping it. A test would need a hook in `serve_home`
+   that holds the answer between computing and sending it.
+
+### Measured
+
+2026-09-25, Apple M3 Pro, Rust 1.96.0, on the final tree:
+
+- **The gate** passes all 8 components, in 103 s from an empty scratch target.
+  There are 300 node tests on each path, across 15 test binaries, where there
+  were 297: the three new `mesh` tests.
+  - rustfmt: glade-node 299 hunks, at its baseline, and no line this step wrote
+    is a deviation. `mesh.rs` holds its 36 hunks as before; one of them now
+    shows an edited doc line as its context. glade-wire 43.
+  - clippy: glade-node 11 warnings and glade-wire 7, at their baselines.
+  - The contracts gate passes, unchanged.
+- **Time**: alone, over three warm runs each, the reorder and deferred tests
+  take 0.05 s, the burst test 0.07 s. Each binds two endpoints on loopback.
+- **Repeat runs**, on one build: the `mesh` module's 15 tests 40 times, and the
+  library's 202 tests 8 times. No failure.
+- **The replay**, from `glade-wz/grazel` as grazel starts the node, on one
+  scratch instance with the desk's two app files: the default binary (4.1b,
+  inode 401201248) twice, then this build twice.
+  - The first start registered `+12 record(s)` and `+10 record(s), 2
+    unchanged`.
+  - Every later start, this build's two included, printed the same nine lines:
+    `+0 record(s), 12 unchanged` for each app, `ws-razel` serving, then
+    `listening`. They differed only in the client port the OS chose, and
+    printed nothing on stderr.
+- **Downstream**, against the default binary (inode 401201248, not rebuilt),
+  through the shims: client-rs 25 + 10, client-ts 48, grip-share 19, grazel
+  29 + 3, glade-gyld 233 (1 ignored) + 33, glade-gwz 9 + 7. All at baseline.
+
+**Size**, in lines added and removed in `.rs` files, doc comments included:
+
+- production: +198/−4, net +194: `mesh.rs` +194/−3, of which 143 lines are
+  code and the rest comments and blank lines; `tasks.rs` +4/−1;
+- tests: +179, in `mesh.rs`.

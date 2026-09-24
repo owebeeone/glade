@@ -33,7 +33,7 @@ pub(crate) type Task = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 pub(crate) type Inbox = mpsc::UnboundedReceiver<Task>;
 
 /// Every place the node spawns a task: the nine of `mesh.rs` and the renewal
-/// loop the plan names, and the four it does not.
+/// loop the plan names, and the five it does not.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Site {
     /// `mesh.rs`, `enable_mesh`: the peer accept loop.
@@ -54,6 +54,9 @@ pub(crate) enum Site {
     SubscriptionWriter,
     /// `mesh.rs`, `forward_interest`: an interest forwarded to a claim holder.
     ForwardInterest,
+    /// `mesh.rs`, `handle_peer_stream`: the pulls from a peer whose push was
+    /// refused as a gap (`pull_on_gap`).
+    GapPull,
     /// `claims.rs`, `adopt_boot_tuned`: the lease-renewal loop.
     Renewal,
     /// `exchange.rs`, `handle_request`: an exchange forwarded to a claim holder.

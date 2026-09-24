@@ -16,7 +16,10 @@
 //! app-share content moves by INTEREST (a routed subscribe), never wholesale.
 //! Ops ingested from a peer are appended through the same verify path as any
 //! carrier and fanned out to local subscribers — the replica serves the reads.
+//! A push the store refuses as a gap starts a pull of the pusher's home share
+//! at once, one at a time per pusher (`pull_on_gap`).
 
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::sync::atomic::Ordering;
@@ -75,6 +78,9 @@ pub struct Mesh {
     /// link's HELLO has proved since the mesh started. A peer's `home`
     /// record from any other node is deferred ([`Round`]).
     pub(crate) signer: NodeSigner,
+    /// The pulls a gap has started ([`pull_on_gap`]): each pusher one runs
+    /// from, with the gaps its pushes have been refused on since.
+    gap_pulls: std::sync::Mutex<BTreeMap<[u8; 32], Gaps>>,
 }
 
 impl Mesh {
@@ -85,6 +91,46 @@ impl Mesh {
             Some(door) => door.report(line),
             None => eprintln!("{line}"),
         }
+    }
+
+    /// Note `gaps`, which a push of `pusher`'s left: with no pull from it
+    /// running, one is to start for them, and they are handed back; else
+    /// they wait for the running pull's end.
+    fn note_gaps(&self, pusher: [u8; 32], gaps: Gaps) -> Option<Gaps> {
+        if gaps.0.is_empty() {
+            return None;
+        }
+        let mut running = self
+            .gap_pulls
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match running.entry(pusher) {
+            Entry::Occupied(mut waiting) => {
+                waiting.get_mut().merge(gaps);
+                None
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(Gaps::default());
+                Some(gaps)
+            }
+        }
+    }
+
+    /// The gaps noted from `pusher` since its pull started or last asked.
+    /// With `end`, and none noted, its pull ends: no gap waits for it.
+    fn take_gaps(&self, pusher: &[u8; 32], end: bool) -> Gaps {
+        let mut running = self
+            .gap_pulls
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let noted = running
+            .get_mut(pusher)
+            .map(std::mem::take)
+            .unwrap_or_default();
+        if end && noted.0.is_empty() {
+            running.remove(pusher);
+        }
+        noted
     }
 }
 
@@ -189,6 +235,7 @@ impl Server {
             forwarded: Mutex::new(BTreeSet::new()),
             door,
             signer: NodeSigner::new(Some(*endpoint.identity())),
+            gap_pulls: std::sync::Mutex::new(BTreeMap::new()),
         });
         self.shared
             .mesh
@@ -286,8 +333,9 @@ async fn run_link(shared: Arc<Shared>, mesh: Arc<Mesh>, link: PeerLink, dialed: 
 /// `ExchangeReq` = a forwarded exchange (this node is the claim holder — the
 /// attached authority answers, one stream one exchange, `exchange.rs`);
 /// `Ops` = a peer's home-share PUSH (freshly-minted directory records, the B9
-/// step) — scoped ingest, home ops only, one frame per stream, one [`Round`].
-/// `node` is the peer, as its HELLO proved it.
+/// step) — scoped ingest, home ops only, one frame per stream, one [`Round`];
+/// a chain it leaves short as a gap starts a pull from the peer
+/// ([`pull_on_gap`]). `node` is the peer, as its HELLO proved it.
 async fn handle_peer_stream(
     shared: Arc<Shared>,
     node: [u8; 32],
@@ -308,7 +356,16 @@ async fn handle_peer_stream(
             for op in o.ops.into_iter().filter(|op| op.share == HOME) {
                 round.take(op).await;
             }
+            // Noted before the round's lines, so a refusal once reported is a
+            // gap some pull answers for; a new pull starts after the lines.
+            let pull = mesh.note_gaps(node, std::mem::take(&mut round.gaps));
             round.end();
+            if let Some(gaps) = pull {
+                let pulling = shared.clone();
+                shared.tasks.spawn(Site::GapPull, async move {
+                    pull_on_gap(&pulling, &mesh, node, gaps).await;
+                });
+            }
             Ok(())
         }
         _ => Ok(()), // unknown opener: drop the stream, never the connection
@@ -320,7 +377,9 @@ async fn handle_peer_stream(
 /// anti-entropy (claim mints, renewals, creates). Scoped to SELF-minted
 /// records by construction (only `claims::publish` calls it); the receiver
 /// ingests and never re-pushes — transitive gossip is deferred. Best-effort:
-/// a lost push is healed by the next connect-time pull.
+/// a push that arrives out of order, or after a lost one, is refused as a gap
+/// and heals by the pull that starts ([`pull_on_gap`]); a lost push with none
+/// after it on its chain waits for the next connect-time pull.
 pub(crate) async fn push_home(shared: &Arc<Shared>, ops: Vec<Op>) {
     let Some(mesh) = shared.mesh.get() else { return };
     if ops.is_empty() {
@@ -588,6 +647,9 @@ struct Round<'a> {
     /// Each chain cut short, by (stream, origin): why, and how many of its
     /// ops were not taken.
     cut: BTreeMap<(String, String), (Cut, usize)>,
+    /// The chains cut short as a gap, which a push's round hands to
+    /// [`pull_on_gap`]. A pull's round leaves them: a pull starts no pull.
+    gaps: Gaps,
 }
 
 /// Why a round cut a chain short.
@@ -609,6 +671,7 @@ impl<'a> Round<'a> {
             from,
             outcome,
             cut,
+            gaps: Gaps::default(),
         }
     }
 
@@ -617,6 +680,7 @@ impl<'a> Round<'a> {
         let chain = (op.glade_id.clone(), op.origin.clone());
         if let Some((_, missed)) = self.cut.get_mut(&chain) {
             *missed += 1;
+            self.gaps.reached(&chain, op.seq);
             return;
         }
         let known = key_of(&op.origin).is_some_and(|node| self.mesh.signer.knows(&node));
@@ -624,9 +688,13 @@ impl<'a> Round<'a> {
             self.cut.insert(chain, (Cut::Deferred, 1));
             return;
         }
+        let seq = op.seq;
         match ingest_and_fanout(self.shared, self.from, op).await {
             Ok(_) => self.outcome.applied += 1,
             Err(e) => {
+                if matches!(e, StoreError::Gap { .. }) {
+                    self.gaps.refused(chain.clone(), seq);
+                }
                 self.cut.insert(chain, (Cut::Refused(e.to_string()), 1));
             }
         }
@@ -660,6 +728,129 @@ impl<'a> Round<'a> {
         }
         outcome
     }
+}
+
+/// Pull from `pusher` at once, the store having refused a push of its as a
+/// gap (the hardening's question 2, ruled (b)): its home share, from this
+/// node's heads, on a new stream of its live link, as at connect. So a chain
+/// that a push reached out of order heals now, not at the next link.
+/// Receiver-side only, with no wire change. One pull runs per pusher. A gap
+/// noted while it runs is judged at its end, and pulled for again only if
+/// still short, since its push may have come after the pusher answered. A
+/// gap noted before it began is covered by it, and another pull would not
+/// heal what it did not. Each pull reports a line: what it took, and each
+/// chain it was for, healed or not. A deferred chain (D9) is not a gap: it
+/// waits for the next pull at connect.
+async fn pull_on_gap(shared: &Arc<Shared>, mesh: &Mesh, pusher: [u8; 32], mut gaps: Gaps) {
+    let peer = hex_id(&pusher);
+    loop {
+        let pulled = pull_from(shared, mesh, &peer, pusher).await;
+        let mut during = mesh.take_gaps(&pusher, false);
+        let (line, again) = {
+            let st = shared.store.lock().await;
+            let again = if pulled.is_ok() {
+                during.split_short(&st)
+            } else {
+                Gaps::default()
+            };
+            gaps.merge(during);
+            (gaps.line(&st, &peer, &pulled), again)
+        };
+        mesh.report(&line);
+        if !again.0.is_empty() {
+            gaps = again;
+            continue;
+        }
+        gaps = mesh.take_gaps(&pusher, true);
+        if gaps.0.is_empty() {
+            return;
+        }
+    }
+}
+
+/// One pull of `pusher`'s home share, on a new stream of its live link.
+async fn pull_from(
+    shared: &Arc<Shared>,
+    mesh: &Mesh,
+    peer: &str,
+    pusher: [u8; 32],
+) -> io::Result<SyncOutcome> {
+    let conn = mesh.links.lock().await.get(peer).cloned();
+    let conn = conn.ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "no live link"))?;
+    let (send, recv) = conn.open_bi().await.map_err(other)?;
+    pull_home(shared, mesh, pusher, send, recv).await
+}
+
+/// The chains a peer's pushes left short as a gap, by (stream, origin): the
+/// highest seq of each that they carried, and how many of them were refused
+/// on it.
+#[derive(Default)]
+struct Gaps(BTreeMap<(String, String), (i64, usize)>);
+
+impl Gaps {
+    /// Note a push refused on `chain` as a gap, at `seq`.
+    fn refused(&mut self, chain: (String, String), seq: i64) {
+        let (last, pushes) = self.0.entry(chain).or_insert((seq, 0));
+        *last = seq.max(*last);
+        *pushes += 1;
+    }
+
+    /// Note that the push carried `chain` to `seq`, if it is short.
+    fn reached(&mut self, chain: &(String, String), seq: i64) {
+        if let Some((last, _)) = self.0.get_mut(chain) {
+            *last = seq.max(*last);
+        }
+    }
+
+    /// Add `other`'s chains and refusals to these.
+    fn merge(&mut self, other: Gaps) {
+        for (chain, (seq, pushes)) in other.0 {
+            let (last, refused) = self.0.entry(chain).or_insert((seq, 0));
+            *last = seq.max(*last);
+            *refused += pushes;
+        }
+    }
+
+    /// Split off the chains that `st` holds short of their seq.
+    fn split_short(&mut self, st: &Store) -> Gaps {
+        let is_short = |((stream, origin), (seq, _)): &((String, String), (i64, usize))| {
+            !holds(st, stream, origin, *seq)
+        };
+        let (short, held) = std::mem::take(&mut self.0).into_iter().partition(is_short);
+        self.0 = held;
+        Gaps(short)
+    }
+
+    /// The line a pull for these gaps reports, from `peer`: what it took, and
+    /// each chain, healed or not as `st` holds it.
+    fn line(&self, st: &Store, peer: &str, pulled: &io::Result<SyncOutcome>) -> String {
+        let mut chains = Vec::new();
+        for ((stream, origin), (seq, _)) in &self.0 {
+            let healed = if holds(st, stream, origin, *seq) {
+                "healed"
+            } else {
+                "not healed"
+            };
+            chains.push(format!("{stream} of node {origin} {healed}"));
+        }
+        let gaps: usize = self.0.values().map(|(_, pushes)| pushes).sum();
+        let chains = chains.join("; ");
+        match pulled {
+            Ok(outcome) => {
+                let n = outcome.applied;
+                format!("pulled {n} home record(s) from peer {peer} after {gaps} gap(s): {chains}")
+            }
+            Err(e) => format!("a pull from peer {peer} after {gaps} gap(s) failed: {e}: {chains}"),
+        }
+    }
+}
+
+/// Whether `st` holds `origin`'s chain of `home`'s `stream` up to `seq`.
+fn holds(st: &Store, stream: &str, origin: &str, seq: i64) -> bool {
+    let heads = st.heads(HOME, stream, &[]);
+    heads
+        .into_iter()
+        .any(|(held, head)| held == origin && head >= seq)
 }
 
 /// Land one peer-ingested op in the local replica (same chain checks as any
@@ -1215,6 +1406,185 @@ mod tests {
         }
         assert_eq!(*a_lines.lock().unwrap(), [deferred, refused]);
         assert_eq!(held(&*a.shared.store.lock().await, &b_id), [b_op]);
+    }
+
+    // ---- a pull on a gap (the hardening's question 2), over real iroh ------
+
+    /// B's `dir.claims` chain, sealed by B: a claim on `ws-razel`, then `n`
+    /// renewals, each a lease further on.
+    fn b_claims(n: i64) -> Vec<Op> {
+        let identity = crate::peer::NodeIdentity::from_key(B_SEED);
+        let b_id = hex_id(&identity.node_id);
+        let mut records = crate::registry::Registry::sealed(identity);
+        let lease = now_ms() + 30_000;
+        let claim = |renewal: i64| {
+            let (node, share) = (b_id.clone(), "ws-razel".to_string());
+            let lease_expiry_ms = lease + renewal;
+            let epoch = 1;
+            Record::Serve(ServeClaim {
+                node,
+                share,
+                lease_expiry_ms,
+                epoch,
+            })
+        };
+        (0..=n)
+            .map(|renewal| records.append_returning(claim(renewal), &b_id).unwrap())
+            .collect()
+    }
+
+    /// A behind a door, linked to B, which holds `held`, its first records:
+    /// A has pulled them. A's report lines, and B.
+    async fn a_linked_to_b(name: &str, held: &[Op]) -> (Server, Lines, Server) {
+        let (a_keys, b_keys) = ([endpoint_of(A_KEY)], [endpoint_of(B_KEY)]);
+        let at = |node: &str| format!("{name}-{node}");
+        let (b, _, at_b) = behind_door(&at("b"), (B_SEED, B_KEY), &a_keys, held).await;
+        let (a, a_lines, _) = behind_door(&at("a"), (A_SEED, A_KEY), &b_keys, &[]).await;
+        a.connect_peer(&at_b).await.unwrap();
+        (a, a_lines, b)
+    }
+
+    /// Land `ops` in B's served store, as a mint does, without a push.
+    async fn minted(b: &Server, ops: &[Op]) {
+        let mut store = b.shared.store.lock().await;
+        for op in ops {
+            store.append(op.clone()).unwrap();
+        }
+    }
+
+    /// Push `ops` from B to A on a stream of their own, as `push_home` does.
+    async fn b_pushes(b: &Server, ops: &[Op]) {
+        let a_id = hex_id(&node_of(A_SEED));
+        let mesh = b.shared.mesh.get().unwrap();
+        let conn = mesh.links.lock().await.get(&a_id).cloned().unwrap();
+        let (mut send, _recv) = conn.open_bi().await.unwrap();
+        let ops = ops.to_vec();
+        let pushed = Frame::Ops(Ops { ops, pri: None });
+        write_frame(&mut send, &pushed).await.unwrap();
+        tokio::io::AsyncWriteExt::shutdown(&mut send).await.unwrap();
+    }
+
+    /// The lines once there are `n`, waiting at most about 5 s for them.
+    async fn reported(lines: &Lines, n: usize) -> Vec<String> {
+        for _ in 0..500 {
+            if lines.lock().unwrap().len() >= n {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        lines.lock().unwrap().clone()
+    }
+
+    /// Whether a pull on a gap runs at `server`.
+    fn pulling(server: &Server) -> bool {
+        let mesh = server.shared.mesh.get().unwrap();
+        !mesh.gap_pulls.lock().unwrap().is_empty()
+    }
+
+    /// A's line for a push of B's claims chain at `seq`, refused as a gap
+    /// while A holds B's claim alone.
+    fn refused_as_a_gap(b_id: &str, seq: i64) -> String {
+        let head = format!("1 home record(s) of node {b_id} on dir.claims from peer {b_id}");
+        format!("refused {head}: a gap: expected seq 1, got {seq}")
+    }
+
+    /// The hardening's question 2, ruled (b). B's renewal pushed ahead of the
+    /// one before it is refused as a gap at A, and A pulls from B at once:
+    /// the chain heals without the link coming up again, with a line saying
+    /// so. The late push of the earlier renewal changes nothing, and the next
+    /// renewal lands in order. Before, the chain stayed short until the next
+    /// link, and so did every later renewal on it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_renewal_pushed_ahead_of_the_one_before_it_heals_by_a_pull() {
+        let chain = b_claims(3);
+        let (a, a_lines, b) = a_linked_to_b("gap-order", &chain[..1]).await;
+        let b_id = hex_id(&node_of(B_SEED));
+        let claims = |st: &Store| st.scan(HOME, G_CLAIMS, &[], &b_id, -1);
+        minted(&b, &chain[1..3]).await;
+        b_pushes(&b, &chain[2..3]).await;
+        wait_for(&a, |st| claims(st).len() == 3, "the chain to heal at A").await;
+        b_pushes(&b, &chain[1..2]).await;
+        minted(&b, &chain[3..]).await;
+        b_pushes(&b, &chain[3..]).await;
+        wait_for(&a, |st| claims(st).len() == 4, "the next renewal at A").await;
+        assert_eq!(claims(&*a.shared.store.lock().await), chain);
+        let pulled = format!(
+            "pulled 2 home record(s) from peer {b_id} after 1 gap(s): dir.claims of node {b_id} healed"
+        );
+        let lines = [refused_as_a_gap(&b_id, 2), pulled];
+        assert_eq!(reported(&a_lines, 2).await, lines);
+    }
+
+    /// A burst of gaps from one pusher is answered by one pull. B's store is
+    /// held, so A's pull waits for B's answer, while B pushes three renewals
+    /// out of order, each refused as a gap. The later two wait for the
+    /// running pull, which heals all three, so no second pull runs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_burst_of_gaps_from_one_pusher_is_answered_by_one_pull() {
+        let chain = b_claims(4);
+        let (a, a_lines, b) = a_linked_to_b("gap-burst", &chain[..1]).await;
+        let b_id = hex_id(&node_of(B_SEED));
+        minted(&b, &chain[1..]).await;
+        let mut lines = Vec::new();
+        {
+            let _answer_waits = b.shared.store.lock().await;
+            for seq in [4, 3, 2] {
+                let at = seq as usize;
+                b_pushes(&b, &chain[at..at + 1]).await;
+                lines.push(refused_as_a_gap(&b_id, seq));
+                assert_eq!(reported(&a_lines, lines.len()).await, lines);
+                assert!(pulling(&a), "the pull the first gap started runs");
+            }
+        }
+        let claims = |st: &Store| st.scan(HOME, G_CLAIMS, &[], &b_id, -1);
+        wait_for(&a, |st| claims(st) == chain, "the chain to heal at A").await;
+        lines.push(format!(
+            "pulled 4 home record(s) from peer {b_id} after 3 gap(s): dir.claims of node {b_id} healed"
+        ));
+        assert_eq!(reported(&a_lines, lines.len()).await, lines);
+        for _ in 0..500 {
+            if !pulling(&a) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!pulling(&a), "the pull ended");
+        assert_eq!(*a_lines.lock().unwrap(), lines, "and no other ran");
+    }
+
+    /// A deferred chain is not a gap (D9 beside the hardening's question 2):
+    /// B pushes two records of C, a node A has not met, and A defers them
+    /// and starts no pull. B's renewal pushed ahead of the one before it
+    /// then starts one, which names B's chain alone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_deferred_chain_starts_no_pull() {
+        let chain = b_claims(2);
+        let (a, a_lines, b) = a_linked_to_b("gap-deferred", &chain[..1]).await;
+        let b_id = hex_id(&node_of(B_SEED));
+        let c_identity = crate::peer::NodeIdentity::from_key(C_SEED);
+        let c_id = hex_id(&c_identity.node_id);
+        let mut c_records = crate::registry::Registry::sealed(c_identity);
+        let c_ops: Vec<Op> = ["c0", "c1"]
+            .into_iter()
+            .map(|name| c_records.append_returning(principal(name), &c_id).unwrap())
+            .collect();
+        b_pushes(&b, &c_ops).await;
+        let deferred = format!(
+            "deferred 2 home record(s) of node {c_id} on dir.principals from peer {b_id}: not a node this node knows"
+        );
+        let only = std::slice::from_ref(&deferred);
+        assert_eq!(reported(&a_lines, 1).await, only);
+        assert!(!pulling(&a), "a deferred chain started a pull");
+
+        minted(&b, &chain[1..]).await;
+        b_pushes(&b, &chain[2..]).await;
+        let pulled = format!(
+            "pulled 2 home record(s) from peer {b_id} after 1 gap(s): dir.claims of node {b_id} healed"
+        );
+        let lines = [deferred, refused_as_a_gap(&b_id, 2), pulled];
+        assert_eq!(reported(&a_lines, 3).await, lines);
+        let st = a.shared.store.lock().await;
+        assert_eq!(st.scan(HOME, G_CLAIMS, &[], &b_id, -1), chain);
     }
 
     // ---- the s-discovery golden path, end to end ---------------------------
