@@ -8,7 +8,7 @@
 //! | Binding | Interface | Port | Provider in the module |
 //! | --- | --- | --- | --- |
 //! | `clock_binding` | [`Clock`] | `ClockPort` | [`SystemClock`] |
-//! | `peer_carrier_binding` | [`PeerCarrier`] | `CarrierPort` | [`PendingIrohAdapter`] |
+//! | `peer_carrier_binding` | [`PeerCarrier`] | `CarrierPort` | [`IrohCarrier`], over iroh (plan Step 4.2c) |
 //! | `client_carrier_binding` | [`ClientCarrier`] | `CarrierPort` | [`PendingWebSocketAdapter`] |
 //! | `record_transport_binding` | [`RecordTransport`] | [`TransportPort`] | [`CarrierTransport`], over the peer occurrence |
 //! | `directory_host_binding` | [`RecordHost`] | [`RecordHostPort`] | [`Records`] |
@@ -67,9 +67,9 @@
 //! use std::sync::Arc;
 //!
 //! use glade_node::assembly::{
-//!     CarrierTransport, PendingIrohAdapter, RecordHost, RecordProfile, RecordProfilePort,
-//!     Records,
+//!     CarrierTransport, RecordHost, RecordProfile, RecordProfilePort, Records,
 //! };
+//! use glade_node::iroh_carrier::IrohCarrier;
 //! use shaku::Component;
 //!
 //! #[derive(Component)]
@@ -91,7 +91,7 @@
 //!
 //! shaku::module! {
 //!     Cyclic {
-//!         components = [DirectoryAsProfile, Records, CarrierTransport, PendingIrohAdapter],
+//!         components = [DirectoryAsProfile, Records, CarrierTransport, IrohCarrier],
 //!         providers = []
 //!     }
 //! }
@@ -105,7 +105,8 @@
 //! peer role.
 //!
 //! ```compile_fail,E0119
-//! use glade_node::assembly::{PeerCarrier, PendingIrohAdapter};
+//! use glade_node::assembly::PeerCarrier;
+//! use glade_node::iroh_carrier::IrohCarrier;
 //! use shaku::{Component, Module, ModuleBuildContext};
 //!
 //! struct SecondPeerAdapter;
@@ -115,13 +116,13 @@
 //!     type Parameters = ();
 //!
 //!     fn build(context: &mut ModuleBuildContext<M>, _: ()) -> Box<dyn PeerCarrier> {
-//!         <PendingIrohAdapter as Component<M>>::build(context, ())
+//!         <IrohCarrier as Component<M>>::build(context, None)
 //!     }
 //! }
 //!
 //! shaku::module! {
 //!     TwoPeers {
-//!         components = [PendingIrohAdapter, SecondPeerAdapter],
+//!         components = [IrohCarrier, SecondPeerAdapter],
 //!         providers = []
 //!     }
 //! }
@@ -138,7 +139,8 @@
 //! use std::sync::Arc;
 //!
 //! use glade_carrier_api::CarrierPort;
-//! use glade_node::assembly::{PendingIrohAdapter, PendingWebSocketAdapter};
+//! use glade_node::assembly::PendingWebSocketAdapter;
+//! use glade_node::iroh_carrier::IrohCarrier;
 //! use shaku::Component;
 //!
 //! trait Relay: shaku::Interface {}
@@ -154,7 +156,7 @@
 //!
 //! shaku::module! {
 //!     ByPortType {
-//!         components = [PendingIrohAdapter, PendingWebSocketAdapter, AnyCarrierRelay],
+//!         components = [IrohCarrier, PendingWebSocketAdapter, AnyCarrierRelay],
 //!         providers = []
 //!     }
 //! }
@@ -180,6 +182,7 @@ use glade_wire::generated::Op;
 use shaku::{module, Component, HasComponent, Module, ModuleBuildContext};
 
 use crate::appdecl::{register, AppDecl, Registered};
+use crate::iroh_carrier::IrohCarrier;
 use crate::peer::NodeIdentity;
 use crate::registry::{
     MemStore, Record, Registry, RegistryApi, RegistryError, StoreApi, G_BINDINGS,
@@ -188,6 +191,7 @@ use crate::registry::{
 };
 use crate::signing::NodeSigner;
 use crate::sysdir::{now_ms, Boot, Profile};
+use crate::transport::EndpointKey;
 
 /// The stderr line the assembled composition root prints before anything
 /// else, so a reader, and a test, can tell which root started the node.
@@ -702,19 +706,18 @@ impl CarrierPort for PendingCarrier {
     }
 }
 
-/// `peer_carrier_binding`'s registration: the iroh adapter is pending (plan
-/// Steps 4.2 and 4.5), so the peer role fails closed. The node's peer
-/// transport is still the `PeerEndpoint` the composition root binds and
-/// `Server::enable_mesh` runs.
-pub struct PendingIrohAdapter;
-
-impl<M: Module> Component<M> for PendingIrohAdapter {
+/// `peer_carrier_binding`'s registration: the iroh adapter (plan Step 4.2c,
+/// `iroh_carrier.rs`), bound with the endpoint key the composition root lends
+/// as this component's parameters. Neither root lends one yet, so the peer
+/// role refuses to bind and fails closed: the node's peer transport is still
+/// the `PeerEndpoint` the root binds and `Server::enable_mesh` runs.
+impl<M: Module> Component<M> for IrohCarrier {
     type Interface = dyn PeerCarrier;
-    type Parameters = ();
+    type Parameters = Option<EndpointKey>;
 
-    fn build(_: &mut ModuleBuildContext<M>, _: ()) -> Box<dyn PeerCarrier> {
+    fn build(_: &mut ModuleBuildContext<M>, key: Option<EndpointKey>) -> Box<dyn PeerCarrier> {
         constructed();
-        Box::new(PendingCarrier { adapter: "iroh" })
+        Box::new(IrohCarrier::new(key))
     }
 }
 
@@ -904,7 +907,7 @@ module! {
             CommandLine,
             SystemClock,
             DirectoryRules,
-            PendingIrohAdapter,
+            IrohCarrier,
             CarrierTransport,
             Records,
             DirectoryFacade,

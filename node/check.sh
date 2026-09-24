@@ -103,7 +103,7 @@ confinement_all_targets='node'
 # starts clean. A name here that is no longer in scope fails the component, as
 # a stale entry.
 style_dispositions='
-glade-node  gap:318  gap:11
+glade-node  gap:317  gap:11
 glade-wire  gap:43   gap:7
 '
 
@@ -697,9 +697,10 @@ dev-docs/LibraryBoundaryAndTestingPolicy.md:88-94 are the checklist:
     conformance          and by node-tests for the node's deterministic providers
                          (tests/assembly: CL, CA, SI, GR), the fail-closed half
                          of the assembled path's grant fold (GR-003), and the
-                         Ed25519 signer, the one real adapter (SI-001..003).
-                         NOT PERFORMED for a real CarrierPort or GrantPort
-                         adapter (LBT-009): none exists yet.
+                         real adapters: the Ed25519 signer (SI-001..003) and
+                         the iroh carrier (CA-001..005 on loopback, in
+                         src/iroh_carrier.rs's tests). NOT PERFORMED for a real
+                         GrantPort adapter (LBT-009): none exists yet.
   5 CI invocation        NOT PERFORMED. This is a local script: no CI job runs it
                          and no required merge check exists (a hosting setting).
 Also not checked: public boundary types and transitive type leakage (LBT-004,

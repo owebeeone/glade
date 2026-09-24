@@ -16,15 +16,23 @@
 //! its chain binds to the node (`transport.rs`). A booted node's endpoint has a
 //! door (plan Step 4.2b): an accept hook refuses an endpoint key the door does
 //! not know, and HELLO refuses a node not bound to its connection's key.
+//! [`IrohCarrier`] is the `CarrierPort` over iroh (plan Step 4.2c), which
+//! tracks its links; the mesh still runs on `PeerEndpoint`.
 
+use std::fmt;
 use std::future::{ready, Future};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::time::Duration;
 
+use glade_carrier_api::{
+    CarrierAddr, CarrierConfig, CarrierError, CarrierLink, CarrierPort, PortFuture, TransportId,
+};
 use iroh::endpoint::presets;
 use iroh::endpoint::{AfterHandshakeOutcome, EndpointHooks, Side, VarInt};
-use iroh::endpoint::{Connection, RecvStream, SendStream};
+use iroh::endpoint::{Connection, ConnectionError, ReadError, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr};
 
 use crate::peer::{hello_accept, hello_dial, Channel, NodeIdentity, PeerHello};
@@ -57,12 +65,16 @@ fn channel(conn: &Connection, dialer: EndpointId, acceptor: EndpointId) -> io::R
 }
 
 /// The one endpoint recipe every constructor shares: localhost,
-/// `presets::Minimal` (relay + discovery disabled), the glade ALPN, the
+/// `presets::Minimal` (relay + discovery disabled), the ALPN `alpn`, the
 /// endpoint key `key`, and the accept hook of `door`, if any.
-async fn bind_endpoint(key: EndpointKey, door: Option<Arc<Door>>) -> io::Result<Endpoint> {
+async fn bind_endpoint(
+    key: EndpointKey,
+    door: Option<Arc<Door>>,
+    alpn: &[u8],
+) -> io::Result<Endpoint> {
     let mut builder = Endpoint::builder(presets::Minimal)
         .secret_key(SecretKey::from_bytes(&key.seed()))
-        .alpns(vec![ALPN.to_vec()]);
+        .alpns(vec![alpn.to_vec()]);
     if let Some(door) = door {
         builder = builder.hooks(DoorHook(door));
     }
@@ -104,6 +116,18 @@ impl EndpointHooks for DoorHook {
             }
         })
     }
+}
+
+/// An endpoint's dialable address: its id, and its IPv4 port on loopback.
+fn loopback_addr(endpoint: &Endpoint) -> io::Result<PeerAddr> {
+    let sockets = endpoint.bound_sockets();
+    let socket = sockets.into_iter().find(|s| s.is_ipv4());
+    let socket = socket.ok_or_else(|| other("no bound IPv4 socket"))?;
+    let socket = SocketAddr::from((Ipv4Addr::LOCALHOST, socket.port()));
+    Ok(PeerAddr {
+        endpoint_id: endpoint.id(),
+        socket,
+    })
 }
 
 /// A dialable address for a peer: its endpoint id + a direct socket address
@@ -200,7 +224,7 @@ impl PeerEndpoint {
     /// (`sysdir::Boot::endpoint_key`), so its endpoint id is the same at every
     /// start (plan Step 4.2) and its binding record names it.
     pub async fn bind_as(identity: NodeIdentity, key: EndpointKey) -> io::Result<PeerEndpoint> {
-        let endpoint = bind_endpoint(key, None).await?;
+        let endpoint = bind_endpoint(key, None, ALPN).await?;
         Ok(PeerEndpoint {
             endpoint,
             identity,
@@ -215,7 +239,7 @@ impl PeerEndpoint {
         key: EndpointKey,
         door: Arc<Door>,
     ) -> io::Result<PeerEndpoint> {
-        let endpoint = bind_endpoint(key, Some(door.clone())).await?;
+        let endpoint = bind_endpoint(key, Some(door.clone()), ALPN).await?;
         Ok(PeerEndpoint {
             endpoint,
             identity,
@@ -241,14 +265,7 @@ impl PeerEndpoint {
 
     /// This endpoint's dialable address (its id + first IPv4 bound socket).
     pub fn addr(&self) -> io::Result<PeerAddr> {
-        let socket = self
-            .endpoint
-            .bound_sockets()
-            .into_iter()
-            .find(|s| s.is_ipv4())
-            .ok_or_else(|| other("no bound IPv4 socket"))?;
-        let socket = SocketAddr::from((Ipv4Addr::LOCALHOST, socket.port()));
-        Ok(PeerAddr { endpoint_id: self.endpoint.id(), socket })
+        loopback_addr(&self.endpoint)
     }
 
     /// Dial a peer (DIAL), open a bidirectional stream, and run the HELLO seam.
@@ -289,6 +306,393 @@ impl PeerEndpoint {
     /// never goes away keeps the port bound, which is how a leaked handle shows up.
     pub async fn close(self) {
         self.endpoint.close().await;
+    }
+}
+
+// ---- the CarrierPort adapter (plan Step 4.2c) --------------------------------
+
+/// The adapter's ALPN, apart from the node's: its links carry opaque frames,
+/// not the node protocol, so a node's endpoint and an adapter never connect.
+pub const CARRIER_ALPN: &[u8] = b"glade/carrier/1";
+
+/// What a dialer sends first, so that its acceptor sees the link at once:
+/// QUIC shows a stream to its peer only when bytes cross it.
+const PREAMBLE: &[u8; 4] = b"gcl1";
+
+/// How long a close waits for the peer to acknowledge what was sent: iroh's
+/// own bound for a drain on a bad link.
+const LINGER: Duration = Duration::from_secs(3);
+
+fn transport(e: impl fmt::Display) -> CarrierError {
+    CarrierError::Transport(e.to_string())
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+type Link = Box<dyn CarrierLink>;
+
+/// `glade_carrier_api::CarrierPort` over iroh (plan Step 4.2c): one endpoint,
+/// bound with the key the port was lent, and a QUIC connection per link, of
+/// frames that are a `u32` little-endian length and the bytes. The address is
+/// `<endpoint-id>@<ip:port>`; `remote_id` is the id the TLS session proved.
+/// `close` ends every link the port tracks and takes their handles, since a
+/// surviving connection keeps the port bound (the async witness's finding).
+/// A link holds the endpoint too, so a port dropped without `close` does not
+/// take its links' transport with it. It binds loopback, on a port the OS
+/// picks (`CarrierConfig::local` is plan Step 4.5's), has no door, and lent
+/// no key refuses to bind.
+pub struct IrohCarrier {
+    key: Option<EndpointKey>,
+    state: Mutex<PortState>,
+}
+
+enum PortState {
+    Unbound,
+    /// The endpoint, the frame limit, and every link the port has made.
+    Bound {
+        ep: Endpoint,
+        max: usize,
+        links: Vec<Weak<LinkState>>,
+    },
+    Closed,
+}
+
+/// Why a port in `state` cannot bind: it is bound or closed already.
+fn refusal(state: &PortState) -> Option<CarrierError> {
+    match state {
+        PortState::Unbound => None,
+        PortState::Bound { .. } => Some(CarrierError::AlreadyBound),
+        PortState::Closed => Some(CarrierError::Closed),
+    }
+}
+
+impl IrohCarrier {
+    /// A port that binds with `key`; lent none, it refuses to.
+    pub fn new(key: Option<EndpointKey>) -> IrohCarrier {
+        let state = Mutex::new(PortState::Unbound);
+        IrohCarrier { key, state }
+    }
+
+    /// Keep `endpoint` as this port's, unless a bind or a close came first.
+    fn place(&self, endpoint: &Endpoint, max: usize) -> Result<(), CarrierError> {
+        let mut state = lock(&self.state);
+        if let Some(refused) = refusal(&state) {
+            return Err(refused);
+        }
+        let (ep, links) = (endpoint.clone(), Vec::new());
+        *state = PortState::Bound { ep, max, links };
+        Ok(())
+    }
+
+    /// The bound endpoint: none before `bind` and after `close`.
+    fn endpoint(&self) -> Option<Endpoint> {
+        match &*lock(&self.state) {
+            PortState::Bound { ep, .. } => Some(ep.clone()),
+            _ => None,
+        }
+    }
+
+    /// Track a new link; none, dropping it, once the port has closed.
+    fn track(&self, conn: Connection, send: SendStream, recv: RecvStream) -> Option<Link> {
+        let mut state = lock(&self.state);
+        let PortState::Bound { ep, max, links } = &mut *state else {
+            return None;
+        };
+        let remote = TransportId(conn.remote_id().as_bytes().to_vec());
+        let send = Some(Sending {
+            stream: send,
+            torn: false,
+        });
+        let recv = Some(Receiving {
+            stream: recv,
+            buf: Vec::new(),
+        });
+        let link = Arc::new(LinkState {
+            remote,
+            max: *max,
+            ended: AtomicBool::new(false),
+            held: Mutex::new(Some((conn, ep.clone()))),
+            send: tokio::sync::Mutex::new(send),
+            recv: tokio::sync::Mutex::new(recv),
+        });
+        links.retain(|link| link.strong_count() > 0);
+        links.push(Arc::downgrade(&link));
+        Some(Box::new(IrohLink(link)))
+    }
+
+    async fn accept_on(&self, endpoint: &Endpoint) -> Result<Option<Link>, CarrierError> {
+        let Some(incoming) = endpoint.accept().await else {
+            return Ok(None);
+        };
+        let accepting = incoming.accept().map_err(transport)?;
+        let conn = accepting.await.map_err(transport)?;
+        let (send, mut recv) = conn.accept_bi().await.map_err(transport)?;
+        let mut preamble = [0; 4];
+        recv.read_exact(&mut preamble).await.map_err(transport)?;
+        if &preamble != PREAMBLE {
+            return Err(transport("not a carrier link"));
+        }
+        Ok(self.track(conn, send, recv))
+    }
+}
+
+impl CarrierPort for IrohCarrier {
+    fn bind(&self, config: CarrierConfig) -> PortFuture<'_, Result<CarrierAddr, CarrierError>> {
+        Box::pin(async move {
+            if let Some(refused) = refusal(&lock(&self.state)) {
+                return Err(refused);
+            }
+            let unkeyed = || transport("the iroh adapter was lent no endpoint key");
+            let key = self.key.ok_or_else(unkeyed)?;
+            let endpoint = bind_endpoint(key, None, CARRIER_ALPN).await;
+            let endpoint = endpoint.map_err(transport)?;
+            let at = loopback_addr(&endpoint).map_err(transport)?;
+            if let Err(refused) = self.place(&endpoint, config.max_frame_bytes.get()) {
+                endpoint.close().await;
+                return Err(refused);
+            }
+            Ok(CarrierAddr(format!("{}@{}", at.endpoint_id, at.socket)))
+        })
+    }
+
+    fn dial<'a>(&'a self, peer: &'a CarrierAddr) -> PortFuture<'a, Result<Link, CarrierError>> {
+        Box::pin(async move {
+            let endpoint = self.endpoint().ok_or(CarrierError::Closed)?;
+            let malformed = || transport(format!("{}: expected <endpoint-id>@<ip:port>", peer.0));
+            let at = PeerAddr::parse(&peer.0).ok_or_else(malformed)?;
+            let at = EndpointAddr::from_parts(at.endpoint_id, [TransportAddr::Ip(at.socket)]);
+            let conn = endpoint.connect(at, CARRIER_ALPN).await;
+            let conn = conn.map_err(transport)?;
+            let (mut send, recv) = conn.open_bi().await.map_err(transport)?;
+            send.write_all(PREAMBLE).await.map_err(transport)?;
+            self.track(conn, send, recv).ok_or(CarrierError::Closed)
+        })
+    }
+
+    fn accept(&self) -> PortFuture<'_, Result<Option<Link>, CarrierError>> {
+        Box::pin(async move {
+            let Some(endpoint) = self.endpoint() else {
+                return Ok(None);
+            };
+            match self.accept_on(&endpoint).await {
+                // A close that cuts a handshake short ends the accept too.
+                Err(_) if self.endpoint().is_none() => Ok(None),
+                accepted => accepted,
+            }
+        })
+    }
+
+    fn close(&self) -> PortFuture<'_, ()> {
+        Box::pin(async move {
+            // Out of the port at the first poll, the links' handles too: a
+            // close dropped part-way gives up the drain, never the handles.
+            let taken = std::mem::replace(&mut *lock(&self.state), PortState::Closed);
+            let PortState::Bound { ep, links, .. } = taken else {
+                return;
+            };
+            let live = links.iter().filter_map(Weak::upgrade);
+            let mut ended: Vec<Ended> = live.map(|link| link.end()).collect();
+            let drained = async {
+                for link in &mut ended {
+                    link.drain().await;
+                }
+            };
+            let _ = tokio::time::timeout(LINGER, drained).await;
+            drop(ended);
+            ep.close().await;
+        })
+    }
+}
+
+/// One link, shared by its [`IrohLink`] and, weakly, its port. Each half has
+/// its own lock, held across awaits, so a send and a receive run together.
+struct LinkState {
+    remote: TransportId,
+    max: usize,
+    ended: AtomicBool,
+    /// The connection, and the endpoint it rides, which lives as long.
+    held: Mutex<Option<(Connection, Endpoint)>>,
+    send: tokio::sync::Mutex<Option<Sending>>,
+    recv: tokio::sync::Mutex<Option<Receiving>>,
+}
+
+struct Sending {
+    stream: SendStream,
+    /// A send is under way, or was dropped part-way: its frame may be torn.
+    torn: bool,
+}
+
+struct Receiving {
+    stream: RecvStream,
+    /// What has arrived of the next frame: a receive dropped part-way loses
+    /// none of it.
+    buf: Vec<u8>,
+}
+
+impl LinkState {
+    fn ended(&self) -> bool {
+        self.ended.load(Ordering::SeqCst)
+    }
+
+    /// End the link: from now on `send` answers `Closed` and `recv`
+    /// `Ok(None)`. What it holds comes out by value; a half an operation
+    /// holds is given up when the operation lets it go.
+    fn end(&self) -> Ended {
+        self.ended.store(true, Ordering::SeqCst);
+        if let Ok(mut half) = self.recv.try_lock() {
+            half.take();
+        }
+        let sending = self.send.try_lock().ok().and_then(|mut h| h.take());
+        let held = lock(&self.held).take();
+        Ended { sending, held }
+    }
+
+    async fn hold<'a, T>(&'a self, half: &'a tokio::sync::Mutex<Option<T>>) -> Held<'a, T> {
+        let (half, ended) = (half.lock().await, &self.ended);
+        Held { half, ended }
+    }
+}
+
+/// What an ended link held: its send half, to drain, and its connection,
+/// closed (code 0, no reason) when this drops.
+struct Ended {
+    sending: Option<Sending>,
+    held: Option<(Connection, Endpoint)>,
+}
+
+impl Ended {
+    /// Finish sending and wait until the peer has it all: what was sent
+    /// reaches the peer before its end of stream.
+    async fn drain(&mut self) {
+        if let Some(half) = self.sending.as_mut().filter(|half| !half.torn) {
+            if half.stream.finish().is_ok() {
+                let _ = half.stream.stopped().await;
+            }
+        }
+    }
+}
+
+impl Drop for Ended {
+    fn drop(&mut self) {
+        if let Some((conn, _endpoint)) = self.held.take() {
+            conn.close(0u32.into(), b"");
+        }
+    }
+}
+
+/// A half, held by one operation; let go once its link has ended, it gives
+/// the half up, so that no handle outlives the end.
+struct Held<'a, T> {
+    half: tokio::sync::MutexGuard<'a, Option<T>>,
+    ended: &'a AtomicBool,
+}
+
+impl<T> Held<'_, T> {
+    /// The half, unless the link has ended.
+    fn live(&mut self) -> Option<&mut T> {
+        let ended = self.ended.load(Ordering::SeqCst);
+        self.half.as_mut().filter(|_| !ended)
+    }
+}
+
+impl<T> Drop for Held<'_, T> {
+    fn drop(&mut self) {
+        if self.ended.load(Ordering::SeqCst) {
+            self.half.take();
+        }
+    }
+}
+
+/// The next whole frame in `buf`, taken out of it: none until one has
+/// arrived, and `FrameTooLarge` for a length over `max`, before its body.
+fn next_frame(buf: &mut Vec<u8>, max: usize) -> Option<Result<Vec<u8>, CarrierError>> {
+    let head: [u8; 4] = buf.get(..4)?.try_into().ok()?;
+    let len = u32::from_le_bytes(head) as usize;
+    if len > max {
+        return Some(Err(CarrierError::FrameTooLarge));
+    }
+    let frame = buf.get(4..4 + len)?.to_vec();
+    buf.drain(..4 + len);
+    Some(Ok(frame))
+}
+
+/// One link of an [`IrohCarrier`].
+struct IrohLink(Arc<LinkState>);
+
+impl CarrierLink for IrohLink {
+    fn send<'a>(&'a self, frame: &'a [u8]) -> PortFuture<'a, Result<(), CarrierError>> {
+        Box::pin(async move {
+            let link = &self.0;
+            let mut held = link.hold(&link.send).await;
+            let Some(half) = held.live() else {
+                return Err(CarrierError::Closed);
+            };
+            let fits = frame.len() <= link.max;
+            let len = u32::try_from(frame.len()).ok().filter(|_| fits);
+            let len = len.ok_or(CarrierError::FrameTooLarge)?;
+            if half.torn {
+                // Rather than follow a frame that may be torn, the link ends.
+                drop(link.end());
+                return Err(CarrierError::Closed);
+            }
+            half.torn = true;
+            let bytes = [&len.to_le_bytes()[..], frame].concat();
+            let written = half.stream.write_all(&bytes).await;
+            half.torn = written.is_err();
+            match written {
+                Ok(()) => Ok(()),
+                Err(_) if link.ended() => Err(CarrierError::Closed),
+                Err(e) => Err(transport(e)).inspect_err(|_| drop(link.end())),
+            }
+        })
+    }
+
+    fn recv(&self) -> PortFuture<'_, Result<Option<Vec<u8>>, CarrierError>> {
+        Box::pin(async move {
+            let link = &self.0;
+            let mut held = link.hold(&link.recv).await;
+            loop {
+                let Some(half) = held.live() else {
+                    return Ok(None);
+                };
+                if let Some(frame) = next_frame(&mut half.buf, link.max) {
+                    return frame.map(Some).inspect_err(|_| drop(link.end()));
+                }
+                let mut chunk = [0; 4096];
+                let read = half.stream.read(&mut chunk).await;
+                let between_frames = half.buf.is_empty();
+                match read {
+                    Ok(Some(n)) => half.buf.extend_from_slice(&chunk[..n]),
+                    // The peer finished, or closed, between two frames.
+                    Ok(None)
+                    | Err(ReadError::ConnectionLost(ConnectionError::ApplicationClosed(_)))
+                        if between_frames =>
+                    {
+                        return Ok(None);
+                    }
+                    Err(_) if link.ended() => return Ok(None),
+                    failed => {
+                        drop(link.end());
+                        let why = failed.err().map(|e| e.to_string());
+                        let why = why.unwrap_or_else(|| "the stream ended inside a frame".into());
+                        return Err(CarrierError::Transport(why));
+                    }
+                }
+            }
+        })
+    }
+
+    fn close(&self) -> PortFuture<'_, ()> {
+        Box::pin(async move {
+            let mut ended = self.0.end();
+            let _ = tokio::time::timeout(LINGER, ended.drain()).await;
+        })
+    }
+
+    fn remote_id(&self) -> Option<TransportId> {
+        Some(self.0.remote.clone())
     }
 }
 
@@ -497,5 +901,195 @@ mod tests {
         );
         drop(kept);
         assert!(port_is_freed(port).await, "the port is free once every clone is gone");
+    }
+
+    // ---- the CarrierPort adapter (plan Step 4.2c) ----
+
+    use glade_carrier_api::conformance::{self as carrier, Fixture};
+    use std::num::NonZeroUsize;
+
+    /// A port lent a fresh endpoint key, as a booted node would lend its own.
+    fn keyed() -> IrohCarrier {
+        let seed = crate::signing::random_seed().unwrap();
+        IrohCarrier::new(Some(EndpointKey::from_seed(seed)))
+    }
+
+    /// A configuration with this frame limit. The address is plan Step
+    /// 4.5's to read.
+    fn limit(max: usize) -> CarrierConfig {
+        let local = CarrierAddr("127.0.0.1:0".into());
+        let max_frame_bytes = NonZeroUsize::new(max).unwrap();
+        CarrierConfig {
+            local,
+            max_frame_bytes,
+        }
+    }
+
+    /// Three ports on loopback, for the contract's probes.
+    fn iroh_fixture() -> Fixture {
+        let port = || -> Arc<dyn CarrierPort> { Arc::new(keyed()) };
+        let anywhere = CarrierAddr("127.0.0.1:0".into());
+        let (at_a, at_b) = (anywhere.clone(), anywhere);
+        Fixture {
+            a: port(),
+            b: port(),
+            fresh: port(),
+            at_a,
+            at_b,
+        }
+    }
+
+    /// A probe left waiting on a peer that never comes fails, not hangs.
+    async fn bounded(probe: impl Future<Output = ()>) {
+        let within = tokio::time::timeout(Duration::from_secs(20), probe).await;
+        within.expect("the probe finished within 20 s");
+    }
+
+    #[tokio::test]
+    async fn ca_001_iroh_carries_frames_whole_once_and_in_order() {
+        bounded(carrier::frames(iroh_fixture())).await;
+    }
+
+    #[tokio::test]
+    async fn ca_002_iroh_holds_the_frame_limit_both_ways() {
+        bounded(carrier::frame_limit(iroh_fixture())).await;
+    }
+
+    #[tokio::test]
+    async fn ca_003_irohs_futures_are_lazy_and_recv_is_cancel_safe() {
+        bounded(carrier::cancellation(iroh_fixture())).await;
+    }
+
+    #[tokio::test]
+    async fn ca_004_an_iroh_port_gives_its_endpoint_up_by_value() {
+        bounded(carrier::close_by_value(iroh_fixture())).await;
+    }
+
+    #[tokio::test]
+    async fn ca_005_iroh_names_each_far_end_by_its_endpoint_id() {
+        bounded(carrier::remote_identity(iroh_fixture())).await;
+    }
+
+    /// Link `a` to `b`, each bound with this frame limit.
+    async fn linked(a: &IrohCarrier, b: &IrohCarrier, max: usize) -> [Box<dyn CarrierLink>; 2] {
+        let at_b = b.bind(limit(max)).await.unwrap();
+        a.bind(limit(max)).await.unwrap();
+        let (dialed, accepted) = tokio::join!(a.dial(&at_b), b.accept());
+        [dialed.unwrap(), accepted.unwrap().unwrap()]
+    }
+
+    /// Plan Step 4.2c: closing the port ends every link it made and takes
+    /// their handles out of them, so its port frees though the links
+    /// themselves survive. The far end sees its stream end.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_closed_carrier_frees_its_port_though_its_links_survive() {
+        let key = EndpointKey::from_seed(crate::signing::random_seed().unwrap());
+        let (a, b) = (keyed(), IrohCarrier::new(Some(key)));
+        let [dialed, accepted] = linked(&a, &b, 64).await;
+        let proved = Some(TransportId(key.endpoint_id.to_vec()));
+        assert_eq!(
+            dialed.remote_id(),
+            proved,
+            "the endpoint id b's TLS session proved"
+        );
+        let port = match &*lock(&b.state) {
+            PortState::Bound { ep, .. } => loopback_addr(ep).unwrap().socket.port(),
+            _ => unreachable!("b is bound"),
+        };
+
+        b.close().await;
+
+        assert!(
+            port_is_freed(port).await,
+            "a link the port made keeps it bound"
+        );
+        assert_eq!(accepted.send(b"late").await, Err(CarrierError::Closed));
+        assert_eq!(dialed.recv().await, Ok(None), "the far end's stream ends");
+    }
+
+    /// A dialer with the adapter's ALPN that writes `first` on its stream,
+    /// raw.
+    async fn raw_dial(to: &CarrierAddr, first: &[u8]) -> (Endpoint, SendStream) {
+        let endpoint = Endpoint::builder(presets::Minimal)
+            .bind_addr((Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let at = PeerAddr::parse(&to.0).unwrap();
+        let at = EndpointAddr::from_parts(at.endpoint_id, [TransportAddr::Ip(at.socket)]);
+        let conn = endpoint.connect(at, CARRIER_ALPN).await.unwrap();
+        let (mut send, _) = conn.open_bi().await.unwrap();
+        send.write_all(first).await.unwrap();
+        (endpoint, send)
+    }
+
+    /// Plan Step 4.2c: a link that does not open with the adapter's word is
+    /// refused, and the port accepts the next. A receive dropped part-way
+    /// through a frame keeps what it read, so the frame arrives whole.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_frame_read_in_two_parts_arrives_whole() {
+        let port = keyed();
+        let at = port.bind(limit(64)).await.unwrap();
+        let (_stranger, refused) = tokio::join!(raw_dial(&at, b"gcl0"), port.accept());
+        let why = CarrierError::Transport("not a carrier link".into());
+        assert_eq!(refused.err(), Some(why), "another word is refused");
+        let ((_dialer, mut send), link) =
+            tokio::join!(raw_dial(&at, b"gcl1\x06\0\0\0abc"), port.accept());
+        let link = link.unwrap().unwrap();
+
+        let mut receiving = link.recv();
+        let half = tokio::time::timeout(Duration::from_millis(200), &mut receiving).await;
+        assert!(half.is_err(), "half a frame is no frame");
+        drop(receiving);
+        send.write_all(b"def\x02\0\0\0gh").await.unwrap();
+
+        let whole = link.recv().await;
+        assert_eq!(
+            whole,
+            Ok(Some(b"abcdef".to_vec())),
+            "the dropped receive kept its part"
+        );
+        assert_eq!(link.recv().await, Ok(Some(b"gh".to_vec())));
+    }
+
+    /// Plan Step 4.2c: a send dropped part-way may leave its frame torn, and a
+    /// torn frame is never followed by another: the next send ends the link.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_torn_frame_is_never_followed_by_another() {
+        let (max, a, b) = (4 << 20, keyed(), keyed());
+        let [dialed, accepted] = linked(&a, &b, max).await;
+        let big = vec![7; max];
+        let stuck = tokio::time::timeout(Duration::from_millis(200), dialed.send(&big)).await;
+        assert!(
+            stuck.is_err(),
+            "a frame past the peer's window waits for the peer"
+        );
+
+        let next = tokio::time::timeout(Duration::from_secs(5), dialed.send(b"x")).await;
+        assert_eq!(
+            next,
+            Ok(Err(CarrierError::Closed)),
+            "the link ended instead"
+        );
+        let after = accepted.recv().await.map(|frame| frame.map(|f| f.len()));
+        assert!(
+            !matches!(after, Ok(Some(_))),
+            "a frame arrived after a torn one: {after:?}"
+        );
+    }
+
+    /// Plan Step 4.2c: a link holds its endpoint, so a port dropped without
+    /// `close`, as both are here, does not take the link's transport with it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_link_outlives_a_port_dropped_without_close() {
+        let [dialed, accepted] = linked(&keyed(), &keyed(), 64).await;
+        dialed.send(b"after").await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(5), accepted.recv()).await;
+        assert_eq!(
+            got,
+            Ok(Ok(Some(b"after".to_vec()))),
+            "the transport went with its port"
+        );
     }
 }

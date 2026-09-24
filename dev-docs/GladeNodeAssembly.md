@@ -28,7 +28,7 @@ shaku::Interface` with `impl<T: Port + 'static> F for T {}` (`AsyncWitnessResult
 | Binding (facade) | Port, and where it is defined | Provider on the assembled path | Fake in a test composition | Consumers |
 | --- | --- | --- | --- | --- |
 | `clock_binding` (`Clock`) | `ClockPort`, `glade-clock-api` | `SystemClock`: the wall clock, as `sysdir::now_ms()` reads it | one shared atomic clock (CL-001, CL-002) | `Directory` (who serves, read at the clock); `Admission` (a decision's instant) |
-| `peer_carrier_binding` (`PeerCarrier`) | `CarrierPort`, `glade-carrier-api` | `PendingIrohAdapter`: fail-closed (`bind` refused, `dial` `Closed`, `accept` `Ok(None)`); built with the record transport `Records` injects, never called | port A on a fake network (CA-001..004) | `Sessions` (peer role); the record transport |
+| `peer_carrier_binding` (`PeerCarrier`) | `CarrierPort`, `glade-carrier-api` | `IrohCarrier` (plan Step 4.2c), lent no endpoint key by either root, so fail-closed (`bind` refused, `dial` `Closed`, `accept` `Ok(None)`), as `PendingIrohAdapter` was before it; built with the record transport `Records` injects, never called | port A on a fake network (CA-001..005) | `Sessions` (peer role); the record transport |
 | `client_carrier_binding` (`ClientCarrier`) | `CarrierPort`, `glade-carrier-api` | `PendingWebSocketAdapter`, the same, `#[lazy]` and never resolved | port B on the same network, a second occurrence | `Sessions` (client role) |
 | `record_transport_binding` (`RecordTransport`) | `TransportPort`, node-local | `CarrierTransport` over the peer occurrence: a view, never overridden | the same view, over port A | `Records` |
 | `directory_host_binding` (`RecordHost`) | `RecordHostPort`, node-local | `Records` over the booted instance (its `Registry` and `BlobStore`), lent by the root | `Records` over the node's own `Registry` and `MemStore` (the in-memory store and registry) | `Directory` |
@@ -98,12 +98,12 @@ refuses; it never acquires one. The assembled root also prints one stderr line
 naming itself, so a test can tell the roots apart.
 
 Real now: the clock, the record host over the booted instance, the rules, the
-configuration, and since 4.1a the signer (Ed25519). Phase 4 replaces the three
-remaining `Pending*` stand-ins: 4.3 the grant fold with its serve-hop consult,
-4.2 and 4.5 an iroh `CarrierPort` adapter (4.2 the remote-identity accessor and link tracking, 4.5
-the bind address CA-004's re-bind needs), and a WebSocket one; the mesh and the
-WS server then move onto the carrier bindings, and 4.4 makes the served store the
-record host. Step 3.3's sdax plan takes over the root's three acquisitions
+configuration, since 4.1a the signer (Ed25519), and since 4.2c the iroh
+`CarrierPort` adapter, lent no key. Phase 4 replaces the two remaining
+`Pending*` stand-ins: 4.3 the grant fold with its serve-hop consult, and a
+WebSocket `CarrierPort` adapter. 4.5 gives the iroh adapter the bind address
+CA-004's re-bind needs; the mesh and the WS server then move onto the carrier
+bindings, and 4.4 makes the served store the record host. Step 3.3's sdax plan takes over the root's three acquisitions
 (instance, endpoint, listener) and releases them in reverse, assembling the module
 over the acquired handles inside a step, as the witness did; the slot's
 take-by-value is the discipline `PeerEndpoint::close(self)` also needs. Step 3.4's
@@ -117,7 +117,8 @@ the fake network loss and duplicates, the fake fold denied authority, and
   `sysdir::now_ms()` (claims, mesh routing, boot's presence claim) and own their
   transports; moving each behind a binding is 3.4's and Phase 4's work, one
   consumer at a time, each with a failing test first.
-- No carrier adapter implements `CarrierPort`: CA-001..004 run on the fake only.
+- CA-001..005 run on the fake network and, since 4.2c, on the iroh adapter
+  over loopback; no root lends that adapter a key, so nothing binds it.
   The pending grant fold passes the fail-closed half of its suite (GR-003)
   and nothing more; the Ed25519 signer passes SI-001..003 (plan Step 4.1a).
 - The node-local ports have no shared conformance suite; the fake host is the
@@ -2442,7 +2443,7 @@ IR, `node/ir/sysdata.taut.py`, gains two record kinds.
   the configuration of known peers and the `CarrierPort` accessor (sections
   8 and 10).
 - **4.2c, its own step** (ruled the same day): an iroh `CarrierPort`
-  adapter that tracks its links.
+  adapter that tracks its links (sections 11 and 12).
 
 Two things forced the first split.
 
@@ -2793,7 +2794,9 @@ The tests and their red runs are in section 10.
   a key, never a node, and outlives the link's close.
   - CA-005 checks it over three endpoints: `a` dials `b`, then `fresh` bound
     where `b` was. Two endpoints cannot tell a link that names its own end
-    from one that names the far end; a third can.
+    from one that names the far end; a third can. (Since 4.2c, `fresh` is
+    dialled where its bind answers, which on iroh is not `b`'s address:
+    section 11.)
   - The contract's fixture gains a deliberately wrong link that names its
     own end, which CA-005 refuses. The node's fake network and its faulty
     link implement the method.
@@ -2801,7 +2804,7 @@ The tests and their red runs are in section 10.
     `CarrierLink`'s methods, so the checker requires it. The lane owner
     added it in 4.2b's commit, for the owner's review, as the policy's
     earlier changes were.
-- **The iroh adapter's links:** 4.2c, ruled a step of its own.
+- **The iroh adapter's links:** 4.2c, ruled a step of its own (section 11).
 - **A gap for later.** A HELLO over a `CarrierLink` would also need the TLS
   exporter bytes (D6), which the port does not expose. That belongs to the
   step that moves the mesh onto the port.
@@ -3068,14 +3071,20 @@ before 4.2a gets 4.2a's changes as well: `endpoint.key` and one binding.
    Recommend that 4.5's configuration add a way to print it without
    serving.
 
+**Ruled, owner, 2026-09-25 ("all recommended"):** 1 `remote_id` in the
+contracts' policy accepted; 2 a first-contact link that a later record
+contradicts is left for the slice; 3 4.5's configuration prints a node's
+endpoint id without serving (added to Step 4.5 in the root plan, so not
+part of 4.2c).
+
 ### Measured (4.2b)
 
 2026-09-25, Apple M3 Pro, Rust 1.96.0, on the final tree:
 
 - **The gate** (`glade/node/check.sh`) passes all 8 components, in 42 s warm
   and 89 s from an empty target. There are 256 node tests on each path,
-  across 15 test binaries, where there were 246. The ten new ones are section 10's rows, less the two changed
-  tests and the contract's own two.
+  across 15 test binaries, where there were 246. The ten new ones are
+  section 10's rows, less the two changed tests and the contract's own two.
 - **rustfmt**: glade-node 318 hunks, at its baseline; no touched file gained
   a deviation. glade-wire 43.
 - **clippy**: glade-node 11 warnings and glade-wire 7, at baseline.
@@ -3125,3 +3134,217 @@ before 4.2a gets 4.2a's changes as well: `endpoint.key` and one binding.
 - tests: +625/−69, net +556;
   - the node +556/−64;
   - the contract's CA-005 probe +37/−1, and its fixture +32/−4.
+
+### 11. The iroh `CarrierPort` adapter (plan Step 4.2c)
+
+Built on 2026-09-25, against glade `63a5799`, as the owner ruled it a step
+of its own (question 5 of 4.2a). Plan Step 4.2 asks for it: "closing an
+endpoint ends its links, so the iroh adapter tracks its links (the witness
+measured that a surviving connection keeps the socket bound)". The tests and
+their red runs are in section 12.
+
+- **What it is.** `iroh_carrier::IrohCarrier` implements `CarrierPort`, and
+  each link it makes implements `CarrierLink`. A port binds one iroh
+  endpoint, with the endpoint key it was lent, on its own ALPN,
+  `glade/carrier/1`. The node's endpoint keeps `glade/node/2`, so a node's
+  endpoint and an adapter never connect. The address is
+  `<endpoint-id>@<ip:port>`, the syntax of a `--peer` entry. A link's
+  `remote_id` is the 32-byte endpoint id its TLS session proved,
+  `Connection::remote_id()`.
+- **A link** is one QUIC connection with one bidirectional stream. The dialer
+  opens the stream and writes four bytes, `gcl1`, because QUIC shows a
+  stream to its peer only once bytes cross it: without them the acceptor's
+  `accept` would wait for the first frame. An acceptor that reads another
+  word answers `Transport("not a carrier link")`, which refuses that attempt
+  only. One connection per link makes a link's close the connection's, and
+  its `remote_id` the connection's.
+- **Frames** are a `u32` little-endian length and the bytes.
+  - `send` refuses a frame over the limit with `FrameTooLarge` and sends
+    nothing; the link stays usable.
+  - `recv` refuses a length over the limit before it reads the body, and ends
+    the link.
+  - What has arrived of the next frame is kept in the link, not in the
+    receive, so a receive dropped part-way loses none of it. noq's `read` is
+    cancel-safe, and the buffer never holds more than the limit and one read.
+- **A torn frame.** A send marks its half torn until its write completes, so
+  a send dropped part-way leaves it marked. The next send ends the link and
+  answers `Closed` rather than follow a frame that may be torn, and a close
+  does not finish such a stream.
+- **A link's close** ends the link at its first poll: `send` answers
+  `Closed`, `recv` `Ok(None)`, and its handles come out of it by value. It
+  then finishes the stream and waits, three seconds at most, until the peer
+  has acknowledged everything (`SendStream::stopped`), and closes the
+  connection with code 0 and no reason. The peer reads what was sent and then
+  the end of the stream, though the connection is closed by then: noq keeps
+  received stream data readable after the peer's close (CA-001).
+- **The port's close** takes the endpoint and its links out of the port at
+  the first poll, and the port answers as closed from then on. It ends every
+  live link as the link's own close would, under one three-second bound for
+  all their drains, closes their connections, and then awaits iroh's
+  `Endpoint::close`. A pending `accept` answers `Ok(None)` once the endpoint
+  closes, and so does one whose handshake the close cut short.
+- **The tracking.** The port holds its links weakly, so a link dropped by its
+  owner is not kept by the port. A link holds the endpoint as well as its
+  connection, so a port dropped without `close` does not take the link's
+  transport with it. iroh aborts an endpoint whose last handle drops
+  unclosed: a link's receive then failed with `connection lost`, and in one
+  run waited for ever. Both handles come out when the link ends, so once the
+  port's close has run, no link keeps the port bound.
+- **Binding.** The adapter binds loopback, on a port the OS picks, as the
+  node's endpoint binds. `CarrierConfig::local` is 4.5's bind address, and is
+  not read. So CA-004's re-bind, "close frees the address by value", is
+  vacuous on iroh until 4.5: `fresh` binds elsewhere. The adapter's own test
+  shows the port freed instead.
+- **CA-005, changed.** The probe reached `fresh` by dialling `b`'s address.
+  An iroh address names its endpoint's key, so that dial reached nobody, and
+  the probe waited until its bound ran out. `fresh` is now asked to bind where
+  `b` was, and dialled where its bind answers. On the two fake networks that
+  is `b`'s address again, as before.
+- **Where it is wired.** `NodeAssembly` binds `IrohCarrier` for the peer role
+  (`peer_carrier_binding`), in place of `PendingIrohAdapter`, with the
+  endpoint key as its component parameters (`Option<EndpointKey>`). Neither
+  root lends one, so it refuses to bind: `Transport("the iroh adapter was
+  lent no endpoint key")`, where the pending adapter answered `the iroh
+  CarrierPort adapter is not built yet (plan Phase 4)`. `dial` answers
+  `Closed` and `accept` `Ok(None)`, as before. The record transport's view
+  rides it and is never called. The mesh stays on `PeerEndpoint`.
+- **No door.** The adapter's endpoint has no accept hook. A door would be lent
+  with a key, when the mesh moves onto the port.
+- **What moving the mesh would take** (question 1): HELLO's exporter bytes
+  (D6), which the port does not expose; the door's hook on the adapter's
+  endpoint; the sync driver's reads and writes moved from QUIC streams to a
+  link's frames; and 4.5's bind address and relay mode. Until then no root
+  lends the adapter a key, so no second endpoint shares the node's endpoint
+  key.
+
+### 12. Tests (4.2c), each begun red
+
+Each was run against the code without the part it guards, switched off by an
+edit and restored after; the message is what that run printed. CA-001..005
+run on real iroh over loopback in `iroh_carrier`'s tests, each bounded at
+20 s, since `tests/assembly` opens no socket.
+
+| Test | Proves | Red first |
+| --- | --- | --- |
+| `iroh_carrier`: `ca_001_iroh_carries_frames_whole_once_and_in_order` | CA-001 on real iroh: frames cross whole, once and in order, both ways; a link's close delivers what was sent, then the end of the stream | with a link's close that does not drain: "CA-001 close delivers what was sent", left `Ok(None)`, right `Ok(Some([108, 97, 115, 116]))` |
+| `iroh_carrier`: `ca_002_iroh_holds_the_frame_limit_both_ways` | CA-002 | with no limit on an arriving frame: "CA-002 an oversized arrival", left `Ok(Some([49, 50, 51, 52, 53, 54]))`, right `Err(FrameTooLarge)` |
+| `iroh_carrier`: `ca_003_irohs_futures_are_lazy_and_recv_is_cancel_safe` | CA-003 | with a half given up whenever an operation lets it go: "CA-003 a dropped recv consumes nothing", left `Ok(None)`, right `Ok(Some([107, 101, 112, 116]))` |
+| `iroh_carrier`: `ca_004_an_iroh_port_gives_its_endpoint_up_by_value` | CA-004, its re-bind vacuous (section 11) | with a port close that ends no link: "CA-004 close ends the endpoint's links", left `Err(Transport("connection lost"))`, right `Err(Closed)` |
+| `iroh_carrier`: `ca_005_iroh_names_each_far_end_by_its_endpoint_id` | CA-005, as changed | with the probe as it was: "the probe finished within 20 s: Elapsed(())"; with a link that names no endpoint: "CA-005 three endpoints are named apart" |
+| `iroh_carrier`: `a_closed_carrier_frees_its_port_though_its_links_survive` | a port's close frees its UDP port though both handles of its link survive; `remote_id` is the id of the key the far port was lent; the closed port's link answers `Closed`, and the far end's stream ends | with a port close that ends no link: "a link the port made keeps it bound", after the two-second wait |
+| `iroh_carrier`: `a_frame_read_in_two_parts_arrives_whole` | from a raw dialer: another first word is refused with `Transport("not a carrier link")`, and the port accepts the next; a receive dropped with half a frame keeps it, and that frame and the next arrive whole | with no check of the first word: "another word is refused", left `None`; with a receive that keeps no part: "the dropped receive kept its part", left `Err(FrameTooLarge)`, right `Ok(Some([97, 98, 99, 100, 101, 102]))` |
+| `iroh_carrier`: `a_torn_frame_is_never_followed_by_another` | a 4 MiB send past the peer's window, dropped part-way; the next send answers `Closed`, and nothing arrives after the torn frame | with the torn mark ignored: "the link ended instead", left `Err(Elapsed(()))`: the next send waited behind the torn frame |
+| `iroh_carrier`: `a_link_outlives_a_port_dropped_without_close` | with both ports dropped unclosed, a frame still crosses their link | with a link that holds no endpoint: "the transport went with its port", left `Ok(Err(Transport("connection lost")))` |
+| `tests/assembly_registration`: `an_assembly_with_nothing_overridden_builds_its_real_providers_and_they_refuse`, changed | the assembled path builds `IrohCarrier` for the peer role, counted as before, and lent no key it refuses to bind | on HEAD's `assembly.rs`: left `Err(Transport("the iroh CarrierPort adapter is not built yet (plan Phase 4)"))`, right `Err(Transport("the iroh adapter was lent no endpoint key"))` |
+| the module's `compile_fail` doctests, three changed | a cycle, two peers and a carrier asked for by port type still fail to compile, with `IrohCarrier` where `PendingIrohAdapter` was | none: they guard the module. Each body, built as an example on a scratch copy, failed with its recorded code and no other: E0277 (the missing binding, unchanged), E0275, E0119, E0277 |
+| contracts: `ca_005_each_link_names_the_far_ends_transport_identity` and `rejects_a_link_that_names_its_own_end`; node: `ca_005_the_fake_network_names_each_far_end` | the changed probe on both fakes, whose `bind` answers the address it was asked for | none: they pass unchanged |
+
+What they do not prove: Windows and Linux, which the lane owner runs on
+dabeest and the Pi; a relay, and two machines (4.5); the re-bind at the
+address a closed port held (4.5).
+
+### Named gaps (4.2c)
+
+- A close while a send on the same link is under way does not drain: that
+  send ends, and frames the peer has not yet acknowledged may be lost.
+- A `dial` or `accept` still pending when the port closes holds an endpoint
+  handle until it is next polled or dropped, as iroh frees the socket only
+  once every handle is gone. The close wakes it, and it answers `Closed` or
+  `Ok(None)`.
+- The acceptor waits for a link's first four bytes without a bound: a dialer
+  that connects and sends nothing holds that `accept`.
+- CA-004's re-bind is vacuous on iroh until 4.5's bind address.
+- Nothing binds the adapter on either root, so its behaviour under load, on a
+  relay or across machines is not measured.
+
+### Default-path changes (4.2c)
+
+1. `NodeAssembly`'s peer role is `IrohCarrier`, lent no key, where it was
+   `PendingIrohAdapter`. Its refusal to bind reads `the iroh adapter was lent
+   no endpoint key`. Nothing on either root binds, dials or accepts through
+   it.
+2. CA-005 dials the address `fresh`'s bind answers.
+3. Nothing else. The node's endpoint, its ALPN, the mesh, HELLO, the door and
+   every line a node prints are as they were. `bind_endpoint` takes the ALPN
+   as an argument.
+
+**What the owner's desk sees at its next restart:** nothing new. The desk's
+node starts from the hand-written root, which builds no `NodeAssembly`; the
+assembled root builds the adapter and never binds it. The rehearsal below
+printed HEAD's lines exactly on both roots, with the same node and endpoint
+ids, and records.json gained only the claim every start mints.
+
+### Questions for the owner (4.2c)
+
+1. **When the mesh moves onto the port.** Recommend a step of its own after
+   4.5, not 4.2c. It needs HELLO's exporter bytes (D6) through the port, or a
+   session-level replacement for them; the door's hook on the adapter's
+   endpoint; the sync driver on a link's frames; and 4.5's bind address and
+   relay mode. Until then the roots lend the adapter no key. The other choice
+   is to fold the move into 4.5, so that its crossing runs on the port; that
+   makes 4.5 larger by all of the above.
+2. **The adapter's own ALPN, `glade/carrier/1`, and its first word, `gcl1`.**
+   Recommend keeping both: a node's endpoint and an adapter cannot connect by
+   mistake, and a later framing can take a new word.
+3. **The unbounded wait for the first word** (named gaps). Recommend a bound
+   when the adapter first faces other machines, with the door in front of it:
+   the mesh's move, or 4.5.
+
+### Measured (4.2c)
+
+2026-09-25, Apple M3 Pro, Rust 1.96.0, on the final tree:
+
+- **The gate** (`glade/node/check.sh`) passes all 8 components, in 94-97 s
+  from an empty target. There are 265 node tests on each path, across 15
+  test binaries, where there were 256: the nine new `iroh_carrier` rows of
+  section 12.
+- **rustfmt**: glade-node 317 hunks, one fewer than before: the body of
+  `PeerEndpoint::addr`, which rustfmt would lay out otherwise, moved into
+  `loopback_addr` in rustfmt's layout. The gate's table now records 317, as
+  the gate asks when a count falls. glade-wire 43.
+- **clippy**: glade-node 11 warnings and glade-wire 7, at baseline.
+- **The contracts**: `glade/contracts/check.sh` passes, with 89 tests, as
+  before.
+- **Time**: the fifteen `iroh_carrier` tests, the nine new ones among them,
+  finish in 0.29 s together.
+- **The rehearsal.** HEAD's binary (`63a5799`, built from a copy of the tree
+  with this change reversed, deleted after) ran twice on a scratch instance
+  with the desk's two app files, as grazel starts it. This build then ran
+  twice on that instance:
+
+  ```text
+  node df5b4298…
+  registry ready (home served: true)
+  app grazel registered (+0 record(s), 11 unchanged)
+  app gyld registered (+0 record(s), 12 unchanged)
+  peer 6507b0a7… 127.0.0.1:51960
+  workspace ws-razel serving
+  workspace ws-razel serving
+  listening 62022
+  ```
+
+  These are HEAD's lines, with the same node and endpoint ids and nothing on
+  stderr; the instance holds one binding. On a second instance, started with
+  `GLADE_NODE_ASSEMBLED=1`, the same held, with the assembled root's one
+  stderr line, as before.
+- **Downstream**, against the rebuilt default binary,
+  `glade/node/target/debug/glade-node` (inode 399895034; 4.2b's was
+  399732389), each Rust suite with a scratch target deleted after it:
+  - client-rs: 9 + 3;
+  - client-ts: 19;
+  - grip-share: 19;
+  - grazel, at `c9f9c7f`, clean before and after: 29 + 3, on that binary;
+  - glade-gwz: 9 + 6;
+  - glade-gyld: 233 (1 ignored) + 31.
+- **The async witness** type-checks against this tree, on a scratch copy.
+  Its `Cargo.lock` lacks glade-node's `ed25519-dalek` and `getrandom` edges,
+  added at 4.1a, so `--locked` refuses it; the check ran `--offline` alone.
+
+**Size**, in lines added and removed in `.rs` files, doc comments included:
+
+- production: the node +442/−35, net +407: `iroh_carrier.rs` +419/−15,
+  `assembly.rs` +23/−20;
+- tests: +214/−22, net +192;
+  - the node +202/−11: `iroh_carrier.rs` +190, the registration test +9/−9,
+    `tests/assembly/conformance.rs`'s header +3/−2;
+  - the contract's CA-005 probe +12/−11.

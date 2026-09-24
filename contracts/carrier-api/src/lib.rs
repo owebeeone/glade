@@ -407,19 +407,20 @@ pub mod conformance {
     }
 
     /// CA-005. Each link names the far end's transport identity. `a` dials
-    /// `b`, then, once `b` has closed, `fresh` bound where `b` was: the two
-    /// endpoints `a` reached are named apart, both name `a` alike, a
-    /// transport with no identity names none on any link, and a name
-    /// outlives the link's close. It assumes the fixture's three ports are
-    /// three endpoints: `fresh` is not `b` again under the same identity.
+    /// `b`, then, once `b` has closed, `fresh`, asked to bind where `b` was
+    /// and dialled where its bind answers: `b`'s address again, where an
+    /// address names no key, and another where it does, as an iroh address
+    /// names its endpoint's. The two endpoints `a` reached are named apart,
+    /// both name `a` alike, a transport with no identity names none on any
+    /// link, and a name outlives the link's close. It assumes the fixture's
+    /// three ports are three endpoints: `fresh` is not `b` again under the
+    /// same identity.
     pub async fn remote_identity(f: Fixture) {
-        let (at_b, a_to_b, b_from_a) = link(&f, 64, 64).await;
+        let (_, a_to_b, b_from_a) = link(&f, 64, 64).await;
         f.b.close().await;
-        f.fresh
-            .bind(config(&at_b, 64))
-            .await
-            .expect("bind fresh where b was");
-        let (a_to_fresh, fresh_from_a) = join(f.a.dial(&at_b), f.fresh.accept()).await;
+        let at_fresh = f.fresh.bind(config(&f.at_b, 64)).await;
+        let at_fresh = at_fresh.expect("bind fresh where b was");
+        let (a_to_fresh, fresh_from_a) = join(f.a.dial(&at_fresh), f.fresh.accept()).await;
         let a_to_fresh = a_to_fresh.expect("dial");
         let fresh_from_a = fresh_from_a.expect("accept").expect("an inbound link");
         let (b, fresh): (Option<TransportId>, _) = (a_to_b.remote_id(), a_to_fresh.remote_id());

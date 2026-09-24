@@ -5,8 +5,9 @@
 //! (GR-003), which is all a provider that refuses can pass; its Ed25519
 //! signer (plan Step 4.1a) runs the whole of SI-001..003, SI-003 with no key
 //! lent; its system clock runs CL-002 (CL-001 needs a clock a test can set).
-//! No carrier on the assembled path implements `CarrierPort` yet, so
-//! CA-001..005 run on the fake network only.
+//! CA-001..005 run here on the fake network. The assembled path's iroh
+//! adapter (plan Step 4.2c) runs them on real iroh over loopback in its own
+//! module's tests (`src/iroh_carrier.rs`), since this binary opens no socket.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};

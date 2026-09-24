@@ -27,11 +27,11 @@ use glade_node::sysdata::NodeRecord;
 use glade_signer_api::{Purpose, SignError};
 use shaku::HasComponent;
 
-/// The pending carriers answer at once; one poll is enough.
+/// The carriers, lent nothing, answer at once; one poll is enough.
 fn now<T>(future: impl Future<Output = T>) -> T {
     match pin!(future).poll(&mut Context::from_waker(Waker::noop())) {
         Poll::Ready(out) => out,
-        Poll::Pending => panic!("a pending carrier waited"),
+        Poll::Pending => panic!("a carrier waited"),
     }
 }
 
@@ -39,8 +39,8 @@ fn now<T>(future: impl Future<Output = T>) -> T {
 fn an_assembly_with_nothing_overridden_builds_its_real_providers_and_they_refuse() {
     assert_eq!(real_providers_constructed(), 0);
 
-    // Eager: the command line, the system clock, the pending iroh adapter
-    // (which the record transport rides) and the record host.
+    // Eager: the command line, the system clock, the iroh adapter (which the
+    // record transport rides) and the record host.
     let node = NodeAssembly::builder().build();
     assert_eq!(real_providers_constructed(), 4);
 
@@ -71,16 +71,16 @@ fn an_assembly_with_nothing_overridden_builds_its_real_providers_and_they_refuse
     let record = Record::Node(NodeRecord::default());
     assert!(matches!(host.append(record, "n1"), Err(HostError::NotOpen)));
 
-    // The pending providers fail closed, and so does the signer, lent no key.
+    // The providers fail closed: the iroh adapter, lent no endpoint key, the
+    // pending ones, and the signer, lent no key.
     let peer: Arc<dyn CarrierPort> = sessions.peer();
     let config = CarrierConfig {
         local: CarrierAddr("127.0.0.1:0".into()),
         max_frame_bytes: NonZeroUsize::new(64).unwrap(),
     };
-    assert!(matches!(
-        now(peer.bind(config)),
-        Err(CarrierError::Transport(_))
-    ));
+    let unkeyed = "the iroh adapter was lent no endpoint key";
+    let bound = now(peer.bind(config));
+    assert_eq!(bound, Err(CarrierError::Transport(unkeyed.into())));
     let dialed = now(peer.dial(&CarrierAddr("x".into())));
     assert!(matches!(dialed, Err(CarrierError::Closed)));
     assert!(matches!(now(sessions.client().accept()), Ok(None)));
