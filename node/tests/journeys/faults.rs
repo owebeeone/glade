@@ -1,7 +1,8 @@
 //! The providers the journeys add to Step 3.2's fakes, each able to change
 //! under a test's hand: a carrier whose links can suffer a transport failure,
-//! an engine the test reads back, and a grant fold the test appends to. Each
-//! says what it does not prove, and each port's shared suite runs below.
+//! an engine the test reads back and can make refuse a save, and a grant fold
+//! the test appends to. Each says what it does not prove, and each port's
+//! shared suite runs below.
 
 use std::collections::VecDeque;
 use std::io;
@@ -133,14 +134,19 @@ impl CarrierLink for FaultyLink {
 
 /// The engine a test node's record host persists through, which the test
 /// reads back: the last snapshot saved, in memory. It is not durability:
-/// nothing outlives the process, and no save fails.
+/// nothing outlives the process, and a node "restarted" over it reloads what
+/// this process kept. A save fails only while the test has it refuse saves,
+/// as a store with a known failure refuses a write: the last snapshot stays.
 #[derive(Clone, Default)]
-pub struct VolatileStore(Arc<Mutex<SystemSnapshot>>);
+pub struct VolatileStore {
+    last: Arc<Mutex<SystemSnapshot>>,
+    refusing: Arc<AtomicBool>,
+}
 
 impl VolatileStore {
     /// What was last persisted.
     pub fn snapshot(&self) -> SystemSnapshot {
-        lock(&self.0).clone()
+        lock(&self.last).clone()
     }
 
     /// The ops last persisted, in the order the fold holds them.
@@ -151,6 +157,16 @@ impl VolatileStore {
             .map(|bytes| Op::from_cbor(&cbor::decode(bytes)))
             .collect()
     }
+
+    /// A handle on this same engine, for a record host to persist through.
+    pub fn boxed(&self) -> Box<dyn StoreApi + Send> {
+        Box::new(self.clone())
+    }
+
+    /// Whether every save fails from now on, leaving the last snapshot.
+    pub fn refuse_saves(&self, refuse: bool) {
+        self.refusing.store(refuse, Ordering::SeqCst);
+    }
 }
 
 impl StoreApi for VolatileStore {
@@ -159,7 +175,10 @@ impl StoreApi for VolatileStore {
     }
 
     fn save(&mut self, snap: &SystemSnapshot) -> io::Result<()> {
-        *lock(&self.0) = snap.clone();
+        if self.refusing.load(Ordering::SeqCst) {
+            return Err(io::Error::other("injected: the engine refused the save"));
+        }
+        *lock(&self.last) = snap.clone();
         Ok(())
     }
 }

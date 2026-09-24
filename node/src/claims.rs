@@ -6,11 +6,12 @@
 //! The server ADOPTS the boot instance ([`Server::adopt_boot`]): the boot
 //! `Registry` stays the single chain authority for this node's own directory
 //! writes (records.json stays current; the instance lock lives as long as the
-//! server), and every runtime mint is (1) appended to the registry, (2)
-//! persisted, (3) landed in the served replica through the same verify path as
-//! any carrier, (4) fanned out to local home subscribers, and (5) PUSHED to
-//! every live peer link — the traces' B9 "directory ops replicate" step
-//! (`mesh::push_home`).
+//! server), and every runtime mint is (1) appended to a staged copy of the
+//! registry, (2) persisted, the copy becoming the fold only once the save
+//! succeeded (slice profile SP-L1: nothing unsaved is folded or sent), (3)
+//! landed in the served replica through the same verify path as any carrier,
+//! (4) fanned out to local home subscribers, and (5) PUSHED to every live peer
+//! link — the traces' B9 "directory ops replicate" step (`mesh::push_home`).
 //!
 //! Serving a workspace ([`Server::serve_workspace`]) mints the entry (diffed —
 //! re-serving appends nothing) + the first claim (epoch = fold max + 1, so a
@@ -30,7 +31,7 @@ use tokio::sync::Mutex;
 use glade_wire::cbor;
 use glade_wire::generated::Op;
 
-use crate::registry::{Record, RegistryApi, StoreApi, G_CLAIMS, G_PRINCIPALS, HOME};
+use crate::registry::{Record, Registry, RegistryApi, G_CLAIMS, G_PRINCIPALS, HOME};
 use crate::server::{Server, Shared};
 use crate::store::Store;
 use crate::sysdata::{PrincipalRecord, ServeClaim, WorkspaceCreateReq, WorkspaceCreateRes, WorkspaceEntry};
@@ -63,29 +64,34 @@ pub(crate) struct DirAuthority {
 }
 
 impl DirAuthority {
-    /// One attributed registry append; the caller persists + publishes.
-    fn append(&mut self, rec: Record, origin: &str) -> io::Result<Op> {
-        self.boot
-            .registry
-            .append_returning(rec, origin)
-            .map_err(|e| other(format!("registry append rejected: {e:?}")))
+    /// Durable acceptance (slice profile SP-L1, plan Step 4.4): `change`
+    /// appends to a staged copy of the registry, the copy is saved to
+    /// records.json, and only then is it the fold. A refused append or a
+    /// failed save leaves the fold and records.json as they were, so the
+    /// caller has nothing to publish, and a retry starts from what was
+    /// accepted.
+    fn accept<T>(&mut self, change: impl FnOnce(&mut Registry) -> io::Result<T>) -> io::Result<T> {
+        let boot = &mut self.boot;
+        boot.registry.accept(&mut boot.store, change)
     }
+}
 
-    /// Diff-idempotent append: a byte-identical record already in the fold is
-    /// skipped (the `appdecl::register` rule, applied to runtime mints).
-    fn append_diffed(&mut self, rec: Record, origin: &str) -> io::Result<Option<Op>> {
-        let (glade_id, payload) = (rec.glade_id().to_string(), rec.encode());
-        if self.boot.registry.contains(&glade_id, &payload) {
-            return Ok(None);
-        }
-        self.append(rec, origin).map(Some)
-    }
+/// One attributed append to the staged `registry`, as `DirAuthority::accept`
+/// hands it.
+fn append(registry: &mut Registry, rec: Record, origin: &str) -> io::Result<Op> {
+    registry
+        .append_returning(rec, origin)
+        .map_err(|e| other(format!("registry append rejected: {e:?}")))
+}
 
-    /// Rewrite records.json (tmp+rename) with the registry's current fold.
-    fn persist(&mut self) -> io::Result<()> {
-        let snap = self.boot.registry.snapshot();
-        self.boot.store.save(&snap)
+/// Diff-idempotent append: a byte-identical record already in the fold is
+/// skipped (the `appdecl::register` rule, applied to runtime mints).
+fn append_diffed(registry: &mut Registry, rec: Record, origin: &str) -> io::Result<Option<Op>> {
+    let (glade_id, payload) = (rec.glade_id().to_string(), rec.encode());
+    if registry.contains(&glade_id, &payload) {
+        return Ok(None);
     }
+    append(registry, rec, origin).map(Some)
 }
 
 impl Server {
@@ -138,8 +144,7 @@ pub(crate) async fn serve_workspace_on(shared: &Arc<Shared>, share: &str, name: 
         return Err(other("no directory authority (adopt_boot first)"));
     };
     let node = state.node_id.clone();
-    let mut ops = Vec::new();
-    {
+    let ops = {
         let mut dir = state.inner.lock().await;
         if dir.served.contains_key(share) {
             return Ok(false); // already serving: records diff to nothing
@@ -149,9 +154,6 @@ pub(crate) async fn serve_workspace_on(shared: &Arc<Shared>, share: &str, name: 
             name: name.into(),
             eligible_hosts: vec![node.clone()],
         };
-        if let Some(op) = dir.append_diffed(Record::Workspace(entry), &node)? {
-            ops.push(op);
-        }
         // Epoch fencing reads the SERVED replica (it may hold peer claims the
         // boot registry never saw); +1 bumps over any stale claim, ours or not.
         let epoch = 1 + {
@@ -164,10 +166,20 @@ pub(crate) async fn serve_workspace_on(shared: &Arc<Shared>, share: &str, name: 
             lease_expiry_ms: now_ms() + state.lease_ms,
             epoch,
         };
-        ops.push(dir.append(Record::Serve(claim), &node)?);
+        // Entry and claim are accepted together, after the last await: a
+        // cancelled call has folded nothing, and a failed save leaves the
+        // share unserved, so a retry mints both again.
+        let ops = dir.accept(|registry| {
+            let mut ops = Vec::new();
+            if let Some(op) = append_diffed(registry, Record::Workspace(entry), &node)? {
+                ops.push(op);
+            }
+            ops.push(append(registry, Record::Serve(claim), &node)?);
+            Ok(ops)
+        })?;
         dir.served.insert(share.into(), epoch);
-        dir.persist()?;
-    }
+        ops
+    };
     publish(shared, ops).await;
     Ok(true)
 }
@@ -207,16 +219,19 @@ pub(crate) async fn note_principal(shared: &Arc<Shared>, principal: &str) {
         }
     }
     let node = state.node_id.clone();
-    let mut ops = Vec::new();
-    {
+    let ops = {
         let mut dir = state.inner.lock().await;
         // append_diffed re-checks under the lock: two racing Hellos for the
-        // same principal serialize here and the second diffs away.
-        if let Ok(Some(op)) = dir.append_diffed(Record::Principal(PrincipalRecord { principal: principal.into() }), &node) {
-            let _ = dir.persist();
-            ops.push(op);
+        // same principal serialize here and the second diffs away. A record
+        // that fails to save is not published; the next Hello retries it.
+        let record = Record::Principal(PrincipalRecord {
+            principal: principal.into(),
+        });
+        match dir.accept(|registry| append_diffed(registry, record, &node)) {
+            Ok(Some(op)) => vec![op],
+            _ => Vec::new(),
         }
-    }
+    };
     publish(shared, ops).await;
 }
 
@@ -237,27 +252,33 @@ fn knows_principal(store: &Store, principal: &str) -> bool {
 async fn renew_leases(shared: &Arc<Shared>) {
     let Some(state) = shared.dir.get() else { return };
     let node = state.node_id.clone();
-    let mut ops = Vec::new();
-    {
+    let lease_ms = state.lease_ms;
+    let ops = {
         let mut dir = state.inner.lock().await;
         if dir.served.is_empty() {
             return;
         }
         let served: Vec<(String, i64)> = dir.served.iter().map(|(s, e)| (s.clone(), *e)).collect();
-        for (share, epoch) in served {
-            let claim = ServeClaim {
-                node: node.clone(),
-                share,
-                lease_expiry_ms: now_ms() + state.lease_ms,
-                epoch,
-            };
-            match dir.append(Record::Serve(claim), &node) {
-                Ok(op) => ops.push(op),
-                Err(_) => break, // a rejected chain append: stop, next tick retries
+        // One acceptance for the tick's renewals: if the save fails, none is
+        // folded or published, and the next tick retries.
+        let renewed = dir.accept(|registry| {
+            let mut ops = Vec::new();
+            for (share, epoch) in served {
+                let claim = ServeClaim {
+                    node: node.clone(),
+                    share,
+                    lease_expiry_ms: now_ms() + lease_ms,
+                    epoch,
+                };
+                match append(registry, Record::Serve(claim), &node) {
+                    Ok(op) => ops.push(op),
+                    Err(_) => break, // a rejected chain append: stop, next tick retries
+                }
             }
-        }
-        let _ = dir.persist();
-    }
+            Ok(ops)
+        });
+        renewed.unwrap_or_default()
+    };
     publish(shared, ops).await;
 }
 
@@ -326,6 +347,145 @@ mod tests {
             }
         }
         max
+    }
+
+    /// A booted node with no mesh, adopted with the renewal loop an hour
+    /// off, so a test renews by hand: its served state and its instance dir.
+    async fn adopted(name: &str) -> (Arc<Shared>, PathBuf) {
+        let sys = fresh(&format!("{name}-sys"));
+        let boot = boot_at(sys.clone(), "gianni").unwrap();
+        let server = Server::open(fresh(&format!("{name}-store"))).unwrap();
+        server
+            .adopt_boot_tuned(boot, LEASE_TTL_MS, 3_600_000)
+            .await
+            .unwrap();
+        (server.shared.clone(), sys)
+    }
+
+    /// Make every save of the instance at `sys` fail, or work again: a
+    /// directory where records.json's temp file goes refuses the save's first
+    /// write, and leaves records.json as it is. Not a full disk or an I/O error.
+    fn refuse_saves(sys: &std::path::Path, refuse: bool) {
+        let blocker = sys.join("records.json.tmp");
+        if refuse {
+            std::fs::create_dir(&blocker).unwrap();
+        } else {
+            std::fs::remove_dir(&blocker).unwrap();
+        }
+    }
+
+    /// How many records the served store holds on `glade_id` that `pick`
+    /// accepts, from any origin: what has been published.
+    fn published(store: &Store, glade_id: &str, pick: impl Fn(&[u8]) -> bool) -> usize {
+        let mut n = 0;
+        for (origin, _) in store.heads(HOME, glade_id, &[]) {
+            for op in store.scan(HOME, glade_id, &[], &origin, i64::MIN) {
+                n += usize::from(pick(&op.payload));
+            }
+        }
+        n
+    }
+
+    /// The entries and the claims for `share` that the served store holds.
+    fn published_serve(store: &Store, share: &str) -> (usize, usize) {
+        let entry = |p: &[u8]| WorkspaceEntry::from_cbor(&cbor::decode(p)).workspace == share;
+        let claim = |p: &[u8]| ServeClaim::from_cbor(&cbor::decode(p)).share == share;
+        let entries = published(store, crate::registry::G_WORKSPACES, entry);
+        (entries, published(store, G_CLAIMS, claim))
+    }
+
+    /// The ops records.json at `sys` holds.
+    fn saved(sys: &std::path::Path) -> Vec<Op> {
+        use crate::registry::StoreApi;
+        let snap = crate::registry::BlobStore::new(sys).load().unwrap();
+        snap.records
+            .iter()
+            .map(|bytes| Op::from_cbor(&cbor::decode(bytes)))
+            .collect()
+    }
+
+    /// How many of `ops` are on `glade_id` with a payload `pick` accepts.
+    fn count(ops: &[Op], glade_id: &str, pick: impl Fn(&[u8]) -> bool) -> usize {
+        ops.iter()
+            .filter(|op| op.glade_id == glade_id && pick(&op.payload))
+            .count()
+    }
+
+    /// Slice profile SP-L1 (plan Step 4.4): a serve whose save fails folds,
+    /// saves, marks and publishes nothing, so the retry mints the entry and
+    /// the claim, saves them, and publishes both.
+    #[tokio::test]
+    async fn a_serve_whose_save_fails_is_retried_in_full() {
+        let (shared, sys) = adopted("sp-l1-serve").await;
+        refuse_saves(&sys, true);
+        assert!(serve_workspace_on(&shared, "ws-a", "a").await.is_err());
+        assert_eq!(published_serve(&*shared.store.lock().await, "ws-a"), (0, 0));
+        refuse_saves(&sys, false);
+        assert!(
+            serve_workspace_on(&shared, "ws-a", "a").await.unwrap(),
+            "the retry mints"
+        );
+        assert_eq!(published_serve(&*shared.store.lock().await, "ws-a"), (1, 1));
+        let claim = |p: &[u8]| ServeClaim::from_cbor(&cbor::decode(p)).share == "ws-a";
+        assert_eq!(count(&saved(&sys), G_CLAIMS, claim), 1, "and saved");
+    }
+
+    /// SP-L1: a renewal whose save fails is neither folded nor published, and
+    /// the next renewal is saved and published on the chain's next seq, which
+    /// the served store takes without a gap.
+    #[tokio::test]
+    async fn a_renewal_whose_save_fails_is_not_published() {
+        let (shared, sys) = adopted("sp-l1-renew").await;
+        assert!(serve_workspace_on(&shared, "ws-a", "a").await.unwrap());
+        refuse_saves(&sys, true);
+        renew_leases(&shared).await;
+        let claims = |store: &Store| published_serve(store, "ws-a").1;
+        assert_eq!(
+            claims(&*shared.store.lock().await),
+            1,
+            "the refused renewal reached no one"
+        );
+        refuse_saves(&sys, false);
+        renew_leases(&shared).await;
+        assert_eq!(claims(&*shared.store.lock().await), 2, "the next one lands");
+        let claim = |p: &[u8]| ServeClaim::from_cbor(&cbor::decode(p)).share == "ws-a";
+        assert_eq!(count(&saved(&sys), G_CLAIMS, claim), 2, "and is saved");
+    }
+
+    /// SP-L1: a principal whose record fails to save is not published, and
+    /// the next Hello naming it mints the record, saved and published.
+    #[tokio::test]
+    async fn a_principal_whose_save_fails_is_not_published() {
+        let (shared, sys) = adopted("sp-l1-principal").await;
+        refuse_saves(&sys, true);
+        note_principal(&shared, "alice").await;
+        assert!(
+            !knows_principal(&*shared.store.lock().await, "alice"),
+            "reached no one"
+        );
+        refuse_saves(&sys, false);
+        note_principal(&shared, "alice").await;
+        assert!(knows_principal(&*shared.store.lock().await, "alice"));
+        let alice = |p: &[u8]| PrincipalRecord::from_cbor(&cbor::decode(p)).principal == "alice";
+        assert_eq!(count(&saved(&sys), G_PRINCIPALS, alice), 1, "and saved");
+    }
+
+    /// Pending-future cancellation (plan Step 4.4): a serve cancelled while it
+    /// waits for the served store's lock has folded, saved and published
+    /// nothing, so the next serve publishes the entry and the claim. It does
+    /// not test a cancellation after the save, when the records are durable
+    /// and not yet published.
+    #[tokio::test]
+    async fn a_serve_cancelled_before_its_save_leaves_nothing_behind() {
+        let (shared, _sys) = adopted("cancel-serve").await;
+        {
+            let _held = shared.store.lock().await;
+            let pending = serve_workspace_on(&shared, "ws-a", "a");
+            let waited = tokio::time::timeout(Duration::from_millis(20), pending).await;
+            assert!(waited.is_err(), "the serve waits for the served store");
+        }
+        assert!(serve_workspace_on(&shared, "ws-a", "a").await.unwrap());
+        assert_eq!(published_serve(&*shared.store.lock().await, "ws-a"), (1, 1));
     }
 
     /// F1 live, two booted nodes over real iroh: B starts serving a workspace

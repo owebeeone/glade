@@ -296,7 +296,8 @@ pub trait RecordHostPort: Send + Sync {
     fn register(&self, decl: &AppDecl, origin: &str) -> Result<Registered, HostError>;
 
     /// Take in an op carried from elsewhere (a peer, the disk): refused unless
-    /// the profile hosts its share and stream, then verified as it lands.
+    /// the profile hosts its share and stream, then verified as it lands. An
+    /// op already held, byte for byte, is a duplicate: `Ok`, saving nothing.
     fn ingest(&self, op: Op) -> Result<(), HostError>;
 
     /// The node serving `share` at the reader's instant `now_ms`; lease expiry
@@ -345,6 +346,13 @@ impl fmt::Display for HostError {
 }
 
 impl std::error::Error for HostError {}
+
+/// A failed save, as `Registry::accept` reports it.
+impl From<io::Error> for HostError {
+    fn from(e: io::Error) -> HostError {
+        HostError::Io(e)
+    }
+}
 
 /// As the hand-written root reports the same failures: a refused registration
 /// as `InvalidData` with the registry's `Debug` text, a failed write as the
@@ -482,8 +490,8 @@ pub type InstanceSlot = Arc<Mutex<Option<Boot>>>;
 enum Held {
     /// The booted instance, lent through the composition root's slot.
     Instance(InstanceSlot),
-    /// The node's own in-memory engine: a `Registry` over a volatile engine,
-    /// `MemStore` unless a test composition hands one in.
+    /// The node's own `Registry`, held here over an engine: `MemStore`, or
+    /// one a test composition hands in.
     Memory(Mutex<(Registry, Box<dyn StoreApi + Send>)>),
 }
 
@@ -506,23 +514,33 @@ impl Records {
         profile: Arc<dyn RecordProfile>,
         transport: Arc<dyn RecordTransport>,
     ) -> Records {
-        Records::in_memory_over(profile, transport, Box::new(MemStore::default()))
-    }
-
-    /// As [`Records::in_memory`], persisting the fold through `store`, an
-    /// engine the test composition can read back (plan Step 3.4's journeys).
-    /// The fold starts empty whatever `store` holds. Never built by the module.
-    pub fn in_memory_over(
-        profile: Arc<dyn RecordProfile>,
-        transport: Arc<dyn RecordTransport>,
-        store: Box<dyn StoreApi + Send>,
-    ) -> Records {
+        let store: Box<dyn StoreApi + Send> = Box::new(MemStore::default());
         let held = Held::Memory(Mutex::new((Registry::new(), store)));
         Records {
             profile,
             transport,
             held,
         }
+    }
+
+    /// The record host over `store`, an engine a test composition can read
+    /// back and may have written before (plan Steps 3.4 and 4.4): the fold is
+    /// loaded from it through verify-as-ingest, as boot loads records.json, so
+    /// a host built again over the same engine resumes from what it accepted.
+    /// A record the load quarantines stays out of the fold, as at boot. Never
+    /// built by the module.
+    pub fn over(
+        profile: Arc<dyn RecordProfile>,
+        transport: Arc<dyn RecordTransport>,
+        store: Box<dyn StoreApi + Send>,
+    ) -> io::Result<Records> {
+        let (registry, _quarantined) = Registry::from_snapshot(&store.load()?);
+        let held = Held::Memory(Mutex::new((registry, store)));
+        Ok(Records {
+            profile,
+            transport,
+            held,
+        })
     }
 
     /// Run `f` over the fold and the engine that persists it.
@@ -545,30 +563,27 @@ impl Records {
     }
 }
 
-/// Rewrite the persisted fold, as `glade-node` does after each write.
-fn persist(registry: &Registry, store: &mut dyn StoreApi) -> Result<(), HostError> {
-    store.save(&registry.snapshot()).map_err(HostError::Io)
-}
-
+// Every write goes through `Registry::accept` (slice profile SP-L1): staged,
+// saved, and only then the fold, so a refused or unsaved write leaves nothing
+// behind and its retry is judged against what was accepted.
 impl RecordHostPort for Records {
     fn append(&self, record: Record, origin: &str) -> Result<bool, HostError> {
         self.with(|registry, store| {
             if registry.contains(record.glade_id(), &record.encode()) {
                 return Ok(false);
             }
-            registry
-                .append(record, origin)
-                .map_err(HostError::Rejected)?;
-            persist(registry, store)?;
+            registry.accept(store, |staged| {
+                staged.append(record, origin).map_err(HostError::Rejected)
+            })?;
             Ok(true)
         })
     }
 
     fn register(&self, decl: &AppDecl, origin: &str) -> Result<Registered, HostError> {
         self.with(|registry, store| {
-            let registered = register(decl, registry, origin).map_err(HostError::Rejected)?;
-            persist(registry, store)?;
-            Ok(registered)
+            registry.accept(store, |staged| {
+                register(decl, staged, origin).map_err(HostError::Rejected)
+            })
         })
     }
 
@@ -578,8 +593,9 @@ impl RecordHostPort for Records {
             return Err(HostError::OutOfScope { share, glade_id });
         }
         self.with(|registry, store| {
-            registry.ingest(op).map_err(HostError::Rejected)?;
-            persist(registry, store)
+            registry.accept(store, |staged| {
+                staged.ingest(op).map(drop).map_err(HostError::Rejected)
+            })
         })
     }
 

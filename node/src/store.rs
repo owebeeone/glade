@@ -287,16 +287,26 @@ fn proofs_path(root: &Path) -> PathBuf {
 }
 
 /// Append a proof as two length-prefixed op CBORs (a then b), mirroring the op
-/// journal's framing. The chain/seq is recoverable from the ops themselves.
+/// journal's framing, in one write. The chain/seq is recoverable from the ops
+/// themselves.
 fn append_proof(path: &Path, proof: &EquivProof) -> Result<(), StoreError> {
     fs::create_dir_all(path.parent().unwrap())?;
     let mut f = OpenOptions::new().create(true).append(true).open(path)?;
-    for op in [&proof.a, &proof.b] {
-        let bytes = cbor::encode(&op.to_cbor());
-        f.write_all(&(bytes.len() as u32).to_le_bytes())?;
-        f.write_all(&bytes)?;
-    }
+    let mut both = framed(&proof.a);
+    both.extend(framed(&proof.b));
+    f.write_all(&both)?;
     Ok(())
+}
+
+/// One journal record: the op's CBOR, prefixed by its length (u32, little
+/// endian), written as one buffer so a crash cannot fall between the two
+/// (plan Step 4.4).
+fn framed(op: &Op) -> Vec<u8> {
+    let bytes = cbor::encode(&op.to_cbor());
+    let mut record = Vec::with_capacity(4 + bytes.len());
+    record.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    record.extend_from_slice(&bytes);
+    record
 }
 
 fn read_proofs(path: &Path) -> Result<Vec<EquivProof>, StoreError> {
@@ -314,25 +324,34 @@ fn log_path(root: &Path, share: &str, origin: &str) -> PathBuf {
 fn append_to_log(root: &Path, op: &Op) -> Result<(), StoreError> {
     let path = log_path(root, &op.share, &op.origin);
     fs::create_dir_all(path.parent().unwrap())?;
-    let bytes = cbor::encode(&op.to_cbor());
     let mut f = OpenOptions::new().create(true).append(true).open(&path)?;
-    f.write_all(&(bytes.len() as u32).to_le_bytes())?;
-    f.write_all(&bytes)?;
+    f.write_all(&framed(op))?;
     Ok(())
 }
 
+/// Every complete record in one journal, in order. A tail too short for its
+/// record is what an interrupted append leaves: it is skipped, as it always
+/// was, and now also cut from the file, so the next append starts on a record
+/// boundary instead of after the torn bytes (plan Step 4.4). A journal whose
+/// records are all complete is not written to.
 fn read_log(path: &Path) -> Result<Vec<Op>, StoreError> {
     let data = fs::read(path)?;
     let mut ops = Vec::new();
     let mut i = 0usize;
     while i + 4 <= data.len() {
         let len = u32::from_le_bytes(data[i..i + 4].try_into().unwrap()) as usize;
-        i += 4;
-        if i + len > data.len() {
-            break; // truncated tail — ignore the partial record
+        let end = i + 4 + len;
+        if end > data.len() {
+            break; // truncated tail — the partial record is cut below
         }
-        ops.push(Op::from_cbor(&cbor::decode(&data[i..i + len])));
-        i += len;
+        ops.push(Op::from_cbor(&cbor::decode(&data[i + 4..end])));
+        i = end;
+    }
+    if i < data.len() {
+        OpenOptions::new()
+            .write(true)
+            .open(path)?
+            .set_len(i as u64)?;
     }
     Ok(ops)
 }
@@ -575,6 +594,47 @@ mod tests {
             assert_eq!(sh.heads[0].seq, 0);
             assert_eq!(sh.heads[0].hash.as_ref().unwrap().len(), 32);
         }
+    }
+
+    /// An interrupted append (plan Step 4.4): a log whose tail holds part of a
+    /// record, as a crash inside an append leaves it. Open loads the complete
+    /// ops and cuts the partial one off, so the next append starts on a record
+    /// boundary and a reopen loads every op. It writes the torn bytes itself,
+    /// so it proves the repair, not what a real crash leaves on a real disk.
+    #[test]
+    fn a_torn_tail_is_cut_so_the_next_append_reopens_whole() {
+        let root = fresh("torn-tail");
+        {
+            let mut s = Store::open(&root).unwrap();
+            s.append(op("sh", "a", 0, b"zero")).unwrap();
+        }
+        let torn = cbor::encode(&op("sh", "a", 1, b"one").to_cbor());
+        let mut log = OpenOptions::new()
+            .append(true)
+            .open(log_path(&root, "sh", "a"))
+            .unwrap();
+        log.write_all(&(torn.len() as u32).to_le_bytes()).unwrap();
+        log.write_all(&torn[..torn.len() / 2]).unwrap();
+        drop(log);
+        {
+            let mut s = Store::open(&root).unwrap();
+            assert_eq!(
+                s.scan("sh", "g", &[], "a", -1).len(),
+                1,
+                "the complete op loads"
+            );
+            assert_eq!(
+                s.append(op("sh", "a", 1, b"uno")).unwrap(),
+                Append::Appended
+            );
+        }
+        let s = Store::open(&root).unwrap();
+        let payloads: Vec<Vec<u8>> = s
+            .scan("sh", "g", &[], "a", -1)
+            .into_iter()
+            .map(|o| o.payload)
+            .collect();
+        assert_eq!(payloads, [b"zero".to_vec(), b"uno".to_vec()]);
     }
 
     #[test]

@@ -3,8 +3,7 @@
 //! entry, then the first claim, epoch 1, both under A's origin.
 
 use glade_carrier_api::CarrierError;
-use glade_node::assembly::HostError;
-use glade_node::registry::{Record, RegistryError};
+use glade_node::registry::Record;
 use glade_node::sysdata::WorkspaceEntry;
 
 use crate::fakes::FakeClock;
@@ -77,9 +76,9 @@ fn exact_retry() {
 /// told `Transport` and cannot know what arrived (the push has no
 /// acknowledgement; `send` is not one). A retries: its exact retry mints
 /// nothing, so it resends the bytes it persisted, and B, receiving each op
-/// twice, holds each once and answers as before. Phase 4: the iroh adapter's
-/// failure evidence and TR-002's unknown outcome (4.2, 4.5); 4.4 across a
-/// restart.
+/// twice, takes each repeat as a duplicate: it answers `Ok`, holds each op
+/// once and answers as before. Phase 4: the iroh adapter's failure evidence
+/// and TR-002's unknown outcome (4.2, 4.5); 4.4 across a restart.
 #[test]
 fn lost_acknowledgement() {
     let (a, b) = pair(&FakeClock::at(T0));
@@ -112,18 +111,9 @@ fn lost_acknowledgement() {
     assert_eq!(b.store.snapshot(), held, "B holds each op once");
     assert_eq!(b.serves(WS), Some("a".into()));
 
-    // Pinned, not endorsed: the registry answers an exact re-delivery
-    // `Equivocation` (`registry.rs:283-286`), against its own comment and the
-    // wire store's `Duplicate` (`store.rs:266-272`). The fold is unchanged
-    // either way. A fix is the owner's call; this assertion, turned round, is
-    // its failing test.
+    // A byte-identical re-delivery is a duplicate, not a fork (owner,
+    // 2026-09-24, plan Step 4.4), as the wire store's `Duplicate` is: this was
+    // pinned as `Equivocation` until the ruling.
     assert_eq!(again.len(), 2);
-    for (op, answer) in ops.iter().zip(&again) {
-        let pinned = matches!(
-            answer,
-            Err(HostError::Rejected(RegistryError::Equivocation { origin, seq }))
-                if *origin == op.origin && *seq == op.seq
-        );
-        assert!(pinned, "{answer:?}");
-    }
+    assert!(again.iter().all(Result::is_ok), "{again:?}");
 }

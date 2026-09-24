@@ -21,7 +21,7 @@
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use glade_wire::cbor;
@@ -118,11 +118,22 @@ impl Record {
 /// Ingest rejection — the verify-as-ingest failures (s-sync Y3), reused for both
 /// live appends and disk load. A rejected op and its suffix are excluded from
 /// the fold; the fold stays a pure function of the valid op-set.
+/// `Equivocation` is a different op at a position the chain already holds, a
+/// fork; the same op again is no error but [`Ingested::Duplicate`].
 #[derive(Debug, PartialEq)]
 pub enum RegistryError {
     Gap { expected: i64, got: i64 },
     ChainBreak { origin: String, seq: i64 },
     Equivocation { origin: String, seq: i64 },
+}
+
+/// Where an ingested op landed: appended to its chain, or already held there
+/// byte for byte, a re-delivery that changes nothing (the wire store's
+/// `Append`, `store.rs`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ingested {
+    Appended,
+    Duplicate,
 }
 
 // ============================================================================
@@ -145,6 +156,12 @@ pub trait StoreApi {
 /// At-rest bytes are canonical CBOR of the [`SystemSnapshot`] (see the module
 /// note): hashing == at-rest, so verify-as-ingest is uniform. The spec's
 /// JSON-text rendering is a later cosmetic — the seam does not depend on it.
+///
+/// A save returns once the snapshot is synced and renamed into place, and
+/// the rename synced with its directory (plan Step 4.4): an interrupted save
+/// leaves the old file whole. It carries no revision and compares nothing:
+/// one writer per instance is the instance lock's job, and two handles on
+/// one directory share one temp name.
 pub struct BlobStore {
     path: PathBuf,
 }
@@ -166,13 +183,43 @@ impl StoreApi for BlobStore {
     }
 
     fn save(&mut self, snap: &SystemSnapshot) -> io::Result<()> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        let dir = match self.path.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
+            _ => PathBuf::from("."),
+        };
+        fs::create_dir_all(&dir)?;
         let bytes = cbor::encode(&snap.to_cbor());
         let tmp = self.path.with_extension("json.tmp");
-        fs::write(&tmp, &bytes)?;
-        fs::rename(&tmp, &self.path) // crash-atomic swap
+        // Durable before visible: the bytes reach the device before the
+        // rename makes them records.json, and the rename is then synced.
+        let mut file = fs::File::create(&tmp)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp, &self.path)?; // crash-atomic swap
+        entry_sync::sync(&dir)
+    }
+}
+
+// A rename is durable once its directory is synced. On Unix that is a sync of
+// a handle opened on the directory; std opens no directory handle elsewhere,
+// so there the rename is not synced. Each platform's branch is one braced
+// module, so the condition encloses the whole section.
+#[cfg(unix)]
+mod entry_sync {
+    use std::path::Path;
+
+    pub(super) fn sync(dir: &Path) -> std::io::Result<()> {
+        std::fs::File::open(dir)?.sync_all()
+    }
+}
+
+#[cfg(not(unix))]
+mod entry_sync {
+    use std::path::Path;
+
+    pub(super) fn sync(_dir: &Path) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -231,8 +278,9 @@ pub trait RegistryApi {
 
 /// The interim RegistryApi: an in-memory op-set materialised from a snapshot,
 /// appends applied in memory. Same per-origin chain discipline as the wire
-/// store, so the disk gets no more trust than any peer.
-#[derive(Default)]
+/// store, so the disk gets no more trust than any peer. A clone is the staged
+/// copy [`Registry::accept`] changes before anything is saved.
+#[derive(Clone, Default)]
 pub struct Registry {
     /// The valid op-set, in ingest order. The fold is a pure function of this.
     ops: Vec<Op>,
@@ -250,6 +298,8 @@ impl Registry {
     /// Materialise a registry from a snapshot — verify-as-ingest per class-2
     /// (s-sync Y2): chain continuity + seq monotonicity per origin. A rejected
     /// op and its chain suffix are excluded (Y3); policy records fail CLOSED.
+    /// A record held twice is taken once: the repeat is a duplicate, which
+    /// quarantines nothing and leaves the rest of its chain loading.
     /// Returns the count of quarantined (rejected) records as load evidence.
     pub fn from_snapshot(snap: &SystemSnapshot) -> (Registry, usize) {
         let mut reg = Registry::new();
@@ -264,7 +314,7 @@ impl Registry {
                 continue;
             }
             match reg.ingest(op) {
-                Ok(()) => {}
+                Ok(_) => {}
                 Err(_) => {
                     rejected += 1;
                     poisoned.insert(chain, true);
@@ -276,12 +326,18 @@ impl Registry {
 
     /// Ingest a fully-formed op with per-origin chain checks (the shared
     /// verify path for both live appends and disk load, and for the ops the
-    /// assembly's record host is handed, `assembly::Records::ingest`).
-    pub(crate) fn ingest(&mut self, op: Op) -> Result<(), RegistryError> {
+    /// assembly's record host is handed, `assembly::Records::ingest`). An op
+    /// the chain already holds, byte for byte, is a duplicate: taken as held,
+    /// and nothing changes (plan Step 4.4; owner, 2026-09-24).
+    pub(crate) fn ingest(&mut self, op: Op) -> Result<Ingested, RegistryError> {
         let chain = (op.glade_id.clone(), op.origin.clone());
         if let Some(&(last_seq, last_hash)) = self.tips.get(&chain) {
             if op.seq <= last_seq {
-                // A record at or below the tip with a different hash is a fork.
+                // At or below the tip: the same op again is a duplicate, as
+                // the wire store takes it; a different op there is a fork.
+                if self.holds(&op) {
+                    return Ok(Ingested::Duplicate);
+                }
                 return Err(RegistryError::Equivocation { origin: op.origin, seq: op.seq });
             }
             if op.seq != last_seq + 1 {
@@ -299,7 +355,18 @@ impl Registry {
         let hash = op_hash(&op);
         self.tips.insert(chain, (op.seq, hash));
         self.ops.push(op);
-        Ok(())
+        Ok(Ingested::Appended)
+    }
+
+    /// Does the fold hold `op` byte for byte (the same op hash) at its chain
+    /// position? A scan of the op-set: a re-delivery is rare, and the fold
+    /// keeps no index by seq.
+    fn holds(&self, op: &Op) -> bool {
+        let at = |held: &&Op| {
+            held.glade_id == op.glade_id && held.origin == op.origin && held.seq == op.seq
+        };
+        let held = self.ops.iter().find(at);
+        held.is_some_and(|held| op_hash(held) == op_hash(op))
     }
 
     /// Is there a NodeRecord for `node_id` in the fold? The boot ladder uses
@@ -369,6 +436,30 @@ impl Registry {
     /// idempotent minting — the same rule `appdecl::register` applies.
     pub fn contains(&self, glade_id: &str, payload: &[u8]) -> bool {
         self.ops.iter().any(|o| o.glade_id == glade_id && o.payload == payload)
+    }
+
+    /// Durable acceptance (slice profile SP-L1, plan Step 4.4): `change` runs
+    /// on a staged copy of this fold, the copy's snapshot is saved through
+    /// `store`, and only then does the copy become the fold. A change the
+    /// registry refuses, or a save that fails, leaves the fold and the stored
+    /// snapshot as they were: nothing unsaved is read or sent, and a retry is
+    /// judged against what was accepted. A change that appends nothing, a
+    /// duplicate among them, saves nothing. The copy costs what the save
+    /// does, one pass over every op.
+    pub fn accept<T, E: From<io::Error>>(
+        &mut self,
+        store: &mut dyn StoreApi,
+        change: impl FnOnce(&mut Registry) -> Result<T, E>,
+    ) -> Result<T, E> {
+        let mut staged = self.clone();
+        let out = change(&mut staged)?;
+        // The fold only grows, so a copy no longer than the fold is the fold.
+        if staged.ops.len() == self.ops.len() {
+            return Ok(out);
+        }
+        store.save(&staged.snapshot())?;
+        *self = staged;
+        Ok(out)
     }
 }
 
@@ -695,6 +786,33 @@ mod tests {
         assert!(rejected >= 1, "the tampered op (and its suffix) is quarantined");
         // the honest records still fold.
         assert_eq!(reg.nodes_of("gianni"), vec!["glade-local", "peer1"]);
+    }
+
+    /// A byte-identical re-delivery is a duplicate (plan Step 4.4; owner,
+    /// 2026-09-24): the registry takes it as held and appends nothing, as the
+    /// wire store takes it. A different op at a position already held is
+    /// still a fork, `Equivocation`, and changes nothing either.
+    #[test]
+    fn a_repeat_is_a_duplicate_and_a_different_op_at_a_held_seq_a_fork() {
+        let mut r = Registry::new();
+        let first = r
+            .append_returning(claim("n1", "ws", 1_000, 1), "n1")
+            .unwrap();
+        r.append(claim("n1", "ws", 2_000, 1), "n1").unwrap();
+        let held = r.snapshot();
+        assert_eq!(r.ingest(first.clone()), Ok(Ingested::Duplicate));
+        assert_eq!(r.snapshot(), held, "a duplicate appends nothing");
+        let fork = Op {
+            payload: claim("n1", "ws", 9_000, 1).encode(),
+            ..first
+        };
+        let fork = r.ingest(fork);
+        let equivocation = RegistryError::Equivocation {
+            origin: "n1".into(),
+            seq: 0,
+        };
+        assert_eq!(fork, Err(equivocation));
+        assert_eq!(r.snapshot(), held);
     }
 
     fn decl(app: &str, glade_id: &str, shape: &str) -> Record {

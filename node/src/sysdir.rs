@@ -345,6 +345,43 @@ mod tests {
         assert_eq!(second.nodes_of_ops(), 1);
     }
 
+    /// A records.json that holds one record twice (plan Step 4.4; owner,
+    /// 2026-09-24): boot takes the repeat as a duplicate, quarantines nothing,
+    /// and folds the rest of that origin's chain; the next save writes the
+    /// record once. Until the ruling the repeat was a fork, and boot set it
+    /// aside with every later record of the chain.
+    #[test]
+    fn boot_takes_a_record_held_twice_as_one_and_keeps_the_rest_of_its_chain() {
+        let dir = fresh("duplicate");
+        let mut peer = Registry::new();
+        for lease_expiry_ms in [1_000, 2_000, 5_000] {
+            let share = "ws-x".into();
+            let claim = ServeClaim {
+                node: "peer".into(),
+                share,
+                lease_expiry_ms,
+                epoch: 1,
+            };
+            peer.append(Record::Serve(claim), "peer").unwrap();
+        }
+        let mut snap = peer.snapshot();
+        let repeat = snap.records[1].clone();
+        snap.records.insert(2, repeat.clone());
+        BlobStore::new(&dir).save(&snap).unwrap();
+
+        let boot = boot_at(dir.clone(), "gianni").unwrap();
+        assert_eq!(boot.rejected, 0, "nothing quarantined");
+        let serves = boot.registry.who_serves("ws-x", 3_000);
+        assert_eq!(serves, Some("peer".into()), "the third claim folds");
+        let saved = BlobStore::new(&dir).load().unwrap();
+        let held = saved
+            .records
+            .iter()
+            .filter(|record| **record == repeat)
+            .count();
+        assert_eq!(held, 1, "and is saved once");
+    }
+
     #[test]
     fn instance_lock_is_single_writer() {
         let dir = fresh("lock");
