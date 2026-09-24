@@ -10,7 +10,7 @@
 //!
 //! **Booted profile form** (opt-in): `glade-node --profile local|peer|server
 //! [--name NAME] [--operator OP] [--app FILE.glade]... [--peer ID[@IP:PORT]]...
-//! [PORT] [STORE_DIR]` —
+//! [--enforce-client-grants] [PORT] [STORE_DIR]` —
 //! reads every `--app` file, then boots the system-data instance (GDL-036): acquires
 //! `~/.glade/sys/<name>/` (the profile picks the default name; `--name`
 //! overrides; `GLADE_HOME` overrides `$HOME/.glade`), runs the load-validation
@@ -50,6 +50,11 @@
 //! Either form binds 127.0.0.1:<port> (0 = OS-assigned) and prints
 //! `listening <port>` so a parent process can read the actual port.
 //!
+//! The grant check (plan Step 4.3): a peer reads a share this node serves only
+//! with a grant from this node's fold, always. A client session is checked
+//! too only with `--enforce-client-grants`, which is off by default; then the
+//! node prints `client grants enforced: …` before it serves.
+//!
 //! **Two composition roots** (plan Step 3.2). The environment variable
 //! `GLADE_NODE_ASSEMBLED` chooses which one starts the node:
 //!
@@ -75,7 +80,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use glade_node::assembly::{Settings, ASSEMBLED_ROOT_LINE};
-use glade_node::grants::GRANTS_UNAVAILABLE;
+use glade_node::grants::{CLIENT_GRANTS_ENFORCED, GRANTS_UNAVAILABLE};
 use glade_node::iroh_carrier::{PeerEndpoint, PeerEntry};
 use glade_node::lifecycle::{conclude, node_plan, Console, NodeStart, StdConsole};
 use glade_node::registry::{RegistryApi, StoreApi, HOME};
@@ -133,6 +138,7 @@ async fn run() -> std::io::Result<()> {
     let mut operator: Option<String> = None;
     let mut apps: Vec<String> = Vec::new();
     let mut peers: Vec<String> = Vec::new();
+    let mut enforce_client_grants = false;
     let mut positional: Vec<String> = Vec::new();
 
     let mut args = std::env::args().skip(1);
@@ -143,6 +149,7 @@ async fn run() -> std::io::Result<()> {
             "--operator" => operator = args.next(),
             "--app" => apps.extend(args.next()),
             "--peer" => peers.extend(args.next()),
+            "--enforce-client-grants" => enforce_client_grants = true,
             _ => positional.push(a),
         }
     }
@@ -205,6 +212,10 @@ async fn run() -> std::io::Result<()> {
     });
 
     let server = Server::open(&dir)?;
+    if enforce_client_grants {
+        server.enforce_client_grants();
+        println!("{CLIENT_GRANTS_ENFORCED}");
+    }
 
     // ---- peer fabric (booted forms only; the legacy form never binds it) ----
     // Adopt the boot instance (seeds the served store; the boot registry stays

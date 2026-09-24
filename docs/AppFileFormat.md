@@ -365,8 +365,13 @@ there.
   read `ws-razel` and use `gwz.ops` there. Without a grant it is refused, and
   what it asks for is not served. The `home` share, where grants are kept,
   needs no grant.
-- **A client** (a browser tab or a supplier on the node's websocket) is not
-  checked yet: everything it reads is served, as before.
+- **A client** (a browser tab or a supplier on the node's websocket) is
+  checked only when the node starts with `--enforce-client-grants`, which is
+  off by default: by default everything a client reads is served, as before.
+  With it, a client reads a share other than `home` only if the principal its
+  Hello names holds `read.subscribe` there, and the node says so when it
+  starts, with `client grants enforced: …`. A client's writes and exchanges
+  are not checked either way.
 - A node that cannot read its own grants refuses every check, and says so when
   it starts, with `grants unavailable: …`.
 
@@ -375,11 +380,11 @@ there.
 | Principal | Meaning |
 | --- | --- |
 | `owner` | The node's owner, the person the node runs for. |
-| 64 lower-case hexadecimal digits | A node: the id a node prints when it starts, on its `node <id>` line. A grant to a node is how the node that serves a share lets another node read it. The id comes from the node's key, so a grant to it is written again if that node's key is replaced. |
+| 64 lower-case hexadecimal digits | A node: the id a node prints when it starts, on its `node <id>` line. A grant to a node is how the node that serves a share lets another node read it. The id comes from the node's key, so a grant to it is written again if that node's key is replaced. A client whose Hello names such a token binds no principal. |
 | any other token | Whoever a client names in its Hello. The node takes the name on the client's word: it does not yet check who the client is. |
 
-Once clients are checked, a client whose Hello names a node's id, or names no
-principal at all, holds no grant.
+When clients are checked, a client that names no principal, or names a node's
+id, holds no grant.
 
 **Verbs.** A verb names what a grant allows on its share.
 

@@ -15,6 +15,9 @@ use glade_wire::generated::Priority;
 
 pub type SessionId = u64;
 
+/// A zone-surface: `(share, glade_id, key)`, what a subscription names.
+pub type Zone = (String, String, Vec<u8>);
+
 /// `(share, glade_id, key) -> subscribed sessions` — one entry per zone-surface.
 #[derive(Default)]
 pub struct Router {
@@ -36,10 +39,13 @@ impl Router {
         }
     }
 
-    /// The zone-surfaces `session` is subscribed to, in order.
-    pub fn zones_of(&self, session: SessionId) -> Vec<(String, String, Vec<u8>)> {
-        let subscribed = self.subs.iter().filter(|(_, set)| set.contains(&session));
-        subscribed.map(|(zone, _)| zone.clone()).collect()
+    /// Every subscription, as (session, zone-surface), in zone order.
+    pub fn entries(&self) -> Vec<(SessionId, Zone)> {
+        let entries = self
+            .subs
+            .iter()
+            .flat_map(|(zone, set)| set.iter().map(move |sid| (*sid, zone.clone())));
+        entries.collect()
     }
 
     /// Drop a session from every subscription (connection teardown).

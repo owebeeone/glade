@@ -37,6 +37,11 @@ pub const READ_SUBSCRIBE: &str = "read.subscribe";
 pub const GRANTS_UNAVAILABLE: &str =
     "grants unavailable: a grant or revocation record was quarantined at load, so every grant check refuses";
 
+/// What a start prints when it checks client sessions too, as switched on by
+/// `--enforce-client-grants` (plan Step 4.3; off by default).
+pub const CLIENT_GRANTS_ENFORCED: &str =
+    "client grants enforced: a client session reads a share other than home only with a grant";
+
 /// Whether `name` is written as a node's id: 64 lower-case hex digits.
 pub fn names_a_node(name: &str) -> bool {
     name.len() == 64
@@ -146,6 +151,12 @@ impl GrantPort for PolicyView {
         };
         fold.check(&name, verb, share)
     }
+}
+
+/// What a refusal says to a client session that names no principal, which
+/// holds nothing (ruled 2026-09-24).
+pub fn no_principal(verb: &str, share: &str) -> String {
+    format!("unauthorized: a session that names no principal holds no grant of {verb} on {share}")
 }
 
 /// What a refusal says: who asked for which verb on which share, and why it

@@ -1121,6 +1121,86 @@ the whole of part 2's estimate (below, "Size").
   comments; the new module `grants.rs` is 167. Tests: 708 added and 98
   removed.
 
+### Part 2, second half: the websocket switch
+
+Built on 2026-09-25 against glade `19fe640`, on the owner's rulings of
+2026-09-24: the websocket path behind a switch that is off by default, and no
+session may claim a node's id.
+
+- **The switch.** `--enforce-client-grants`, off by default, parsed by both
+  roots (the hand-written root's parser, and `Settings` for the assembled
+  one). With it, `Server::enforce_client_grants` turns the check on before the
+  node serves, and both roots print
+  `client grants enforced: a client session reads a share other than home only with a grant`
+  after the `app` lines. grazel passes no such flag.
+- **The check**, when on (`server.rs`, the `Subscribe` arm). It comes after the
+  provider-attach branch and the route's absence, under the cut, before
+  anything is registered, served or forwarded.
+  - A share other than `home` needs the session's principal, as its Hello
+    claimed it, to hold `read.subscribe` there.
+  - A session that names no principal holds nothing.
+  - Refused, the subscribe gets the refused subscribe's two frames (R6), with
+    `unauthorized: principal <p> holds no grant of read.subscribe on <share>`
+    or `unauthorized: a session that names no principal holds no grant of …`.
+  - A client's writes and exchanges are not checked.
+- **The Hello rule**, always on: a Hello naming 64 lower-case hex digits binds
+  no principal and mints no principal record. The adapter already matched
+  such a principal to nothing.
+- **The re-check pass** covers client zones when the switch is on. A refused
+  zone gets a lone `Error{Unauthorized}` and leaves the router, and the
+  session's other zones go on. `Router::entries` lists every subscription; a
+  session that is not in the admission table is a client.
+- **Tests**, each seen red in a scratch copy with the part it guards switched
+  off.
+  - `a_session_claiming_no_principal_is_refused` (`server.rs`). With the check
+    off, the subscribe is accepted (`refused: 1`). With the Hello rule off, the
+    reason names `principal 0101…` instead of no principal.
+  - `a_session_claiming_a_granted_principal_is_served`. With the session's
+    principal not read, bob is refused as naming no principal, not as
+    `principal bob`.
+  - `a_revocation_ends_a_client_zone_of_a_claimed_principal`. With client
+    zones left out of the pass, "timed out waiting for the lone refusal".
+  - `both_roots_check_client_grants_only_when_switched_on`
+    (`tests/assembled_path.rs`). With the switch never turning on,
+    `left: [Ok(1), Ok(1)]`, `right: [Err(…), Ok(1)]`.
+- **Default-path change.** One, always on: a Hello naming a node's id binds no
+  principal. No shipped client sends one. Everything else waits for the
+  switch.
+- **The desk's next restart**: unchanged. Replayed in a temp home with both
+  app files, the default binary and this build print the same lines, and a
+  desk tab (a random principal), the suppliers (`grazel`), a session with no
+  Hello and one claiming `owner` are each accepted on `ws-razel`, as is `home`.
+- **With the switch on today**, replayed on this build with the desk's app
+  files and `--enforce-client-grants`:
+  - A desk tab, with its random per-tab principal, is refused every subscribe
+    on `ws-razel`, so the desk shows nothing. Its exchange, `gyld.ops`, is not
+    checked and still answers.
+  - The suppliers, as `grazel`, are refused their subscribes. glade-gyld's
+    resume of its own chains is refused; it says so on stderr and writes
+    anyway, from a stale value (`supplier.rs`, `resume`). glade-gwz reads
+    nothing. Provider attaches are not checked.
+  - A session with no Hello is refused.
+  - A session claiming `owner`, as a tab opened with `?principal=owner` does,
+    is served: grazel-app and gyld-app seed `owner`.
+  - `home` is open to all.
+  - The seeds grant `owner`, and no shipped client presents it. That is the
+    gap the appearance plan's principal work (Steps 1.2 and 1.3, in gryth-ui)
+    is meant to close.
+- **Named gaps.**
+  - The principal is the client's claim until session identity lands, and
+    the `Origin` check admits any loopback page.
+  - A client's writes and exchanges are not checked.
+  - A provider attach is not gated (B1).
+- **Measured** on 2026-09-25.
+  - The gate passes all 8 components, with 282 node tests on each path.
+  - rustfmt stays at 307, glade-wire 43. clippy stays at 11 and 7.
+  - Against the default binary, through the shims: client-rs 25 + 10,
+    client-ts 48, grip-share 19, grazel 29 + 3, glade-gyld 233 (1 ignored) +
+    33, glade-gwz 9 + 7.
+- **Size.** Production: 122 lines added and 40 removed, 41 of the added
+  comments. Tests: 292 added and 4 removed. Part 2 as a whole came to about
+  570 production lines against the estimate of 300.
+
 ### The grant fold: the node's own registry
 
 Two folds hold `dir.grants` and `dir.revocations`.
@@ -1618,9 +1698,9 @@ over the ~400-line production cap, so it splits in two.
   - precondition 4's warning;
   - the format page: the route beside `seed`, and the definitions of `service
     <name>`, the verbs and the principals.
-- **Part 2: the check.** About 300 production lines and 500 test lines (its
-  first half, the peer paths, is built, and larger: see "Part 2, first half:
-  the check on the peer paths"):
+- **Part 2: the check.** About 300 production lines and 500 test lines (built
+  in two halves, and larger: see "Part 2, first half: the check on the peer
+  paths" and "Part 2, second half: the websocket switch"):
   - the policy view and its generation;
   - the `GrantPort` adapter;
   - the checks, on the paths the answer to question 4 enforces;

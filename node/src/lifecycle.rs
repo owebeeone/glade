@@ -42,7 +42,7 @@ use crate::appdecl::AppDecl;
 use crate::assembly::{
     CommandLine, Config, Directory, InstanceSlot, NodeAssembly, Records, Settings,
 };
-use crate::grants::GRANTS_UNAVAILABLE;
+use crate::grants::{CLIENT_GRANTS_ENFORCED, GRANTS_UNAVAILABLE};
 use crate::iroh_carrier::{PeerEndpoint, PeerEntry};
 use crate::mesh::{release_links, EndpointSlot};
 use crate::peer::NodeIdentity;
@@ -245,6 +245,10 @@ impl Storage {
             (None, None) => std::env::temp_dir().join("glade-node-bin"),
         };
         let server = Server::open(&dir)?;
+        if start.settings.enforce_client_grants {
+            server.enforce_client_grants();
+            start.console.out(CLIENT_GRANTS_ENFORCED);
+        }
         let (owners, sessions, records) = tasks::owners();
         server.own_tasks(owners)?;
         if let Some(boot) = instance.take() {

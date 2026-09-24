@@ -9,9 +9,11 @@
 //! the same whichever way the suite runs (the node gate runs it both ways).
 //! One test starts each root twice with an app file whose seed names a share
 //! no `workspace` line declares, the second time with a `revoke` line added
-//! (plan Step 4.3). The last tests start each root on an instance written
-//! before plan Step 4.1a changed the node id, and check plan Step 4.2's
-//! endpoint key: one id across starts, and a replaced key's binding revoked.
+//! (plan Step 4.3), and another starts each root with and without
+//! `--enforce-client-grants` and subscribes from a websocket session. The last
+//! tests start each root on an instance written before plan Step 4.1a changed
+//! the node id, and check plan Step 4.2's endpoint key: one id across starts,
+//! and a replaced key's binding revoked.
 //! Every file goes under a fresh directory in the system temp dir, and the node
 //! runs with `GLADE_HOME` and `HOME` pointed there: `~/.glade` is never touched.
 
@@ -23,14 +25,17 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use glade_node::appdecl::{load, register, AppDecl};
 use glade_node::assembly::ASSEMBLED_ROOT_LINE;
+use glade_node::frame::Frame;
+use glade_node::grants::CLIENT_GRANTS_ENFORCED;
 use glade_node::mesh::who_serves;
 use glade_node::registry::{BlobStore, Record, Registry, RegistryApi, StoreApi, HOME};
 use glade_node::store::Store;
 use glade_node::sysdata::{NodeRecord, ServeClaim};
 use glade_node::sysdir::{boot_at, now_ms};
 use glade_node::transport::Bound;
+use glade_node::ws;
 use glade_wire::cbor;
-use glade_wire::generated::Op;
+use glade_wire::generated::{Hello, Op, Subscribe};
 use sha2::{Digest, Sha256};
 
 const VARIABLE: &str = "GLADE_NODE_ASSEMBLED";
@@ -331,6 +336,108 @@ fn both_roots_warn_of_a_seeds_undeclared_share_and_register_a_revoke_line() {
             "{root:?}"
         );
         assert_eq!(registry.grants_for("owner", "ws-x"), ["read.*"], "{root:?}");
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The next frame a websocket session reads, within 5 s.
+async fn ws_next(r: &mut ws::WsReader) -> Frame {
+    let read = tokio::time::timeout(Duration::from_secs(5), r.read());
+    match read.await.expect("the node answered").unwrap() {
+        ws::Msg::Binary(bytes) => Frame::from_bytes(&bytes).unwrap(),
+        ws::Msg::Close => panic!("the node closed the session"),
+    }
+}
+
+/// A websocket session on the node at `port`, whose Hello claims
+/// `principal`, if any, then subscribes `ws-x/x.one`: the number of zones an
+/// accepted ack names, or the reason a refusal gives after its ack that names
+/// no zone.
+async fn ws_subscribe(port: u16, principal: Option<&str>) -> Result<usize, String> {
+    let (mut r, w) = ws::connect("127.0.0.1", port).await.unwrap();
+    if let Some(principal) = principal {
+        let hello = Hello {
+            session: "s".into(),
+            protocol: 1,
+            principal: Some(principal.into()),
+            capability: None,
+            heads: vec![],
+        };
+        w.send_binary(&Frame::Hello(hello).to_bytes())
+            .await
+            .unwrap();
+        assert!(matches!(ws_next(&mut r).await, Frame::Welcome(_)));
+    }
+    let subscribe = Subscribe {
+        share: "ws-x".into(),
+        glade_id: "x.one".into(),
+        key: None,
+        from: None,
+    };
+    w.send_binary(&Frame::Subscribe(subscribe).to_bytes())
+        .await
+        .unwrap();
+    match ws_next(&mut r).await {
+        Frame::Heads(h) if h.streams.is_empty() => match ws_next(&mut r).await {
+            Frame::Error(e) => Err(e.message),
+            other => panic!("expected the reason, got {other:?}"),
+        },
+        Frame::Heads(h) => Ok(h.streams.len()),
+        other => panic!("expected an ack, got {other:?}"),
+    }
+}
+
+/// Plan Step 4.3's websocket switch, on each root. Without
+/// `--enforce-client-grants`, the default, a session that names no principal
+/// is served, as ever. With it, the node says so before it serves, refuses
+/// that session's subscribe, and serves a session whose Hello claims `owner`,
+/// whom the app file seeds `read.*` on the share.
+#[test]
+fn both_roots_check_client_grants_only_when_switched_on() {
+    let dir = scratch("client-grants");
+    let home = dir.join("glade-home");
+    let app = dir.join("x.glade");
+    let text = "glade-app v1\napp x\n\
+                binding x.one value share commons latest\n\
+                seed owner ws-x read.*\n\
+                workspace ws-x notes\n";
+    std::fs::write(&app, text).unwrap();
+    let path = app.display().to_string();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let why =
+        "unauthorized: a session that names no principal holds no grant of read.subscribe on ws-x";
+    for (root, name) in [(Root::HandWritten, "h"), (Root::Assembled, "a")] {
+        for checked in [false, true] {
+            let mut args = vec!["--profile", "local", "--name", name, "--app", &path];
+            if checked {
+                args.push("--enforce-client-grants");
+            }
+            args.push("0");
+            let node = Running::start(&home, root, &args);
+            let lines = node.lines.clone();
+            let port = lines
+                .iter()
+                .find_map(|line| line.strip_prefix("listening "));
+            let port: u16 = port.unwrap().parse().unwrap();
+            let asked = async {
+                [
+                    ws_subscribe(port, None).await,
+                    ws_subscribe(port, Some("owner")).await,
+                ]
+            };
+            let answers = runtime.block_on(asked);
+            let stderr = node.stop();
+            let said = lines.iter().any(|line| line == CLIENT_GRANTS_ENFORCED);
+            assert_eq!(said, checked, "{root:?}: {lines:?}");
+            let expected = match checked {
+                true => [Err(why.to_string()), Ok(1)],
+                false => [Ok(1), Ok(1)],
+            };
+            assert_eq!(answers, expected, "{root:?}, checked {checked}: {stderr}");
+        }
     }
     std::fs::remove_dir_all(&dir).unwrap();
 }

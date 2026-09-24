@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use tokio::net::{TcpListener, TcpStream};
@@ -20,7 +20,7 @@ use glade_grant_api::{GrantPort, Holder};
 
 use crate::echo::Echo;
 use crate::frame::Frame;
-use crate::grants::{refusal, Policy, PolicyView, READ_SUBSCRIBE};
+use crate::grants::{names_a_node, no_principal, refusal, Policy, PolicyView, READ_SUBSCRIBE};
 use crate::mesh::Mesh;
 use crate::registry::HOME;
 use crate::router::{Router, SessionId};
@@ -69,6 +69,9 @@ pub(crate) struct Shared {
     /// node serves, by the session id it is routed under, with the node it
     /// serves. The re-check pass reads it whenever the fold is replaced.
     pub(crate) admitted: Mutex<BTreeMap<SessionId, [u8; 32]>>,
+    /// Whether client sessions are checked too (plan Step 4.3): the websocket
+    /// path's switch, off unless [`Server::enforce_client_grants`] turns it on.
+    pub(crate) client_grants: AtomicBool,
     /// Where every task this node spawns goes (plan Step 3.3, `tasks.rs`):
     /// detached, unless the assembled root's lifecycle owns them.
     pub(crate) tasks: Tasks,
@@ -96,6 +99,7 @@ impl Server {
                 principals: Mutex::new(BTreeMap::new()),
                 policy: PolicyView::unavailable(),
                 admitted: Mutex::new(BTreeMap::new()),
+                client_grants: AtomicBool::new(false),
                 tasks: Tasks::unowned(),
             }),
         })
@@ -105,6 +109,16 @@ impl Server {
     /// 3.3): the assembled root's lifecycle, before anything is spawned.
     pub(crate) fn own_tasks(&self, owners: Owners) -> std::io::Result<()> {
         self.shared.tasks.own(owners)
+    }
+
+    /// Check client sessions against the grant fold too (plan Step 4.3): the
+    /// websocket path's switch, `--enforce-client-grants`, which is off by
+    /// default. A client session then reads a share other than `home` only
+    /// if the principal its Hello names holds `read.subscribe` there; one
+    /// that names none holds nothing. Its writes and exchanges are not
+    /// checked. Call before serving.
+    pub fn enforce_client_grants(&self) {
+        self.shared.client_grants.store(true, Ordering::SeqCst);
     }
 
     /// Seed the live replica with a boot registry snapshot: the home-share
@@ -161,38 +175,37 @@ pub(crate) async fn refresh_policy(shared: &Arc<Shared>, fold: Option<Policy>) -
 }
 
 /// The re-check pass (plan Step 4.3, the authorization model's §6): each
-/// admitted peer stream is checked against the fold as it now is, under the
-/// cut, so no op fanned out after a change reaches a stream it refuses. A
-/// refused stream is told why, and leaves the router, the session table and
-/// the admission table; its writer then finishes the stream, so the
-/// forwarding node's forward lapses. What it was sent before stays sent:
-/// revocation is forward-only.
+/// admitted subscription is checked against the fold as it now is, under the
+/// cut, so no op fanned out after a change reaches a session it refuses. A
+/// refused peer stream is told why, and leaves the router, the session table
+/// and the admission table; its writer then finishes the stream, so the
+/// forwarding node's forward lapses. When client sessions are checked, a
+/// client's refused zone is told why and leaves the router, and its other
+/// zones go on. What was sent before stays sent: revocation is forward-only.
 async fn recheck(shared: &Arc<Shared>) {
     let _cut = shared.cut.lock().await;
-    let admitted: Vec<(SessionId, [u8; 32])> = shared
-        .admitted
-        .lock()
-        .await
-        .iter()
-        .map(|(sid, node)| (*sid, *node))
-        .collect();
+    let peers = shared.admitted.lock().await.clone();
+    let clients = shared.client_grants.load(Ordering::SeqCst);
+    let entries = shared.router.lock().await.entries();
     let mut refused = Vec::new();
-    {
-        let router = shared.router.lock().await;
-        for (sid, node) in admitted {
-            let holder = Holder::Node(node);
-            for (share, glade_id, key) in router.zones_of(sid) {
-                if share == HOME {
-                    continue;
-                }
-                if let Err(denial) = shared.policy.check(&holder, READ_SUBSCRIBE, &share) {
-                    let why = refusal(&holder, READ_SUBSCRIBE, &share, denial);
-                    refused.push((sid, share, glade_id, key, why));
-                }
+    for (sid, (share, glade_id, key)) in entries {
+        if share == HOME {
+            continue;
+        }
+        let verdict = match peers.get(&sid) {
+            Some(node) => {
+                let holder = Holder::Node(*node);
+                let checked = shared.policy.check(&holder, READ_SUBSCRIBE, &share);
+                checked.map_err(|denial| refusal(&holder, READ_SUBSCRIBE, &share, denial))
             }
+            None if clients => client_check(shared, sid, &share).await,
+            None => Ok(()),
+        };
+        if let Err(why) = verdict {
+            refused.push((sid, peers.contains_key(&sid), share, glade_id, key, why));
         }
     }
-    for (sid, share, glade_id, key, why) in refused {
+    for (sid, peer, share, glade_id, key, why) in refused {
         shared
             .router
             .lock()
@@ -200,9 +213,24 @@ async fn recheck(shared: &Arc<Shared>) {
             .unsubscribe(sid, &share, &glade_id, &key);
         let told = refusal_frame(ErrorCode::Unauthorized, why, &share, &glade_id);
         send(shared, sid, &told).await;
-        shared.out.lock().await.remove(&sid);
-        shared.admitted.lock().await.remove(&sid);
+        if peer {
+            shared.out.lock().await.remove(&sid);
+            shared.admitted.lock().await.remove(&sid);
+        }
     }
+}
+
+/// The grant check for a client session (plan Step 4.3): the principal its
+/// Hello bound, as the client claimed it, asked for `read.subscribe` on
+/// `share`. A session that bound none holds nothing. `Err` is the refusal's
+/// reason.
+async fn client_check(shared: &Arc<Shared>, sid: SessionId, share: &str) -> Result<(), String> {
+    let Some(principal) = shared.principals.lock().await.get(&sid).cloned() else {
+        return Err(no_principal(READ_SUBSCRIBE, share));
+    };
+    let holder = Holder::Principal(principal);
+    let checked = shared.policy.check(&holder, READ_SUBSCRIBE, share);
+    checked.map_err(|denial| refusal(&holder, READ_SUBSCRIBE, share, denial))
 }
 
 /// The answer to a client's op on the home share (ruling H-R3, plan Step 4.3):
@@ -276,9 +304,16 @@ async fn handle(shared: Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
                 }
                 // Principals minimal (P0.S7): a Hello naming a principal BINDS
                 // the session to it, and an unknown principal auto-appends a
-                // minimal dir.principals record — identity as data, nothing
-                // enforced. No principal = origin-as-identity, unchanged.
-                if let Some(p) = h.principal.as_deref().filter(|p| !p.is_empty()) {
+                // minimal dir.principals record — identity as data, taken on
+                // the client's word. No principal = origin-as-identity,
+                // unchanged. A name written as a node's id, 64 lower-case hex
+                // digits, binds nothing: no session may claim a node (plan
+                // Step 4.3).
+                let named = h
+                    .principal
+                    .as_deref()
+                    .filter(|p| !p.is_empty() && !names_a_node(p));
+                if let Some(p) = named {
                     shared.principals.lock().await.insert(sid, p.to_string());
                     crate::claims::note_principal(&shared, p).await;
                 }
@@ -322,6 +357,20 @@ async fn handle(shared: Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
                         let zone = (s.share.clone(), s.glade_id.clone(), key.clone());
                         let their = client_heads.get(&zone).cloned().unwrap_or_default();
                         let cut = shared.cut.lock().await;
+                        // The grant check, when client sessions are checked
+                        // (plan Step 4.3): refused, the refused subscribe's
+                        // two frames (R6), and nothing is registered, served
+                        // or forwarded. `home` is exempt.
+                        if s.share != HOME && shared.client_grants.load(Ordering::SeqCst) {
+                            if let Err(why) = client_check(&shared, sid, &s.share).await {
+                                drop(cut);
+                                let code = ErrorCode::Unauthorized;
+                                for frame in refused_subscribe(code, why, &s.share, &s.glade_id) {
+                                    send(&shared, sid, &frame).await;
+                                }
+                                continue;
+                            }
+                        }
                         let mut router = shared.router.lock().await;
                         router.subscribe(sid, &s.share, &s.glade_id, &key);
                         drop(router);
@@ -1070,5 +1119,186 @@ mod tests {
             gap.is_empty(),
             "the session's own op came back after a Hello announced a lower seq: {gap:?}"
         );
+    }
+
+    // ---- the grant check on client sessions (plan Step 4.3) ---------------
+
+    /// A server over a fresh store named `name`, whose grant fold is `policy`,
+    /// with client sessions checked when `checked`: its state and its port.
+    async fn guarded(name: &str, policy: Policy, checked: bool) -> (Arc<Shared>, u16) {
+        let dir = std::env::temp_dir().join(format!("glade-server-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let server = Server::open(&dir).unwrap();
+        refresh_policy(&server.shared, Some(policy)).await;
+        if checked {
+            server.enforce_client_grants();
+        }
+        let shared = server.shared.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(server.run(listener));
+        (shared, port)
+    }
+
+    /// A client session on `port` whose Hello claims `principal`, if any.
+    async fn session(port: u16, principal: Option<&str>) -> (ws::WsReader, ws::WsWriter) {
+        let (mut r, w) = ws::connect("127.0.0.1", port).await.unwrap();
+        if let Some(principal) = principal {
+            let hello = Hello {
+                session: "s".into(),
+                protocol: 1,
+                principal: Some(principal.into()),
+                capability: None,
+                heads: vec![],
+            };
+            w.send_binary(&Frame::Hello(hello).to_bytes())
+                .await
+                .unwrap();
+            let welcome = next(&mut r, "the welcome").await;
+            assert!(matches!(welcome, Frame::Welcome(_)), "{welcome:?}");
+        }
+        (r, w)
+    }
+
+    /// Subscribe `share/g` and read the answer: `Ok` with the number of zones
+    /// an accepted ack names, or `Err` with the reason a refusal gives after
+    /// its ack that names no zone (R6).
+    async fn subscribe_on(
+        r: &mut ws::WsReader,
+        w: &ws::WsWriter,
+        share: &str,
+    ) -> Result<usize, Error> {
+        let subscribe = Subscribe {
+            share: share.into(),
+            glade_id: "g".into(),
+            key: None,
+            from: None,
+        };
+        w.send_binary(&Frame::Subscribe(subscribe).to_bytes())
+            .await
+            .unwrap();
+        match next(r, "the ack").await {
+            Frame::Heads(h) if h.streams.is_empty() => match next(r, "the reason").await {
+                Frame::Error(e) => Err(e),
+                other => panic!("expected the reason, got {other:?}"),
+            },
+            Frame::Heads(h) => Ok(h.streams.len()),
+            other => panic!("expected an ack, got {other:?}"),
+        }
+    }
+
+    /// With client sessions checked (plan Step 4.3), a session that names no
+    /// principal holds nothing: its subscribe to a share other than `home` is
+    /// refused with the refused subscribe's two frames (R6), and nothing is
+    /// registered, while `home` stays open. A Hello that claims 64 hex digits,
+    /// a node's id, binds no principal, so it is refused the same way, though
+    /// the fold grants that node. Unchecked, the default, the session is
+    /// served.
+    #[tokio::test]
+    async fn a_session_claiming_no_principal_is_refused() {
+        let node = "01".repeat(32);
+        let mut policy = Policy::default();
+        policy.grant(&node, "sh", [READ_SUBSCRIBE.to_string()]);
+
+        let (_, port) = guarded("unchecked", policy.clone(), false).await;
+        let (mut r, w) = session(port, None).await;
+        let answer = subscribe_on(&mut r, &w, "sh").await;
+        assert_eq!(
+            answer.map_err(|e| e.message),
+            Ok(1),
+            "unchecked, the default"
+        );
+
+        let (shared, port) = guarded("no-principal", policy, true).await;
+        let why = "unauthorized: a session that names no principal holds no grant of read.subscribe on sh";
+        for claimed in [None, Some(node.as_str())] {
+            let (mut r, w) = session(port, claimed).await;
+            let e = subscribe_on(&mut r, &w, "sh").await.expect_err("refused");
+            let named = (e.code, e.share.as_deref(), e.glade_id.as_deref());
+            assert_eq!(named, (ErrorCode::Unauthorized, Some("sh"), Some("g")));
+            assert_eq!((e.message.as_str(), e.corr), (why, None), "{claimed:?}");
+            let home = subscribe_on(&mut r, &w, HOME).await;
+            assert_eq!(home.map_err(|e| e.message), Ok(1), "home is open");
+        }
+        let bound = shared.principals.lock().await.len();
+        assert_eq!(bound, 0, "a node's id binds no principal");
+        let routed = shared.router.lock().await.route(0, "sh", "g", &[]);
+        assert_eq!(routed, Vec::<SessionId>::new(), "nothing registered");
+    }
+
+    /// With client sessions checked, a session whose Hello claims a principal
+    /// the fold grants `read.*` on `sh` is served, its ack and the ops that
+    /// follow; one claiming another principal is refused. The principal is
+    /// the client's claim: nothing proves it yet.
+    #[tokio::test]
+    async fn a_session_claiming_a_granted_principal_is_served() {
+        let mut policy = Policy::default();
+        policy.grant("alice", "sh", ["read.*".to_string()]);
+        let (_, port) = guarded("granted-principal", policy, true).await;
+
+        let (mut rb, wb) = session(port, Some("bob")).await;
+        let e = subscribe_on(&mut rb, &wb, "sh")
+            .await
+            .expect_err("bob is refused");
+        let why = "unauthorized: principal bob holds no grant of read.subscribe on sh";
+        assert_eq!(e.message, why);
+
+        let (mut ra, wa) = session(port, Some("alice")).await;
+        let answer = subscribe_on(&mut ra, &wa, "sh").await;
+        assert_eq!(answer.map_err(|e| e.message), Ok(1));
+        let (mut rw, ww) = session(port, None).await;
+        let written = op("w", 0, b"for alice");
+        ww.send_binary(&ops_frame(written.clone())).await.unwrap();
+        match next(&mut rw, "the writer's status").await {
+            Frame::Error(e) => assert_eq!(said(&e), status_for(&written, ErrorCode::Ok)),
+            other => panic!("the writer expected its op's status, got {other:?}"),
+        }
+        match next(&mut ra, "alice's op").await {
+            Frame::Ops(ops) => assert_eq!(ops.ops[0].payload, b"for alice"),
+            other => panic!("alice expected the op, got {other:?}"),
+        }
+    }
+
+    /// The re-check pass reaches client sessions when they are checked: a
+    /// revocation of alice on `sh` ends her live zone there, told by a lone
+    /// `Error{Unauthorized}`, and her zone on `sh2` goes on.
+    #[tokio::test]
+    async fn a_revocation_ends_a_client_zone_of_a_claimed_principal() {
+        let mut policy = Policy::default();
+        policy.grant("alice", "sh", ["read.*".to_string()]);
+        policy.grant("alice", "sh2", ["read.*".to_string()]);
+        let (shared, port) = guarded("client-revoke", policy.clone(), true).await;
+        let (mut ra, wa) = session(port, Some("alice")).await;
+        for share in ["sh", "sh2"] {
+            let answer = subscribe_on(&mut ra, &wa, share).await;
+            assert_eq!(answer.map_err(|e| e.message), Ok(1), "{share}");
+        }
+
+        let mut revoked = policy;
+        revoked.revoke("alice", "sh");
+        refresh_policy(&shared, Some(revoked)).await;
+        match next(&mut ra, "the lone refusal").await {
+            Frame::Error(e) => {
+                let named = (e.code, e.share.as_deref(), e.glade_id.as_deref());
+                assert_eq!(named, (ErrorCode::Unauthorized, Some("sh"), Some("g")));
+                let why = "unauthorized: principal alice's grants on sh are revoked";
+                assert_eq!(e.message, why);
+            }
+            other => panic!("alice expected the refusal, got {other:?}"),
+        }
+        let routed = shared.router.lock().await.route(0, "sh", "g", &[]);
+        assert_eq!(routed, Vec::<SessionId>::new(), "her sh zone ended");
+
+        let (mut rw, ww) = session(port, None).await;
+        let on_sh2 = Op {
+            share: "sh2".into(),
+            ..op("w", 0, b"sh2 goes on")
+        };
+        ww.send_binary(&ops_frame(on_sh2)).await.unwrap();
+        let _status = next(&mut rw, "the writer's status").await;
+        match next(&mut ra, "the sh2 op").await {
+            Frame::Ops(ops) => assert_eq!(ops.ops[0].payload, b"sh2 goes on"),
+            other => panic!("alice expected the sh2 op, got {other:?}"),
+        }
     }
 }

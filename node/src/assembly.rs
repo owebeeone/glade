@@ -229,6 +229,9 @@ pub struct Settings {
     pub operator: Option<String>,
     pub apps: Vec<String>,
     pub peers: Vec<String>,
+    /// `--enforce-client-grants` (plan Step 4.3): check client sessions
+    /// against the grant fold too. Off by default.
+    pub enforce_client_grants: bool,
     pub positional: Vec<String>,
 }
 
@@ -246,6 +249,7 @@ impl Settings {
                 "--operator" => settings.operator = args.next(),
                 "--app" => settings.apps.extend(args.next()),
                 "--peer" => settings.peers.extend(args.next()),
+                "--enforce-client-grants" => settings.enforce_client_grants = true,
                 _ => settings.positional.push(arg),
             }
         }
