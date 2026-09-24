@@ -45,10 +45,15 @@ service grazel gwz.ops
 # seed <principal> <share> <verb[,verb...]>
 # Bootstrap shortcuts, not a parallel ACL system: compiled to CapabilityGrant
 # records at registration; ordinary fold rules (revocation wins) from then on.
-# A seed names the workspace share (ws-razel), not the app: these two lines are
-# corrected together with the revocation route at plan Step 4.3.
-seed owner grazel read.*
-seed owner grazel gwz.*
+# A seed names the workspace share its surfaces live on (ws-razel), not the app.
+seed owner ws-razel read.*
+seed owner ws-razel gwz.*
+
+# revoke <principal> <share>
+# Withdraws every grant of the pair, for good. Until plan Step 4.3 the two
+# seeds above named the app, `grazel`, as their share: this line withdraws the
+# grants they made. A node built before Step 4.3 refuses this file.
+revoke owner grazel
 
 # workspace <share> <name>
 # The workspace share this app serves from (audit F1): the node LOADING this

@@ -731,8 +731,9 @@ mod tests {
     /// ws.diff/term.log) PLUS the 3 pre-declared supplier surfaces (gwz.output
     /// from glade-gwz; chat.msgs + chat.groups from glade-chat, declared here so
     /// they exist node-side regardless of a running TS chat host) — 1 service, 2
-    /// ACL seeds, and the declared workspace share (audit F1: the workspace↔share
-    /// association is DATA).
+    /// ACL seeds on the workspace share, the revocation of the pair its seeds
+    /// named until plan Step 4.3 (`owner`, `grazel`), and the declared
+    /// workspace share (audit F1: the workspace↔share association is DATA).
     #[test]
     fn grazel_file_matches_the_trace_shape() {
         let decl = parse(&grazel_file()).unwrap();
@@ -740,6 +741,15 @@ mod tests {
         assert_eq!(decl.bindings.len(), 7, "4 workspace + 3 composed-supplier surfaces");
         assert_eq!(decl.services.len(), 1, "1 service (grazel)");
         assert_eq!(decl.seeds.len(), 2, "2 ACL seeds");
+        for g in &decl.seeds {
+            let pair = (g.principal.as_str(), g.share.as_str());
+            assert_eq!(pair, ("owner", "ws-razel"));
+        }
+        let old_pair = CapabilityRevocation {
+            principal: "owner".into(),
+            share: "grazel".into(),
+        };
+        assert_eq!(decl.revocations, [old_pair]);
         assert_eq!(decl.workspaces, vec![WorkspaceDecl { share: "ws-razel".into(), name: "razel".into() }]);
         // the directed surface the service answers (discovery.ts phase D):
         assert_eq!(decl.services[0].glade_id, "gwz.ops");
@@ -849,10 +859,10 @@ mod tests {
         let decl = parse(&grazel_file()).unwrap();
         let mut reg = Registry::new();
         let first = register(&decl, &mut reg, "node-1").unwrap();
-        assert_eq!(first, Registered { appended: 11, unchanged: 0 }); // 7 bindings +1 service +2 seeds +1 workspace
+        assert_eq!(first, Registered { appended: 12, unchanged: 0 }); // 7 bindings +1 service +2 seeds +1 revocation +1 workspace
         let snap1 = reg.snapshot();
         let second = register(&decl, &mut reg, "node-1").unwrap();
-        assert_eq!(second, Registered { appended: 0, unchanged: 11 });
+        assert_eq!(second, Registered { appended: 0, unchanged: 12 });
         assert_eq!(reg.snapshot(), snap1, "re-registration is a byte-identical no-op");
     }
 
@@ -863,18 +873,18 @@ mod tests {
         let decl = parse(&grazel_file()).unwrap();
         let mut reg = Registry::new();
         register(&decl, &mut reg, "node-1").unwrap();
-        assert_eq!(reg.grants_for("owner", "grazel"), vec!["gwz.*", "read.*"]);
+        assert_eq!(reg.grants_for("owner", "ws-razel"), vec!["gwz.*", "read.*"]);
         // runtime ACL update: the admin revokes (an ordinary append).
-        reg.append(
-            Record::Revoke(CapabilityRevocation { principal: "owner".into(), share: "grazel".into() }),
-            "node-1",
-        )
-        .unwrap();
-        assert_eq!(reg.grants_for("owner", "grazel"), Vec::<String>::new());
+        let revocation = CapabilityRevocation {
+            principal: "owner".into(),
+            share: "ws-razel".into(),
+        };
+        reg.append(Record::Revoke(revocation), "node-1").unwrap();
+        assert_eq!(reg.grants_for("owner", "ws-razel"), Vec::<String>::new());
         // the file seeds once; the fold rules forever.
         let again = register(&decl, &mut reg, "node-1").unwrap();
         assert_eq!(again.appended, 0, "identical seeds diff away on re-load");
-        assert_eq!(reg.grants_for("owner", "grazel"), Vec::<String>::new(), "revocation stays");
+        assert_eq!(reg.grants_for("owner", "ws-razel"), Vec::<String>::new(), "revocation stays");
     }
 
     /// §4.7 row 17 (R10(a)): the regression that pins plan Step 2.3 ahead of
@@ -1146,6 +1156,9 @@ mod tests {
             .map(|b| Record::Binding(b.clone()))
             .chain(decl.services.iter().map(|s| Record::Service(s.clone())))
             .chain(decl.seeds.iter().map(|g| Record::Grant(g.clone())))
+            // plan Step 4.3's `revoke` lines, which came after that
+            // `register`, take the same envelope, where `register` puts them
+            .chain(decl.revocations.iter().map(|r| Record::Revoke(r.clone())))
             .chain(decl.workspaces.iter().map(|w| {
                 Record::Workspace(WorkspaceEntry {
                     workspace: w.share.clone(),

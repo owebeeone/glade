@@ -2,7 +2,9 @@
 //! glade-wz root), over the five app files of the reconciliation document's
 //! census (`dev-docs/glade/GladeDeclReconciliation.md`, §4.4 bullet 6): every
 //! shipped file is headed `glade-app v1` and loads with no warning, because
-//! every zone and retention in it is one `v1` accepts. Headed `glade-app v0`,
+//! every zone and retention in it is one `v1` accepts, and every seed names
+//! a share one of its `workspace` lines declares (plan Step 4.3's
+//! precondition 4, checked by `load_all`). Headed `glade-app v0`,
 //! as each was until Step 2.7, the same declarations load with one warning,
 //! the header's, which names the header to write (Step 2.6's done-when).
 //!
@@ -16,7 +18,7 @@
 
 use std::path::PathBuf;
 
-use glade_node::appdecl::{load, parse, AppFileVersion};
+use glade_node::appdecl::{load_all, parse, AppFileVersion};
 
 /// The census's five files, by path from this crate: grazel's two app files,
 /// the byte-identical twin of grazel-app.glade in this repository, and the
@@ -73,8 +75,9 @@ fn every_shipped_file_loads_with_no_warning() {
         let text = std::fs::read_to_string(&file).unwrap();
         let at = header_at(&text);
 
-        // As the node loads it: headed `glade-app v1`, with no warning,
-        let decl = load(&file).unwrap();
+        // As the node loads it, with `load_all`, which also checks each
+        // seed's share (plan Step 4.3): headed `glade-app v1`, with no warning,
+        let decl = load_all(&[&file]).unwrap().remove(0);
         assert_eq!(decl.version, AppFileVersion::V1, "{rel}");
         assert_eq!(decl.warnings, Vec::<String>::new(), "{rel}");
         // so the node prints none to stderr (grazel forwards it as `[node] …`).

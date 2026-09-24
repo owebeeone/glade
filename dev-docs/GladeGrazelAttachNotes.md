@@ -15,7 +15,8 @@ Normative language per AGENTS.md: MUST / SHOULD / MAY.
 
 IN: the `<app>.glade` file format + parser/validator (`node/src/appdecl.rs`);
 registration as diff-idempotent attributed record appends (BindingDecl /
-ServiceDefinition / seed→CapabilityGrant); the `--app` flag on the booted bin
+ServiceDefinition / seed→CapabilityGrant / revoke→CapabilityRevocation, the
+last from plan Step 4.3); the `--app` flag on the booted bin
 form; authority-provider attach + EXCHANGE routing (local, forwarded, absent);
 the E2E. OUT: capability ENFORCEMENT on exchange/provider attach (the seams
 stay stub-allow-all, matching every other gate); claim renewal/takeover;
@@ -34,6 +35,7 @@ app grazel                                          # exactly once, first
 binding <glade_id> <shape> <authority> <zone> <retention> [ttl=<duration>] [shape-profile=<profile>]
 service <name> <exchange-glade-id>
 seed <principal> <share> <verb[,verb...]>
+revoke <principal> <share>                          # withdraws every grant of the pair
 workspace <share> <name>                            # makes declared surfaces routable
 # comments + blank lines anywhere; `#` starts a comment
 ```
@@ -113,8 +115,9 @@ id declared by two apps is allowed, unwarned, the newer live declaration
 standing. R9 governs `dir.bindings` only (its option (s), a retract half for
 the other lines, was not taken): deleting a `service` or `workspace` line
 retracts nothing, so a retired exchange stays routable, and `seed`'s remove
-half is a runtime revocation (item 4 below). `glade/docs/AppFileFormat.md`
-states the same rules for authors.
+half is a `revoke <principal> <share>` line (plan Step 4.3), which registers
+an ordinary revocation (item 4 below). `glade/docs/AppFileFormat.md` states
+the same rules for authors.
 
 An app is declared by one file. `register` takes a file as its app's whole
 binding set, so two files naming one app would retract each other's bindings
@@ -161,7 +164,12 @@ same way, with the same caveat; none does yet.
 4. **Seeds registered even if identical grant was revoked.** The diff skips
    only byte-identical records; `grants_for` applies revocation-wins at
    `(principal, share)` regardless of order, so even a NON-identical re-seed
-   cannot resurrect access. Fold authority holds both ways.
+   cannot resurrect access. Fold authority holds both ways. Since plan Step
+   4.3 a file withdraws a seed's grant itself: a `revoke <principal> <share>`
+   line registers a `CapabilityRevocation` under the registrant's chain,
+   diffed like a seed (`a_revoke_line_withdraws_a_seeded_grant`), and
+   grazel-app.glade carries `revoke owner grazel` for the grants its old seed
+   lines made.
 
 ## The exchange leg (discovery.ts phase D, fanout.ts asymmetry)
 

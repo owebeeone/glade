@@ -206,11 +206,10 @@ The warning is expected on a node that reads a share another node serves: its
 seeds grant its own clients on that share, and it must not load the share's
 `workspace` line, which would make it claim the share.
 
-The shipped `grazel-app.glade` does not follow this yet: its
-`seed owner grazel …` lines name the app, and the node warns about both. They
-are corrected, with a `revoke owner grazel` line that withdraws the grants they
-made, once a node that reads `revoke` is deployed (Step 4.3 of
-`dev-docs/GladeFirstSlicePlan.md` in the glade-wz workspace).
+The shipped `grazel-app.glade` did not follow this until Step 4.3 of
+`dev-docs/GladeFirstSlicePlan.md` in the glade-wz workspace: its two seeds
+named the app, as `seed owner grazel …`. They now name `ws-razel`, and the
+file's `revoke owner grazel` line withdraws the grants the old lines made.
 
 ### `revoke`: withdrawing grants
 

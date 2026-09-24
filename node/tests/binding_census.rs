@@ -34,8 +34,8 @@ const GYLD: &str = "../../grazel/apps/gyld-app.glade";
 /// `from_cursor`) and one for the `windowed` line Step 2.4 moved, and leave
 /// every other record unchanged.
 const CENSUS: [(&str, Registered); 5] = [
-    (GRAZEL, Registered { appended: 5, unchanged: 6 }),
-    ("../apps/grazel-app.glade", Registered { appended: 5, unchanged: 6 }),
+    (GRAZEL, Registered { appended: 5, unchanged: 7 }),
+    ("../apps/grazel-app.glade", Registered { appended: 5, unchanged: 7 }),
     (GYLD, Registered { appended: 2, unchanged: 10 }),
     ("../../glade-gyld/tests/fixtures/gyld-test-app.glade", Registered { appended: 2, unchanged: 7 }),
     ("../../glade-gwz/tests/fixtures/gwz-test-app.glade", Registered { appended: 1, unchanged: 3 }),
@@ -59,10 +59,11 @@ fn read_all<const N: usize>(rels: [&str; N]) -> [String; N] {
     rels.map(|rel| std::fs::read_to_string(path(rel)).unwrap())
 }
 
-/// Every record a parse registers: its bindings, services, seeds and
-/// workspace entries.
+/// Every record a parse registers: its bindings, services, seeds,
+/// revocations and workspace entries.
 fn records(decl: &AppDecl) -> usize {
-    decl.bindings.len() + decl.services.len() + decl.seeds.len() + decl.workspaces.len()
+    let grants = decl.seeds.len() + decl.revocations.len();
+    decl.bindings.len() + decl.services.len() + grants + decl.workspaces.len()
 }
 
 /// Undo plan Step 2.4's one token edit (grazel 05553b4, glade 7bd5f9d):
@@ -186,15 +187,16 @@ fn row9_the_owners_two_file_store_appends_7() {
     let (pre_grazel, pre_gyld) =
         (pre_amendment(&before_step_2_4(&grazel).0), pre_amendment(&before_step_2_4(&gyld).0));
     let mut reg = Registry::new();
-    assert_eq!(register(&pre_grazel, &mut reg, ORIGIN).unwrap(), Registered { appended: 11, unchanged: 0 });
-    // the `workspace ws-razel razel` entry both files declare registers once
-    assert_eq!(register(&pre_gyld, &mut reg, ORIGIN).unwrap(), Registered { appended: 11, unchanged: 1 });
+    assert_eq!(register(&pre_grazel, &mut reg, ORIGIN).unwrap(), Registered { appended: 12, unchanged: 0 });
+    // the `workspace ws-razel razel` entry and the `seed owner ws-razel read.*`
+    // grant both files declare register once
+    assert_eq!(register(&pre_gyld, &mut reg, ORIGIN).unwrap(), Registered { appended: 10, unchanged: 2 });
 
     let mut reg = reboot(&reg);
     let (post_grazel, post_gyld) = (parse(&grazel).unwrap(), parse(&gyld).unwrap());
     let a = register(&post_grazel, &mut reg, ORIGIN).unwrap();
     let b = register(&post_gyld, &mut reg, ORIGIN).unwrap();
-    assert_eq!((a, b), (Registered { appended: 5, unchanged: 6 }, Registered { appended: 2, unchanged: 10 }));
+    assert_eq!((a, b), (Registered { appended: 5, unchanged: 7 }, Registered { appended: 2, unchanged: 10 }));
     assert_eq!(reg.bindings_of(), declared(&[&post_grazel, &post_gyld]));
     assert_eq!(reg.bindings_of().len(), 15);
     assert_eq!(retracted(&reg), vec![]);
@@ -204,8 +206,8 @@ fn row9_the_owners_two_file_store_appends_7() {
 /// with the gyld leg on does.
 fn both_registered(grazel: &AppDecl, gyld: &AppDecl) -> Registry {
     let mut reg = Registry::new();
-    assert_eq!(register(grazel, &mut reg, ORIGIN).unwrap(), Registered { appended: 11, unchanged: 0 });
-    assert_eq!(register(gyld, &mut reg, ORIGIN).unwrap(), Registered { appended: 11, unchanged: 1 });
+    assert_eq!(register(grazel, &mut reg, ORIGIN).unwrap(), Registered { appended: 12, unchanged: 0 });
+    assert_eq!(register(gyld, &mut reg, ORIGIN).unwrap(), Registered { appended: 10, unchanged: 2 });
     reg
 }
 
@@ -232,7 +234,7 @@ fn row10_a_file_not_loaded_retracts_nothing() {
     let (grazel, gyld) = (parse(&grazel).unwrap(), parse(&gyld).unwrap());
     let before = both_registered(&grazel, &gyld).snapshot();
     let (mut reg, _) = Registry::from_snapshot(&before);
-    assert_eq!(register(&grazel, &mut reg, ORIGIN).unwrap(), Registered { appended: 0, unchanged: 11 });
+    assert_eq!(register(&grazel, &mut reg, ORIGIN).unwrap(), Registered { appended: 0, unchanged: 12 });
     assert_eq!(reg.snapshot(), before, "nothing appended");
     let gyld_live: Vec<BindingDecl> = reg.bindings_of().into_iter().filter(|b| b.app == "gyld").collect();
     assert_eq!(gyld_live, declared(&[&gyld]), "gyld's 8 untouched");
@@ -257,7 +259,7 @@ fn row10_a_deleted_line_retracts_exactly_its_surface() {
     let edited = parse(&(edited.join("\n") + "\n")).unwrap();
 
     let mut reg = reboot(&reg);
-    assert_eq!(register(&grazel_decl, &mut reg, ORIGIN).unwrap(), Registered { appended: 0, unchanged: 11 });
+    assert_eq!(register(&grazel_decl, &mut reg, ORIGIN).unwrap(), Registered { appended: 0, unchanged: 12 });
     // the retraction is gyld's one append; its 7 bindings, service, 2 seeds
     // and workspace are unchanged
     assert_eq!(register(&edited, &mut reg, ORIGIN).unwrap(), Registered { appended: 1, unchanged: 11 });

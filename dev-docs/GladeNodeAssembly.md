@@ -906,7 +906,8 @@ once this build is the default binary.
     (`app grazel registered (+2 record(s), 10 unchanged)`). The fold then gives
     `owner` nothing on `grazel`, and `gwz.*`, `gyld.*` and `read.*` on
     `ws-razel`. The next start registers nothing.
-- **Landing (ii)**, once this build is the default binary.
+- **Landing (ii)**, once this build is the default binary (built: see "Part 1,
+  landing (ii)").
   - Both grazel-app.glade copies: the seeds name `ws-razel`, and
     `revoke owner grazel` withdraws the old pair.
   - The fixtures' seeds name `ws-razel`.
@@ -927,6 +928,77 @@ once this build is the default binary.
 - **Size.** Production: 94 lines added and 15 removed in `appdecl.rs`; of the
   added, 47 are code and 46 comment. Tests: 183 added and 4 removed. The page:
   100 added and 14 removed.
+
+### Part 1, landing (ii): the shipped files
+
+Built on 2026-09-25 against glade `dea365e`, after the lane owner rebuilt the
+default binary from landing (i), so the desk's node parses `revoke` before any
+file carries it. No production code changed.
+
+- **The files.**
+  - grazel-app.glade, in both byte-identical homes (`grazel/apps` and
+    `glade/apps`): the two seeds name `ws-razel`, and a new line,
+    `revoke owner grazel`, withdraws the grants the old seeds made on
+    `grazel`.
+  - The fixtures seed `owner ws-razel gyld.*`
+    (`glade-gyld/tests/fixtures/gyld-test-app.glade`) and
+    `owner ws-razel gwz.*` (`glade-gwz/tests/fixtures/gwz-test-app.glade`).
+    Their grants live only in the suites' temporary instances, so they carry
+    no revocation.
+  - `grazel/apps/gyld-app.glade`: a comment only. It no longer says
+    grazel-app.glade "stays exactly as it is".
+  - The page's grazel-app paragraph is in the past tense.
+    `GladeGrazelAttachNotes.md` gains `revoke` in its scope, its grammar and
+    its two notes on withdrawing a seed.
+- **The tests that follow the files.**
+  - `tests/binding_census.rs`: `records()` counts revocations.
+    - grazel-app.glade registers 12 records: 7 bindings, a service, 2 seeds,
+      the revocation and the workspace.
+    - Row 9 is `{5, 7}` in both homes, and the census still appends 15.
+    - In the owner's two-file store, grazel-app.glade registers `{12, 0}` and
+      gyld-app.glade `{10, 2}`: its `seed owner ws-razel read.*` is now
+      byte-identical to grazel-app.glade's, so it registers once.
+    - Row 10's reload of grazel-app.glade is `{0, 12}`.
+  - `tests/shipped_app_files.rs`, the census test, loads each shipped file as
+    the node does, through `load_all`, so a seed on an undeclared share fails
+    it.
+  - `appdecl.rs`:
+    - the trace shape checks that the seeds are on `ws-razel` and that the one
+      revocation is `(owner, grazel)`;
+    - registering twice counts 12;
+    - the runtime-revocation regression moves to `ws-razel`;
+    - the pre-amendment bytes put the revocation where `register` does.
+  - `exchange.rs`, `grazel_attach_end_to_end`: 12 records, and the grants B
+    shows A are on `ws-razel`.
+- **Red first**, in a scratch copy that still held the files before this
+  landing: ten tests fail with these test edits.
+  - The four unit tests. The trace shape reads `("owner", "grazel")`, and
+    registering twice reads `{11, 0}` for `{12, 0}`.
+  - The five binding census tests: `{11, 0}` for `{12, 0}`, and row 9
+    `{5, 6}` for `{5, 7}`.
+  - The census test, on grazel-app.glade's lines 50 and 51, with the seed
+    warning.
+  - With this landing's files the copy passes 270.
+- **The fixtures changed one commit after the warning**, not in its commit as
+  precondition 3 said. The warning had to reach the desk's binary before any
+  `revoke` line reached its file. In between, each fixture drew one warning on
+  the suites' stderr, which no suite asserts on.
+- **The desk's next restart** (replayed at landing (i)). Registration appends
+  the `gwz.*` grant on `ws-razel` and the revocation:
+  `app grazel registered (+2 record(s), 10 unchanged)`, because the gyld leg
+  has run there. The two warnings stop, and the next start appends nothing.
+- **Measured** on 2026-09-25.
+  - The gate passes all 8 components, with 270 node tests on each path.
+  - rustfmt: glade-node 315 hunks, one below the old baseline, which is lowered
+    to 315; glade-wire 43. clippy stays at 11 and 7.
+  - Against the default binary (inode 400427243, not rebuilt): client-rs
+    25 + 10, client-ts 48, grazel 29 + 3, glade-gyld 233 (1 ignored) + 33,
+    glade-gwz 9 + 7, all at baseline. None of their logs holds a warning line;
+    grazel's held two per boot of grazel-app.glade before this landing.
+- **Size.** Tests: 51 lines added and 32 removed, in four files. App files: 9
+  added and 4 removed in each grazel-app.glade copy, one line changed in each
+  fixture, and two comment lines in gyld-app.glade. The page: 4 added and 5
+  removed; the attach notes: 12 added and 4 removed.
 
 ### The grant fold: the node's own registry
 
@@ -1279,14 +1351,18 @@ production.
   and `seed owner ws-razel gwz.*`.
   - They land with the route's withdrawal of the old pair: under (a), a
     `revoke owner grazel` line.
-  - Not done: they wait for the route.
+  - Not done: they wait for the route. Done at landing (ii): see "Part 1,
+    landing (ii)".
 - gyld-app.glade `:63` and `:66` already name `ws-razel`.
 - The fixtures name the app: `glade-gyld/tests/fixtures/gyld-test-app.glade:27`
   (`seed owner gyld gyld.*`) and `glade-gwz/tests/fixtures/gwz-test-app.glade:18`
   (`seed owner gwz gwz.*`). Each declares `workspace ws-razel` (`:30` and
   `:21`).
   - **They must change, to `ws-razel`, in the commit that adds precondition
-    4's warning.**
+    4's warning.** They changed one commit later, at landing (ii), with
+    grazel-app's lines: the warning had to reach the desk's binary before any
+    `revoke` line reached its file. In between, each fixture drew one warning
+    on the suites' stderr, which no suite asserts on.
   - The node's census test loads each of its five files alone, the two
     fixtures included (`node/tests/shipped_app_files.rs:22-30`). It asserts
     that each file loads with no warning, and with exactly one warning when

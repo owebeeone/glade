@@ -641,7 +641,8 @@ mod tests {
         let mut boot_b = boot_at(fresh("e2e-b-sys"), "gianni").unwrap();
         let b_id = boot_b.node_id.clone();
         let loaded = appdecl::register(&grazel_decl(), &mut boot_b.registry, &b_id).unwrap();
-        assert_eq!(loaded.appended, 11, "7 bindings + 1 service + 2 seeds + 1 workspace registered");
+        let registered = "7 bindings + 1 service + 2 seeds + 1 revocation + 1 workspace registered";
+        assert_eq!(loaded.appended, 12, "{registered}");
         boot_b
             .registry
             .append(
@@ -738,8 +739,8 @@ mod tests {
         assert_eq!(
             grants,
             vec![
-                ("owner".to_string(), "grazel".to_string(), "gwz.*".to_string()),
-                ("owner".to_string(), "grazel".to_string(), "read.*".to_string()),
+                ("owner".to_string(), "ws-razel".to_string(), "gwz.*".to_string()),
+                ("owner".to_string(), "ws-razel".to_string(), "read.*".to_string()),
             ]
         );
 
