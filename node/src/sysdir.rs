@@ -13,6 +13,7 @@
 //! | `local.json`    | 3 — node-private assertions              | never |
 //! | `cache/`        | 4 — derived, rebuildable                 | never |
 //! | `instance.lock` | — single-writer lock                     | never |
+//! | `records.json.lock` | — records.json's compare-and-swap lock | never |
 //! | `records.legacy-<date>.json` | — set aside, never read (4.1a, 4.1b) | never |
 //!
 //! Boot = sync from a carrier named "the disk", in class order: node.key perms
@@ -33,6 +34,10 @@
 //! `node.key` so the identity survives the transport key's replacement. The
 //! boot binds it to the node by a signed record, and revokes the node's
 //! bindings of any key it replaced (`transport.rs`).
+//!
+//! records.json carries its store's revision (the owner's ruling of
+//! 2026-09-24, `records_file.rs`), and is read with checked heads: a damaged
+//! one refuses the boot with a message, where the wire codec panicked.
 
 use std::fmt;
 use std::fs;
@@ -327,6 +332,7 @@ fn set_aside(dir: &Path, snap: &mut SystemSnapshot) -> io::Result<Option<SetAsid
     let legacy = SystemSnapshot {
         records: old,
         heads: vec![],
+        revision: None,
     };
     let file = unused_path(dir, &format!("records.legacy-{}", today()), ".json");
     let mut out = fs::File::create_new(&file)?;
@@ -707,6 +713,67 @@ mod tests {
             .collect();
         let legacy = names.iter().any(|name| name.starts_with("records.legacy"));
         assert!(!legacy, "nothing set aside: {names:?}");
+    }
+
+    /// The persistence suite on records.json (owner, 2026-09-24): a
+    /// records.json that is damaged, here cut in half, refuses the boot with
+    /// a message naming it and what is wrong, before anything is written:
+    /// records.json is as it was, and no legacy file appears. The wire codec
+    /// panicked on it.
+    #[test]
+    fn a_boot_refuses_a_damaged_records_json_and_writes_nothing() {
+        let dir = fresh("damaged");
+        drop(boot_at(dir.clone(), "gianni").unwrap());
+        let records = dir.join("records.json");
+        let whole = fs::read(&records).unwrap();
+        let torn = &whole[..whole.len() / 2];
+        fs::write(&records, torn).unwrap();
+
+        let err = boot_at(dir.clone(), "gianni").map(|_| ()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let named = format!(
+            "{} cannot be read as a snapshot (a torn or unreadable item): it is damaged, or not a records.json",
+            records.display()
+        );
+        assert!(err.to_string().starts_with(&named), "{err}");
+        assert_eq!(fs::read(&records).unwrap(), torn, "written nothing");
+        let names: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        let legacy = names.iter().any(|name| name.starts_with("records.legacy"));
+        assert!(!legacy, "nothing set aside: {names:?}");
+    }
+
+    /// The ruling's acceptance at boot: an instance whose records.json the
+    /// build before this step wrote, keys 1 and 2 alone, boots with the same
+    /// fold, nothing quarantined or set aside, and records.json read, not
+    /// written; the boot's store then saves it as revision 2.
+    #[test]
+    fn an_instance_from_before_the_revision_boots_unchanged_as_revision_1() {
+        use crate::records_file::RecordsFile;
+        use glade_wire::cbor::Cbor;
+
+        let dir = fresh("before-revision");
+        let boot = boot_at(dir.clone(), "gianni").unwrap();
+        let fold = boot.registry.snapshot();
+        drop(boot);
+        let list = |items: &[Vec<u8>]| {
+            let items = items.iter().map(|x| Cbor::Bytes(x.clone()));
+            Cbor::Array(items.collect())
+        };
+        let (records, heads) = (list(&fold.records), list(&fold.heads));
+        let old = cbor::encode(&Cbor::Map(vec![(1, records), (2, heads)]));
+        let path = dir.join("records.json");
+        fs::write(&path, &old).unwrap();
+
+        let mut boot = boot_at(dir.clone(), "gianni").unwrap();
+        assert_eq!((boot.rejected, boot.set_aside.is_none()), (0, true));
+        assert_eq!(boot.registry.snapshot(), fold, "the same fold");
+        assert_eq!(fs::read(&path).unwrap(), old, "read, not written");
+        boot.store.save(&boot.registry.snapshot()).unwrap();
+        let saved = RecordsFile::new(&dir).load().unwrap();
+        assert_eq!(saved, Some((2, old)), "revision 2, keys 1 and 2 kept");
     }
 
     /// The legacy file's date: the UTC calendar date of an epoch-ms instant,

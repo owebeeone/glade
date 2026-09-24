@@ -277,8 +277,10 @@ fn item(bytes: &[u8], at: &mut usize, depth: u8) -> Option<Cbor> {
     }
 }
 
-/// One CBOR item's head at `*at`: its major type and its argument.
-fn head(bytes: &[u8], at: &mut usize) -> Option<(u8, u64)> {
+/// One CBOR item's head at `*at`: its major type and its argument. `None`
+/// for a torn head, and for a reserved one or an indefinite length, which
+/// glade-wire never writes.
+pub(crate) fn head(bytes: &[u8], at: &mut usize) -> Option<(u8, u64)> {
     let first = *bytes.get(*at)?;
     *at += 1;
     let width = match first & 0x1f {

@@ -1,13 +1,16 @@
 //! The tests the contracts README requires of a real persistence adapter
 //! (`glade/contracts/README.md`, "Test coverage and limits"), on the node's
 //! real engine, records.json through `BlobStore`. Each says what it proves and
-//! what it cannot. It is not `SnapshotStore`: records.json has no revision and
-//! the node does not depend on the persistence port, so PS-001..008 do not run
-//! here (`glade/dev-docs/GladeNodeAssembly.md`, "Durable store and restart").
-//! Cancellation of a pending future has no test here: `StoreApi` is
-//! synchronous, and `claims.rs` tests the one future that waits around a save.
-//! Capacity has none either: neither store enforces one, and a full disk
-//! cannot be produced here.
+//! what it cannot. records.json now carries its revision, and each save is a
+//! compare-and-swap against it (`records_file.rs`, whose own tests cover the
+//! format, a damaged file, the lock and the last revision). It is not yet
+//! `SnapshotStore`: the node does not depend on the persistence port, so
+//! PS-001..008 do not run here until part 2 of "The persistence suite on
+//! records.json" (`glade/dev-docs/GladeNodeAssembly.md`), which waits on a
+//! question for the owner. Cancellation of a pending future has no test here:
+//! `StoreApi` is synchronous, and `claims.rs` tests the one future that waits
+//! around a save. Capacity has none either: neither store enforces one, and a
+//! full disk cannot be produced here.
 
 use std::fs;
 
@@ -23,6 +26,7 @@ fn snapshot(fill: u8, len: usize) -> SystemSnapshot {
     SystemSnapshot {
         records: vec![vec![fill; len]],
         heads: vec![],
+        revision: None,
     }
 }
 
@@ -76,22 +80,29 @@ fn a_save_interrupted_before_its_rename_leaves_the_previous_snapshot_whole() {
     assert!(!tmp.exists(), "the leftover was replaced, then renamed");
 }
 
-/// Concurrent handles: two handles on one directory, in turn. The second's
-/// save replaces the first's, which it never read, and nothing reports a
-/// conflict: there is no revision to compare, so one writer per instance
-/// rests on the instance lock (`sysdir`'s `instance_lock_is_single_writer`
-/// proves the lock). Two saves in flight at once can also tear the file, since
-/// the handles share one temp name; that depends on timing, and no test here
-/// shows it.
+/// Concurrent handles: each save is a compare-and-swap against the revision
+/// its handle last read or wrote, under records.json's lock. Two handles on
+/// one directory: the first saves, the second reads and saves over it, and
+/// the first's next save, over a revision it never read, conflicts and writes
+/// nothing; once it has read that revision, it saves. Before, that save
+/// replaced the second's, which it never read, and nothing reported it. Two
+/// saves at once take turns under the lock: `records_file`'s tests hold the
+/// lock and show a swap waiting for it.
 #[test]
-fn two_handles_on_one_directory_replace_each_other_without_a_conflict() {
+fn a_handle_that_did_not_read_the_last_save_conflicts_and_writes_nothing() {
     let disk = DiskStore::fresh("two-handles");
     let (mut one, mut two) = (BlobStore::new(disk.dir()), BlobStore::new(disk.dir()));
     one.save(&snapshot(1, 8)).unwrap();
+    two.load().unwrap();
     two.save(&snapshot(2, 8)).unwrap();
-    assert_eq!(
-        one.load().unwrap(),
-        snapshot(2, 8),
-        "the first save is gone"
-    );
+    let records = disk.dir().join("records.json");
+    let held = fs::read(&records).unwrap();
+
+    let err = one.save(&snapshot(3, 8)).unwrap_err().to_string();
+    let conflict = "it holds revision 2, where revision 1 was expected: another handle saved it";
+    assert!(err.ends_with(conflict), "{err}");
+    assert_eq!(fs::read(&records).unwrap(), held, "written nothing");
+    assert_eq!(one.load().unwrap(), snapshot(2, 8));
+    one.save(&snapshot(3, 8)).unwrap();
+    assert_eq!(two.load().unwrap(), snapshot(3, 8));
 }

@@ -181,7 +181,17 @@ SCHEMA = schema(
     # ---- the snapshot wrapper (substrate vocabulary, not a hack) -----------
     # The whole system state as ONE taut message: a cached fold + heads.
     # records[i] = CBOR(wire Op)   heads[j] = CBOR(wire StreamHeads).
+    #
+    # `revision` (the persistence suite on records.json, owner 2026-09-24) is
+    # records.json's store revision: 1 at the first save, one more at each.
+    # Only the store writes it (node/src/records_file.rs), and reads it with a
+    # checked reader, never this codec: a file without it, as every build
+    # before wrote, reads as revision 1. An older build reads keys 1 and 2 and
+    # drops it when it saves. A snapshot in memory, a fold and its heads,
+    # leaves it unset. The store keeps the persistence contract's u64: a
+    # revision past i64::MAX, which only a test writes, is past this INT.
     Msg("SystemSnapshot",
         F("records", 1, List(BYTES)),
-        F("heads", 2, List(BYTES))),
+        F("heads", 2, List(BYTES)),
+        F("revision", 3, INT, optional=True)),
 )

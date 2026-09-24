@@ -13,7 +13,7 @@
 //! `--enforce-client-grants` and subscribes from a websocket session. The last
 //! tests check plan Step 4.2's endpoint key (one id across starts, and a
 //! replaced key's binding revoked), and start each root on an instance written
-//! before plan Step 4.1b signed its records.
+//! before plan Step 4.1b signed its records, and on a damaged records.json.
 //! Every file goes under a fresh directory in the system temp dir, and the node
 //! runs with `GLADE_HOME` and `HOME` pointed there: `~/.glade` is never touched.
 
@@ -758,6 +758,38 @@ fn both_roots_refuse_a_store_in_a_newer_format_with_a_clear_message() {
         assert!(!stderr.contains("panicked"), "{root:?}: {stderr}");
         let now = std::fs::read(instance.join("records.json")).unwrap();
         assert_eq!(now, written, "{root:?}: records.json as it was");
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The persistence suite on records.json (owner, 2026-09-24), on each root:
+/// an instance whose records.json is damaged, here cut in half. The start is
+/// refused: the node exits 1 and says on stderr which file it cannot read,
+/// what is wrong and what to do, with no panic, and records.json is as it
+/// was. The wire codec panicked on it.
+#[test]
+fn both_roots_refuse_a_damaged_records_json_with_a_clear_message() {
+    let dir = scratch("damaged");
+    let home = dir.join("glade-home");
+    for (root, name) in [(Root::HandWritten, "h"), (Root::Assembled, "a")] {
+        let instance = home.join("sys").join(name);
+        drop(boot_at(instance.clone(), "local").unwrap());
+        let records = instance.join("records.json");
+        let whole = std::fs::read(&records).unwrap();
+        let torn = &whole[..whole.len() / 2];
+        std::fs::write(&records, torn).unwrap();
+
+        let args = ["--profile", "local", "--name", name, "0"];
+        let (status, stderr) = ended(&home, root, &args);
+        assert_eq!(status.code(), Some(1), "{root:?}: {stderr}");
+        let named = format!(
+            "{} cannot be read as a snapshot (a torn or unreadable item): it is damaged, or not a records.json; move it aside to start without it",
+            records.display()
+        );
+        assert!(stderr.contains(&named), "{root:?}: {stderr}");
+        assert!(!stderr.contains("panicked"), "{root:?}: {stderr}");
+        let now = std::fs::read(&records).unwrap();
+        assert_eq!(now, torn, "{root:?}: records.json as it was");
     }
     std::fs::remove_dir_all(&dir).unwrap();
 }

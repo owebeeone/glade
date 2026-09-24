@@ -19,6 +19,7 @@ pub mod iroh_carrier;
 pub mod lifecycle;
 pub mod mesh;
 pub mod peer;
+pub mod records_file;
 pub mod registry;
 pub mod router;
 pub mod server;

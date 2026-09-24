@@ -4550,3 +4550,348 @@ What they do not prove:
 - production: +198/−4, net +194: `mesh.rs` +194/−3, of which 143 lines are
   code and the rest comments and blank lines; `tasks.rs` +4/−1;
 - tests: +179, in `mesh.rs`.
+
+## The persistence suite on records.json (the owner's ruling of 2026-09-24)
+
+Design addition, 2026-09-25, written before the code against glade `d69fdce`.
+The red runs and the measured figures were filled in afterwards. The owner
+ruled on 2026-09-24, "all recommended": "PS-001..008 run on records.json with
+an optional revision field in `SystemSnapshot` (today's files read as revision
+1), as a step of its own" (`dev-docs/GladeFirstSlicePlan.md` at the glade-wz
+root). That is option (ii) of 4.4's "Blocked, for the owner", above.
+
+**The step is split in two.**
+
+- **Part 1, built with this note:** the revision in records.json, the store
+  that commits it with the bytes, and a checked read that answers a damaged
+  records.json with an error where the wire codec panicked (sections 1 to 5).
+  No dependency, contract or policy changes.
+- **Part 2, the persistence port itself:** the dependency on
+  `glade-persistence-api`, the policy change, `SnapshotStore` over records.json
+  and PS-001..008. It waits on one question for the owner (section 6): the
+  contract's probes commit bytes that are not a snapshot, and records.json, as
+  ruled, holds a snapshot.
+
+### 1. The format
+
+- records.json stays the canonical CBOR of a `SystemSnapshot`. It gains key 3,
+  `revision`: the store's revision, a CBOR unsigned integer, 1 at the first
+  save and one more at each save after. In the IR, `F("revision", 3, INT,
+  optional=True)`, regenerated with `--legacy-codec`
+  (`GladeProgramStatus.md:29`).
+- **Today's files.** A records.json without key 3, as every build so far wrote
+  it, reads as revision 1, its bytes unchanged. So does a key 3 that is null,
+  which is what the generated codec writes for no revision.
+- **An older build** (today's default binary, glade `d69fdce`) reads a file
+  this build wrote. Its decoder takes keys 1 and 2 and ignores key 3. Its next
+  save writes keys 1 and 2 alone, so the revision is dropped, and this build
+  then reads the file as revision 1 again.
+- **The generated decoder is not used on records.json.** It panics on a
+  missing key 3, as on any key it does not find. The store reads the file with
+  a checked reader instead (section 3).
+- **In memory**, a snapshot stays a fold and its heads. `Registry::snapshot`
+  leaves the field `None`, `BlobStore::load` hands back the snapshot without
+  it, and a save ignores it. The revision belongs to the store: "storage-local,
+  not a source epoch", as the contract has it.
+- **The range** is the contract's, 1 to `u64::MAX`. The IR's INT holds up to
+  `i64::MAX`, which one save every 10 s would pass in about 3×10^12 years. A
+  revision above it is written as the CBOR unsigned integer it is, which the
+  generated INT codec cannot hold. Only a test writes one.
+
+### 2. The store: `RecordsFile` (`node/src/records_file.rs`)
+
+It keeps records.json and its revision, whatever the snapshot inside holds.
+
+- **`load()`** answers `None` when records.json is absent: established absence,
+  as today. Otherwise it answers the revision and the snapshot's bytes, which
+  are the file's map without key 3, byte for byte. A file without key 3 comes
+  back exactly as it is on disk.
+- **`compare_exchange(expected, snapshot)`**, under the store's lock:
+  1. It reads the revision records.json holds, and answers `Conflict` unless it
+     is `expected` (`None` meaning absent).
+  2. It writes the snapshot with the next revision at key 3, in its canonical
+     place, by 4.4's order: to `records.json.tmp`, synced, renamed over
+     records.json, and the directory synced.
+  3. It answers the new revision.
+  The snapshot must be a CBOR map with its keys in order and no key 3. The
+  node's always is.
+- **The outcomes** are the persistence contract's, each with what went wrong:
+  - `Unavailable`: a read, the lock, or a write before the rename failed.
+    Nothing changed.
+  - `Corrupt`: records.json is not a CBOR map this build can read, or its key 3
+    is not a revision (section 3). A load answers it, and so does a
+    compare-and-swap, which then writes nothing. Corruption never reads as
+    absence or as an empty snapshot.
+  - `Conflict`: records.json holds another revision.
+  - `Exhausted`: the revision is `u64::MAX`. Nothing is written.
+  - `OutcomeUnknown`: the rename happened and the directory's sync failed. The
+    new snapshot is in place, and may not survive a crash.
+  - `NotASnapshot`: the bytes handed to it are not such a map. Nothing is
+    written. What the port makes of this is section 6's question.
+  - No capacity is enforced. A full disk fails the temp write, as
+    `Unavailable`, and records.json is unchanged.
+- **The lock** is `records.json.lock` in the instance directory: an exclusive
+  OS lock (`File::lock`, in std since 1.89) held for each compare-and-swap.
+  - Two handles, in one process or two, take turns: the second reads the
+    revision the first wrote, and conflicts.
+  - The file stays, empty.
+  - A load takes no lock. The rename is atomic, so a load sees the old file or
+    the new one, whole.
+  - It closes 4.4's finding under "Concurrent handles": two saves in flight
+    could tear the file through their one temp name.
+- **Cost**: each compare-and-swap reads records.json to find its revision, as
+  well as writing it (Measured).
+
+### 3. The checked reader
+
+- **The container.** The store walks records.json without decoding it: the
+  map's head, then each entry's key, an unsigned integer, and its value, one
+  well-formed CBOR item of the kinds glade-wire writes, skipped by its length.
+  Key 3 may appear once, and its value must be an unsigned integer from 1, or
+  null.
+- **`Corrupt` names what is wrong**: a torn or unreadable item (an indefinite
+  length among them, which glade-wire never writes), bytes left over, not a
+  map, a key that is not an unsigned integer, a tag, key 3 twice, or a key 3
+  that is not a revision.
+- **The snapshot.** The node's engine finds keys 1 and 2 by the same walk and
+  reads each with 4.1b's checked decoder (`envelope::parse`): a list of byte
+  strings. Other keys are ignored, as the wire codec ignored them: a newer
+  build's, which this build then drops at its next save, as an older build
+  drops the revision. A key 1 or 2 that is missing, repeated or of another
+  type fails too.
+- **So** a records.json that is damaged, or not a records.json, refuses the
+  start with a message, and nothing is written, where the wire codec panicked.
+  This closes 4.1b's named gap ("The containers") for the snapshot. Each record
+  inside, a wire `Op`, is still read by the wire codec (named gaps).
+
+### 4. The node's engine: `BlobStore` over `RecordsFile`
+
+- **`load()`** answers the snapshot, decoded as section 3 says, without its
+  revision. The handle keeps the revision it read. A damaged file fails as
+  `InvalidData`: `<path> cannot be read as a snapshot (<why>): it is damaged,
+  or not a records.json; move it aside to start without it`.
+- **`save()`** writes the snapshot's keys 1 and 2, compared and swapped against
+  the revision this handle last read or wrote, and keeps the new one.
+  - A handle that has read nothing saves over whatever records.json holds, at
+    its revision plus one. That is what `BlobStore::new(dir).save(..)` did
+    before, and tests use it to write an instance. The node reads first at
+    every boot, and saves through that handle.
+  - A conflict fails the save: `<path>: it holds revision N, where revision
+    M was expected: another handle saved it`. It fails as a refused save
+    does, so `Registry::accept` commits nothing and publishes nothing. Under
+    the instance lock a node has no other writer, so it does not happen there.
+  - After `OutcomeUnknown`, the handle takes records.json's revision afresh at
+    its next save. The node is its instance's one writer, so what it finds is
+    its own.
+- `MemStore` and the journeys' engines are unchanged: they keep what they are
+  given.
+
+### 5. Compatibility, and the desk
+
+- **The desk's next restart on this build.** records.json reads as revision 1,
+  its records and heads as they were. The first save writes revision 2, and
+  each save one more: the hand-written root saves once per app file at every
+  start, then once per mint (the claim, a renewal every 10 s, each new
+  principal), so about 8,640 a day. `records.json.lock` appears beside
+  records.json at the first save.
+- **Back to today's binary** (a downgrade): it starts, reads keys 1 and 2, and
+  drops key 3 at its first save. It ignores `records.json.lock`. This build
+  then reads revision 1 again, so the revision restarts after a downgrade. A
+  handle that read revision r before the downgrade could then compare equal to
+  a different file at r; no handle outlives its process, so no node sees it.
+- The served store, the wire and every record's bytes are unchanged.
+
+### 6. The question for the owner: the probes' bytes
+
+**The fact.** The contract stores opaque bytes: "Schema/authenticity
+validation remains with the caller" (`contracts/persistence-api/src/lib.rs`,
+the trait's doc), and its README speaks of "opaque caller-encoded snapshots".
+The probes commit `[1, 2, 3]`, `[]`, `[4, 5]` and `[7, 8]`, and PS-008 preloads
+`[9]`: none is a CBOR map. A store that keeps its revision inside the snapshot,
+as ruled, has to read the snapshot's container to put it there, so it can keep
+a map but not arbitrary bytes. So PS-001..008 cannot run on records.json's
+format as the contract states them. Neither 4.4's note nor the ruling looked
+at the probes' bytes.
+
+**The options.**
+
+- **(a) Snapshots only, the probes through a fixture.** The adapter keeps the
+  node's snapshot, a map, and adds the revision. It refuses any other bytes
+  before writing. The contract has no outcome for that; the nearest is
+  `Capacity` ("records.json has room for a snapshot"). PS-001..008 run on it
+  through a test fixture that carries each probe's bytes as the one record of
+  a snapshot, as `tests/durable/adapter.rs` already carries its bytes. They
+  then exercise records.json's one form, the form the node writes, end to
+  end. The deviation: a precondition on the bytes, which the contract does not
+  provide for.
+- **(b) Any bytes, in two forms.** As (a) for a map. Any other bytes are kept
+  whole at key 4 beside the revision, `{3: revision, 4: bytes}`, which is
+  option (i)'s container. The probes run unmodified, but on key 4's form,
+  which no node writes; the node's form is covered by its own tests. There is
+  no deviation from the contract, and a second form that an older build cannot
+  read (no node writes it).
+- **(c) A second view.** The port's impl keeps a caller's bytes as the one
+  record of a snapshot, through the same store and revision code. The probes
+  run unmodified on it. The node's own bytes and the port's are then shaped
+  differently in one file format, so a later engine behind the port could not
+  replace records.json for the node without the node moving onto the port.
+- **(d) Option (i) after all.** A container, `{revision, bytes}`, holds
+  anything, and the probes run unmodified on the node's own form. An older
+  build cannot read a new file. A build from before 4.1b cannot start on an
+  instance a later build wrote anyway, so what (ii) keeps is a downgrade to a
+  build since 4.1b, today's among them.
+- **(e) A contract change**: the probes take their bytes from the fixture. It
+  changes a contract for one adapter.
+
+**Recommendation: (a).** It keeps the ruled format with one form, runs the
+node's saves and the probes through the same store, and has the probes cover
+exactly what the node writes. The precondition is what (ii) implies: a
+revision inside the snapshot needs a snapshot. Part 1 stands under (a), (b),
+(c) and (e); (d) would replace its format.
+
+**Part 2, once ruled** (an estimate): the dependency, normal and dev with
+`conformance`, and its lockfile entry; the policy's two entries and its
+reason, for the owner's review; `impl SnapshotStore for RecordsFile` with the
+contract's outcomes, 40 to 60 lines (the refusal under (a), key 4 under (b),
+the second view under (c)); PS-001..008, about 120 lines of tests. PS-006's
+lost reply is injected by a fixture that drops the answer of a committed swap,
+and PS-008's file, at revision `u64::MAX`, is written by hand.
+
+### 7. Tests (part 1), each begun red
+
+Built on 2026-09-25 against glade `d69fdce`. Three tests were run against
+that commit's production code, in a copy of the sources with the new test
+added; the rest with the part each guards switched off, by one edit in a copy
+of this tree. The message is what each red run printed.
+
+| Test | Proves | Red first |
+| --- | --- | --- |
+| `records_file`: `a_file_from_before_the_revision_loads_byte_for_byte_as_revision_1` | the ruling's acceptance: a records.json as every build before wrote it (keys 1 and 2), and one whose key 3 is null, load byte for byte as revision 1; the node's engine reads the same snapshot, writing nothing; its next save is revision 2, with keys 1 and 2 as they were | with the generated decoder reading records.json, as `BlobStore::load` did, over the regenerated IR: `no map key 3` |
+| `records_file`: `each_swap_commits_the_next_revision_with_its_bytes` | absence is `None`; a swap from none is revision 1 and the file is the snapshot's map with `3: 1` after keys 1 and 2; the next is 2; a second handle reads it | with the revision not written: the file `[162, …]` where `[163, …, 3, 1]` was expected |
+| `records_file`: `a_stale_revision_conflicts_and_writes_nothing` | a swap expecting none, 0 or 2 over revision 1 conflicts, naming both, and writes nothing | with no comparison: `None: Ok(2)` |
+| `records_file`: `a_damaged_records_json_is_corrupt_and_never_a_panic` | twelve damaged files (empty, torn, a byte left over, an array, a text key, an indefinite length, a tag, a count past the bytes, key 3 of 0, of text, negative, twice) are each `Corrupt` with its reason, for a load and a swap, which writes nothing; the node's engine answers `InvalidData` naming the file, and for a key 1 that is not a list | with the wire codec reading the container: `index out of bounds: the len is 0 but the index is 0` |
+| `records_file`: `a_swap_waits_for_the_lock_another_handle_holds` | while the test holds `records.json.lock`, a swap in another thread waits and writes nothing; released, it lands at revision 1 | with no lock taken: `the swap waits for the lock` |
+| `records_file`: `the_last_revision_is_exhausted_and_writes_nothing` | a file at revision `u64::MAX`, written as the 9-byte CBOR unsigned integer, loads; a swap from it is `Exhausted` and writes nothing | with the revision wrapping: `Ok(0)` |
+| `records_file`: `an_older_build_reads_the_file_and_drops_the_revision_when_it_saves` | the decoder the build before generated for keys 1 and 2 reads a file at revision 2; its save, keys 1 and 2 alone, reads here as revision 1 | with the revision kept in option (i)'s container, `{3: revision, 4: snapshot}`: `no map key 1` |
+| `sysdir`: `a_boot_refuses_a_damaged_records_json_and_writes_nothing` | a records.json cut in half refuses the boot (`InvalidData`) with the message; records.json is as it was, and nothing is set aside | against `d69fdce`: `range end index 913 out of range for slice of length 658` (the wire codec) |
+| `sysdir`: `an_instance_from_before_the_revision_boots_unchanged_as_revision_1` | an instance whose records.json has keys 1 and 2 alone boots with the same fold, nothing quarantined or set aside, records.json read and not written; the boot's store then saves revision 2 | with the generated decoder, as above: `no map key 3` |
+| `tests/durable`: `a_handle_that_did_not_read_the_last_save_conflicts_and_writes_nothing` (replaces `two_handles_on_one_directory_replace_each_other_without_a_conflict`) | of two engines on one directory, the one whose next save is over a revision it never read conflicts, with the message, and writes nothing; having read it, it saves | against `d69fdce`: ``called `Result::unwrap_err()` on an `Ok` value: ()`` |
+| `tests/assembled_path`: `both_roots_refuse_a_damaged_records_json_with_a_clear_message` | on each root, as processes: a records.json cut in half ends the start with exit 1 and the message on stderr, no panic, records.json as it was | against `d69fdce`: exit `Some(101)` where `Some(1)` was expected; the node panicked with `range end index 912 out of range for slice of length 657` |
+
+Changed and passing: the other two tests in `tests/durable/adapter.rs` and
+the module's note (records.json now has a revision; PS-001..008 wait on part
+2); `SystemSnapshot` literals gain `revision: None`. Every other test runs
+unchanged, the durable journeys over the revised records.json.
+
+What they do not prove: a crash between the rename and the directory's sync
+(`OutcomeUnknown` is not produced); two processes, rather than two threads, on
+the lock; Windows and Linux, which the lane owner runs on dabeest and the Pi.
+
+### Named gaps (part 1)
+
+- **The port.** PS-001..008 do not run yet (section 6).
+- **Each record inside** records.json, a wire `Op`, is still read by the wire
+  codec, which panics on a type it does not expect (4.1b's "The containers",
+  now closed for the snapshot alone). A checked `Op` decoder would be about 40
+  lines: the op nests three deep (its `refs`), past `envelope::parse`'s two.
+- **Each save reads records.json whole** to find its revision, under the lock.
+  At a week of renewals, about 60,000 records and 18 MB, a save measured 32
+  ms where it was 19 ms, and a load 24 ms where it was 11 ms (Measured). A
+  handle could skip the read while the file is the one it last wrote, but std
+  has no portable file identity, as the hardening found for the instance
+  lock.
+- **The IR's INT** is `i64`, and the store's revision is the contract's `u64`.
+  A revision past `i64::MAX` is written as the unsigned integer it is, which the
+  generated codec cannot hold; only a test writes one.
+- **A downgrade restarts the revision** at 1 (section 5).
+- **`records.json.lock` stays**, empty, like `instance.lock` before the
+  hardening removed it on release. Removing it would need the identity check
+  `InstanceLock` makes, for the same race.
+- **Seen in passing, not this step's:** from the fourth start of the replay,
+  30 s after the first, every build prints `registry ready (home served:
+  false)`. The `home` claim minted at a first boot carries a 30 s lease, and
+  nothing renews it: `renew_leases` renews the shares `serve_workspace_on`
+  entered. So any start more than 30 s after an instance's first boot prints
+  `false`, today's binary's too; earlier replays stopped each start at
+  `listening`, within the 30 s.
+
+### Default-path changes (part 1)
+
+1. records.json gains key 3, its revision: 2 at the desk's first save after
+   the upgrade, one more at each save (about 8,640 a day).
+2. `records.json.lock` appears in the instance directory at the first save.
+3. Each save reads records.json, under that lock, before it writes.
+4. A save over a revision its handle did not read fails. Under the instance
+   lock the node has one handle, so this does not happen.
+5. A damaged records.json refuses the start with `<path> cannot be read as a
+   snapshot (<why>): it is damaged, or not a records.json; move it aside to
+   start without it`, exit 1, where the wire codec panicked (exit 101).
+6. A save over a damaged records.json fails (`Corrupt`), where it overwrote
+   it. Boot refuses such a file before any save, so only a test could meet
+   this.
+7. A downgrade to today's binary works: it starts, and drops the revision at
+   its first save.
+
+### Measured (part 1)
+
+2026-09-25, Apple M3 Pro, Rust 1.96.0, on the final tree:
+
+- **The gate** passes all 8 components, in 102 s from an empty scratch target,
+  with 310 node tests on each path, where there were 300: the ten new tests of
+  section 7 (the eleventh replaces a test). rustfmt: glade-node 299 hunks, at
+  its baseline. The regenerated `sysdata.rs` adds one, its long codec lines,
+  and `BlobStore::new`'s old one went with its rewrite; no line this step
+  wrote by hand is a deviation. glade-wire 43. clippy: 11 and 7, at baseline.
+  The contracts gate passes, untouched.
+- **The regeneration.** The generator at taut `7a5f616` reproduces
+  `d69fdce`'s `sysdata.rs` byte for byte (`cmp`); after the IR change,
+  regenerated with `--legacy-codec`, `sysdata.rs` is exactly what it wrote:
+  +3 lines, the field and its codec.
+- **Time.** `tests/durable`'s 15 tests take 0.22–0.26 s, as before; the fast
+  loop does not touch records.json.
+- **A save and a load**, debug build (the desk's), records of 294 bytes (a
+  signed renewal), three interleaved rounds against `d69fdce`'s engine, each
+  the mean of ten, load average 5–8:
+
+  | records | records.json | save, before | save, after | load, before | load, after |
+  | --- | --- | --- | --- | --- | --- |
+  | 300 | 90 KB | 6.5–7.4 ms | 5.1–7.6 ms | 0.07–0.16 ms | 0.12–0.60 ms |
+  | 8,640 (a day) | 2.6 MB | 8.3–8.8 ms | 9.0–10.8 ms | 1.5–1.8 ms | 3.2–3.3 ms |
+  | 60,480 (a week) | 18 MB | 18.8–19.4 ms | 31.9–32.7 ms | 11.2–11.4 ms | 24.3–24.5 ms |
+
+  A save is dominated by its two syncs until the file is large; the read and
+  walk under the lock then add about 13 ms at a week's size. A load walks the
+  file twice and copies it once more than before; it runs once a boot, beside
+  about 3 s of signature checks at that size (4.1b's F4).
+
+- **The replay**, from `glade-wz/grazel` as grazel starts the node
+  (`--profile local --name grazel --app apps/grazel-app.glade --app
+  apps/gyld-app.glade 0`), on one scratch instance. Each start lived 11 s past
+  `listening`, one renewal tick, and was stopped. Today's default binary
+  (inode 401419601) twice, this build twice, then today's binary on the store
+  this build wrote, then this build again:
+
+  | Start | Lines | records.json after it |
+  | --- | --- | --- |
+  | today's, 1 | `registry ready (home served: true)`, `+12 record(s), 0 unchanged`, `+10 record(s), 2 unchanged`, `ws-razel` serving (twice), `listening` | keys 1 and 2, 27 records, 8 heads, 8,043 bytes; no lock file |
+  | today's, 2 | `+0 record(s), 12 unchanged` for each app, the rest as before | keys 1 and 2, 29 records |
+  | this build, 1 | the same lines as today's second | keys 1, 2 and 3, **revision 5** (read as 1, then two registrations, the claim, a renewal), 31 records: the 29 from before first, byte for byte; `records.json.lock` present |
+  | this build, 2 | the same, but `home served: false` (below) | revision 9, 33 records |
+  | today's, on this build's store | the same lines, nothing on stderr | **keys 1 and 2**: the revision dropped at its first save; 35 records; the lock file left, unused |
+  | this build, again | the same | revision 5 (read as 1 again), 37 records |
+
+  Every start printed nothing on stderr. Node and endpoint ids were the same
+  throughout. From the fourth start on, every build printed `home served:
+  false`, the 30 s `home` lease (named gaps).
+- **Downstream**, against the default binary (inode 401419601, not rebuilt),
+  through the shims: client-rs 25 + 10, client-ts 48, grip-share 19, grazel
+  29 + 3, glade-gyld 233 (1 ignored) + 33, glade-gwz 9 + 7. All at baseline.
+
+**Size**, in lines added and removed in `.rs` files, doc comments included:
+
+- production: +485/−35, net +450: `records_file.rs` +389, new;
+  `registry.rs` +82/−33; `sysdir.rs` +6; `envelope.rs` +4/−2; `sysdata.rs`
+  +3 (generated); `lib.rs` +1;
+- tests: +395/−21: `records_file.rs` +269, `sysdir.rs` +61, `tests/durable/
+  adapter.rs` +31/−20, `tests/assembled_path.rs` +33/−1, `registry.rs` +1;
+- beside them, the IR +11/−1.

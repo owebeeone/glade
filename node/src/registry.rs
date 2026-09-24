@@ -20,9 +20,9 @@
 
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
-use std::fs;
-use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::io;
+use std::path::Path;
+use std::sync::{Mutex, PoisonError};
 
 use glade_wire::cbor;
 use glade_wire::generated::{Head, Op, Shape, StreamHeads};
@@ -31,6 +31,7 @@ use crate::chain::op_hash;
 use crate::envelope::{self, Refused};
 use crate::grants::Policy;
 use crate::peer::NodeIdentity;
+use crate::records_file::{self, FileError, RecordsFile};
 use crate::sysdata::{
     BindingDecl, BindingRetraction, CapabilityGrant, CapabilityRevocation, NodeRecord, NodeTransportBinding,
     NodeTransportRevocation, PrincipalRecord, ServeClaim, ServiceDefinition, SystemSnapshot, WorkspaceEntry,
@@ -163,61 +164,104 @@ pub enum Ingested {
 /// Persist the whole system state. The trait is deliberately the whole-blob
 /// shape so a SQLite (or any) engine can re-implement it without any caller
 /// changing — `load`/`save` a [`SystemSnapshot`], nothing else. Nothing above
-/// this trait knows files exist.
+/// this trait knows files exist. A snapshot here is a fold and its heads: its
+/// `revision` is the engine's own, which `load` leaves unset and `save`
+/// ignores.
 pub trait StoreApi {
     fn load(&self) -> io::Result<SystemSnapshot>;
     fn save(&mut self, snap: &SystemSnapshot) -> io::Result<()>;
 }
 
 /// The interim engine: the whole snapshot as one taut message on disk
-/// (`records.json`), rewritten tmp+rename (crash-atomic). This IS the
-/// degenerate-sync artifact a connecting peer would ingest.
+/// (`records.json`), rewritten tmp+rename (crash-atomic) through
+/// [`RecordsFile`], which keeps its revision. This IS the degenerate-sync
+/// artifact a connecting peer would ingest.
 ///
 /// At-rest bytes are canonical CBOR of the [`SystemSnapshot`] (see the module
 /// note): hashing == at-rest, so verify-as-ingest is uniform. The spec's
 /// JSON-text rendering is a later cosmetic — the seam does not depend on it.
 ///
-/// A save returns once the snapshot is synced and renamed into place, and
-/// the rename synced with its directory (plan Step 4.4): an interrupted save
-/// leaves the old file whole. It carries no revision and compares nothing:
-/// one writer per instance is the instance lock's job, and two handles on
-/// one directory share one temp name.
+/// A load reads the file with checked heads, so a damaged one fails as
+/// `InvalidData`, never a panic, and the handle keeps the revision it read. A
+/// save is a compare-and-swap against the revision this handle last read or
+/// wrote: it returns once the snapshot is synced and renamed into place with
+/// the next revision, and the rename synced with its directory (plan Step
+/// 4.4), and it fails, writing nothing, if another handle saved meanwhile. A
+/// handle that has read nothing saves over whatever records.json holds.
 pub struct BlobStore {
-    path: PathBuf,
+    file: RecordsFile,
+    seen: Mutex<Seen>,
+}
+
+/// What a [`BlobStore`] handle knows of records.json's revision.
+#[derive(Clone, Copy)]
+enum Seen {
+    /// Nothing yet, or nothing since a save whose outcome is unknown: its next
+    /// save goes over whatever records.json holds.
+    Nothing,
+    /// That there is no records.json.
+    Absent,
+    /// The revision it last read or wrote.
+    At(u64),
 }
 
 impl BlobStore {
     /// A blob engine writing `records.json` under `dir`.
     pub fn new(dir: impl AsRef<Path>) -> BlobStore {
-        BlobStore { path: dir.as_ref().join("records.json") }
+        let (file, seen) = (RecordsFile::new(dir), Mutex::new(Seen::Nothing));
+        BlobStore { file, seen }
     }
 }
 
 impl StoreApi for BlobStore {
     fn load(&self) -> io::Result<SystemSnapshot> {
-        match fs::read(&self.path) {
-            Ok(bytes) => Ok(SystemSnapshot::from_cbor(&cbor::decode(&bytes))),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(SystemSnapshot::default()),
-            Err(e) => Err(e),
-        }
+        let path = self.file.path();
+        let (seen, snap) = match self.file.load().map_err(|e| failed(path, e))? {
+            None => (Seen::Absent, SystemSnapshot::default()),
+            Some((revision, bytes)) => {
+                let snap = records_file::decode(&bytes);
+                let snap = snap.map_err(|why| failed(path, FileError::Corrupt(why)))?;
+                (Seen::At(revision), snap)
+            }
+        };
+        *self.seen.lock().unwrap_or_else(PoisonError::into_inner) = seen;
+        Ok(snap)
     }
 
     fn save(&mut self, snap: &SystemSnapshot) -> io::Result<()> {
-        let dir = match self.path.parent() {
-            Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
-            _ => PathBuf::from("."),
+        let path = self.file.path();
+        let seen = self.seen.get_mut().unwrap_or_else(PoisonError::into_inner);
+        let expected = match *seen {
+            Seen::At(revision) => Some(revision),
+            Seen::Absent => None,
+            Seen::Nothing => self.file.revision().map_err(|e| failed(path, e))?,
         };
-        fs::create_dir_all(&dir)?;
-        let bytes = cbor::encode(&snap.to_cbor());
-        let tmp = self.path.with_extension("json.tmp");
-        // Durable before visible: the bytes reach the device before the
-        // rename makes them records.json, and the rename is then synced.
-        let mut file = fs::File::create(&tmp)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&tmp, &self.path)?; // crash-atomic swap
-        entry_sync::sync(&dir)
+        let snapshot = records_file::encode(snap);
+        let answer = self.file.compare_exchange(expected, &snapshot);
+        match &answer {
+            Ok(revision) => *seen = Seen::At(*revision),
+            Err(FileError::OutcomeUnknown(_)) => *seen = Seen::Nothing,
+            Err(_) => {}
+        }
+        answer.map(|_| ()).map_err(|e| failed(path, e))
+    }
+}
+
+/// `e`, a failed load or save of `path`, as the error the engine answers: a
+/// damaged records.json names itself and the way out, and an I/O failure
+/// keeps its kind.
+fn failed(path: &Path, e: FileError) -> io::Error {
+    let file = path.display();
+    match e {
+        FileError::Unavailable(e) | FileError::OutcomeUnknown(e) => e,
+        FileError::Corrupt(why) => io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{file} cannot be read as a snapshot ({why}): it is damaged, or not a records.json; move it aside to start without it"
+            ),
+        ),
+        FileError::Conflict { .. } => io::Error::other(format!("{file}: {e}: another handle saved it")),
+        FileError::Exhausted | FileError::NotASnapshot => io::Error::other(format!("{file}: {e}")),
     }
 }
 
@@ -668,7 +712,12 @@ impl RegistryApi for Registry {
                 )
             })
             .collect();
-        SystemSnapshot { records, heads }
+        // A fold has no revision: the engine that saves it keeps its own.
+        SystemSnapshot {
+            records,
+            heads,
+            revision: None,
+        }
     }
 }
 
@@ -788,6 +837,7 @@ impl BindingFold {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn ws(id: &str, hosts: &[&str]) -> Record {
         Record::Workspace(WorkspaceEntry {

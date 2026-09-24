@@ -326,18 +326,21 @@ impl WorkspaceCreateRes {
 pub struct SystemSnapshot {
     pub records: Vec<Vec<u8>>,
     pub heads: Vec<Vec<u8>>,
+    pub revision: Option<i64>,
 }
 impl SystemSnapshot {
     pub fn to_cbor(&self) -> Cbor {
         Cbor::Map(vec![
             (1, Cbor::Array(self.records.iter().map(|x| Cbor::Bytes(x.clone())).collect())),
             (2, Cbor::Array(self.heads.iter().map(|x| Cbor::Bytes(x.clone())).collect())),
+            (3, match &self.revision { Some(v) => Cbor::Int(*v), None => Cbor::Null }),
         ])
     }
     pub fn from_cbor(c: &Cbor) -> Self {
         Self {
             records: c.get(1).array().iter().map(|x| x.bytes()).collect(),
             heads: c.get(2).array().iter().map(|x| x.bytes()).collect(),
+            revision: { let v = c.get(3); if v.is_null() { None } else { Some(v.int()) } },
         }
     }
 }
