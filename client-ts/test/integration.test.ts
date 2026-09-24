@@ -14,6 +14,7 @@ import { GladeClient } from "../src/client.ts";
 import { UnresumedChain } from "../src/session.ts";
 import type { OpOutcome } from "../src/answers.ts";
 import { hex, utf8 } from "../src/bytes.ts";
+import { opHash } from "../src/hash.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const corpus = join(here, "..", "..", "..", "taut", "corpus");
@@ -182,14 +183,62 @@ test("a refused append stops its chain", async () => {
     // Answer 4: the refused op is dropped, and its chain takes no append ...
     assert.deepEqual(second.session.dump(), []);
     assert.throws(() => second.append("sh", "g", "value", utf8("third")), UnresumedChain);
-    // ... until a subscribe of its zone: the replay brings the node's op 0.
+    // ... until a subscribe of its zone returns, with the replay that brings
+    // the node's op 0 (R7).
     await second.subscribe("sh", "g");
-    await until(() => second.session.dump().length === 1);
+    assert.equal(second.session.dump().length, 1);
     const resumed = await second.appendOutcome("sh", "g", "value", utf8("third"));
     assert.equal(resumed.ok, true);
     assert.equal(resumed.op.seq, 1);
     first.close();
     second.close();
+  } finally {
+    child.kill();
+  }
+});
+
+// The subscribe outcome (client-writes plan Step 3.4; GladeSubstrateV1 §6,
+// R5-R7): a subscribe returns once its replay has arrived.
+
+test("subscribe returns after the replay is folded", async () => {
+  const { port, child } = await startNode();
+  const url = `ws://127.0.0.1:${port}`;
+  try {
+    const writer = new GladeClient(schema, "writer");
+    await writer.connect(url);
+    for (let i = 0; i < 1999; i++) {
+      writer.append("sh", "replay", "log", utf8(`line-${i}`));
+    }
+    assert.equal((await writer.appendOutcome("sh", "replay", "log", utf8("line-1999"))).ok, true);
+    const reader = new GladeClient(schema, "reader");
+    await reader.connect(url);
+    await reader.subscribe("sh", "replay");
+    assert.equal((reader.fold("sh", "replay", "log") as Uint8Array[]).length, 2000);
+    writer.close();
+    reader.close();
+  } finally {
+    child.kill();
+  }
+});
+
+test("subscribeOutcome returns the node's heads, with their hashes", async () => {
+  const { port, child } = await startNode();
+  const url = `ws://127.0.0.1:${port}`;
+  try {
+    const writer = new GladeClient(schema, "writer");
+    await writer.connect(url);
+    writer.append("sh", "g", "value", utf8("one"));
+    const last = await writer.appendOutcome("sh", "g", "value", utf8("two"));
+    const reader = new GladeClient(schema, "reader");
+    await reader.connect(url);
+    const outcome = await reader.subscribeOutcome("sh", "g");
+    assert.equal(outcome.ok, true);
+    assert.deepEqual(
+      outcome.heads.map((h) => [h.origin, h.seq, hex(h.hash ?? new Uint8Array())]),
+      [["writer", 1, hex(opHash(schema, last.op as never))]],
+    );
+    writer.close();
+    reader.close();
   } finally {
     child.kill();
   }

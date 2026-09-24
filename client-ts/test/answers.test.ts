@@ -1,7 +1,8 @@
-// Op outcomes (client-writes plan Step 3.3; GladeSubstrateV1 §6, "Session
-// answers" R1 and R7, and "Cross-node writes" W5). The answers table is pure,
-// and the client reads it over a fake socket: no node, no socket and no clock
-// (LBT-008). The backoff runs on node:test's mock timers.
+// Op outcomes and the subscribe outcome (client-writes plan Steps 3.3 and 3.4;
+// GladeSubstrateV1 §6, "Session answers" R1 and R5-R7, and "Cross-node writes"
+// W5). The answers and replays tables are pure, and the client reads them over
+// a fake socket: no node, no socket and no clock (LBT-008). The backoff runs on
+// node:test's mock timers.
 
 import test, { mock } from "node:test";
 import assert from "node:assert/strict";
@@ -11,7 +12,7 @@ import { dirname, join } from "node:path";
 
 import { loadSchema } from "../src/taut/schema.ts";
 import * as codec from "../src/taut/codec.ts";
-import { Answers, backoffMs, type OpOutcome } from "../src/answers.ts";
+import { Answers, Replays, backoffMs, type OpOutcome, type SubscribeOutcome } from "../src/answers.ts";
 import { GladeClient } from "../src/client.ts";
 import { Session, UnresumedChain, type Op } from "../src/session.ts";
 import { zoneKey } from "../src/store.ts";
@@ -182,6 +183,101 @@ test("the backoff's schedule: 1 s doubling to 30 s, per zone, afresh once placed
   assert.equal(answers.nextResend(zone), 1000);
 });
 
+// ---- catching up (R5-R7) -----------------------------------------------------
+
+const empty = new Uint8Array();
+
+/** An ack of a subscribe to ("sh", `gladeId`) naming each [origin, seq] (R5). */
+function acked(heads: Array<[string, number]>, gladeId = "g") {
+  return [{ share: "sh", glade_id: gladeId, key: empty, heads: heads.map(([origin, seq]) => ({ origin, seq, hash: null })) }];
+}
+
+/** Keep a subscribe to ("sh", `gladeId`) as sent, and catch how it settles. */
+function subscribing(replays: Replays, gladeId = "g"): { outcome?: SubscribeOutcome; failure?: Error } {
+  const caught: { outcome?: SubscribeOutcome; failure?: Error } = {};
+  replays.sent("sh", gladeId, empty, (o) => {
+    caught.outcome = o;
+  }, (e) => {
+    caught.failure = e;
+  });
+  return caught;
+}
+
+test("an ack with no origins completes at once, as does one the connection has reached", () => {
+  const replays = new Replays();
+  const first = subscribing(replays);
+  assert.equal(replays.ack(acked([])), true);
+  assert.deepEqual(first.outcome, { ok: true, heads: [], code: "ok", message: "" });
+  // An op received on this connection before the ack counts (R7).
+  replays.reach(chain("a", 1)[0]);
+  const second = subscribing(replays);
+  assert.equal(replays.ack(acked([["a", 0]])), true);
+  assert.equal(second.outcome?.ok, true);
+});
+
+test("a replay is in once each origin reaches its acked seq: below waits, at or above is done", () => {
+  const ops = chain("a", 3);
+  const replays = new Replays();
+  const at = subscribing(replays);
+  assert.equal(replays.ack(acked([["a", 1], ["b", 0]])), false);
+  assert.equal(replays.reach(ops[0]), false);
+  assert.equal(replays.reach(chain("b", 1)[0]), false);
+  assert.equal(replays.reach(ops[1]), true);
+  assert.deepEqual(at.outcome?.heads.map((h) => [h.origin, h.seq]), [["a", 1], ["b", 0]]);
+  const fresh = new Replays();
+  const above = subscribing(fresh);
+  fresh.ack(acked([["a", 1]]));
+  assert.equal(fresh.reach(ops[2]), true);
+  assert.equal(above.outcome?.ok, true);
+});
+
+test("an ack that names no zone is a refusal, and its reason is the next Error for its zone with no corr", () => {
+  const replays = new Replays();
+  const caught = subscribing(replays);
+  assert.equal(replays.ack([]), false);
+  replays.reason("sh", "other", "unknown_share", "not this subscribe's");
+  const waiting = caught.outcome;
+  assert.equal(waiting, undefined);
+  replays.reason("sh", "g", "unknown_share", "no such share");
+  assert.deepEqual(caught.outcome, { ok: false, heads: [], code: "unknown_share", message: "no such share" });
+});
+
+test("the connection's end fails every waiting subscribe, and what it reached is forgotten", () => {
+  const replays = new Replays();
+  const refused = subscribing(replays, "r");
+  replays.ack([]);
+  const replaying = subscribing(replays);
+  replays.ack(acked([["a", 0]]));
+  const unacked = subscribing(replays);
+  replays.reach(chain("b", 1)[0]);
+  replays.ended();
+  // A refusal whose reason did not come is still a refusal.
+  assert.deepEqual(refused.outcome, { ok: false, heads: [], code: null, message: "refused; its reason did not come" });
+  assert.match(String(replaying.failure), /the connection ended/);
+  assert.match(String(unacked.failure), /the connection ended/);
+  const next = subscribing(replays);
+  assert.equal(replays.ack(acked([["b", 0]])), false);
+  assert.equal(next.outcome, undefined);
+});
+
+test("a frame the client cannot take fails its zones' replays; an ack for another zone fails them all", () => {
+  const replays = new Replays();
+  const mine = subscribing(replays);
+  replays.ack(acked([["a", 0]]));
+  const other = subscribing(replays, "h");
+  replays.ack(acked([["a", 0]], "h"));
+  replays.fail("an op it cannot take", new Set([zone]));
+  assert.match(String(mine.failure), /an op it cannot take/);
+  const untouched = other.failure;
+  assert.equal(untouched, undefined);
+  // Acks come in the order the subscribes went, so an ack for another zone
+  // means none can be matched to its subscribe any more.
+  const next = subscribing(replays);
+  assert.equal(replays.ack(acked([], "elsewhere")), false);
+  assert.match(String(next.failure), /another zone/);
+  assert.match(String(other.failure), /another zone/);
+});
+
 // ---- the client, over a fake socket ------------------------------------------
 
 /** Stands in for the global WebSocket: it opens at once, keeps what the
@@ -215,18 +311,34 @@ class FakeSocket {
   status(op: Op, code: string): void {
     this.deliver(12, "Error", { code, message: code, share: op.share, glade_id: op.glade_id, corr: hashOf(op) });
   }
-  /** The node's ack of a subscribe to ("sh", "g") (R5). */
-  ack(): void {
-    this.deliver(5, "Heads", { streams: [{ share: "sh", glade_id: "g", key: new Uint8Array(), heads: [] }] });
+  /** The node's ack of a subscribe to ("sh", `gladeId`), naming each [origin, seq] (R5). */
+  ack(heads: Array<[string, number]> = [], gladeId = "g"): void {
+    this.deliver(5, "Heads", { streams: acked(heads, gladeId) });
+  }
+  /** The node's refusal of a subscribe to ("sh", "g") (R6). */
+  refuse(code: string, message: string): void {
+    this.deliver(5, "Heads", { streams: [] });
+    this.deliver(12, "Error", { code, message, share: "sh", glade_id: "g", corr: null });
+  }
+  /** Ops from the node: a replay, or live ops. */
+  receive(ops: Op[]): void {
+    this.deliver(4, "Ops", { ops, pri: null });
+  }
+  /** Bytes as they came, which need not be a frame. */
+  raw(bytes: Uint8Array): void {
+    this.onmessage?.({ data: bytes.slice().buffer });
   }
   private deliver(tag: number, message: string, value: unknown): void {
     const body = codec.encode(schema, message, value as never);
     const bytes = new Uint8Array(1 + body.length);
     bytes[0] = tag;
     bytes.set(body, 1);
-    this.onmessage?.({ data: bytes.buffer });
+    this.raw(bytes);
   }
 }
+
+/** Lets pending promise callbacks run. */
+const turn = () => new Promise((resolve) => setImmediate(resolve));
 
 async function fakeClient(origin: string): Promise<{ client: GladeClient; socket: FakeSocket }> {
   const real = globalThis.WebSocket;
@@ -244,6 +356,7 @@ test("an outcome call fails at once when no socket is open, and leaves the chain
   const never = new GladeClient(schema, "a");
   await assert.rejects(never.appendOutcome("sh", "g", "value", utf8("x")), /not connected/);
   await assert.rejects(never.sendOpsOutcome(chain("a", 1)), /not connected/);
+  await assert.rejects(never.subscribeOutcome("sh", "g"), /not connected/);
   assert.deepEqual(never.session.dump(), []);
   const { client, socket } = await fakeClient("a");
   socket.close();
@@ -251,7 +364,7 @@ test("an outcome call fails at once when no socket is open, and leaves the chain
   assert.deepEqual(client.session.dump(), []);
 });
 
-test("a session the client owns drops a refused op until its zone's ack; the listener is told", async () => {
+test("a session the client owns drops a refused op until a subscribe of its zone has its replay", async () => {
   const { client, socket } = await fakeClient("a");
   const told: OpOutcome[] = [];
   client.onRefused((o) => told.push(o));
@@ -260,8 +373,14 @@ test("a session the client owns drops a refused op until its zone's ack; the lis
   assert.deepEqual(told.map((o) => o.code), ["equivocation"]);
   assert.deepEqual(client.session.dump(), []);
   assert.throws(() => client.append("sh", "g", "value", utf8("y")), UnresumedChain);
-  socket.ack();
-  assert.equal(client.append("sh", "g", "value", utf8("y")).seq, 0);
+  // The ack alone does not resume the chain; the replay that brings the op
+  // the node holds at seq 0 does.
+  const subscribed = client.subscribe("sh", "g");
+  socket.ack([["a", 0]]);
+  assert.throws(() => client.append("sh", "g", "value", utf8("y")), UnresumedChain);
+  socket.receive(chain("a", 1));
+  await subscribed;
+  assert.equal(client.append("sh", "g", "value", utf8("y")).seq, 1);
 });
 
 test("a session a binder owns is only told, and a refusal no listener takes goes to the console", async () => {
@@ -281,7 +400,7 @@ test("a session a binder owns is only told, and a refusal no listener takes goes
   assert.equal(client.session.append("sh", "g", "value", utf8("y")).seq, 1);
 });
 
-test("an op not placed is told once, and sent again on the backoff and on its zone's ack", async () => {
+test("an op not placed is told once, and sent again on the backoff and once its zone's replay is in", async () => {
   mock.timers.enable({ apis: ["setTimeout"] });
   try {
     const { client, socket } = await fakeClient("a");
@@ -302,7 +421,12 @@ test("an op not placed is told once, and sent again on the backoff and on its zo
     assert.equal(told.length, 2);
     mock.timers.tick(2000);
     assert.equal(socket.ops().length, 6);
-    socket.ack();
+    // Not at the ack: once the replay is in.
+    const subscribed = client.subscribe("sh", "g");
+    socket.ack([["b", 0]]);
+    assert.equal(socket.ops().length, 6);
+    socket.receive(chain("b", 1));
+    await subscribed;
     assert.equal(socket.ops().length, 8);
     socket.status(first, "ok");
     socket.status(second, "ok");
@@ -312,4 +436,79 @@ test("an op not placed is told once, and sent again on the backoff and on its zo
   } finally {
     mock.timers.reset();
   }
+});
+
+test("a refused subscribe resolves as an empty zone, and subscribeOutcome gives its reason", async () => {
+  const { client, socket } = await fakeClient("a");
+  const plain = client.subscribe("sh", "g");
+  socket.refuse("unknown_share", "no live claim");
+  await plain;
+  const outcome = client.subscribeOutcome("sh", "g");
+  socket.refuse("unknown_share", "no live claim");
+  assert.deepEqual(await outcome, { ok: false, heads: [], code: "unknown_share", message: "no live claim" });
+  assert.equal(client.fold("sh", "g", "value"), null);
+});
+
+test("the session's own ops count toward its replay once answered Ok", async () => {
+  // The node sends an op's status before a later subscribe's ack, and its gap
+  // leaves out what the session sent and the node holds (R4). Here the ack
+  // comes first, to show that the op counts only once it is answered.
+  const { client, socket } = await fakeClient("a");
+  const op = client.append("sh", "g", "value", utf8("x"));
+  let returned = false;
+  const subscribed = client.subscribe("sh", "g").then(() => {
+    returned = true;
+  });
+  socket.ack([["a", 0]]);
+  await turn();
+  assert.equal(returned, false);
+  socket.status(op, "ok");
+  await subscribed;
+  assert.equal(returned, true);
+});
+
+test("a frame the client cannot read fails every waiting subscribe, and goes to the console", async () => {
+  const { client, socket } = await fakeClient("a");
+  const replaying = client.subscribe("sh", "g");
+  socket.ack([["b", 0]]);
+  const unacked = client.subscribe("sh", "h");
+  const warn = mock.method(console, "warn", () => {});
+  try {
+    socket.raw(new Uint8Array([99, 0xff]));
+    assert.equal(warn.mock.callCount(), 1);
+  } finally {
+    warn.mock.restore();
+  }
+  await assert.rejects(replaying, /could not take/);
+  await assert.rejects(unacked, /could not take/);
+});
+
+test("an Ops frame the client cannot take fails its zone's replay, and no other", async () => {
+  const { client, socket } = await fakeClient("a");
+  const [theirs] = chain("b", 1);
+  const here = client.subscribe("sh", "g");
+  socket.ack([["b", 0]]);
+  const elsewhere = client.subscribe("sh", "h");
+  socket.ack([["b", 0]], "h");
+  const warn = mock.method(console, "warn", () => {});
+  try {
+    socket.receive([{ ...theirs, shape: "stream" }]);
+    assert.equal(warn.mock.callCount(), 1);
+  } finally {
+    warn.mock.restore();
+  }
+  await assert.rejects(here, /could not take/);
+  socket.receive([{ ...theirs, glade_id: "h" }]);
+  await elsewhere;
+});
+
+test("a replay a consumer throws on still counts as received", async () => {
+  const { client, socket } = await fakeClient("a");
+  client.onOps = () => {
+    throw new Error("the binder threw");
+  };
+  const subscribed = client.subscribe("sh", "g");
+  socket.ack([["b", 0]]);
+  assert.throws(() => socket.receive(chain("b", 1)), /the binder threw/);
+  await subscribed;
 });

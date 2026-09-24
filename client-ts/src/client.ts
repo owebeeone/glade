@@ -1,8 +1,9 @@
 // WS destination (P2.S4) — connects a Session to a glade node over a websocket
 // using Node's built-in WebSocket. Frames are `[FrameType tag][CBOR body]`
 // (the frozen wire). Inbound Ops fold into the session; Subscribe is acked by a
-// Heads frame, and each op sent is answered by an Error frame naming it by hash
-// (answers.ts). Carrier detail only — the convergence lives in the Session.
+// Heads frame, and returns once the zone's replay is in; each op sent is
+// answered by an Error frame naming it by hash (answers.ts). Carrier detail
+// only — the convergence lives in the Session.
 
 import { Session } from "./session.ts";
 import * as codec from "./taut/codec.ts";
@@ -10,12 +11,12 @@ import type { SchemaIndex } from "./taut/schema.ts";
 import { zoneKey, type Op } from "./store.ts";
 import { requireOpShape } from "./shapes.ts";
 import { decodeSwmrAction } from "./swmr.ts";
-import { Answers, type OpOutcome } from "./answers.ts";
+import { Answers, Replays, type OpOutcome, type SubscribeOutcome, type ZoneHeads } from "./answers.ts";
 import { hex } from "./bytes.ts";
 import { opHash } from "./hash.ts";
 
-// The node's answer to an op is part of the client API surface — re-export it.
-export type { OpOutcome } from "./answers.ts";
+// The node's answers are part of the client API surface — re-export them.
+export type { OpOutcome, SubscribeOutcome } from "./answers.ts";
 
 const TAG = {
   Hello: 0, Welcome: 1, Subscribe: 2, Unsubscribe: 3, Ops: 4, Heads: 5,
@@ -70,7 +71,6 @@ export class GladeClient {
   readonly session: Session;
   private schema: SchemaIndex;
   private ws: WebSocket | null = null;
-  private subAcks: Array<() => void> = [];
   private welcomeAcks: Array<() => void> = [];
 
   /** When set, inbound ops are handed here instead of applied to this client's
@@ -93,6 +93,8 @@ export class GladeClient {
   // The node answers every op this client sends (GladeSubstrateV1 §6, R1):
   // the ops wait here by hash, and refusals and unplaced ops are told.
   private answers = new Answers();
+  /** Subscribes, until each one's answer and replay are in (R5-R7). */
+  private replays = new Replays();
   private refusedListeners = new Set<(outcome: OpOutcome) => void>();
   private unplacedListeners = new Set<(outcome: OpOutcome) => void>();
   /** Each zone's next resend of its unplaced ops (W5). */
@@ -124,34 +126,61 @@ export class GladeClient {
 
   private onMessage(bytes: Uint8Array): void {
     const tag = bytes[0];
-    const value = codec.decode(this.schema, MSG_BY_TAG[tag], bytes.slice(1)) as Record<string, unknown>;
+    let value: Record<string, unknown>;
+    try {
+      value = codec.decode(this.schema, MSG_BY_TAG[tag], bytes.slice(1)) as Record<string, unknown>;
+    } catch (e) {
+      // It may have been an ack, so no waiting subscribe can be matched to
+      // its answer any more.
+      this.notTaken(e);
+      return;
+    }
     if (tag === TAG.Ops) {
       const ops = value.ops as Op[];
       // Reject the whole batch before session storage or consumer callbacks.
-      for (const op of ops) {
-        const shape = requireOpShape(op.shape, "receive");
-        if (shape === "swmr") decodeSwmrAction(op.payload);
+      try {
+        for (const op of ops) {
+          const shape = requireOpShape(op.shape, "receive");
+          if (shape === "swmr") {
+            decodeSwmrAction(op.payload);
+          }
+        }
+      } catch (e) {
+        this.notTaken(e, new Set(ops.map((op) => zoneKey(op.share, op.glade_id, op.key))));
+        return;
       }
       // The `onOps` field keeps its exact contract (grip-share owns folding
       // when set; else the session folds). Op listeners are an additive
       // fan-out for suppliers serving shares — byte-for-byte for the field.
-      if (this.onOps) this.onOps(ops);
-      else this.session.applyRemote(ops);
-      for (const h of [...this.opsListeners]) h(ops);
+      try {
+        if (this.onOps) {
+          this.onOps(ops);
+        } else {
+          this.session.applyRemote(ops);
+        }
+        for (const h of [...this.opsListeners]) {
+          h(ops);
+        }
+      } finally {
+        // What the connection received counts toward its zones' replays (R7),
+        // even if a consumer throws on it.
+        for (const op of ops) {
+          this.reach(op);
+        }
+      }
     } else if (tag === TAG.Heads) {
       // An accepted subscribe's ack names its zone, a refused one's none (R6).
-      // The zone's chain resumes after a refusal, and its unplaced ops go
-      // again (answer 4, W5): Step 3.4 moves both to the end of the replay.
-      for (const s of value.streams as Array<{ share: string; glade_id: string; key: Uint8Array }>) {
-        this.session.resume(s.share, s.glade_id, s.key);
-        this.resend(zoneKey(s.share, s.glade_id, s.key));
+      const streams = value.streams as ZoneHeads[];
+      if (this.replays.ack(streams)) {
+        this.caughtUp(streams[0].share, streams[0].glade_id, streams[0].key);
       }
-      this.subAcks.shift()?.();
     } else if (tag === TAG.Error) {
-      // An op's status names it by hash (R1). An Error with no corr is a
-      // refused subscribe's reason (R6), which Step 3.4 reads.
+      // An op's status names it by hash (R1); an Error with no corr is a
+      // refused subscribe's reason (R6).
       if (value.corr !== null) {
         this.onStatus(value.corr as string, value.code as string, value.message as string);
+      } else {
+        this.replays.reason(value.share as string, value.glade_id as string, value.code as string, value.message as string);
       }
     } else if (tag === TAG.Welcome) {
       this.welcomeAcks.shift()?.();
@@ -191,11 +220,22 @@ export class GladeClient {
     });
   }
 
-  /** Subscribe to a zone-surface (share, gladeId, key); resolves on the node's
-   *  Heads ack. An absent/empty key is the commons zone. */
-  subscribe(share: string, gladeId: string, key?: Uint8Array): Promise<void> {
-    return new Promise((resolve) => {
-      this.subAcks.push(resolve);
+  /** Subscribe to a zone-surface (share, gladeId, key); resolves once the
+   *  node's ack has come and the zone's replay is in (R7). A refused subscribe
+   *  resolves too, as an empty zone. It rejects when no socket is open, or if
+   *  the connection ends, or a frame cannot be taken, first. An absent/empty
+   *  key is the commons zone. */
+  async subscribe(share: string, gladeId: string, key?: Uint8Array): Promise<void> {
+    await this.subscribeOutcome(share, gladeId, key);
+  }
+
+  /** `subscribe`, resolving with the node's answer as data: the ack's heads,
+   *  with their hashes, once the replay is in (R5, R7), or the refusal and its
+   *  reason (R6). */
+  async subscribeOutcome(share: string, gladeId: string, key?: Uint8Array): Promise<SubscribeOutcome> {
+    this.requireOpen();
+    return new Promise((resolve, reject) => {
+      this.replays.sent(share, gladeId, key ?? new Uint8Array(), resolve, reject);
       this.send(frame(this.schema, TAG.Subscribe, "Subscribe", {
         share, glade_id: gladeId, key: key && key.length ? key : null, from: null,
       }));
@@ -340,6 +380,11 @@ export class GladeClient {
     if (!answered) {
       return;
     }
+    // An op sent on this connection and held counts toward its zone's replay,
+    // since the node's gap leaves it out (R4, R7).
+    if (code === "ok") {
+      this.reach(answered.outcome.op);
+    }
     if (answered.refused) {
       if (!this.onOps) {
         this.session.refuse(answered.outcome.op);
@@ -390,10 +435,35 @@ export class GladeClient {
     }
   }
 
-  /** The connection ended: its waiting ops' fates are unknown (R7), and no
-   *  resend runs until an ack on a new one (W5). */
+  /** An op this connection received, or sent and had answered Ok (R7). */
+  private reach(op: Op): void {
+    if (this.replays.reach(op)) {
+      this.caughtUp(op.share, op.glade_id, op.key);
+    }
+  }
+
+  /** A subscribe's replay is in (R7): its zone's refused chain resumes
+   *  (answer 4), and its unplaced ops go again (W5). */
+  private caughtUp(share: string, gladeId: string, key: Uint8Array): void {
+    this.session.resume(share, gladeId, key);
+    this.resend(zoneKey(share, gladeId, key));
+  }
+
+  /** A frame the client could not take goes to the console, and fails the
+   *  subscribes it may have answered: those of its zones, or, with none
+   *  known, every one waiting. */
+  private notTaken(e: unknown, zones?: Set<string>): void {
+    const why = `a frame the client could not take: ${e instanceof Error ? e.message : String(e)}`;
+    console.warn(`[glade] ${why}`);
+    this.replays.fail(why, zones);
+  }
+
+  /** The connection ended: its waiting ops' fates are unknown (R7), its
+   *  waiting subscribes fail, and no resend runs until a replay on a new one
+   *  (W5). */
   private ended(): void {
     this.answers.ended();
+    this.replays.ended();
     for (const t of this.resendTimers.values()) {
       clearTimeout(t);
     }
