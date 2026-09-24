@@ -637,6 +637,16 @@ unchanged.
 - **Gate:** as for 3.1.
 - **Size:** ~130 production lines, ~180 test lines.
 - **Depends on:** 3.1, which shares `dispatch`, and 2.2's binary.
+- **Done, 2026-09-25,** glade `e5fdcf3`: R5-R7 in client-rs. `subscribe_outcome` returns the
+  heads with their hashes, or the refusal and its reason; `subscribe` returns once the
+  replay is in, a refusal as an empty zone. A frame the session cannot take fails its
+  zones' waiting subscribes. A completed subscribe clears the unresumed mark and does W5's
+  resend. `supplier.rs` turns a refused subscribe into an error, so `serve_*` fails and a
+  reattach retries. Two older bugs fixed: a subscribe whose send failed left a waiter that
+  stole the next ack, and a subscribe pending at `close` never returned. client-rs 25 + 10
+  (was 18 + 6); grazel, glade-gwz and glade-gyld at baseline; clippy adds nothing. **Open
+  for the owner:** the node refusing `stream`-shaped client ops (`Protocol`); a subscribe's
+  wait against a node older than Phase 2, folded into 3.1's no-time-limit question.
 
 **Step 3.3 — client-ts: op outcomes**
 
