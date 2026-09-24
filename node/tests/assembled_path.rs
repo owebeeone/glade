@@ -7,6 +7,8 @@
 //!
 //! Each test sets or removes the variable on the node it spawns, so it reads
 //! the same whichever way the suite runs (the node gate runs it both ways).
+//! The last test starts each root on an instance written before plan Step
+//! 4.1a changed the node id.
 //! Every file goes under a fresh directory in the system temp dir, and the node
 //! runs with `GLADE_HOME` and `HOME` pointed there: `~/.glade` is never touched.
 
@@ -16,7 +18,16 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
+use glade_node::appdecl::{load, register, AppDecl};
 use glade_node::assembly::ASSEMBLED_ROOT_LINE;
+use glade_node::mesh::who_serves;
+use glade_node::registry::{BlobStore, Record, Registry, RegistryApi, StoreApi, HOME};
+use glade_node::store::Store;
+use glade_node::sysdata::{NodeRecord, ServeClaim};
+use glade_node::sysdir::{boot_at, now_ms};
+use glade_wire::cbor;
+use glade_wire::generated::Op;
+use sha2::{Digest, Sha256};
 
 const VARIABLE: &str = "GLADE_NODE_ASSEMBLED";
 
@@ -240,5 +251,109 @@ fn both_roots_boot_register_and_serve_alike() {
     assert_eq!(assembled[2], "registry ready (home served: true)");
     assert_eq!(assembled[3], "app x registered (+2 record(s), 0 unchanged)");
     assert_eq!(assembled[5], "workspace ws-x serving");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// What a node at `instance` wrote before plan Step 4.1a, under the id its key
+/// had then, `hex(sha256(node.key))`: its presence, `decl` registered, and
+/// `decl`'s workspace `ws-x` served at epoch 3 on a live lease, in records.json
+/// and in the served store. Returns that id and how many records it wrote.
+fn written_before_the_step(instance: &Path, decl: &AppDecl) -> (String, usize) {
+    drop(boot_at(instance.to_path_buf(), "local").unwrap());
+    let seed = std::fs::read(instance.join("node.key")).unwrap();
+    let old: String = Sha256::digest(&seed)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let claim = |share: &str, epoch| {
+        Record::Serve(ServeClaim {
+            node: old.clone(),
+            share: share.into(),
+            lease_expiry_ms: now_ms() + 60_000,
+            epoch,
+        })
+    };
+    let mut registry = Registry::new();
+    let presence = NodeRecord {
+        node_id: old.clone(),
+        operator: "local".into(),
+    };
+    registry.append(Record::Node(presence), &old).unwrap();
+    registry.append(claim(HOME, 1), &old).unwrap();
+    register(decl, &mut registry, &old).unwrap();
+    registry.append(claim("ws-x", 3), &old).unwrap();
+    let snapshot = registry.snapshot();
+    BlobStore::new(instance).save(&snapshot).unwrap();
+    let mut store = Store::open(instance.join("cache").join("store")).unwrap();
+    for bytes in &snapshot.records {
+        store.append(Op::from_cbor(&cbor::decode(bytes))).unwrap();
+    }
+    (old, snapshot.records.len())
+}
+
+/// Plan Step 4.1a, on each root: an instance a node wrote before the step,
+/// whose records.json and served store name it by its old id. The node
+/// starts, prints its new id and the records it set aside, registers the app
+/// again and serves the workspace. Afterwards records.json names only the new
+/// id, and `who_serves` answers it from records.json and from the served
+/// store, which holds `ws-x`'s claim at epoch 1. The old records are written
+/// through the node's own registry and store code, as its boot, registration
+/// and serving wrote them, and `node.key` by a boot of this build, the same
+/// 32 bytes either way. It does not run the old binary.
+#[test]
+fn both_roots_set_an_old_instance_aside_and_serve_under_the_new_id() {
+    let dir = scratch("transition");
+    let home = dir.join("glade-home");
+    let app = dir.join("x.glade");
+    let text = "glade-app v1\napp x\n\
+                binding x.one value share commons latest\n\
+                workspace ws-x notes\n";
+    std::fs::write(&app, text).unwrap();
+    let decl = load(&app).unwrap();
+    let app = app.display().to_string();
+    let expected = [
+        "instance",
+        "node",
+        "set",
+        "registry",
+        "app",
+        "peer",
+        "workspace",
+        "listening",
+    ];
+    for (root, name) in [(Root::HandWritten, "h"), (Root::Assembled, "a")] {
+        let instance = home.join("sys").join(name);
+        let (old, written) = written_before_the_step(&instance, &decl);
+        let args = ["--profile", "local", "--name", name, "--app", &app, "0"];
+        let (lines, stderr) = start_and_stop(&home, root, &args);
+        assert_eq!(kinds(&lines), expected, "{root:?}: {lines:?}, {stderr}");
+        let new = lines[1].strip_prefix("node ").unwrap().to_string();
+        assert_ne!(new, old);
+        let aside = format!("set aside {written} record(s) of old node id {old} in ");
+        assert!(lines[2].starts_with(&aside), "{root:?}: {}", lines[2]);
+        assert_eq!(lines[4], "app x registered (+2 record(s), 0 unchanged)");
+
+        let saved = BlobStore::new(&instance).load().unwrap();
+        let origins: Vec<String> = saved
+            .records
+            .iter()
+            .map(|bytes| Op::from_cbor(&cbor::decode(bytes)).origin)
+            .collect();
+        let only_new = origins.iter().all(|origin| *origin == new);
+        assert!(only_new, "{root:?}: {origins:?}");
+        let (registry, quarantined) = Registry::from_snapshot(&saved);
+        assert_eq!(quarantined, 0);
+        assert_eq!(registry.who_serves("ws-x", now_ms()), Some(new.clone()));
+        let store = Store::open(instance.join("cache").join("store")).unwrap();
+        assert_eq!(who_serves(&store, "ws-x", now_ms()), Some(new.clone()));
+        let epochs: Vec<i64> = store
+            .scan(HOME, "dir.claims", &[], &new, i64::MIN)
+            .iter()
+            .map(|op| ServeClaim::from_cbor(&cbor::decode(&op.payload)))
+            .filter(|claim| claim.share == "ws-x")
+            .map(|claim| claim.epoch)
+            .collect();
+        assert_eq!(epochs, [1], "{root:?}: ws-x's claims under the new id");
+    }
     std::fs::remove_dir_all(&dir).unwrap();
 }

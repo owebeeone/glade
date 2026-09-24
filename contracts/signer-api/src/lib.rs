@@ -10,7 +10,9 @@
 //! return `impl Future`, so they cannot be injected as `dyn`. One ed25519
 //! adapter may implement both and run both suites (plan Step 4.1).
 
-/// A node's identity: `sha256` of its node key, as `NodeIdentity::from_key` derives it.
+/// A node's identity: its node key's Ed25519 public key, the key being the
+/// 32-byte seed in `node.key`, as `NodeIdentity::from_key` derives it (plan
+/// Step 4.1a). A verifier needs no lookup: the id is the key.
 pub type NodeId = [u8; 32];
 
 /// What a signature is for. Each purpose is its own signing domain.

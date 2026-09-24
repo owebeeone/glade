@@ -14,7 +14,9 @@
 //! reads every `--app` file, then boots the system-data instance (GDL-036): acquires
 //! `~/.glade/sys/<name>/` (the profile picks the default name; `--name`
 //! overrides; `GLADE_HOME` overrides `$HOME/.glade`), runs the load-validation
-//! ladder, materialises the RegistryApi fold, and writes its own presence —
+//! ladder (the first boot after plan Step 4.1a also sets aside, once, the
+//! records naming the node by its key's old id, and prints `set aside …` after
+//! `node`), materialises the RegistryApi fold, and writes its own presence —
 //! the node serves itself from its own disk BEFORE any client connects (the
 //! s-boot trace). The registry then seeds the served store (the home share is
 //! an ORDINARY share, GDL-038), the iroh peer endpoint binds with the node's
@@ -146,6 +148,9 @@ async fn run() -> std::io::Result<()> {
         let mut node = boot(profile.unwrap_or(Profile::Local), name.as_deref(), operator.as_deref())?;
         println!("instance {}", node.dir.display());
         println!("node {}", node.node_id);
+        if let Some(aside) = &node.set_aside {
+            println!("{aside}");
+        }
         if node.rejected > 0 {
             println!("quarantined {} record(s) at load", node.rejected);
         }

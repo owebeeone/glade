@@ -47,6 +47,7 @@ use crate::mesh::{release_links, EndpointSlot};
 use crate::peer::NodeIdentity;
 use crate::registry::HOME;
 use crate::server::{accept_clients, Server, Shared};
+use crate::signing::NodeSigner;
 use crate::sysdir::{boot_at, instance_dir, Boot, Profile};
 use crate::tasks::{self, Inbox};
 
@@ -184,6 +185,9 @@ impl Instance {
             .console
             .out(&format!("instance {}", boot.dir.display()));
         start.console.out(&format!("node {}", boot.node_id));
+        if let Some(aside) = &boot.set_aside {
+            start.console.out(&aside.to_string());
+        }
         if boot.rejected > 0 {
             start
                 .console
@@ -318,11 +322,14 @@ struct SessionsServe {
 /// Plan Step 3.2's module, assembled over the acquired instance inside a
 /// step: registers each app file through the directory and returns the
 /// workspaces they declare. The module is dropped here; its record host
-/// answers `NotOpen` once `Storage` has adopted the instance.
+/// answers `NotOpen` once `Storage` has adopted the instance. Its signer holds
+/// the instance's key (plan Step 4.1a), none in the legacy form.
 fn assemble(start: &NodeStart, instance: &Instance) -> Result<Declared, Error> {
+    let identity = instance.booted.as_ref().map(|booted| booted.identity);
     let module = NodeAssembly::builder()
         .with_component_parameters::<CommandLine>(start.settings.clone())
         .with_component_parameters::<Records>(instance.slot.clone())
+        .with_component_parameters::<NodeSigner>(identity)
         .build();
     let config: Arc<dyn Config> = module.resolve();
     let directory: Arc<dyn Directory> = module.resolve();

@@ -247,6 +247,43 @@ impl Store {
             .filter_map(|((_, _, _, origin), log)| log.last().map(|o| (origin.clone(), o.seq)))
             .collect()
     }
+
+    /// Take `origin`'s chains on `share` out of the store, and rename their
+    /// journal to `<journal>.legacy-<date>`, which `open` never replays and no
+    /// later call replaces. Plan Step 4.1a sets a node's `home` records under
+    /// its old id aside so. Returns how many ops left the store.
+    pub fn set_aside(&mut self, share: &str, origin: &str, date: &str) -> std::io::Result<usize> {
+        let mut left = 0;
+        self.logs.retain(|(s, _, _, o), log| {
+            let aside = s == share && o == origin;
+            if aside {
+                left += log.len();
+            }
+            !aside
+        });
+        let (dir, name) = (self.root.join(hex(share)), format!("{}.log", hex(origin)));
+        if dir.join(&name).exists() {
+            let to = unused_path(&dir, &format!("{name}.legacy-{date}"), "");
+            fs::rename(dir.join(&name), to)?;
+        }
+        Ok(left)
+    }
+}
+
+/// The first of `<stem><ext>`, `<stem>-2<ext>`, `<stem>-3<ext>` and so on in
+/// `dir` that names nothing yet: a legacy file never replaces another.
+pub(crate) fn unused_path(dir: &Path, stem: &str, ext: &str) -> PathBuf {
+    let mut n = 1;
+    loop {
+        let path = match n {
+            1 => dir.join(format!("{stem}{ext}")),
+            _ => dir.join(format!("{stem}-{n}{ext}")),
+        };
+        if !path.exists() {
+            return path;
+        }
+        n += 1;
+    }
 }
 
 /// The append verdict for one op against its chain's current tail. Split out so

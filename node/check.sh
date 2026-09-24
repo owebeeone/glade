@@ -60,20 +60,27 @@ checker="$node_root/../../glade-discover/tools/architecture-check/Cargo.toml"
 # iroh may be seen only by glade-node, whose peer carrier it is, shaku only by
 # glade-node, whose assembly it is (plan Step 3.2, src/assembly.rs), and the
 # sdax family only by glade-node, whose lifecycle it is (plan Step 3.3,
-# src/lifecycle.rs; sdax-testkit as a dev-dependency). The contracts workspace
-# must never reach iroh, tokio, shaku or sdax.
+# src/lifecycle.rs; sdax-testkit as a dev-dependency). ed25519-dalek and
+# getrandom may be seen only by glade-node, whose signing module they serve
+# (plan Step 4.1a, src/signing.rs), so the ports stay algorithm-free. The
+# contracts workspace must never reach iroh, tokio, shaku, sdax, ed25519-dalek
+# or getrandom.
 confinement_allowlist='
-node       iroh          glade-node
-node       shaku         glade-node
-node       sdax          glade-node
-node       sdax-tokio    glade-node
-node       sdax-testkit  glade-node
-contracts  iroh          -
-contracts  tokio         -
-contracts  shaku         -
-contracts  sdax          -
-contracts  sdax-tokio    -
-contracts  sdax-testkit  -
+node       iroh           glade-node
+node       shaku          glade-node
+node       sdax           glade-node
+node       sdax-tokio     glade-node
+node       sdax-testkit   glade-node
+node       ed25519-dalek  glade-node
+node       getrandom      glade-node
+contracts  iroh           -
+contracts  tokio          -
+contracts  shaku          -
+contracts  sdax           -
+contracts  sdax-tokio     -
+contracts  sdax-testkit   -
+contracts  ed25519-dalek  -
+contracts  getrandom      -
 '
 # A real edge confinement must SEE: glade-node's peer carrier depends on iroh.
 # If this is not seen, the check is blind, not passing.
@@ -96,7 +103,7 @@ confinement_all_targets='node'
 # starts clean. A name here that is no longer in scope fails the component, as
 # a stale entry.
 style_dispositions='
-glade-node  gap:333  gap:11
+glade-node  gap:325  gap:11
 glade-wire  gap:43   gap:7
 '
 
@@ -688,10 +695,11 @@ dev-docs/LibraryBoundaryAndTestingPolicy.md:88-94 are the checklist:
                          glade/dev-docs/GladeNodeAssembly.md).
   4 behavioural          PERFORMED for the contracts' own suites (their check.sh),
     conformance          and by node-tests for the node's deterministic providers
-                         (tests/assembly: CL, CA, SI, GR) and the fail-closed half
-                         of the assembled path's grant fold and signer (GR-003,
-                         SI-003). NOT PERFORMED for any real adapter (LBT-009):
-                         none implements CarrierPort, GrantPort or SignerPort yet.
+                         (tests/assembly: CL, CA, SI, GR), the fail-closed half
+                         of the assembled path's grant fold (GR-003), and the
+                         Ed25519 signer, the one real adapter (SI-001..003).
+                         NOT PERFORMED for a real CarrierPort or GrantPort
+                         adapter (LBT-009): none exists yet.
   5 CI invocation        NOT PERFORMED. This is a local script: no CI job runs it
                          and no required merge check exists (a hosting setting).
 Also not checked: public boundary types and transitive type leakage (LBT-004,

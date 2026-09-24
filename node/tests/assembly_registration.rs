@@ -54,7 +54,7 @@ fn an_assembly_with_nothing_overridden_builds_its_real_providers_and_they_refuse
     let admission: Arc<dyn Admission> = node.resolve();
     assert_eq!(real_providers_constructed(), 6, "the pending grant fold");
     let signer: Arc<dyn Signer> = node.resolve();
-    assert_eq!(real_providers_constructed(), 7, "the pending node signer");
+    assert_eq!(real_providers_constructed(), 7, "the node signer");
 
     // One scope, one occurrence: resolving again builds nothing more.
     let _: Arc<dyn Directory> = node.resolve();
@@ -71,7 +71,7 @@ fn an_assembly_with_nothing_overridden_builds_its_real_providers_and_they_refuse
     let record = Record::Node(NodeRecord::default());
     assert!(matches!(host.append(record, "n1"), Err(HostError::NotOpen)));
 
-    // The pending providers fail closed.
+    // The pending providers fail closed, and so does the signer, lent no key.
     let peer: Arc<dyn CarrierPort> = sessions.peer();
     let config = CarrierConfig {
         local: CarrierAddr("127.0.0.1:0".into()),

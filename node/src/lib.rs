@@ -21,6 +21,7 @@ pub mod registry;
 pub mod router;
 pub mod server;
 pub mod session;
+pub mod signing;
 pub mod store;
 pub mod sysdata;
 pub mod sysdir;

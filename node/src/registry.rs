@@ -206,19 +206,19 @@ impl StoreApi for BlobStore {
 // so there the rename is not synced. Each platform's branch is one braced
 // module, so the condition encloses the whole section.
 #[cfg(unix)]
-mod entry_sync {
+pub(crate) mod entry_sync {
     use std::path::Path;
 
-    pub(super) fn sync(dir: &Path) -> std::io::Result<()> {
+    pub(crate) fn sync(dir: &Path) -> std::io::Result<()> {
         std::fs::File::open(dir)?.sync_all()
     }
 }
 
 #[cfg(not(unix))]
-mod entry_sync {
+pub(crate) mod entry_sync {
     use std::path::Path;
 
-    pub(super) fn sync(_dir: &Path) -> std::io::Result<()> {
+    pub(crate) fn sync(_dir: &Path) -> std::io::Result<()> {
         Ok(())
     }
 }

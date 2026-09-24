@@ -1,11 +1,12 @@
 //! LBT-009: every provider a `NodeAssembly` composition binds for a Step 3.1
 //! port runs that port's shared conformance suite, through each contract's
 //! `conformance` feature. The test composition's fakes run the whole suite.
-//! The assembled path's pending grant fold and signer run the fail-closed half
-//! (GR-003, SI-003), which is all a provider that refuses can pass; its
-//! system clock runs CL-002 (CL-001 needs a clock a test can set). No carrier
-//! on the assembled path implements `CarrierPort` yet, so CA-001..004 run on
-//! the fake network only.
+//! The assembled path's pending grant fold runs the fail-closed half
+//! (GR-003), which is all a provider that refuses can pass; its Ed25519
+//! signer (plan Step 4.1a) runs the whole of SI-001..003, SI-003 with no key
+//! lent; its system clock runs CL-002 (CL-001 needs a clock a test can set).
+//! No carrier on the assembled path implements `CarrierPort` yet, so
+//! CA-001..004 run on the fake network only.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -15,7 +16,9 @@ use glade_carrier_api::{CarrierAddr, CarrierPort};
 use glade_clock_api::conformance as clock;
 use glade_clock_api::ClockPort;
 use glade_grant_api::conformance as grant;
-use glade_node::assembly::{PendingGrantFold, PendingNodeSigner, SystemClock};
+use glade_node::assembly::{PendingGrantFold, SystemClock};
+use glade_node::peer::NodeIdentity;
+use glade_node::signing::NodeSigner;
 use glade_signer_api::conformance as signer;
 
 use crate::fakes::{run, FakeClock, FakeNet, KeyedTestSigner, MemGrants, OTHER, STRANGER};
@@ -90,9 +93,32 @@ fn si_003_the_keyed_test_signer_refuses_without_key_material() {
     signer::unavailable(&KeyedTestSigner::unavailable());
 }
 
+/// The Ed25519 signer over a key, as a booted node's assembly builds it.
+fn node_signer() -> NodeSigner {
+    NodeSigner::new(Some(NodeIdentity::from_key([11; 32])))
+}
+
 #[test]
-fn si_003_the_pending_node_signer_refuses_both_ways() {
-    signer::unavailable(&PendingNodeSigner);
+fn si_001_the_node_signer_round_trips_every_purpose() {
+    signer::round_trip(&node_signer());
+}
+
+/// On real keys: `other` is a node the signer has recorded as authenticated,
+/// `stranger` a genuine key it has not, so it resolves the one and not the
+/// other.
+#[test]
+fn si_002_the_node_signer_binds_bytes_purpose_and_signer() {
+    let port = node_signer();
+    let other = NodeIdentity::from_key([22; 32]).node_id;
+    let stranger = NodeIdentity::from_key([33; 32]).node_id;
+    port.authenticated(other);
+    signer::binding(&port, &other, &stranger);
+}
+
+/// With no key lent, as the legacy form builds it.
+#[test]
+fn si_003_the_node_signer_without_a_key_refuses_both_ways() {
+    signer::unavailable(&NodeSigner::new(None));
 }
 
 #[test]

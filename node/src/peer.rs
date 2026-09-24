@@ -6,29 +6,34 @@
 //!
 //!   1. **Framed IO** — a `u32`-length prefix around each `Frame` (the exact
 //!      framing the WS carrier uses, minus the websocket).
-//!   2. **HELLO seam** — peers exchange a node identity (`node_id =
-//!      sha256(node key)`, the stubbed-but-structure-real posture from
-//!      GladeSystemDataSeamNotes; ed25519 swaps in behind `verify_peer`). The
-//!      s-sync DIAL gate: operator chains "verify", but NOTHING downstream trusts
-//!      this — sync integrity is end-to-end from origin chains, never the carrier.
+//!   2. **HELLO seam** — peers exchange node identities, each signed for the
+//!      connection it rides (plan Step 4.1a): the node id is the node key's
+//!      Ed25519 public key, and the signature covers the TLS session, both
+//!      endpoint ids and the role. It proves who is on the link; sync integrity
+//!      still comes from the origin chains, never from the carrier.
 //!
 //! The heads/gap sync driver (per-(origin, zone) chains, verify-as-ingest,
 //! reject-suffix + re-fetch, equivocation proof) lives in the second half.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::io;
 
-use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+use glade_signer_api::{Purpose, SignatureStatus};
+use glade_wire::cbor::{self, Cbor};
 use glade_wire::generated::{Heads, NodeHello, NodeWelcome, Op, Ops, Priority};
 
 use crate::frame::Frame;
 use crate::session::missing_for;
+use crate::signing;
 use crate::store::{EquivProof, Store, StoreError};
 
-/// Wire protocol version spoken on the peer link.
-pub const PROTOCOL: i64 = 1;
+/// Wire protocol version spoken on the peer link: 2 from plan Step 4.1a, whose
+/// HELLO is signed. The carrier's ALPN names it too, so a node that speaks 1
+/// fails at connect.
+pub const PROTOCOL: i64 = 2;
 
 // ---- framed IO ------------------------------------------------------------
 
@@ -54,34 +59,86 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Frame> {
 
 // ---- node identity + HELLO seam ------------------------------------------
 
-/// A node's stubbed-but-structure-real identity: `node_id = sha256(key)`
-/// (GladeSystemDataSeamNotes). The `key` is a 32-byte node key — today an
-/// arbitrary seed (the iroh secret-key public bytes in the carrier); ed25519
-/// swaps in behind the same shape without a wire change.
-#[derive(Clone, Copy, Debug)]
+/// A node's identity (plan Step 4.1a; `GladeNodeSigning.md` D2): `node.key` is
+/// a 32-byte Ed25519 seed, and `node_id` is its public key, so a verifier
+/// needs no lookup. The seed never leaves this value: `Debug` prints the id.
+#[derive(Clone, Copy)]
 pub struct NodeIdentity {
-    pub key: [u8; 32],
+    seed: [u8; 32],
     pub node_id: [u8; 32],
 }
 
 impl NodeIdentity {
-    /// Derive the identity from a node key: `node_id = sha256(key)`.
-    pub fn from_key(key: [u8; 32]) -> Self {
-        NodeIdentity { key, node_id: Sha256::digest(key).into() }
+    /// The identity a 32-byte seed signs as: `node_id` is its public key.
+    pub fn from_key(seed: [u8; 32]) -> Self {
+        let node_id = signing::public_key(&seed);
+        NodeIdentity { seed, node_id }
     }
 
-    /// The origin/operator signature seam over the handshake. STUBBED: a
-    /// domain-separated digest, not a real signature — `verify_peer` accepts
-    /// unconditionally today. Real ed25519 over `node_id` drops in here.
-    fn stub_sig(&self) -> Vec<u8> {
-        let mut h = Sha256::new();
-        h.update(b"glade/peer/hello");
-        h.update(self.key);
-        h.finalize().to_vec()
+    /// A fresh identity from the operating system's randomness, for an
+    /// endpoint bound without an instance (`PeerEndpoint::bind`).
+    pub fn generate() -> io::Result<Self> {
+        signing::random_seed().map(NodeIdentity::from_key)
+    }
+
+    /// This node's signature on `message`, for `purpose`.
+    pub(crate) fn sign(&self, purpose: Purpose, message: &[u8]) -> Vec<u8> {
+        signing::sign(&self.seed, purpose, message).to_vec()
     }
 }
 
-/// The verified peer, as far as the (stubbed) seam vouches.
+impl fmt::Debug for NodeIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let id: String = self.node_id.iter().map(|b| format!("{b:02x}")).collect();
+        f.debug_struct("NodeIdentity")
+            .field("node_id", &id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The end of a connection a HELLO speaks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    Dialer,
+    Acceptor,
+}
+
+/// What both ends of one connection know without sending it (D6): the two
+/// iroh endpoint ids, and 32 bytes exported from the connection's TLS session
+/// (`iroh_carrier.rs`). Another connection has other bytes, so a HELLO signed
+/// for one does not verify on another. The in-memory tests fix one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Channel {
+    pub dialer: [u8; 32],
+    pub acceptor: [u8; 32],
+    pub exported: [u8; 32],
+}
+
+/// What a HELLO signs (D6), as canonical CBOR: `{1: protocol, 2: role,
+/// 3: node id, 4: dialer endpoint id, 5: acceptor endpoint id, 6: exported
+/// bytes}`, the role being `"dialer"` or `"acceptor"`.
+fn transcript(role: Role, node_id: &[u8; 32], channel: &Channel) -> Vec<u8> {
+    let role = match role {
+        Role::Dialer => "dialer",
+        Role::Acceptor => "acceptor",
+    };
+    cbor::encode(&Cbor::Map(vec![
+        (1, Cbor::Int(PROTOCOL)),
+        (2, Cbor::Text(role.into())),
+        (3, Cbor::Bytes(node_id.to_vec())),
+        (4, Cbor::Bytes(channel.dialer.to_vec())),
+        (5, Cbor::Bytes(channel.acceptor.to_vec())),
+        (6, Cbor::Bytes(channel.exported.to_vec())),
+    ]))
+}
+
+/// This node's signature on the HELLO it sends as `role` on `channel`.
+fn hello_sig(me: &NodeIdentity, role: Role, channel: &Channel) -> Option<Vec<u8>> {
+    Some(me.sign(Purpose::PeerHello, &transcript(role, &me.node_id, channel)))
+}
+
+/// The verified peer: a node that proved on this connection that it holds the
+/// key of the id it named.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PeerHello {
     pub peer_id: [u8; 32],
@@ -93,39 +150,92 @@ fn peer_id_of(node_id: &[u8]) -> io::Result<[u8; 32]> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "peer node_id not 32 bytes"))
 }
 
-/// The HELLO verification seam. STUBBED: structure is real (we parse the claimed
-/// node_id and carry the signature) but the check always accepts — matching the
-/// s-sync gate note that sync integrity never depends on this handshake.
-fn verify_peer(node_id: &[u8], _sig: &Option<Vec<u8>>) -> io::Result<PeerHello> {
-    Ok(PeerHello { peer_id: peer_id_of(node_id)? })
+/// Check the HELLO the other end sent as `role` on `channel` (D6): protocol 2,
+/// and a signature that verifies under the id it names for the transcript
+/// this end computes. The id is the key, so first contact needs no lookup.
+/// Anything else is refused (`PermissionDenied`).
+fn verify_peer(
+    node_id: &[u8],
+    protocol: i64,
+    sig: &Option<Vec<u8>>,
+    role: Role,
+    channel: &Channel,
+) -> io::Result<PeerHello> {
+    let peer_id = peer_id_of(node_id)?;
+    let refused = |why: String| {
+        let why = format!("HELLO refused: {why}");
+        io::Error::new(io::ErrorKind::PermissionDenied, why)
+    };
+    if protocol != PROTOCOL {
+        return Err(refused(format!("protocol {protocol}, not {PROTOCOL}")));
+    }
+    let Some(sig) = sig else {
+        return Err(refused("no signature".into()));
+    };
+    let transcript = transcript(role, &peer_id, channel);
+    match signing::verify(&peer_id, Purpose::PeerHello, &transcript, sig) {
+        SignatureStatus::Valid => Ok(PeerHello { peer_id }),
+        SignatureStatus::Invalid => Err(refused("its signature is not for this connection".into())),
+    }
 }
 
 /// Dialer side of the node<->node HELLO: send `NodeHello`, await `NodeWelcome`,
-/// return the (stubbed-)verified peer identity.
-pub async fn hello_dial<R, W>(r: &mut R, w: &mut W, me: &NodeIdentity) -> io::Result<PeerHello>
+/// and return the peer once its WELCOME verifies for `channel`.
+pub async fn hello_dial<R, W>(
+    r: &mut R,
+    w: &mut W,
+    me: &NodeIdentity,
+    channel: &Channel,
+) -> io::Result<PeerHello>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let hello = NodeHello { node_id: me.node_id.to_vec(), protocol: PROTOCOL, sig: Some(me.stub_sig()) };
+    let hello = NodeHello {
+        node_id: me.node_id.to_vec(),
+        protocol: PROTOCOL,
+        sig: hello_sig(me, Role::Dialer, channel),
+    };
     write_frame(w, &Frame::NodeHello(hello)).await?;
     match read_frame(r).await? {
-        Frame::NodeWelcome(nw) => verify_peer(&nw.node_id, &nw.sig),
-        other => Err(io::Error::new(io::ErrorKind::InvalidData, format!("expected NodeWelcome, got {other:?}"))),
+        Frame::NodeWelcome(nw) => {
+            verify_peer(&nw.node_id, nw.protocol, &nw.sig, Role::Acceptor, channel)
+        }
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("expected NodeWelcome, got {other:?}"),
+        )),
     }
 }
 
-/// Acceptor side: await `NodeHello`, reply `NodeWelcome`, return the peer.
-pub async fn hello_accept<R, W>(r: &mut R, w: &mut W, me: &NodeIdentity) -> io::Result<PeerHello>
+/// Acceptor side: await `NodeHello` and check it for `channel`; only then reply
+/// `NodeWelcome`. A refused HELLO gets no answer.
+pub async fn hello_accept<R, W>(
+    r: &mut R,
+    w: &mut W,
+    me: &NodeIdentity,
+    channel: &Channel,
+) -> io::Result<PeerHello>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     let peer = match read_frame(r).await? {
-        Frame::NodeHello(nh) => verify_peer(&nh.node_id, &nh.sig)?,
-        other => return Err(io::Error::new(io::ErrorKind::InvalidData, format!("expected NodeHello, got {other:?}"))),
+        Frame::NodeHello(nh) => {
+            verify_peer(&nh.node_id, nh.protocol, &nh.sig, Role::Dialer, channel)?
+        }
+        other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("expected NodeHello, got {other:?}"),
+            ))
+        }
     };
-    let welcome = NodeWelcome { node_id: me.node_id.to_vec(), protocol: PROTOCOL, sig: Some(me.stub_sig()) };
+    let welcome = NodeWelcome {
+        node_id: me.node_id.to_vec(),
+        protocol: PROTOCOL,
+        sig: hello_sig(me, Role::Acceptor, channel),
+    };
     write_frame(w, &Frame::NodeWelcome(welcome)).await?;
     Ok(peer)
 }
@@ -253,19 +363,32 @@ mod hello_tests {
     use super::*;
     use tokio::io::split;
 
-    /// node_id is sha256(key) — deterministic, and distinct keys give distinct ids.
-    #[test]
-    fn node_id_is_sha256_of_key() {
-        let a = NodeIdentity::from_key([1u8; 32]);
-        let b = NodeIdentity::from_key([1u8; 32]);
-        let c = NodeIdentity::from_key([2u8; 32]);
-        assert_eq!(a.node_id, b.node_id); // deterministic
-        assert_ne!(a.node_id, c.node_id); // key-bound
-        assert_eq!(a.node_id.to_vec(), sha2::Sha256::digest([1u8; 32]).to_vec());
+    fn hex32(hex: &str) -> [u8; 32] {
+        let byte = |at: usize| u8::from_str_radix(&hex[at..at + 2], 16).unwrap();
+        std::array::from_fn(|i| byte(2 * i))
     }
 
+    /// The id is the seed's Ed25519 public key (plan Step 4.1a, D2), checked
+    /// against RFC 8032 §7.1, TEST 1, whose secret key is a 32-byte seed as
+    /// `node.key` is. It proves the derivation, not how a key is stored.
+    #[test]
+    fn node_id_is_the_ed25519_public_key_of_the_seed() {
+        let seed = hex32("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60");
+        let public = hex32("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a");
+        assert_eq!(NodeIdentity::from_key(seed).node_id, public);
+    }
+
+    /// A fixed channel for the in-memory HELLOs: what the carrier reads from a
+    /// real connection (`iroh_carrier.rs` tests the real one).
+    const CHANNEL: Channel = Channel {
+        dialer: [1; 32],
+        acceptor: [2; 32],
+        exported: [3; 32],
+    };
+
     /// The DIAL gate over an in-memory duplex: dialer and acceptor complete the
-    /// HELLO and each learns the OTHER's node_id (not its own).
+    /// HELLO and each learns the OTHER's node_id (not its own). The genuine
+    /// case: accepted before plan Step 4.1a signed it, and after.
     #[tokio::test]
     async fn hello_handshake_exchanges_identities() {
         let dialer = NodeIdentity::from_key([7u8; 32]);
@@ -276,12 +399,136 @@ mod hello_tests {
         let (mut ar, mut aw) = split(a);
         let (mut br, mut bw) = split(b);
 
-        let acc = tokio::spawn(async move { hello_accept(&mut br, &mut bw, &acceptor).await });
-        let seen_by_dialer = hello_dial(&mut ar, &mut aw, &dialer).await.unwrap();
+        let acc =
+            tokio::spawn(async move { hello_accept(&mut br, &mut bw, &acceptor, &CHANNEL).await });
+        let dialed = hello_dial(&mut ar, &mut aw, &dialer, &CHANNEL).await;
+        let seen_by_dialer = dialed.unwrap();
         let seen_by_acceptor = acc.await.unwrap().unwrap();
 
-        assert_eq!(seen_by_dialer.peer_id, acceptor.node_id, "dialer learns acceptor id");
-        assert_eq!(seen_by_acceptor.peer_id, dialer.node_id, "acceptor learns dialer id");
+        assert_eq!(
+            seen_by_dialer.peer_id, acceptor.node_id,
+            "dialer learns acceptor id"
+        );
+        assert_eq!(
+            seen_by_acceptor.peer_id, dialer.node_id,
+            "acceptor learns dialer id"
+        );
+    }
+
+    /// The HELLO `me` sends as the dialer on `channel`.
+    fn hello_from(me: &NodeIdentity, channel: &Channel) -> NodeHello {
+        NodeHello {
+            node_id: me.node_id.to_vec(),
+            protocol: PROTOCOL,
+            sig: hello_sig(me, Role::Dialer, channel),
+        }
+    }
+
+    /// Present `hello` to an acceptor on `channel`: its verdict, and whether
+    /// it answered with a WELCOME.
+    async fn present(hello: NodeHello, channel: Channel) -> (io::Result<PeerHello>, bool) {
+        let acceptor = NodeIdentity::from_key([9u8; 32]);
+        let (a, b) = tokio::io::duplex(4096);
+        let (mut ar, mut aw) = split(a);
+        let (mut br, mut bw) = split(b);
+        let hello = Frame::NodeHello(hello);
+        write_frame(&mut aw, &hello).await.unwrap();
+        let verdict = hello_accept(&mut br, &mut bw, &acceptor, &channel).await;
+        drop((br, bw));
+        let answered = read_frame(&mut ar).await.is_ok();
+        (verdict, answered)
+    }
+
+    /// Plan Step 4.1a: a tampered HELLO is refused and gets no answer: a
+    /// flipped signature byte, another node's id under the signature, protocol
+    /// 1, and no signature. The untouched HELLO is accepted and answered. It
+    /// does not try every byte.
+    #[tokio::test]
+    async fn a_tampered_hello_is_refused() {
+        let dialer = NodeIdentity::from_key([7u8; 32]);
+        let genuine = hello_from(&dialer, &CHANNEL);
+        let mut flipped = genuine.clone();
+        if let Some(sig) = flipped.sig.as_mut() {
+            sig[10] ^= 1;
+        }
+        let mut renamed = genuine.clone();
+        renamed.node_id = NodeIdentity::from_key([8u8; 32]).node_id.to_vec();
+        let mut old = genuine.clone();
+        old.protocol = 1;
+        let mut unsigned = genuine.clone();
+        unsigned.sig = None;
+        let tampered = [
+            ("a flipped signature byte", flipped),
+            ("another node's id", renamed),
+            ("protocol 1", old),
+            ("no signature", unsigned),
+        ];
+        for (what, hello) in tampered {
+            let (verdict, answered) = present(hello, CHANNEL).await;
+            assert!(verdict.is_err(), "{what}: accepted");
+            assert!(!answered, "{what}: answered");
+        }
+        let (verdict, answered) = present(genuine, CHANNEL).await;
+        assert_eq!(verdict.unwrap().peer_id, dialer.node_id);
+        assert!(answered, "the genuine HELLO is answered");
+    }
+
+    /// Plan Step 4.1a: a HELLO recorded on one connection is refused on
+    /// another, where the exported bytes differ, or the endpoint ids do. The
+    /// real carrier's bytes differ per connection (`iroh_carrier.rs`).
+    #[tokio::test]
+    async fn a_hello_replayed_from_another_connection_is_refused() {
+        let dialer = NodeIdentity::from_key([7u8; 32]);
+        let recorded = hello_from(&dialer, &CHANNEL);
+        let another_session = Channel {
+            exported: [4; 32],
+            ..CHANNEL
+        };
+        let another_endpoint = Channel {
+            dialer: [5; 32],
+            ..CHANNEL
+        };
+        for channel in [another_session, another_endpoint] {
+            let (verdict, answered) = present(recorded.clone(), channel).await;
+            assert!(verdict.is_err(), "replayed onto {channel:?}: accepted");
+            assert!(!answered, "replayed onto {channel:?}: answered");
+        }
+    }
+
+    /// Plan Step 4.1a: a HELLO reflected with the roles swapped is refused. The
+    /// dialer's own HELLO, mirrored back as the WELCOME, is checked as the
+    /// acceptor's and fails; an acceptor's WELCOME, presented to it as a HELLO,
+    /// is checked as a dialer's and fails.
+    #[tokio::test]
+    async fn a_reflected_hello_is_refused() {
+        let dialer = NodeIdentity::from_key([7u8; 32]);
+        let (a, b) = tokio::io::duplex(4096);
+        let (mut ar, mut aw) = split(a);
+        let (mut br, mut bw) = split(b);
+        let mirror = tokio::spawn(async move {
+            let Frame::NodeHello(hello) = read_frame(&mut br).await.unwrap() else {
+                panic!("expected the dialer's HELLO");
+            };
+            let welcome = NodeWelcome {
+                node_id: hello.node_id,
+                protocol: hello.protocol,
+                sig: hello.sig,
+            };
+            write_frame(&mut bw, &Frame::NodeWelcome(welcome)).await.unwrap();
+        });
+        let verdict = hello_dial(&mut ar, &mut aw, &dialer, &CHANNEL).await;
+        mirror.await.unwrap();
+        assert!(verdict.is_err(), "the dialer took its own HELLO back");
+
+        let acceptor = NodeIdentity::from_key([9u8; 32]);
+        let reflected = NodeHello {
+            node_id: acceptor.node_id.to_vec(),
+            protocol: PROTOCOL,
+            sig: hello_sig(&acceptor, Role::Acceptor, &CHANNEL),
+        };
+        let (verdict, answered) = present(reflected, CHANNEL).await;
+        assert!(verdict.is_err(), "the acceptor took its own WELCOME back");
+        assert!(!answered);
     }
 }
 

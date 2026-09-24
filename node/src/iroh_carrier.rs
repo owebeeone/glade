@@ -7,9 +7,11 @@
 //! stream, and hands back a `PeerLink` whose framed streams the sync driver
 //! then speaks over — the SAME `Frame` bytes the websocket carries.
 //!
-//! The node key is the iroh secret key's public bytes, so the glade
-//! `node_id = sha256(iroh pubkey)` — the stubbed-but-structure-real identity
-//! (GladeSystemDataSeamNotes); swapping the seam for ed25519 needs no wire change.
+//! The iroh key is transport-only. The glade identity is the node key, whose
+//! Ed25519 public key is the node id (plan Step 4.1a), and each HELLO is signed
+//! for the connection it rides: this module reads both endpoint ids and 32
+//! bytes exported from the connection's TLS session, and hands them to
+//! `peer::hello_*` as the [`Channel`].
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -18,13 +20,32 @@ use iroh::endpoint::presets;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, EndpointId, TransportAddr};
 
-use crate::peer::{hello_accept, hello_dial, NodeIdentity, PeerHello};
+use crate::peer::{hello_accept, hello_dial, Channel, NodeIdentity, PeerHello};
 
-/// ALPN for the glade node<->node protocol (protocol 1).
-pub const ALPN: &[u8] = b"glade/node/1";
+/// ALPN for the glade node<->node protocol 2 (`peer::PROTOCOL`, plan Step
+/// 4.1a), whose HELLO is signed: a node of protocol 1 fails at connect, not
+/// mid-sync.
+pub const ALPN: &[u8] = b"glade/node/2";
 
 fn other<E: Into<Box<dyn std::error::Error + Send + Sync>>>(e: E) -> io::Error {
     io::Error::new(io::ErrorKind::Other, e)
+}
+
+/// The exporter label the HELLO's keying material is drawn under (RFC 8446
+/// §7.5), with no context.
+const HELLO_EXPORTER: &[u8] = b"glade/v1/peer-hello";
+
+/// What both ends of `conn` know without sending it: the endpoint ids, and 32
+/// bytes exported from its TLS session, the same at both ends.
+fn channel(conn: &Connection, dialer: EndpointId, acceptor: EndpointId) -> io::Result<Channel> {
+    let mut exported = [0u8; 32];
+    conn.export_keying_material(&mut exported, HELLO_EXPORTER, b"")
+        .map_err(|_| other("the TLS session exported no keying material"))?;
+    Ok(Channel {
+        dialer: *dialer.as_bytes(),
+        acceptor: *acceptor.as_bytes(),
+        exported,
+    })
 }
 
 /// The one endpoint recipe both constructors share: localhost, `presets::Minimal`
@@ -82,12 +103,12 @@ pub struct PeerEndpoint {
 }
 
 impl PeerEndpoint {
-    /// Bind a localhost QUIC endpoint (relay + discovery disabled). The glade
-    /// identity is derived from the iroh key: `node_id = sha256(iroh pubkey)`.
+    /// Bind a localhost QUIC endpoint (relay + discovery disabled) with a fresh
+    /// random glade identity, which dies with it: for tests, which boot no
+    /// instance. A booted node binds with its own ([`PeerEndpoint::bind_with`]).
     pub async fn bind() -> io::Result<PeerEndpoint> {
-        let endpoint = bind_endpoint().await?;
-        let key = *endpoint.secret_key().public().as_bytes();
-        Ok(PeerEndpoint { endpoint, identity: NodeIdentity::from_key(key) })
+        let identity = NodeIdentity::generate()?;
+        PeerEndpoint::bind_with(identity).await
     }
 
     /// Bind with an EXPLICIT glade identity (a booted node passes the identity
@@ -120,8 +141,9 @@ impl PeerEndpoint {
     pub async fn dial(&self, addr: &PeerAddr) -> io::Result<PeerLink> {
         let ea = EndpointAddr::from_parts(addr.endpoint_id, [TransportAddr::Ip(addr.socket)]);
         let conn = self.endpoint.connect(ea, ALPN).await.map_err(other)?;
+        let channel = channel(&conn, self.endpoint.id(), conn.remote_id())?;
         let (mut send, mut recv) = conn.open_bi().await.map_err(other)?;
-        let peer = hello_dial(&mut recv, &mut send, &self.identity).await?;
+        let peer = hello_dial(&mut recv, &mut send, &self.identity, &channel).await?;
         Ok(PeerLink { peer, conn, send, recv })
     }
 
@@ -130,8 +152,9 @@ impl PeerEndpoint {
     pub async fn accept(&self) -> io::Result<Option<PeerLink>> {
         let Some(incoming) = self.endpoint.accept().await else { return Ok(None) };
         let conn = incoming.accept().map_err(other)?.await.map_err(other)?;
+        let channel = channel(&conn, conn.remote_id(), self.endpoint.id())?;
         let (mut send, mut recv) = conn.accept_bi().await.map_err(other)?;
-        let peer = hello_accept(&mut recv, &mut send, &self.identity).await?;
+        let peer = hello_accept(&mut recv, &mut send, &self.identity, &channel).await?;
         Ok(Some(PeerLink { peer, conn, send, recv }))
     }
 
@@ -179,6 +202,67 @@ mod tests {
 
         let served = acc.await.unwrap().unwrap().unwrap();
         assert_eq!(served.peer.peer_id, dial_id, "acceptor learns dialer node_id over iroh");
+
+        // Plan Step 4.1a's premise: both ends of one connection export the
+        // same bytes, and a second connection between the same two endpoints
+        // exports other bytes, which is what refuses a replayed HELLO.
+        let acc_ep = acceptor.clone();
+        let again = tokio::spawn(async move { acc_ep.accept().await });
+        let second = dialer.dial(&acc_addr).await.unwrap();
+        let _served_again = again.await.unwrap().unwrap().unwrap();
+        let (me, it) = (dialer.endpoint.id(), acceptor.endpoint.id());
+        let at_dialer = channel(&link.conn, me, link.conn.remote_id()).unwrap();
+        let at_acceptor = channel(&served.conn, served.conn.remote_id(), it).unwrap();
+        let other = channel(&second.conn, me, second.conn.remote_id()).unwrap();
+        assert_eq!(at_dialer, at_acceptor, "one connection, one channel");
+        assert_ne!(
+            at_dialer.exported, other.exported,
+            "another connection, other bytes"
+        );
+    }
+
+    /// Plan Step 4.1a: the ALPN names protocol 2, so a node of protocol 1, an
+    /// endpoint offering only `glade/node/1`, fails at connect in either
+    /// direction, before any HELLO is sent.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_protocol_1_node_fails_at_connect() {
+        let bound = std::time::Duration::from_secs(10);
+        let v1: &[u8] = b"glade/node/1";
+        let old = Endpoint::builder(presets::Minimal)
+            .alpns(vec![v1.to_vec()])
+            .bind_addr((Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let old_accepts = old.clone();
+        tokio::spawn(async move {
+            while let Some(incoming) = old_accepts.accept().await {
+                if let Ok(connecting) = incoming.accept() {
+                    let _ = connecting.await;
+                }
+            }
+        });
+        let new = PeerEndpoint::bind().await.unwrap();
+        let new_accepts = new.clone();
+        tokio::spawn(async move { new_accepts.accept().await });
+
+        let at_new = new.addr().unwrap();
+        let ea = EndpointAddr::from_parts(at_new.endpoint_id, [TransportAddr::Ip(at_new.socket)]);
+        let dialed = tokio::time::timeout(bound, old.connect(ea, v1)).await;
+        let refused = dialed.expect("bounded").is_err();
+        assert!(refused, "a protocol-1 dialer connected");
+
+        let sockets = old.bound_sockets();
+        let port = sockets.iter().find(|s| s.is_ipv4()).unwrap().port();
+        let socket = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        let at_old = PeerAddr {
+            endpoint_id: old.id(),
+            socket,
+        };
+        let dialed = tokio::time::timeout(bound, new.dial(&at_old)).await;
+        let refused = dialed.expect("bounded").is_err();
+        assert!(refused, "it accepted a protocol-2 dialer");
     }
 
     /// Full s-sync over REAL iroh QUIC: the acceptor serves a store with a

@@ -14,7 +14,7 @@
 //! | `directory_host_binding` | [`RecordHost`] | [`RecordHostPort`] | [`Records`] |
 //! | `directory_profile_binding` | [`RecordProfile`] | [`RecordProfilePort`] | [`DirectoryRules`] |
 //! | grant | [`Grants`] | `GrantPort` | [`PendingGrantFold`] |
-//! | signer | [`Signer`] | `SignerPort` | [`PendingNodeSigner`] |
+//! | signer | [`Signer`] | `SignerPort` | [`NodeSigner`], Ed25519 (plan Step 4.1a) |
 //! | configuration | [`Config`] | [`ConfigPort`] | [`CommandLine`] |
 //!
 //! Every port is bridged by a facade declared here, `trait F: Port +
@@ -175,18 +175,18 @@ use glade_carrier_api::{
 };
 use glade_clock_api::ClockPort;
 use glade_grant_api::{Denial, GrantPort, Holder};
-use glade_signer_api::{
-    NodeId, Purpose, SignError, SignatureStatus, SignerPort, VerificationError,
-};
+use glade_signer_api::SignerPort;
 use glade_wire::generated::Op;
 use shaku::{module, Component, HasComponent, Module, ModuleBuildContext};
 
 use crate::appdecl::{register, AppDecl, Registered};
+use crate::peer::NodeIdentity;
 use crate::registry::{
     MemStore, Record, Registry, RegistryApi, RegistryError, StoreApi, G_BINDINGS,
     G_BINDING_RETRACTIONS, G_CLAIMS, G_GRANTS, G_NODES, G_PRINCIPALS, G_REVOCATIONS, G_SERVICES,
     G_WORKSPACES, HOME,
 };
+use crate::signing::NodeSigner;
 use crate::sysdir::{now_ms, Boot, Profile};
 
 /// The stderr line the assembled composition root prints before anything
@@ -202,8 +202,8 @@ static REAL_PROVIDERS: AtomicUsize = AtomicUsize::new(0);
 
 /// How many real providers `NodeAssembly` modules have constructed in this
 /// process: the system clock, the command line, the record host as the
-/// module builds it, and the four pending adapters. A test composition
-/// overrides each of them, so it adds nothing here (DI-E01).
+/// module builds it, the three pending adapters and the node signer. A test
+/// composition overrides each of them, so it adds nothing here (DI-E01).
 pub fn real_providers_constructed() -> usize {
     REAL_PROVIDERS.load(Ordering::SeqCst)
 }
@@ -754,38 +754,18 @@ impl<M: Module> Component<M> for PendingGrantFold {
     }
 }
 
-/// The signer binding's registration: no signing key is usable before plan
-/// Step 4.1 (ed25519), so signing and verifying are both `Unavailable`
-/// (SI-003), and the handle names no node: its id is all zeros.
-pub struct PendingNodeSigner;
-
-impl SignerPort for PendingNodeSigner {
-    fn node_id(&self) -> NodeId {
-        [0; 32]
-    }
-
-    fn sign(&self, _purpose: Purpose, _message: &[u8]) -> Result<Vec<u8>, SignError> {
-        Err(SignError::Unavailable)
-    }
-
-    fn verify(
-        &self,
-        _signer: &NodeId,
-        _purpose: Purpose,
-        _message: &[u8],
-        _signature: &[u8],
-    ) -> Result<SignatureStatus, VerificationError> {
-        Err(VerificationError::Unavailable)
-    }
-}
-
-impl<M: Module> Component<M> for PendingNodeSigner {
+/// The signer binding's registration: the Ed25519 signer over the node key
+/// (plan Step 4.1a, `signing.rs`), the key being the identity the composition
+/// root lends as this component's parameters. Lent none, as in the legacy
+/// form, it holds no key and refuses both ways (SI-003), and its id is all
+/// zeros. No consumer resolves it before plan Step 4.1b.
+impl<M: Module> Component<M> for NodeSigner {
     type Interface = dyn Signer;
-    type Parameters = ();
+    type Parameters = Option<NodeIdentity>;
 
-    fn build(_: &mut ModuleBuildContext<M>, _: ()) -> Box<dyn Signer> {
+    fn build(_: &mut ModuleBuildContext<M>, identity: Option<NodeIdentity>) -> Box<dyn Signer> {
         constructed();
-        Box::new(PendingNodeSigner)
+        Box::new(NodeSigner::new(identity))
     }
 }
 
@@ -930,7 +910,7 @@ module! {
             #[lazy] RoleSessions,
             #[lazy] PendingGrantFold,
             #[lazy] GrantAdmission,
-            #[lazy] PendingNodeSigner
+            #[lazy] NodeSigner
         ],
         providers = []
     }

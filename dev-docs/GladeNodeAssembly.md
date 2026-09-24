@@ -34,7 +34,7 @@ shaku::Interface` with `impl<T: Port + 'static> F for T {}` (`AsyncWitnessResult
 | `directory_host_binding` (`RecordHost`) | `RecordHostPort`, node-local | `Records` over the booted instance (its `Registry` and `BlobStore`), lent by the root | `Records` over the node's own `Registry` and `MemStore` (the in-memory store and registry) | `Directory` |
 | `directory_profile_binding` (`RecordProfile`) | `RecordProfilePort`, node-local | `DirectoryRules`: pure, the same in every composition | not overridden | `Records` |
 | grant (`Grants`) | `GrantPort`, `glade-grant-api` | `PendingGrantFold`: every check `Unavailable` (GR-003), `#[lazy]` | an in-memory fold, revocation wins (GR-001..003) | `Admission` |
-| signer (`Signer`) | `SignerPort`, `glade-signer-api` | `PendingNodeSigner`: sign and verify `Unavailable` (SI-003), `#[lazy]` | a keyed test signer, FNV over a per-node secret (SI-001..003) | none until 4.1 |
+| signer (`Signer`) | `SignerPort`, `glade-signer-api` | `NodeSigner` (plan Step 4.1a): Ed25519 over the booted instance's key, lent as its component parameters; lent none, sign and verify `Unavailable` (SI-003); `#[lazy]` | a keyed test signer, FNV over a per-node secret (SI-001..003) | none until 4.1b |
 | configuration (`Config`) | `ConfigPort`, node-local | `CommandLine`: the arguments the root parsed | fixed `Settings` | the root; 4.5's carriers |
 
 Roles are told apart by binding occurrence: `PeerCarrier` and `ClientCarrier` are
@@ -98,9 +98,9 @@ refuses; it never acquires one. The assembled root also prints one stderr line
 naming itself, so a test can tell the roots apart.
 
 Real now: the clock, the record host over the booted instance, the rules, the
-configuration. Phase 4 replaces the four `Pending*` stand-ins: 4.1 the signer
-(ed25519), 4.3 the grant fold with its serve-hop consult, 4.2 and 4.5 an iroh
-`CarrierPort` adapter (4.2 the remote-identity accessor and link tracking, 4.5
+configuration, and since 4.1a the signer (Ed25519). Phase 4 replaces the three
+remaining `Pending*` stand-ins: 4.3 the grant fold with its serve-hop consult,
+4.2 and 4.5 an iroh `CarrierPort` adapter (4.2 the remote-identity accessor and link tracking, 4.5
 the bind address CA-004's re-bind needs), and a WebSocket one; the mesh and the
 WS server then move onto the carrier bindings, and 4.4 makes the served store the
 record host. Step 3.3's sdax plan takes over the root's three acquisitions
@@ -118,8 +118,8 @@ the fake network loss and duplicates, the fake fold denied authority, and
   transports; moving each behind a binding is 3.4's and Phase 4's work, one
   consumer at a time, each with a failing test first.
 - No carrier adapter implements `CarrierPort`: CA-001..004 run on the fake only.
-  The pending grant fold and signer pass the fail-closed half of their suites
-  (GR-003, SI-003) and nothing more.
+  The pending grant fold passes the fail-closed half of its suite (GR-003)
+  and nothing more; the Ed25519 signer passes SI-001..003 (plan Step 4.1a).
 - The node-local ports have no shared conformance suite; the fake host is the
   node's own `Registry` over `MemStore`, so its fold is the real fold.
 - DI-E01's "no I/O" rests on construction (every I/O-capable provider
@@ -1774,3 +1774,321 @@ stalls in the served store.
 
 Production code grows by 136 lines net in `.rs` files, doc comments included,
 and by 3 in `Cargo.toml`.
+
+## Signing: the key, the id and HELLO (plan Step 4.1a)
+
+Design addition, 2026-09-24, written before the code against glade `1501a67`.
+The red runs and the measured figures were filled in afterwards. The spec is
+plan Step 4.1a and the owner's rulings on `glade/dev-docs/GladeNodeSigning.md`,
+every one as recommended: D1, D2, D3, D6, D7's HELLO tag, D11's 4.1a row, and
+D8 (a) where this step changes the id (its findings F5 and F6 apply). Not in
+this step: signed directory records, refusing unsigned ones and requiring
+`prev` (4.1b), the recovery key (4.1c), a stable endpoint key and the binding
+record (4.2).
+
+Nothing changes in the wire IR. The contracts change in one doc line, the
+`NodeId` doc of `signer-api`, which the ruling allows.
+
+### 1. The crate and the randomness (D1)
+
+- `ed25519-dalek = "=3.0.0"`, pinned exactly, default features (`fast`,
+  `zeroize`). The lockfile moves `ed25519-dalek` from `3.0.0-rc.0` to `3.0.0`
+  and `curve25519-dalek` from `5.0.0-rc.0` to `5.0.0`. iroh 1.2 accepts both,
+  no crate is added, and the move resolves offline. Every check is
+  `verify_strict`.
+- `getrandom = "=0.4.3"`, pinned exactly, no features, for the seed of a new
+  `node.key`. The lockfile holds 0.2.17 and 0.4.3. 0.4.3 is the one iroh's own
+  randomness comes from: `rand` 0.10's OS source, from which iroh draws a new
+  endpoint key at every start, so it already runs on every machine the node
+  runs on, dabeest included. 0.2.17 is in the lock only for `ring`. The pin
+  fixes iroh's copy too, as the dalek pin does.
+- `random_key` read `/dev/urandom`, which Windows has not got, so on dabeest
+  no node could make its key. It now calls `getrandom::fill`: `getrandom(2)`
+  on Linux, `getentropy` on macOS, `ProcessPrng` on Windows.
+- Both crates join the glade-node row of `glade/node/architecture-policy.json`,
+  which the checker holds to an exact match, and the gate's confinement
+  allowlist: `node ed25519-dalek glade-node` and `contracts ed25519-dalek -`,
+  and the same two rows for `getrandom`. The policy change is for the owner's
+  review, as shaku's and sdax's were.
+
+### 2. The key and the id (D2, D3)
+
+- `node.key` is kept. Its 32 bytes are the Ed25519 seed. A new key is 32 bytes
+  from `getrandom`, written 0600, as before.
+- The node id is the hex of the seed's Ed25519 public key.
+  `NodeIdentity::from_key` gives its raw 32 bytes, which HELLO carries. So a
+  verifier needs no lookup: the id is the key.
+- A `node.key` that is not 32 bytes refuses the boot (`InvalidData`) before
+  anything is written. Before, the boot wrote presence under a hash of it, and
+  the start failed later, at `Boot::identity`.
+- `NodeIdentity` keeps the seed private and prints only its id.
+- `PeerEndpoint::bind()`, which only tests call, takes a fresh random seed. It
+  used the iroh key's public bytes as the key, which anyone could now sign
+  with. A booted node passes its own identity to `bind_with`, as before.
+- `node.key` signs for the node (D3). Certification under an account root
+  stays a slice gap for 5.1.
+
+### 3. The signing domains (D7) and the adapter
+
+Every signature is pure Ed25519 over a purpose's tag followed by the message.
+The tags are ASCII and end in a zero byte, so no tag is a prefix of another.
+
+| Purpose | Tag | Used by |
+| --- | --- | --- |
+| `PeerHello` | `glade/v1/peer-hello\0` | HELLO (this step) |
+| `OriginOp` | `glade/v1/origin-op\0` | directory records (4.1b) |
+| `LocalOverlay` | `glade/v1/local-overlay\0` | the local overlay (4.1c) |
+
+A new module, `src/signing.rs`, holds the tags, `sign` and `verify`. `verify`
+takes the signer's id as its key, and answers `Valid` only when the id is a
+point, not of small order, and `verify_strict` accepts the signature over tag
+and message. Anything else is `Invalid`.
+
+`NodeSigner` is the `SignerPort` adapter, in the same module:
+
+- `node_id` is the key's id. `sign` signs for the purpose.
+- `verify` is `Err(Unavailable)` when the adapter holds no key, and when the
+  signer is neither this node nor a node recorded as authenticated. That is
+  SI-002's rule: an unknown key is not proof of invalidity. Otherwise it is the
+  strict check.
+- It replaces `PendingNodeSigner` in `NodeAssembly`, `#[lazy]` as before. The
+  booted identity is its component parameter. With none, as in the legacy form
+  or `NodeAssembly::builder().build()`, it holds no key and refuses both ways,
+  as the pending signer did.
+- No consumer resolves it before 4.1b. 4.1b also records the nodes that HELLO
+  authenticates.
+
+HELLO does not go through the port. The carrier signs with `NodeIdentity` and
+checks with `signing::verify`, taking the claimed id as the key: first contact
+needs no lookup (D2).
+
+### 4. HELLO (D6)
+
+- **The channel.** Where `dial` and `accept` hold the connection, the carrier
+  reads what both ends know without sending it: the dialer's and the
+  acceptor's iroh endpoint ids, and 32 bytes exported from the connection's
+  TLS session (`Connection::export_keying_material`, label
+  `glade/v1/peer-hello`, no context). Both ends compute the same bytes, and
+  another connection gets other bytes. The in-memory tests pass a fixed
+  channel.
+- **The transcript** is canonical CBOR: `{1: protocol, 2: role, 3: node id,
+  4: dialer endpoint id, 5: acceptor endpoint id, 6: exported bytes}`, the role
+  being `"dialer"` or `"acceptor"`. It is signed under the `PeerHello` tag.
+- `NodeHello` and `NodeWelcome` keep their three fields, and `sig` carries the
+  64-byte signature. No wire-IR change.
+- **The checks.** The acceptor checks the dialer's HELLO before it answers,
+  and the dialer checks the WELCOME. A HELLO is refused when its protocol is
+  not 2, when it has no signature, or when the signature does not verify for
+  the transcript this end computes for the other role. A refused HELLO gets no
+  answer, and the link is dropped. The accept loop goes on to the next
+  connection. A `--peer` dial that fails prints `peer <target>: …`, with
+  `HELLO refused: …` when the dialer refused the WELCOME, and a closed stream
+  when the acceptor refused the HELLO.
+- **The ALPN** becomes `glade/node/2` and `PROTOCOL` 2, so a node of
+  protocol 1 and one of protocol 2 fail at connect, not mid-sync.
+
+What a completed HELLO shows: the peer holds the key of the id it named, and
+signed for this TLS session, between these two endpoints, in its role. A
+recorded HELLO does not verify on another connection, whose exported bytes
+differ. A HELLO reflected back with the roles swapped does not verify, because
+the role differs. A relay through a third party does not verify: that is two
+sessions, with two sets of bytes and endpoint ids. What it does not show: that
+the id is bound to the iroh endpoint key by a record, or that the peer is one
+the operator configured. Any key that proves itself is admitted, until 4.2.
+
+### 5. Existing instances (D8 (a), for the id change)
+
+Today's records name `hex(sha256(node.key))`. After this step the same key's
+id is its public key.
+
+**records.json.** At boot, once the key is loaded, every record in records.json
+whose origin is the old id is written, byte for byte, to a new
+`records.legacy-<date>.json` beside it: the date is UTC, and the file is a
+`SystemSnapshot` of those records, with no heads. It is created new and synced,
+and never overwritten: if the name is taken, `-2`, `-3` and so on are added.
+Then records.json is saved without them. They are never folded. Records of
+other origins stay, as before. The boot prints one line after `node`:
+`set aside N record(s) of old node id <old> in records.legacy-<date>.json`.
+A crash between the two writes repeats the set-aside at the next boot, into a
+second file, so nothing is lost.
+
+The node then re-mints as on a first boot: its presence (the `NodeRecord` and
+the home claim), its registrations (the fold is empty, so every declaration
+appends again), its claims as it serves, and principals as sessions say Hello.
+
+**The served store.** Its `home` share holds the same records under the old id,
+in one journal per origin: `cache/store/<hex(home)>/<hex(old id)>.log`. D8
+gives this half to 4.1b. Left in place, those copies would:
+
+- not break subscribe routing. `serve_workspace` fences over the old claims
+  (epoch = old maximum + 1), and no client is admitted before the node's own
+  claims are minted;
+- put `declared_exchange` on two clocks for the binding family: the old id's,
+  frozen, and the new one's, starting again at 0. The fold orders by lamport,
+  so an old declaration or retraction outranks a newer record for the same
+  binding under the new id, and a changed exchange binding would route by the
+  old line. That breaks routing for a single node. It would not bite the
+  desk's files today: they declare their exchanges as `service` lines, which
+  any origin satisfies;
+- stop the principal re-mint. `note_principal` finds the old copies and mints
+  nothing, so records.json never holds the principals under the new id.
+
+So this step handles the store half minimally. When the server adopts the
+instance, before it seeds the registry, the old id's `home` journal is renamed
+to `<name>.log.legacy-<date>`, which `Store::open` never replays, and its
+chains leave the in-memory store. Every other share, the app data, is
+untouched. The check runs at every adoption, so a crash between boot and
+adoption is repaired at the next start.
+
+**What the desk sees at its first restart on this binary.** grazel forwards
+the node's lines. `node` names a new id. A `set aside` line names the old id
+and the legacy file. Each app registers again: grazel `+11 record(s), 0
+unchanged` and gyld `+10 record(s), 1 unchanged` (the `ws-razel` entry both
+files declare), where a restart printed `+0`. `ws-razel` is served under the
+new id with claim epoch 1, where the old id's had reached one per earlier
+restart. When a tab says Hello again, each principal it presents is minted
+under the new id. The app data (chat,
+terminal logs, gyld output) is untouched, and no shipped client reads `home`,
+so the UI works as before. The old records stay on disk, in the legacy file
+and the renamed journal.
+
+### 6. Tests, each begun red
+
+Each was run first against the code without its change; the message is what
+that run printed.
+
+| Test | Proves | Red first |
+| --- | --- | --- |
+| `peer`: `node_id_is_the_ed25519_public_key_of_the_seed` | the id is RFC 8032 §7.1 TEST 1's public key for its seed | on the old derivation: `left` was `sha256(seed)`, `right` the RFC key |
+| `peer`: `hello_handshake_exchanges_identities` | a genuine HELLO is accepted both ways (the existing test, with a channel) | none: it passed before and after |
+| `peer`: `a_tampered_hello_is_refused` | a flipped signature byte, another node's id under the signature, protocol 1 and no signature are each refused, with no WELCOME sent; the untouched HELLO is answered | with the old accept-anything check: "a flipped signature byte: accepted" |
+| `peer`: `a_hello_replayed_from_another_connection_is_refused` | a HELLO recorded on one channel is refused on another session, and on another endpoint | "replayed onto Channel { … exported: [4, …] }: accepted" |
+| `peer`: `a_reflected_hello_is_refused` | a dialer's HELLO mirrored back as the WELCOME, and an acceptor's WELCOME presented to it as a HELLO, are refused | "the dialer took its own HELLO back" |
+| `signing`: `a_signature_is_pure_ed25519_over_the_tag_then_the_message` | a plain `verify_strict` over tag then message accepts the signature, and over the bare message does not | against a signer that signed the bare message: the tagged check failed |
+| `signing`: `a_small_order_id_signs_nothing` | the identity-point id with R the identity and S zero, which the lax check accepts, is `Invalid` | against a lax `verify`: `left: Valid`, `right: Invalid` |
+| `iroh_carrier`: `dial_and_hello_over_iroh`, extended | over real QUIC both ends export the same bytes, and a second connection exports other bytes | none: it checks iroh, the premise of the replay refusal |
+| `iroh_carrier`: `a_protocol_1_node_fails_at_connect` | an endpoint offering only `glade/node/1` fails at connect, dialing or dialed | with the ALPN at 1: "a protocol-1 dialer connected" |
+| `tests/assembly`: SI-001, SI-002, SI-003 on `NodeSigner` | the adapter passes the port's suite; SI-002 on real keys, `other` recorded as authenticated | SI-001 and SI-002 on the provider the module bound before, `PendingNodeSigner`: "SI-001 signing: Unavailable", "SI-002 signing: Unavailable" |
+| `sysdir`: `a_node_key_that_is_not_32_bytes_refuses_the_boot` | a 31-byte key refuses the boot (`InvalidData`), and nothing is written | on the old boot: "called `Result::unwrap_err()` on an `Ok` value" |
+| `sysdir`: `a_first_boot_on_the_new_id_sets_the_old_records_aside_once` | the old id's records go, byte for byte, to a new file beside an older one it does not overwrite; another origin's record stays; one node for the operator; a second boot sets nothing aside | with the set-aside stubbed: "the old records are set aside" |
+| `sysdir`: `dates_are_utc_calendar_dates` | the file's date across a leap day, a day boundary and 1969 | against a stub: `left: ""` |
+| `claims`: `adoption_sets_the_old_ids_home_records_aside` | the dropped exchange binding stops routing, `alice` is minted again under the new id, `ws-x` is claimed at epoch 1, `who_serves` answers the new id from both stores, app data stays | without the adoption's set-aside: "the dropped binding routes no exchange". With its checks turned into prints, that run showed `x.gone` still routable, `alice` not minted, the new claim at epoch 4, fenced over the old 3, both ids' claim chains, and `who_serves` already answering the new id |
+| `tests/assembled_path`: `both_roots_set_an_old_instance_aside_and_serve_under_the_new_id` | on each root: the new id, one `set aside` line, `+2 record(s), 0 unchanged`, records.json naming only the new id, `who_serves` the new id from records.json and the served store, `ws-x`'s claim at epoch 1 | with both halves of the set-aside stubbed out, the id change alone: no `set` line, and `app x registered (+1 record(s), 1 unchanged)`, the binding left under the old id |
+
+What they do not prove: that another language's Ed25519 agrees with the tags
+(the `proof_family` corpus has no vectors yet); a crash between the legacy
+file and records.json; the Windows or Linux runs, which the lane owner makes
+on dabeest and the Pi; the old binary itself, which the rehearsal below runs.
+
+### Named gaps
+
+- A peer that holds this node's old records, or its own, serves them at the
+  next pull, and the served store takes them unchecked until 4.1b refuses
+  unsigned records. No two nodes have linked yet: 4.5's machines ran the
+  suites only.
+- HELLO admits any key that proves itself (4.2's binding record and refusal at
+  accept).
+- The iroh endpoint key is new at every start (F1; 4.2).
+- No consumer resolves the `SignerPort` adapter yet (4.1b).
+- The legacy files are never read and never pruned.
+- Off Unix, `node.key` gets default permissions and no check (F5, unchanged).
+
+### Default-path changes
+
+1. The node id changes once, for every instance: `node` prints the hex of the
+   key's public key.
+2. The first boot on this binary sets the node's old-id records aside, prints
+   one `set aside` line after `node`, and rewrites records.json without them.
+   The legacy file is about the size of today's records.json, which on the
+   desk holds every renewal (F4); records.json starts small again.
+3. Adoption renames the served store's old-id `home` journal aside.
+4. That boot registers every app again (`+N record(s)`), and the first claim of
+   each served workspace is epoch 1.
+5. HELLO is signed and checked, on ALPN `glade/node/2`: a node of this build
+   and one of an older build cannot link.
+6. A new `node.key` comes from `getrandom`, not `/dev/urandom`; a `node.key`
+   that is not 32 bytes refuses the boot before anything is written.
+
+### Questions for the owner
+
+1. **The served store's half of D8, done here.** D8 gave it to 4.1b; this step
+   did it minimally, one journal renamed, because leaving it breaks exchange
+   routing for a single node once a binding changes, and stops the principal
+   re-mint. Recommend keeping it. The other choice is to leave it for 4.1b and
+   accept both effects until then.
+2. **The policy entry.** `ed25519-dalek =3.0.0` and `getrandom =0.4.3` join
+   glade-node's row. Recommend accepting both, as shaku and sdax were.
+3. **Which `getrandom`.** Recommend 0.4.3, as built: iroh's own randomness
+   already runs on it on every machine. 0.2.17 is in the lock only for `ring`.
+4. **A refused dialer learns nothing.** An acceptor that refuses a HELLO
+   closes the stream without a reason. Recommend keeping it so: an
+   unauthenticated peer gets no hint, and 4.2's refusal at accept is the
+   place to report one locally.
+5. **The legacy files are never read or pruned.** Recommend keeping them,
+   under B5's "kept as history but never govern", and pruning by hand once
+   4.1b has run; 4.1b's own set-aside writes a second file beside them.
+
+### Measured
+
+2026-09-24, Apple M3 Pro, Rust 1.96.0, on the final tree:
+
+- **The gate** (`glade/node/check.sh`) passes all 8 components. There are 226
+  node tests on each path across 15 test binaries, 213 before: 10 in the
+  library, 2 net in `tests/assembly` (three SI tests replace the pending
+  signer's one) and 1 in `tests/assembled_path`. Confinement sees
+  `ed25519-dalek` and `getrandom` from glade-node only, and neither from the
+  contracts. `glade/contracts/check.sh` also passes on its own.
+- **rustfmt**: glade-node has 325 hunks, 8 below the old baseline of 333, and
+  none in a line this step wrote. The 8 went from code it rewrote: HELLO and
+  its test in `peer.rs` (5), `Boot::identity` and the boot's return in
+  `sysdir.rs` (2), and `PeerEndpoint::bind` (1). The baseline is lowered to
+  325 in `check.sh`, as Steps 4.4 and the hardening lowered it. glade-wire
+  stays at 43.
+- **clippy**: glade-node 11 warnings and glade-wire 7, at the same sites as
+  before; one moved four lines down in `iroh_carrier.rs`.
+- **The lockfile**: `cargo update --offline --workspace` in `glade/node`, after
+  a `--dry-run`. `ed25519-dalek` 3.0.0-rc.0 → 3.0.0 and `curve25519-dalek`
+  5.0.0-rc.0 → 5.0.0; glade-node lists its two new dependencies; and
+  `crypto-common` 0.2.2 and `signature` 3.0.0 each gain an edge to the
+  `rand_core` 0.10.1 already in the lock, which the stable releases' features
+  forward to. 379 packages before and after: none added or removed.
+- **The branches not compiled here**: the whole node cannot be checked for
+  MSVC on this machine, because `ring`'s build script needs the MSVC
+  toolchain. So `signing.rs` and `registry.rs`'s two `entry_sync` modules,
+  verbatim, with the set-aside's std calls, were checked in a scratch crate on
+  the pinned crates: `cargo check` passes with no warning for
+  x86_64-pc-windows-msvc, x86_64-pc-windows-gnu, x86_64-unknown-linux-gnu and
+  aarch64-apple-darwin.
+- **Time**: the 14 HELLO, signing, set-aside, date, adoption and carrier lib
+  tests take 0.07-0.10 s together, SI-001..003 under 0.02 s, and the two-root
+  transition test 1.3-2.1 s (it starts two nodes), over three warm runs each.
+- **The rehearsal.** HEAD's binary (`1501a67`, built to a scratch path) ran
+  twice on a scratch instance with the desk's two app files, `--name grazel`,
+  as grazel starts it. It printed `node 76b2fa…` and, the second time,
+  `+0 record(s), 11 unchanged` for each app. Then this build, on that
+  instance:
+
+  ```text
+  node 5d8c6089…
+  set aside 27 record(s) of old node id 76b2fa… in records.legacy-2026-09-24.json
+  registry ready (home served: true)
+  app grazel registered (+11 record(s), 0 unchanged)
+  app gyld registered (+10 record(s), 1 unchanged)
+  workspace ws-razel serving
+  ```
+
+  The old `home` journal became `<hex(old id)>.log.legacy-2026-09-24` beside
+  the new id's, and `node.key` was untouched. A second start set nothing
+  aside and printed `+0 record(s), 11 unchanged` for each app.
+- **Downstream**, against the rebuilt default binary
+  (`glade/node/target/debug/glade-node`), each suite with a scratch target:
+  grazel 26 + 3, glade-gwz 9 + 5, glade-gyld 233 (1 ignored) + 31. All at
+  baseline.
+
+**Size**, in lines added and removed in `.rs` files, doc comments included:
+production +568/−158 (net +410): `signing.rs` +138, `peer.rs` +160/−50,
+`sysdir.rs` +152/−51, `iroh_carrier.rs` +36/−13, `store.rs` +37,
+`assembly.rs` +17/−37, `claims.rs` +9/−1, the roots +14/−2, `registry.rs`
++4/−4, `lib.rs` +1. Tests +586/−24. Beside them `Cargo.toml` +8, the policy
++3/−1, and `check.sh`'s rows, text and ratchet.
+

@@ -38,7 +38,7 @@ use crate::registry::{Record, Registry, RegistryApi, G_CLAIMS, G_PRINCIPALS, HOM
 use crate::server::{Server, Shared};
 use crate::store::Store;
 use crate::sysdata::{PrincipalRecord, ServeClaim, WorkspaceCreateReq, WorkspaceCreateRes, WorkspaceEntry};
-use crate::sysdir::{now_ms, Boot};
+use crate::sysdir::{now_ms, today, Boot};
 use crate::tasks::Site;
 
 /// Default serve-lease TTL — matches the 30s the traces and tests use.
@@ -112,7 +112,15 @@ impl Server {
     /// and spawn the lease-renewal loop. `lease_ms`/`renew_ms` tune the claim
     /// TTL and renewal cadence (tests shorten them to observe renewal live).
     /// Returns how many ops the seed newly appended. Call once, before serving.
+    ///
+    /// First, plan Step 4.1a: the replica's copies of this node's `home`
+    /// records under its old id are set aside, as boot set records.json's
+    /// aside, so the replica folds one id for this node, as the registry does.
     pub async fn adopt_boot_tuned(&self, boot: Boot, lease_ms: i64, renew_ms: u64) -> io::Result<usize> {
+        {
+            let mut store = self.shared.store.lock().await;
+            store.set_aside(HOME, &boot.legacy_id(), &today())?;
+        }
         let seeded = self.seed_registry(&boot.registry.snapshot()).await;
         let state = DirState {
             node_id: boot.node_id.clone(),
@@ -549,6 +557,98 @@ mod tests {
         renew_leases(&shared).await;
         let (served, saved) = claims_chain(&shared, &sys).await;
         assert_eq!(served, saved, "and does after the next renewal");
+    }
+
+    /// Plan Step 4.1a: an instance whose records.json and served store hold
+    /// its `home` records under its old id, `hex(sha256(node.key))`, as the
+    /// node wrote them before the step (written here through the same
+    /// registry and store code): an exchange binding its app file has since
+    /// dropped, the principal `alice`, and a live claim on `ws-x` at epoch 3,
+    /// beside a client's app data on `ws-x`. Adoption sets the old id's `home`
+    /// journal aside, so the served store folds the new id's records only:
+    /// the dropped binding routes no exchange, `alice` is minted again under
+    /// the new id, `ws-x` is claimed at epoch 1, and `who_serves` answers the
+    /// new id from the served store and from the registry. The app data
+    /// stays. It does not reach a peer, which can serve the old records back
+    /// until plan Step 4.1b refuses unsigned ones.
+    #[tokio::test]
+    async fn adoption_sets_the_old_ids_home_records_aside() {
+        use crate::registry::StoreApi;
+        let (sys, at) = (fresh("legacy-sys"), fresh("legacy-store"));
+        let old = boot_at(sys.clone(), "gianni").unwrap().legacy_id();
+        let mut before = Registry::new();
+        let dropped = crate::sysdata::BindingDecl {
+            app: "x".into(),
+            glade_id: "x.gone".into(),
+            shape: "exchange".into(),
+            authority: "share".into(),
+            zone: "commons".into(),
+            retention: "latest".into(),
+        };
+        before.append(Record::Binding(dropped), &old).unwrap();
+        let alice = PrincipalRecord {
+            principal: "alice".into(),
+        };
+        before.append(Record::Principal(alice), &old).unwrap();
+        let live = ServeClaim {
+            node: old.clone(),
+            share: "ws-x".into(),
+            lease_expiry_ms: now_ms() + 60_000,
+            epoch: 3,
+        };
+        before.append(Record::Serve(live), &old).unwrap();
+        crate::registry::BlobStore::new(&sys)
+            .save(&before.snapshot())
+            .unwrap();
+        let mut served = Store::open(&at).unwrap();
+        for bytes in &before.snapshot().records {
+            served.append(Op::from_cbor(&cbor::decode(bytes))).unwrap();
+        }
+        let note = Op {
+            share: "ws-x".into(),
+            glade_id: "notes".into(),
+            origin: "client".into(),
+            payload: b"kept".to_vec(),
+            ..Op::default()
+        };
+        served.append(note).unwrap();
+        drop(served);
+
+        let boot = boot_at(sys, "gianni").unwrap();
+        let new = boot.node_id.clone();
+        let server = Server::open(&at).unwrap();
+        let adopted = server.adopt_boot_tuned(boot, LEASE_TTL_MS, 3_600_000);
+        adopted.await.unwrap();
+        let shared = server.shared.clone();
+        assert!(serve_workspace_on(&shared, "ws-x", "x").await.unwrap());
+        note_principal(&shared, "alice").await;
+
+        let st = shared.store.lock().await;
+        let routes = crate::exchange::declared_exchange(&st, "x.gone");
+        assert!(!routes, "the dropped binding routes no exchange");
+        let minted = st.scan(HOME, G_PRINCIPALS, &[], &new, i64::MIN);
+        assert_eq!(minted.len(), 1, "alice, minted again under the new id");
+        let claims = st.scan(HOME, G_CLAIMS, &[], &new, i64::MIN);
+        let epochs: Vec<i64> = claims
+            .iter()
+            .map(|op| ServeClaim::from_cbor(&cbor::decode(&op.payload)).epoch)
+            .collect();
+        assert_eq!(epochs, [1, 1], "the home claim, then ws-x's, at epoch 1");
+        assert_eq!(who_serves(&st, "ws-x", now_ms()), Some(new.clone()));
+        let chains = st.heads(HOME, G_CLAIMS, &[]);
+        let only_new = chains.iter().all(|(origin, _)| *origin == new);
+        assert!(only_new, "{chains:?}");
+        let notes = st.scan("ws-x", "notes", &[], "client", -1);
+        assert_eq!(notes.len(), 1, "app data stays");
+        drop(st);
+        let dir = shared.dir.get().unwrap().inner.lock().await;
+        assert_eq!(dir.boot.registry.who_serves("ws-x", now_ms()), Some(new));
+        let hexed = |s: &str| s.bytes().map(|b| format!("{b:02x}")).collect::<String>();
+        let journal = at.join(hexed(HOME)).join(format!("{}.log", hexed(&old)));
+        assert!(!journal.exists(), "the old journal is no longer replayed");
+        let legacy = format!("{}.legacy-{}", journal.display(), crate::sysdir::today());
+        let kept = std::path::Path::new(&legacy).exists();
+        assert!(kept, "it is kept beside it");
     }
 
     /// F1 live, two booted nodes over real iroh: B starts serving a workspace

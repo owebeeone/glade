@@ -12,28 +12,34 @@
 //! | `local.json`    | 3 — node-private assertions              | never |
 //! | `cache/`        | 4 — derived, rebuildable                 | never |
 //! | `instance.lock` | — single-writer lock                     | never |
+//! | `records.legacy-<date>.json` | — set aside, never read (4.1a)  | never |
 //!
 //! Boot = sync from a carrier named "the disk", in class order: node.key perms
 //! → NodeId; records.json verify-as-ingest (the same chain checks as the wire
 //! store); local.json self-signature with fail-closed defaults; cache/ hash or
 //! discard-and-refold. Nothing above [`StoreApi`] knows files exist.
 //!
-//! M-LIMP note: matching the codebase's "security seams present but
-//! unenforced" posture, the ed25519 signing is stubbed — NodeId is
-//! `sha256(node.key)` (a deterministic stand-in for the pubkey) and the
-//! class-3 self-signature is structural. The permission check, the class-2
-//! chain verification, and the fail-closed load STRUCTURE are real; the crypto
-//! is the punt (`GladeSubstrateV1` §2), swappable without touching this seam.
+//! Plan Step 4.1a: `node.key` is an Ed25519 seed and the NodeId is its public
+//! key (`GladeNodeSigning.md` D2). A boot that finds this node's records under
+//! the id the key had before, `sha256(node.key)`, sets them aside once. Still
+//! structural: class-2 records carry no signatures until 4.1b, and the class-3
+//! self-signature is not checked until 4.1c. The permission check, the class-2
+//! chain verification, and the fail-closed load STRUCTURE are real.
 
+use std::fmt;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
+use glade_wire::cbor;
+use glade_wire::generated::Op;
 use sha2::{Digest, Sha256};
 
 use crate::peer::NodeIdentity;
 use crate::registry::{BlobStore, Record, Registry, RegistryApi, StoreApi, HOME};
-use crate::sysdata::{NodeRecord, ServeClaim};
+use crate::signing;
+use crate::store::unused_path;
+use crate::sysdata::{NodeRecord, ServeClaim, SystemSnapshot};
 
 /// A launch profile — a default instance name + typical roles. A deployment
 /// label only; the protocol knows roles + operators, never a profile.
@@ -137,10 +143,35 @@ pub struct Boot {
     pub store: BlobStore,
     /// records quarantined by verify-as-ingest (load evidence).
     pub rejected: usize,
-    /// The raw class-1 node key bytes — kept in memory ONLY to derive the peer
-    /// identity ([`Boot::identity`]); never shipped, never in any snapshot.
-    node_key: Vec<u8>,
+    /// What this boot set aside under the node's old id (plan Step 4.1a).
+    pub set_aside: Option<SetAside>,
+    /// The class-1 node key, an Ed25519 seed — kept in memory ONLY to sign as
+    /// this node ([`Boot::identity`]); never shipped, never in any snapshot.
+    seed: [u8; 32],
     _lock: InstanceLock,
+}
+
+/// What a boot set aside (plan Step 4.1a; `GladeNodeSigning.md` D8 (a)): this
+/// node's records under the id its key had before the step,
+/// `hex(sha256(node.key))`, written to a new `records.legacy-<date>.json` in
+/// the instance and never folded. The first boot after the step does it once.
+#[derive(Debug)]
+pub struct SetAside {
+    pub records: usize,
+    pub old_id: String,
+    pub file: PathBuf,
+}
+
+/// The line both composition roots print after `node`.
+impl fmt::Display for SetAside {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = self.file.file_name().unwrap_or_default().to_string_lossy();
+        let (records, old_id) = (self.records, &self.old_id);
+        write!(
+            f,
+            "set aside {records} record(s) of old node id {old_id} in {name}"
+        )
+    }
 }
 
 impl Boot {
@@ -150,12 +181,13 @@ impl Boot {
     /// Claim routing depends on this: a folded `ServeClaim.node` (hex) must
     /// match the id a peer link vouches.
     pub fn identity(&self) -> io::Result<NodeIdentity> {
-        let key: [u8; 32] = self
-            .node_key
-            .as_slice()
-            .try_into()
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "node.key is not 32 bytes"))?;
-        Ok(NodeIdentity::from_key(key))
+        Ok(NodeIdentity::from_key(self.seed))
+    }
+
+    /// The id this node's key had before plan Step 4.1a, `hex(sha256(key))`,
+    /// which its older records name.
+    pub(crate) fn legacy_id(&self) -> String {
+        legacy_id_of(&self.seed)
     }
 }
 
@@ -179,11 +211,14 @@ pub fn boot_at(dir: PathBuf, operator: &str) -> io::Result<Boot> {
     let lock = InstanceLock::acquire(dir.join("instance.lock"))?;
 
     // ---- class 1: node.key -> NodeId (ssh-discipline perms) ----------------
-    let (node_key, node_id) = load_or_create_node_key(&dir)?;
+    let seed = load_or_create_node_key(&dir)?;
+    let node_id = node_id_of(&seed);
 
     // ---- class 2: records.json -> verify-as-ingest -> the fold -------------
-    let store = BlobStore::new(&dir);
-    let snap = store.load()?;
+    // The records under the key's old id leave the snapshot first, once.
+    let mut store = BlobStore::new(&dir);
+    let mut snap = store.load()?;
+    let set_aside = set_aside(&dir, &mut snap, &legacy_id_of(&seed))?;
     let (mut registry, rejected) = Registry::from_snapshot(&snap);
 
     // ---- class 3: local.json (node-self-signature, fail-closed) ------------
@@ -192,7 +227,7 @@ pub fn boot_at(dir: PathBuf, operator: &str) -> io::Result<Boot> {
     // ---- class 1 <-> class 2 identity match / first-boot presence ----------
     // Our derived NodeId must correspond to our own NodeRecord. Absent it, this
     // is a first boot: write presence (K1) — an ATTRIBUTED append, not setConfig.
-    let mut store = store;
+    let mut changed = set_aside.is_some();
     if !registry.has_node(&node_id) {
         registry
             .append(Record::Node(NodeRecord { node_id: node_id.clone(), operator: operator.into() }), &node_id)
@@ -205,29 +240,93 @@ pub fn boot_at(dir: PathBuf, operator: &str) -> io::Result<Boot> {
                 &node_id,
             )
             .map_err(reg_io)?;
+        changed = true;
+    }
+    if changed {
         store.save(&registry.snapshot())?; // rewritten tmp+rename
     }
 
-    Ok(Boot { dir, node_id, operator: operator.into(), registry, store, rejected, node_key, _lock: lock })
+    Ok(Boot {
+        dir,
+        node_id,
+        operator: operator.into(),
+        registry,
+        store,
+        rejected,
+        set_aside,
+        seed,
+        _lock: lock,
+    })
 }
 
-/// Load `node.key` (refusing group/world-readable, the ssh discipline) or
-/// create it 0600 on first boot; derive the NodeId. Class-1 secret: never
-/// shipped, never in any snapshot.
-fn load_or_create_node_key(dir: &Path) -> io::Result<(Vec<u8>, String)> {
+/// Load `node.key` (refusing group/world-readable, the ssh discipline, and any
+/// length but the 32 bytes of an Ed25519 seed) or create it 0600 on first boot
+/// from the OS's randomness. Class-1 secret: never shipped, never in any
+/// snapshot.
+fn load_or_create_node_key(dir: &Path) -> io::Result<[u8; 32]> {
     let path = dir.join("node.key");
-    let key = if path.exists() {
+    if path.exists() {
         platform::check_key_perms(&path)?;
-        let mut buf = Vec::new();
-        fs::File::open(&path)?.read_to_end(&mut buf)?;
-        buf
-    } else {
-        let key = random_key()?;
-        platform::write_secret(&path, &key)?;
-        key
+        let mut held = Vec::new();
+        fs::File::open(&path)?.read_to_end(&mut held)?;
+        return held.as_slice().try_into().map_err(|_| {
+            let why = format!("node.key is {} bytes, not an Ed25519 seed's 32", held.len());
+            io::Error::new(io::ErrorKind::InvalidData, why)
+        });
+    }
+    let seed = signing::random_seed()?;
+    platform::write_secret(&path, &seed)?;
+    Ok(seed)
+}
+
+/// Plan Step 4.1a (`GladeNodeSigning.md` D8 (a), for the id change): take this
+/// node's records under `old_id` out of `snap`, and write them, byte for byte,
+/// to a new `records.legacy-<date>.json` in `dir`, synced with its directory
+/// entry before records.json is saved without them. A crash between the two
+/// repeats this at the next boot, into a second file: nothing is lost.
+fn set_aside(dir: &Path, snap: &mut SystemSnapshot, old_id: &str) -> io::Result<Option<SetAside>> {
+    let ours = |bytes: &Vec<u8>| Op::from_cbor(&cbor::decode(bytes)).origin == old_id;
+    let (old, kept): (Vec<_>, Vec<_>) = snap.records.drain(..).partition(ours);
+    snap.records = kept;
+    if old.is_empty() {
+        return Ok(None);
+    }
+    let records = old.len();
+    let legacy = SystemSnapshot {
+        records: old,
+        heads: vec![],
     };
-    let node_id = node_id_of(&key);
-    Ok((key, node_id))
+    let file = unused_path(dir, &format!("records.legacy-{}", today()), ".json");
+    let mut out = fs::File::create_new(&file)?;
+    out.write_all(&cbor::encode(&legacy.to_cbor()))?;
+    out.sync_all()?;
+    crate::registry::entry_sync::sync(dir)?;
+    let old_id = old_id.into();
+    Ok(Some(SetAside {
+        records,
+        old_id,
+        file,
+    }))
+}
+
+/// Today's UTC date, `YYYY-MM-DD`, which names what plan Step 4.1a sets aside.
+pub(crate) fn today() -> String {
+    date_of(now_ms())
+}
+
+/// The UTC calendar date of an epoch-ms instant, `YYYY-MM-DD`: Howard
+/// Hinnant's civil-from-days, on days since 1970-01-01.
+fn date_of(ms: i64) -> String {
+    let z = ms.div_euclid(86_400_000) + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
 }
 
 /// Wall-clock now in epoch ms — used only to STAMP write-time values (lease
@@ -237,11 +336,21 @@ pub fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
-/// NodeId = hex(sha256(key)) — a deterministic stand-in for the ed25519 pubkey
-/// (M-LIMP). Key replacement changes this ⇒ identity loss, never forgery.
-fn node_id_of(key: &[u8]) -> String {
-    let h: [u8; 32] = Sha256::digest(key).into();
-    h.iter().map(|b| format!("{:02x}", b)).collect()
+/// NodeId = hex of the node key's Ed25519 public key (plan Step 4.1a, D2): the
+/// id is the key, so a verifier needs no lookup. Key replacement changes it ⇒
+/// identity loss, never forgery.
+fn node_id_of(seed: &[u8; 32]) -> String {
+    hex(&signing::public_key(seed))
+}
+
+/// The id the same key had before plan Step 4.1a, `hex(sha256(key))`, which
+/// the node's older records name.
+fn legacy_id_of(seed: &[u8; 32]) -> String {
+    hex(&Sha256::digest(seed))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 // What std offers on Unix alone: file modes, and a file's identity. Each
@@ -309,14 +418,6 @@ mod platform {
     pub(super) fn names(_path: &Path, _file: &fs::File) -> io::Result<bool> {
         Ok(true)
     }
-}
-
-/// 32 random bytes from the OS CSPRNG (`/dev/urandom`) — zero-dep, matching the
-/// wire crate's no-dependency discipline.
-fn random_key() -> io::Result<Vec<u8>> {
-    let mut buf = vec![0u8; 32];
-    fs::File::open("/dev/urandom")?.read_exact(&mut buf)?;
-    Ok(buf)
 }
 
 /// Class 3 — node-private assertions (authority overlay, suspect marks, resume
@@ -418,6 +519,90 @@ mod tests {
             .filter(|record| **record == repeat)
             .count();
         assert_eq!(held, 1, "and is saved once");
+    }
+
+    /// Plan Step 4.1a (D8 (a), for the id change): an instance written before
+    /// the step names its node `hex(sha256(node.key))`, as the records.json
+    /// written here does. The first boot on the new id writes those records,
+    /// byte for byte, to a new `records.legacy-<date>.json`, beside an older
+    /// file of that name, which it does not overwrite. records.json keeps
+    /// another origin's record and gains the new presence, and the operator
+    /// has one node, not two. A second boot sets nothing aside. It does not
+    /// reach the served store (`claims.rs` does), or a crash between the writes.
+    #[test]
+    fn a_first_boot_on_the_new_id_sets_the_old_records_aside_once() {
+        let dir = fresh("legacy");
+        let seed = boot_at(dir.clone(), "gianni").unwrap().seed;
+        let old = legacy_id_of(&seed);
+        let mut before = Registry::new();
+        let presence = NodeRecord {
+            node_id: old.clone(),
+            operator: "gianni".into(),
+        };
+        before.append(Record::Node(presence), &old).unwrap();
+        let claim = |node: &str, share: &str| {
+            Record::Serve(ServeClaim {
+                node: node.into(),
+                share: share.into(),
+                lease_expiry_ms: 1,
+                epoch: 1,
+            })
+        };
+        before.append(claim(&old, HOME), &old).unwrap();
+        before.append(claim("peer", "ws-p"), "peer").unwrap();
+        let written = before.snapshot();
+        BlobStore::new(&dir).save(&written).unwrap();
+        let taken = dir.join(format!("records.legacy-{}.json", date_of(now_ms())));
+        fs::write(&taken, "an older file").unwrap();
+
+        let boot = boot_at(dir.clone(), "gianni").unwrap();
+        let aside = boot.set_aside.as_ref().expect("the old records set aside");
+        assert_eq!((aside.records, &aside.old_id), (2, &old));
+        assert_ne!(aside.file, taken);
+        let older = fs::read(&taken).unwrap();
+        assert_eq!(older, b"an older file", "not overwritten");
+        let held = SystemSnapshot::from_cbor(&cbor::decode(&fs::read(&aside.file).unwrap()));
+        assert_eq!(held.records, written.records[..2], "byte for byte");
+        assert_eq!(boot.registry.nodes_of("gianni"), vec![boot.node_id.clone()]);
+        let saved = BlobStore::new(&dir).load().unwrap();
+        let origins: Vec<String> = saved
+            .records
+            .iter()
+            .map(|bytes| Op::from_cbor(&cbor::decode(bytes)).origin)
+            .collect();
+        assert!(!origins.contains(&old), "records.json holds none of them");
+        let peer = "peer".to_string();
+        assert!(origins.contains(&peer), "and keeps the peer's");
+        drop(boot);
+        assert!(boot_at(dir, "gianni").unwrap().set_aside.is_none(), "once");
+    }
+
+    /// The legacy file's date: the UTC calendar date of an epoch-ms instant,
+    /// across a leap day, the last and first milliseconds of a day, and
+    /// before 1970.
+    #[test]
+    fn dates_are_utc_calendar_dates() {
+        assert_eq!(date_of(0), "1970-01-01");
+        assert_eq!(date_of(951_782_400_000), "2000-02-29");
+        assert_eq!(date_of(1_790_208_000_000 - 1), "2026-09-23");
+        assert_eq!(date_of(1_790_208_000_000), "2026-09-24");
+        assert_eq!(date_of(-1), "1969-12-31");
+    }
+
+    /// Plan Step 4.1a: `node.key` is an Ed25519 seed, so a key that is not 32
+    /// bytes refuses the boot (`InvalidData`) before anything is written.
+    /// Before, boot hashed whatever the file held and wrote presence under it.
+    #[test]
+    fn a_node_key_that_is_not_32_bytes_refuses_the_boot() {
+        let dir = fresh("short-key");
+        drop(boot_at(dir.clone(), "gianni").unwrap());
+        fs::remove_file(dir.join("records.json")).unwrap();
+        let path = dir.join("node.key");
+        let key = fs::OpenOptions::new().write(true).open(path);
+        key.and_then(|key| key.set_len(31)).unwrap();
+        let err = boot_at(dir.clone(), "gianni").map(|_| ()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(!dir.join("records.json").exists(), "nothing written");
     }
 
     #[test]

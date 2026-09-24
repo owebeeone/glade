@@ -36,6 +36,14 @@ glade-carrier-api = { path = "../contracts/carrier-api" }
 glade-clock-api = { path = "../contracts/clock-api" }
 glade-grant-api = { path = "../contracts/grant-api" }
 glade-signer-api = { path = "../contracts/signer-api" }
+# Genuine signing (plan Step 4.1a, src/signing.rs): Ed25519 under the node key,
+# pinned exactly, because another verification library changes which signatures
+# count; the pin also governs iroh's copy (glade/dev-docs/GladeNodeSigning.md D1).
+ed25519-dalek = "=3.0.0"
+# The seed of a new node.key, from the OS on every platform (/dev/urandom is Unix
+# only). 0.4.3 is the version iroh's own randomness already uses; pinned exactly,
+# as every 0.x is.
+getrandom = "=0.4.3"
 # The lifecycle (plan Step 3.3, src/lifecycle.rs): the assembled path's start-up and
 # cleanup as one sdax plan. Git-only until crates.io, pinned at the async witness's
 # revision (version_pin: every 0.x pinned exactly). sdax, sdax-tokio and, below,
