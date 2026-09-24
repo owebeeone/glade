@@ -272,6 +272,32 @@ follow the read route, refusal included; 6 the verb is `write.append`, granted b
 the claim holder against the forwarding node's id by default and at the client's node behind 4.3's switch; 7
 statuses keep their order within a zone only; 8 X1.1 now, the node steps after the first slice's 4.6.
 
+### Open points found at X1.1 (for the owner, before X3.2)
+
+The substrate document's cross-node subsection ends with two points that
+neither plan settles ("Not covered"). Both follow an op answered
+`UnknownShare` (W5).
+
+**(a) An op sent past an unplaced one.** An earlier op of its chain came back
+`UnknownShare`, and a later op, sent before the client knew, reached A past
+the gap and was refused `Protocol`. CW answer 4 would drop it and the rest of
+its chain, though they would land after the earlier op. Recommend: the client
+does not send past an unplaced op of the same chain. It treats a gap refusal
+that follows an unplaced op of the same chain as "not placed" too, so it keeps
+and resends both in order. CW answer 4 does not apply to it. The client knows
+the gap by its place, not its code: `Protocol` also names a chain break, a bad
+SWMR envelope and a SWMR or shape conflict, and any of those comes again when
+the ops are resent, where answer 4 then applies. If ruled so, the clients
+build it with W5's client half (CW 3.1, 3.3), and the node changes nothing.
+
+**(b) A late `Ok` after B answered `UnknownShare`.** B answered an op
+`UnknownShare` at 12 s, and A accepted it afterwards. Recommend: B needs no
+special handling. B drops the late status, since no session waits on it. The
+client's resend is answered `Ok` ("already held") by A, and B lands the op on
+that `Ok`, as on any `Ok` (W3). Until then B does not hold it: A's fan-out
+skips the forward that carried it (W2), and A's gap carries it to B only when
+a forward reopens (W4).
+
 ## 5. Phases and steps
 
 **Rules for every step** (`GladeClientWritesPlan.md:352-363`): one commit per
@@ -306,6 +332,11 @@ Milestone: W1–W8, as ruled, in the substrate document.
   (LBT-006).
 - **Size:** ~120 lines of text. **Depends on:** questions 2–7; nothing in the
   slice; before CW 3.1 and 3.3 if question 4 is to be built into them.
+- **Done, 2026-09-24,** glade `55e636c`: W1–W8 in the substrate document's §6,
+  as the subsection "Cross-node writes (W1–W8)", ruled, not built. It listed
+  the passages the rules contradict in a list of its own, rather than joining
+  the session answers' list. A later edit put a note that opens *Amended
+  2026-09-24* at each of them, R2's two points and R1 among them.
 
 ### Phase X2 — The node's foundations
 

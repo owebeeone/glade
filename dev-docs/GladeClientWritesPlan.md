@@ -512,6 +512,11 @@ unchanged.
 **Step 3.1 — client-rs: op outcomes**
 
 - **Goal:** R1 and R7 in client-rs, and §5 questions 3 and 4.
+- **Also:** W5's client half, the cross-node answer 4 ruled in §5. An op
+  answered `UnknownShare` is "not placed", so the client keeps it and its
+  chain and sends them again. The step writes the pure tests that the
+  cross-node plan's X3.3a lists: unplaced is not refused; a repeat's `Ok`
+  settles it; a later refusal still drops the tail; the backoff's schedule.
 - **Files:**
   - `client.rs`: `dispatch` reads `Error` frames (`:108`). New
     `append_outcome`, `send_ops_outcome` and `on_refused`. `append` and
@@ -616,6 +621,11 @@ unchanged.
   - A refusal that no listener takes goes to `console.warn`. The desk's console
     then shows it without a gryth-ui change.
   - A session that a binder owns is only told.
+  - W5's client half, the cross-node answer 4, as in 3.1: an op answered
+    `UnknownShare` is "not placed", so the client keeps it and its chain and
+    sends them again; a session that a binder owns is told, and the client
+    resends what it sent. The step writes the tests that the cross-node
+    plan's X3.3b lists: X3.3a's, in TypeScript, in `answers.test.ts`.
 - **Tests:**
   - pure, in a new `glade/client-ts/test/answers.test.ts`;
   - integration, in `test/integration.test.ts`: an accepted op, a refused op
