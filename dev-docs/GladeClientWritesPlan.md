@@ -580,6 +580,18 @@ unchanged.
   part may split off at build time as 3.1b. Either way, its resend rides the
   subscribe ack until 3.2 lands, as the unresumed mark does.
 - **Depends on:** 1.1, and 2.1's binary for the integration tests.
+- **Done, 2026-09-25,** glade `f0b6637`: R1 and R7 in client-rs, W5's client half
+  (X3.3a) kept in. `append_outcome` and `send_ops_outcome` return the node's answer to
+  each op; `on_refused` reports every refusal, and the session drops a refused op of its
+  own with its chain's tail and stops the chain until a subscribe ack for its zone
+  ("subscribe to the zone to resume the chain"). An op answered `UnknownShare` is told
+  once through `on_unplaced`, kept, and sent again at its zone's next ack and on a backoff
+  of 1 s doubling to 30 s, one timer per zone, skipping an op whose resend still waits.
+  The connection's end answers every waiting op `Unknown`; at most 4,096 ops wait. client-rs
+  18 + 6 (was 9 + 3); grazel, glade-gwz and glade-gyld at baseline; clippy adds nothing.
+  **Open for the owner:** skipping an in-flight resend in both clients (client-ts resends
+  each tick); `append_outcome` with no time limit against a node older than Phase 2;
+  3.2 resubscribing a `ShareController` surface whose chain a refusal stopped.
 
 **Step 3.2 — client-rs: the subscribe outcome**
 
