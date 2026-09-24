@@ -219,6 +219,196 @@ that iroh carries node-to-node.
   the TCP table, multiplies auth/resume state machines, and forfeits
   scheduling control.
 
+### Session answers (client path)
+
+**Ruled 2026-09-24; not built.** These are rules that the client-writes plan
+(`GladeClientWritesPlan.md`) will build: the node in its Phase 2 (Steps 2.1 and
+2.2), then both clients in its Phase 3 (Steps 3.1 to 3.4). They do not yet
+describe the code. Today the node answers an accepted op with nothing, and
+a refused one with an `Error` whose `corr` is `None`
+(`node/src/server.rs:276-305`, `node/src/session.rs:37-66`). Its subscribe ack
+is not a cut, and carries no hashes (`server.rs:249-266`).
+
+**Sources.** The owner ruled the plan's seven questions "all recommended"
+(`GladeClientWritesPlan.md:296-299`; "answer N" below), and the plan with them
+(root `dev-docs/GladeFirstSlicePlan.md:830`). The plan answers the two gaps
+that Step 4.4 recorded and handed on (`GladeFirstSlicePlan.md:827-828`). Step
+4.3's ruling fixes the refusal form, "an empty `Heads` and then
+`Error{Unauthorized}`", and puts the websocket grant check behind a switch that
+is off by default (`:808`). Code paths are from this repository's root, and
+`server.rs`, `session.rs`, `store.rs`, `mesh.rs`, `exchange.rs`, `router.rs`
+and `chain.rs` are in `node/src/`. `taut/ir/glade.taut.py` is from the glade-wz
+root. Lines were read on 2026-09-24, while `node/` and `GladeNodeAssembly.md`
+were being edited, so theirs may move.
+
+**Scope.** A session here is one client websocket connection, from its upgrade
+to its close. The node keeps nothing of it afterwards (`server.rs:310-316`). An
+upgrade whose `Origin` is not loopback gets `403`, and no session
+(`GladeFirstSlicePlan.md:829`). A zone is `(share, glade_id, key)`; a subscribe
+with no key names the empty key (`server.rs:216-220`). Peers, exchanges and
+channels are outside these rules. No frame or field changes: `Error`
+(`glade.taut.py:187-192`), `ErrorCode.ok` (`:56`), `Head.hash` (`:69`), `Heads`
+(`:147-148`) and `Subscribe.from` (`:134`) are all in the IR.
+
+**R1. One status per op,** always on, for every session, with no negotiation
+(answer 1).
+
+- The node answers each op in a client's `Ops` frame with one `Error` frame, in
+  the order the ops were sent. Its `corr` is the op's hash (`chain.rs:10-13`) in
+  lower-case hex. Its `share` and `glade_id` are the op's.
+- The code is `Ok` if the node holds the op: appended now, or a byte-identical
+  op already held at its seq, as Step 4.4 ruled for a re-delivery
+  (`GladeFirstSlicePlan.md:827`). Otherwise the code names the refusal
+  (`session.rs:37-66`, `server.rs:137-145`): `Equivocation` if a different op
+  holds the seq; `Protocol` for a gap, a chain break, a SWMR envelope that does
+  not decode, a second SWMR writer or a shape conflict; `Unauthorized` for an
+  op on `home` (H-R3, `GladeFirstSlicePlan.md:807`); `Internal` for an I/O
+  error.
+- A client matches a status to its op by `corr`, never by its place among other
+  frames. Statuses keep the order of the session's ops, so an op sent twice
+  gets its two statuses in that order.
+- Fails: a status may never come. A node from before Phase 2 sends no `Ok` and
+  no `corr`, and nothing tells it apart: `Welcome.protocol` stays 1
+  (`server.rs:213`). A frame the node cannot decode is dropped unanswered
+  (`server.rs:172-175`). So a client may not count on a status arriving (R7).
+
+**R2. What `Ok` promises** (LBT-006, root
+`dev-docs/LibraryBoundaryAndTestingPolicy.md:37`).
+
+- The op is in this node's served store, written to its log before any fan-out,
+  with no fsync (`store.rs:150-153`, `:361-367`). It survives a crash of the
+  node process, not an OS crash or power loss, as Step 4.4 left it
+  (`GladeNodeAssembly.md:405-412`, "Durable store and restart").
+- An op appended now was queued, before its `Ok`, for every other session then
+  subscribed to its zone on this node, a peer's forwarded interest included
+  (`router.rs:46-53`, `mesh.rs:309`). A repeat is not sent again.
+- It promises nothing about delivery, or about any other node. An op on a share
+  this node forwards stays here: the forward only reads, and the node pushes
+  only its own `home` records (`mesh.rs:395-426`, `:277-293`).
+- Fails: an OS crash can lose an op after its `Ok`. The next ack then names a
+  lower head for its origin, the client's next op on that chain is refused as
+  a gap, and the lost op returns only if the client sends it again.
+- Open: the store takes an op below the first seq it holds on a chain as seen,
+  without holding it (`store.rs:302`, `:308`). `Ok` for it would break R2, and
+  no ruling names its code.
+
+**R3. A refused op is not held by its sender.** The node adds an op's seq to
+the session's heads only once it holds the op, and keeps the highest seq.
+Today it adds the seq before the append (`server.rs:288-292`), so a later
+subscribe skips the node's own op at that seq (the plan's F1). Under R3 the
+gap carries that op, which a refused writer needs in order to recover (answer
+4). R3 adds no failure: the refusal itself arrives under R1.
+
+**R4. The ack is a cut.**
+
+- A session not yet subscribed to a zone receives none of its ops before the
+  ack.
+- After the ack, the gap and then the live ops carry every op of the zone that
+  the node holds, or comes to hold, above two things: what the session
+  announced in its `Hello` (`server.rs:198-204`), and what it sent that the
+  node holds. The session's own ops are not echoed back.
+- This covers the local and the forwarded route (`server.rs:244-248`). A
+  subscribe to a declared exchange attaches a provider instead: its ack names
+  the zone with no origins, and nothing replays (`exchange.rs:87-93`).
+- It assumes the carrier delivers a session's frames in the order the node
+  queues them, as the websocket and today's first-in, first-out outbound do.
+  Reordering them, as the priority scheduler or a second bulk lane above would,
+  or conflating values, breaks R4 and R7.
+- Fails: a `Hello`'s heads are taken on the client's word, and the ops at or
+  below them are never shipped. A connection that ends mid-replay leaves the
+  replay incomplete (R7).
+
+**R5. The ack names each origin's head,** by seq and hash. For each origin
+with an op in the zone on this node, it gives the last seq, and in `Head.hash`
+the 32 bytes of that op's hash, as `Store::all_heads` computes them
+(`store.rs:215-230`). R1's `corr` is the same hash in hex. An empty zone's ack
+names the zone and no origin.
+
+**R6. A refused subscribe** gets `Heads{streams: []}`, then an `Error` with the
+subscribe's share and glade id, the reason's code, and no `corr` (answer 2).
+
+- `UnknownShare` on the absent route, from Step 2.2. Until then that route
+  sends the `Error` alone (`server.rs:232-243`), so a client's subscribe waits,
+  or takes the next zone's ack (the plan's F3).
+- `Unauthorized` for Step 4.3's grant refusal, once it is built and its switch
+  is on (`GladeFirstSlicePlan.md:808`). Answer 2 reads that ruling's "empty
+  `Heads`" as naming no zone; the 4.3 note's option (b) named the zone
+  (`GladeNodeAssembly.md:921-923`), as an accepted empty zone's ack does.
+- An accepted ack always names its zone (`server.rs:255-265`,
+  `exchange.rs:89-91`), so a client knows a refusal at the ack. Its reason is
+  the next `Error` with no `corr` for that share and glade id. A client that
+  reads no `Error` resolves the subscribe, and sees an empty zone.
+- The session is not subscribed, and no op of the zone follows.
+
+**R7. What a client may conclude.**
+
+- An op is accepted when its `Ok` arrives, and refused when its refusal
+  arrives. Its fate is unknown if the connection ends first, or if no status
+  comes (R1). A client can learn it by sending the op again: a repeat the node
+  holds gets `Ok`.
+- A replay is complete when, for each origin in the ack, the session has an op
+  of that origin at or above the acked seq: announced in its `Hello`, received
+  on this connection, or sent on it and answered `Ok`. No client announces
+  heads today (`client-rs/src/client.rs:218`, `client-ts/src/client.ts:148`).
+- For a share the node forwards, "complete" means complete against this
+  node's replica (`server.rs:244-248`). What the claim holder holds beyond it
+  arrives as live ops, while the forward runs.
+
+**R8. `Subscribe.from` stays unread on the client path** (answer 5), until a
+client keeps its store across restarts. A client's `from` changes nothing: R4
+cuts the gap. The peer path reads it (`mesh.rs:327-328`).
+
+**The client libraries** (answers 3 and 4, built in Steps 3.1 to 3.4).
+`append`, `send_ops` / `sendOps` and `subscribe` keep their signatures;
+`subscribe` returns after the replay, and returns a refusal as an empty zone.
+New calls return the node's answer as data, as `ExchangeOutcome` does
+(`client-rs/src/client.rs:29-35`): `append_outcome`, `send_ops_outcome` and
+`subscribe_outcome` (in TypeScript, `appendOutcome`, `sendOpsOutcome` and
+`subscribeOutcome`). `on_refused` / `onRefused` reports every refusal. A client
+drops a refused op and every later op it sent on that chain, and its next
+append on that chain fails until a subscribe has caught the chain up. So a
+session never builds on, or folds, a refused op. A TypeScript session that a
+binder owns is only told, and glial decides.
+
+**Not covered.** The peer subscribe keeps F2's race until Step 4.3's peer
+check (`mesh.rs:309`). A live subscription that 4.3's revocation pass ends
+gets `Error{Unauthorized}` alone (`GladeNodeAssembly.md`, "How a revocation
+reaches a live subscription"); these rules do not yet say how a client reads
+it.
+
+**Where each rule comes from, and what pins it.** Each step writes its new
+tests red first. "The plan" is the plan as ruled (`GladeFirstSlicePlan.md:830`).
+
+| Rule | Ruling | Steps | Tests the steps write |
+| --- | --- | --- | --- |
+| R1 | answer 1; H-R3; 4.4's re-delivery | 2.1; 3.1, 3.3 | `every_client_op_gets_one_status_named_by_its_hash`; updated: `a_client_op_on_home_is_refused_and_never_stored`, `a_client_op_on_any_other_share_still_lands`, `end_to_end_over_websocket`, `grazel_attach_end_to_end`, `forked_op_surfaces_error_frame_not_silent`; 3.1's pure tests (`client-rs/src/answers.rs`), `an_accepted_append_is_ok`, `a_repeated_append_is_ok`; 3.3's, in TypeScript |
+| R2 | the plan, with its §10: held, not synced | 2.1 | none for durability. 4.4's `a_torn_tail_is_cut_so_the_next_append_reopens_whole` covers a torn record only |
+| R3 | the plan (F1) | 2.1 | `a_refused_op_is_not_held_by_its_sender` |
+| R4 | the plan's option (a) for gap 2 (F2) | 2.2 | `no_op_of_a_zone_reaches_a_subscriber_before_its_ack` |
+| R5 | the plan's option (a); GQ-9 (§2) | 2.2; 3.2, 3.4 | `the_ack_names_each_origin_head_with_its_hash`; `subscribe_outcome_returns_the_nodes_heads` |
+| R6 | answer 2; 4.3's refusal form | 2.2; 3.2, 3.4; 4.3 | phase E of `s_discovery_golden_path_end_to_end`, turned round; 3.2's pure test that an ack naming no zone is a refusal; 4.3's `a_session_claiming_no_principal_is_refused` |
+| R7 | answers 1, 3 and 4 | 3.1 to 3.4 | 3.1's and 3.2's pure tests; `a_refused_append_stops_its_chain`, `subscribe_returns_after_the_replay_is_folded`, `a_refused_chain_resumes_after_a_subscribe`; 3.3's and 3.4's, in TypeScript |
+| R8 | answer 5 | none | none: the node never reads `from` on this path today (`server.rs:215-275`) |
+
+**What these rules contradict elsewhere in this document** (found by Step 1.1;
+to reconcile when the plan's Phase 2 lands, not yet changed):
+
+- §6's "transport ordering is not load-bearing": R4 and R7 need one session's
+  frames to arrive in the order the node queued them.
+- §6's priority scheduler and value conflation: live ops that jump the queue
+  would overtake the replay, and conflation would drop ops R4 promises. The
+  rules hold today because the outbound queue is first in, first out (§12).
+- §6's second bulk lane "with no protocol change": a replay on its own lane
+  breaks R4's cut, so it becomes a protocol change. And "scoped to the session,
+  never the socket" (with §2's Session row): the node's session is one
+  connection, and the statuses, R3's heads and R7's completeness end with it.
+- §6's resume in "both directions": on the client path it runs one way. The node
+  ignores a client's `Heads`, R8 leaves `from` unread, and the node never asks
+  for a tail it lost (§12 already notes the missing exchange).
+- §5's "append to the local destination unconditionally" and §2's "appending
+  never blocks on the network": under answer 4 the next append on a chain after
+  a refused op fails until a subscribe has caught the chain up.
+
 ## 7. Reassembler layer (delta-heavy surfaces)
 
 Share/reassembly logic MUST NOT live in UI consumers. For patch-shaped
