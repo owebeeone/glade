@@ -461,6 +461,9 @@ linked node; c gets A's verdict; B holds only what A accepted.
 - **Depends on:** X1.1; CW 3.1, 3.2; nothing in the slice. Question 4 was ruled
   first, so it folds into CW 3.1 (as 3.1b where that step splits), whose resend
   rides the subscribe ack until 3.2 lands.
+- **Built with CW 3.1, 2026-09-25,** glade `f0b6637`: this step's pure tests, in
+  `answers.rs`, and the resend on one timer per zone. Its wiring in `client.rs` is tested
+  without a node until X2.3 answers `UnknownShare` on ops.
 
 **X3.3b — client-ts keeps a write that was not placed**
 
