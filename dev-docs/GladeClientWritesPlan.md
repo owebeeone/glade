@@ -771,6 +771,16 @@ unseen. A restarted glade-gwz streams its runs.
   plus 31 more (`GladeNodeAssembly.md:836-837`).
 - **Size:** ~80 production lines (about 30 removed), ~150 test lines.
 - **Depends on:** 3.1, 3.2, and Phase 2's binary.
+- **Done, 2026-09-25,** glade-gyld `f17259b`: `resume` drops its settle loop and its two
+  constants, since a subscribe returns after its replay, and logs a refused subscribe with
+  its code. One `Writer` carries every write (the publications, `append_ask`, `append`): it
+  picks the chain up once, appends with `append_outcome`, and on a refusal logs the chain,
+  the seq and the code, picks the chain up again and retries once; a second refusal is
+  logged and the write dropped, and the chain is picked up afresh by the next write.
+  glade-gyld 233 (1 ignored) + 33 (was + 31); clippy 0; fmt clean. About half the production
+  diff is plumbing, the writer through twelve signatures. **Open for the owner:** picking a
+  twice-refused chain up afresh on the next write (built so); no time limit on the write's
+  answer, which is 3.1's question.
 
 **Step 4.2 — glade-gwz: run ids that survive a restart; refusals reported**
 
