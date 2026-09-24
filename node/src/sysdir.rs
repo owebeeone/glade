@@ -42,7 +42,7 @@ use std::path::{Path, PathBuf};
 use glade_wire::cbor;
 use glade_wire::generated::Op;
 
-use crate::envelope;
+use crate::envelope::{self, Format};
 use crate::peer::NodeIdentity;
 use crate::registry::{BlobStore, Record, Registry, RegistryApi, StoreApi, HOME};
 use crate::signing;
@@ -300,14 +300,25 @@ fn load_or_create_secret(dir: &Path, name: &str) -> io::Result<[u8; 32]> {
 }
 
 /// Plan Step 4.1b (`GladeNodeSigning.md` D8 (a)): take the unsigned records,
-/// whose payload is no envelope, out of `snap`, and write them, byte for
-/// byte, to a new `records.legacy-<date>.json` in `dir`, synced with its
-/// directory entry before records.json is saved without them. A crash between
-/// the two repeats this at the next boot, into a second file: nothing is lost.
+/// written before the step, out of `snap`, and write them, byte for byte, to a
+/// new `records.legacy-<date>.json` in `dir`, synced with its directory entry
+/// before records.json is saved without them. A crash between the two
+/// repeats this at the next boot, into a second file: nothing is lost. A
+/// record in a format this build does not know refuses the boot before
+/// anything is written (part 2's hardening): it is not this build's to set
+/// aside.
 fn set_aside(dir: &Path, snap: &mut SystemSnapshot) -> io::Result<Option<SetAside>> {
-    let unsigned =
-        |bytes: &Vec<u8>| !envelope::is_envelope(&Op::from_cbor(&cbor::decode(bytes)).payload);
-    let (old, kept): (Vec<_>, Vec<_>) = snap.records.drain(..).partition(unsigned);
+    let (mut old, mut kept) = (Vec::new(), Vec::new());
+    for bytes in snap.records.drain(..) {
+        let op = Op::from_cbor(&cbor::decode(&bytes));
+        match envelope::format(&op) {
+            Format::Sealed => kept.push(bytes),
+            Format::Unsigned => old.push(bytes),
+            Format::Unknown => {
+                return Err(envelope::unreadable(&dir.join("records.json"), &op));
+            }
+        }
+    }
     snap.records = kept;
     if old.is_empty() {
         return Ok(None);
@@ -664,6 +675,38 @@ mod tests {
         assert_eq!(boot.rejected, 1);
         assert!(boot.registry.policy_quarantined());
         assert_eq!(boot.registry.policy(), None);
+    }
+
+    /// Plan Step 4.1b's part 2's hardening: a record in a format this build
+    /// does not know, here what a newer build might write (this build's
+    /// envelope on a stream it does not know), refuses the boot with a
+    /// message naming it, before anything is written: records.json is as it
+    /// was, and no legacy file appears.
+    #[test]
+    fn a_boot_refuses_a_record_in_a_format_it_does_not_know_and_writes_nothing() {
+        let dir = fresh("newer");
+        let boot = boot_at(dir.clone(), "gianni").unwrap();
+        let (seed, node) = (boot.seed, boot.node_id.clone());
+        let mut snap = boot.registry.snapshot();
+        drop(boot);
+        let newer = envelope::testing::newer(seed);
+        snap.records.push(cbor::encode(&newer.to_cbor()));
+        BlobStore::new(&dir).save(&snap).unwrap();
+        let written = fs::read(dir.join("records.json")).unwrap();
+
+        let err = boot_at(dir.clone(), "gianni").map(|_| ()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let named = format!(
+            "holds a home record this build cannot read (dir.recovery-keys of node {node} at seq 0)"
+        );
+        assert!(err.to_string().contains(&named), "{err}");
+        assert_eq!(fs::read(dir.join("records.json")).unwrap(), written);
+        let names: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        let legacy = names.iter().any(|name| name.starts_with("records.legacy"));
+        assert!(!legacy, "nothing set aside: {names:?}");
     }
 
     /// The legacy file's date: the UTC calendar date of an epoch-ms instant,

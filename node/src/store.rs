@@ -25,7 +25,7 @@ use glade_wire::generated::{Head, Op, Shape, StreamHeads};
 use glade_wire::swmr::{decode_swmr, SwmrPayloadError};
 
 use crate::chain::op_hash;
-use crate::envelope::{self, Refused};
+use crate::envelope::{self, Format, Refused};
 use crate::registry::HOME;
 use crate::sysdir::today;
 
@@ -87,6 +87,35 @@ impl From<std::io::Error> for StoreError {
     }
 }
 
+/// Why an op was refused, as a line of text (plan Step 4.1b's part 2
+/// reports a peer's refused records so).
+impl std::fmt::Display for StoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StoreError::Gap { expected, got } => {
+                write!(f, "a gap: expected seq {expected}, got {got}")
+            }
+            StoreError::Equivocation { origin, seq } => write!(f, "a fork at ({origin},{seq})"),
+            StoreError::ChainBreak { origin, seq } => {
+                write!(f, "a chain break at ({origin},{seq})")
+            }
+            StoreError::InvalidSwmrPayload { error } => {
+                write!(f, "an invalid SWMR envelope: {error:?}")
+            }
+            StoreError::SwmrWriterConflict { expected, got } => {
+                write!(f, "a second SWMR writer: expected {expected}, got {got}")
+            }
+            StoreError::ShapeConflict { expected, got } => {
+                write!(f, "a shape conflict: expected {expected:?}, got {got:?}")
+            }
+            StoreError::Unverified { origin, seq, why } => {
+                write!(f, "({origin},{seq}) does not verify: {why}")
+            }
+            StoreError::Io(e) => write!(f, "io: {e}"),
+        }
+    }
+}
+
 /// A chain identity: `(share, glade_id, key, origin)`. The zone `key` joins the
 /// axis so each zone is an independently contiguous, independently shippable
 /// chain (GladeZones.md).
@@ -137,7 +166,8 @@ impl Store {
     /// A `home` journal is replayed only if it verifies as its ops would if
     /// appended one by one (plan Step 4.1b). One that does not, such as any
     /// journal written before the step, is renamed aside whole, and
-    /// [`Store::set_aside`] reports it.
+    /// [`Store::set_aside`] reports it. One holding a record in a format this
+    /// build does not know refuses the open, and is left as it is.
     pub fn open(root: impl Into<PathBuf>) -> Result<Store, StoreError> {
         let root = root.into();
         let mut logs: BTreeMap<ChainId, Vec<Op>> = BTreeMap::new();
@@ -164,6 +194,10 @@ impl Store {
                     let fname = log_ent.file_name().to_string_lossy().to_string();
                     if fname.ends_with(".log") {
                         let ops = read_log(&log_ent.path())?;
+                        let unknown = |op: &&Op| home && envelope::format(op) == Format::Unknown;
+                        if let Some(op) = ops.iter().find(unknown) {
+                            return Err(envelope::unreadable(&log_ent.path(), op).into());
+                        }
                         if home && !verifies(&ops) {
                             let legacy = format!("{fname}.legacy-{}", aside.date);
                             fs::rename(
@@ -653,6 +687,32 @@ mod tests {
         assert!(Path::new(&legacy).exists(), "kept, renamed");
         drop(s);
         assert!(Store::open(&root).unwrap().set_aside().is_none(), "once");
+    }
+
+    /// Part 2's hardening: a `home` journal holding a record in a format this
+    /// build does not know (a newer build's, it may be) refuses the open,
+    /// naming the journal and the record, and is left as it is, not set
+    /// aside.
+    #[test]
+    fn open_refuses_a_home_journal_in_a_format_it_does_not_know_and_leaves_it() {
+        let root = fresh("home-newer");
+        let newer = envelope::testing::newer([6; 32]);
+        append_to_log(&root, &newer).unwrap();
+        let journal = root
+            .join(hex(HOME))
+            .join(format!("{}.log", hex(&newer.origin)));
+        let written = fs::read(&journal).unwrap();
+        let err = match Store::open(&root) {
+            Err(StoreError::Io(e)) => e,
+            other => panic!("expected a refusal, got {:?}", other.map(|_| ())),
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let named = format!(
+            "{} holds a home record this build cannot read (dir.recovery-keys of node",
+            journal.display()
+        );
+        assert!(err.to_string().starts_with(&named), "{err}");
+        assert_eq!(fs::read(&journal).unwrap(), written, "left as it is");
     }
 
     #[test]

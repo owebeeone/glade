@@ -113,8 +113,8 @@ impl NodeSigner {
     }
 
     /// Record `node` as authenticated, its HELLO having verified on a link:
-    /// from now on its signatures are checked. Plan Step 4.1b's part 2, D9's
-    /// known set, is to call it.
+    /// from now on its signatures are checked. The mesh calls it for each
+    /// peer a link's HELLO proves (plan Step 4.1b's part 2).
     pub fn authenticated(&self, node: NodeId) {
         let mut known = self
             .authenticated
@@ -123,12 +123,20 @@ impl NodeSigner {
         known.insert(node);
     }
 
-    fn knows(&self, me: &NodeIdentity, signer: &NodeId) -> bool {
+    /// Whether `node` is known: this node, or one recorded as authenticated.
+    /// It is D9's known set (`GladeNodeSigning.md`; plan Step 4.1b's part
+    /// 2): a peer's `home` record is taken only from a node known here, and
+    /// `verify` answers `Unavailable` for any other. A signer with no key
+    /// knows no one.
+    pub fn knows(&self, node: &NodeId) -> bool {
+        let Some(me) = &self.identity else {
+            return false;
+        };
         let known = self
             .authenticated
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        *signer == me.node_id || known.contains(signer)
+        *node == me.node_id || known.contains(node)
     }
 }
 
@@ -149,9 +157,9 @@ impl SignerPort for NodeSigner {
         message: &[u8],
         signature: &[u8],
     ) -> Result<SignatureStatus, VerificationError> {
-        match &self.identity {
-            Some(me) if self.knows(me, signer) => Ok(verify(signer, purpose, message, signature)),
-            _ => Err(VerificationError::Unavailable),
+        match self.knows(signer) {
+            true => Ok(verify(signer, purpose, message, signature)),
+            false => Err(VerificationError::Unavailable),
         }
     }
 }

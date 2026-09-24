@@ -355,6 +355,13 @@ impl Door {
         self.fold().door(endpoint, Some(node), configured, now_ms())
     }
 
+    /// Report `line` as the door reports its refusals: a stderr line, for the
+    /// node. The mesh reports its deferred and refused records so (plan Step
+    /// 4.1b's part 2).
+    pub fn report(&self, line: &str) {
+        (self.report)(line);
+    }
+
     /// Report a refusal of the key `endpoint`, with its reason.
     pub fn refused(&self, endpoint: &[u8; 32], why: &dyn fmt::Display) {
         (self.report)(&format!("peer refused: endpoint {}: {why}", hex(endpoint)));

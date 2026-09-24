@@ -879,7 +879,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&cdir);
         let mut client = Store::open(&cdir).unwrap();
         let mut link = dialer.dial(&acc_addr).await.unwrap();
-        let out = pull_sync(&mut link.recv, &mut link.send, &mut client).await.unwrap();
+        let anyone = |_: &str| true;
+        let out = pull_sync(&mut link.recv, &mut link.send, &mut client, &anyone)
+            .await
+            .unwrap();
         let (_served, sent) = acc.await.unwrap();
         let sent = sent.unwrap();
 

@@ -291,6 +291,10 @@ pub struct SyncOutcome {
     /// Nothing that peer sent after the break is kept; the caller re-fetches
     /// these chains elsewhere (resume is exact).
     pub rejected: Vec<ChainKey>,
+    /// `home` chains deferred FROM THIS PEER (plan Step 4.1b's part 2, D9):
+    /// their origin is not a node the puller knows. Nothing of them is kept,
+    /// and the next pull asks for them again.
+    pub deferred: Vec<ChainKey>,
     /// Equivocation proofs newly recorded while ingesting this stream — a signed
     /// fork by the ORIGIN (SY4), not the carrier's fault.
     pub equivocations: Vec<EquivProof>,
@@ -349,8 +353,14 @@ where
 /// origin signature, plan Step 4.1b; app ops carry none, D5). On a
 /// chain-check failure the whole suffix of that (origin, zone) chain from this
 /// peer is dropped and reported for re-fetch; equivocation records a proof.
-/// Ends at the peer's stream close.
-pub async fn pull_sync<R, W>(r: &mut R, w: &mut W, store: &mut Store) -> io::Result<SyncOutcome>
+/// A `home` op whose origin `known` does not answer for is deferred with its
+/// chain's suffix, and kept nowhere (D9). Ends at the peer's stream close.
+pub async fn pull_sync<R, W>(
+    r: &mut R,
+    w: &mut W,
+    store: &mut Store,
+    known: &dyn Fn(&str) -> bool,
+) -> io::Result<SyncOutcome>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -367,8 +377,12 @@ where
         let Frame::Ops(ops) = frame else { continue }; // pull channel carries only Ops
         for op in ops.ops {
             let ck = chain_key(&op);
-            if out.rejected.contains(&ck) {
+            if out.rejected.contains(&ck) || out.deferred.contains(&ck) {
                 continue; // suffix of an already-broken chain from this peer
+            }
+            if op.share == HOME && !known(&op.origin) {
+                out.deferred.push(ck);
+                continue;
             }
             match store.append(op) {
                 Ok(_) => out.applied += 1,
@@ -653,6 +667,12 @@ mod sync_tests {
         ops
     }
 
+    /// A puller that knows every node, so D9's rule defers nothing (plan Step
+    /// 4.1b's part 2).
+    fn anyone(_: &str) -> bool {
+        true
+    }
+
     /// The holder the duplex tests serve, as its HELLO would claim it, and a
     /// grant fold that lets it read `sh` (plan Step 4.3).
     fn reader() -> (Holder, crate::grants::PolicyView) {
@@ -678,7 +698,9 @@ mod sync_tests {
         let (holder, grants) = reader();
         let serve = async move { serve_sync(&mut br, &mut bw, &server, &holder, &grants).await };
         let srv = tokio::spawn(serve);
-        let out = pull_sync(&mut ar, &mut aw, &mut client).await.unwrap();
+        let out = pull_sync(&mut ar, &mut aw, &mut client, &anyone)
+            .await
+            .unwrap();
         let sent = srv.await.unwrap().unwrap();
 
         assert_eq!(sent, 8);
@@ -717,7 +739,9 @@ mod sync_tests {
         let (holder, grants) = reader();
         let serve = async move { serve_sync(&mut br, &mut bw, &server, &holder, &grants).await };
         let srv = tokio::spawn(serve);
-        let out = pull_sync(&mut ar, &mut aw, &mut client).await.unwrap();
+        let out = pull_sync(&mut ar, &mut aw, &mut client, &anyone)
+            .await
+            .unwrap();
         assert_eq!(
             srv.await.unwrap().unwrap(),
             3,
@@ -732,6 +756,60 @@ mod sync_tests {
             client.scan("other", "g", b"", "b", -1).is_empty(),
             "a zone its holder may not read"
         );
+    }
+
+    /// Plan Step 4.1b's part 2 (D9): a pull takes a `home` record only from a
+    /// node the puller knows. The peer serves two signed `home` chains of two
+    /// records each, and an app zone; the puller knows one of the two nodes,
+    /// so the other's chain is deferred whole and kept nowhere, while the
+    /// known node's chain and the app zone land as before.
+    #[tokio::test]
+    async fn pull_sync_defers_a_home_chain_whose_origin_is_not_known() {
+        use crate::registry::{Record, Registry, G_PRINCIPALS};
+        use crate::sysdata::PrincipalRecord;
+        let mut server = Store::open(fresh("d9-srv")).unwrap();
+        chained(&mut server, "a", b"", 2);
+        let mut origins = Vec::new();
+        for seed in [3, 4] {
+            let identity = NodeIdentity::from_key([seed; 32]);
+            let origin = crate::transport::hex(&identity.node_id);
+            let mut registry = Registry::sealed(identity);
+            for name in ["p0", "p1"] {
+                let principal = name.into();
+                let record = Record::Principal(PrincipalRecord { principal });
+                let op = registry.append_returning(record, &origin).unwrap();
+                server.append(op).unwrap();
+            }
+            origins.push(origin);
+        }
+        let (known, stranger) = (origins[0].clone(), origins[1].clone());
+        let mut client = Store::open(fresh("d9-cli")).unwrap();
+        let (ca, cb) = tokio::io::duplex(64 * 1024);
+        let (mut ar, mut aw) = split(ca);
+        let (mut br, mut bw) = split(cb);
+        let (holder, grants) = reader();
+        let serve = async move { serve_sync(&mut br, &mut bw, &server, &holder, &grants).await };
+        let srv = tokio::spawn(serve);
+        let knows = |origin: &str| origin == known;
+        let out = pull_sync(&mut ar, &mut aw, &mut client, &knows)
+            .await
+            .unwrap();
+        srv.await.unwrap().unwrap();
+
+        let deferred = (
+            HOME.to_string(),
+            G_PRINCIPALS.to_string(),
+            vec![],
+            stranger.clone(),
+        );
+        assert_eq!(out.deferred, [deferred]);
+        assert_eq!(
+            out.applied, 4,
+            "the app zone's two and the known node's two"
+        );
+        assert!(out.rejected.is_empty());
+        assert_eq!(client.scan(HOME, G_PRINCIPALS, &[], &known, -1).len(), 2);
+        assert_eq!(client.scan(HOME, G_PRINCIPALS, &[], &stranger, -1), []);
     }
 
     /// SY3: a tampering carrier flips op 3's `prev`. The chain check rejects op 3
@@ -756,7 +834,9 @@ mod sync_tests {
             write_frame(&mut bw, &Frame::Ops(Ops { ops: malicious, pri: Some(Priority::Bulk) })).await.unwrap();
             bw.shutdown().await.unwrap();
         });
-        let out = pull_sync(&mut ar, &mut aw, &mut client).await.unwrap();
+        let out = pull_sync(&mut ar, &mut aw, &mut client, &anyone)
+            .await
+            .unwrap();
         carrier.await.unwrap();
 
         assert_eq!(out.applied, 3); // 0,1,2 landed; 3 broke, 4 (suffix) dropped
@@ -770,7 +850,9 @@ mod sync_tests {
         let (holder, grants) = reader();
         let serve = async move { serve_sync(&mut br2, &mut bw2, &truth, &holder, &grants).await };
         let srv = tokio::spawn(serve);
-        let out2 = pull_sync(&mut ar2, &mut aw2, &mut client).await.unwrap();
+        let out2 = pull_sync(&mut ar2, &mut aw2, &mut client, &anyone)
+            .await
+            .unwrap();
         srv.await.unwrap().unwrap();
 
         assert!(out2.rejected.is_empty());
@@ -794,7 +876,9 @@ mod sync_tests {
             write_frame(&mut bw, &Frame::Ops(Ops { ops: vec![conflict], pri: Some(Priority::Bulk) })).await.unwrap();
             bw.shutdown().await.unwrap();
         });
-        let out = pull_sync(&mut ar, &mut aw, &mut client).await.unwrap();
+        let out = pull_sync(&mut ar, &mut aw, &mut client, &anyone)
+            .await
+            .unwrap();
         carrier.await.unwrap();
 
         assert_eq!(out.applied, 0);

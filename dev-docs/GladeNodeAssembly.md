@@ -3741,10 +3741,12 @@ gains one message. The ALPN moves to `glade/node/3` (section 7).
 - **Part 1, built with this note:** the envelope, sealing at append, the check
   at every `home` ingest, D8's set-aside and re-mint, the folds and the ALPN
   (sections 1 to 7).
-- **Part 2, D9's *deferred* path:** designed here (section 8), not built. As
-  ruled, it defers every record of a node this node has not met. The door's
-  introductions, ruled a day later for 4.2b, assumed such records arrive.
-  Question 1 asks which reading governs.
+- **Part 2, D9's *deferred* path:** designed in section 8 and built after
+  part 1 landed (glade `02e2a9e`), on the lane owner's word of 2026-09-25:
+  option (a), as ruled. It defers every record of a node this node has not
+  met; the door's introductions, ruled a day later for 4.2b, assumed such
+  records arrive, and question 1 puts (b) and (c) to the owner. With it, a
+  hardening the lane owner asked for (section 10).
 
 ### 1. The envelope
 
@@ -3926,7 +3928,7 @@ change. A second start sets nothing aside and registers `+0`.
 - **The owner's desk** at its next restart: section 4's two lines, `+N` for
   each app, `ws-razel` at epoch 1. "Measured" has the replay.
 
-### 8. D9: *deferred* (part 2, designed, not built)
+### 8. D9: *deferred* (part 2)
 
 D9 as ruled: a record whose verifier is unavailable is never persisted or
 folded; it is retried next round and reported as *deferred*. Under D2(A) the
@@ -3965,8 +3967,9 @@ node knows "itself and the nodes it has authenticated at HELLO".
 - **Boot** defers nothing, so prints no `deferred` line: records.json holds
   the node's own records, and an unreadable key refuses the start (D9).
 - `SyncOutcome` gains `deferred`, beside `applied` and `rejected`, and the
-  library's sync driver, `pull_sync`, takes the same rule.
-- **Size:** about 100 production lines and 200 of tests.
+  library's sync driver, `pull_sync`, takes the same rule. A mesh round
+  returns one too.
+- **Size:** estimated at about 100 production lines and 200 of tests.
 - **What it does to introductions** (question 1). A configured peer's
   directory can no longer carry a third node's records here, its binding
   included. The door's rule that such bindings count (4.2b's ruling) keeps its
@@ -4082,11 +4085,14 @@ lines.
 
    Recommend (a) for the slice, and revisit with account-root certification
    (D3's gap), where a certificate, not a peer, would introduce a node.
+   **Built as (a)**, as ruled, on the lane owner's word of 2026-09-25; (b)
+   and (c) are with the owner.
 2. **What a node holds is not admitted again** (part 2; section 8). At boot and
    at open, records are checked (section 4), not held to D9's known set: D9
    governs arrivals. Recommend keeping this. The other reading would drop
    every peer's records at each restart until the peer links again, and epoch
-   fencing would bump over nothing.
+   fencing would bump over nothing. **Kept as built** (the lane owner,
+   2026-09-25).
 3. **The cost on the desk's debug build** (F4, measured). A check costs about
    0.29 ms in a debug build, and each start checks each `home` record twice,
    so a desk restart costs about 5 s more for each day of uptime since the
@@ -4095,7 +4101,8 @@ lines.
    (`[profile.dev.package.<crate>]` in `node/Cargo.toml`, six lines), a check
    measured 46 µs: about 6 s after a week. The options: (a) accept, as F4 was
    ruled; (b) the profile override, now; (c) AZ-12's checkpoints, F4's ruled
-   remedy. Recommend (b) with part 1's landing, and (c) later.
+   remedy. Recommend (b) with part 1's landing, and (c) later. **The lane
+   owner added (b) with part 1** (glade `02e2a9e`), for the owner's review.
 4. **Built in part 1, for review; each recommended as built:**
    - the ALPN and `PROTOCOL` at 3, which D4's "old and new nodes must not
      sync" requires;
@@ -4188,3 +4195,152 @@ lines.
     +2/−1, `lib.rs` +1;
 - tests: +878/−173, net +705;
 - beside them, the IR +13 (`sysdata.taut.py`) and `check.sh`'s baseline.
+
+### 10. A format this build does not know (part 2's hardening)
+
+Asked by the lane owner with part 2, after the replay showed today's older
+binary panicking (`not text`) at boot on an upgraded store. That cannot be
+fixed after the fact, but the next format change, such as 4.1c's recovery-key
+record on a stream of its own, should not repeat it.
+
+Part 1 already reads a `home` payload without panicking, but it guesses: a
+payload that is not this build's envelope is set aside as unsigned, and a
+signed record on a stream or of a kind this build does not know is quarantined
+and dropped at the next save. On a downgrade either would rewrite a newer
+store. So each `home` payload read from disk is classed first
+(`envelope::format`):
+
+| Class | What it is | At boot (records.json) | At the served store's open |
+| --- | --- | --- | --- |
+| sealed | this build's envelope, on a directory stream, its record of that stream's kind | checked (section 3) | checked with its journal |
+| unsigned | a map whose field 1 is text: the shape of every record before this step, whose kinds were only ever added, never changed (the IR's history) | set aside (D8) | its journal set aside (D8) |
+| unknown | anything else: another envelope, a stream or a kind this build does not know, a map whose field 1 is bytes, bytes that are not CBOR | the start is refused, before anything is written | the start is refused; the journal is not renamed |
+
+The refusal names the file, the stream, the origin and the seq, and says what
+to do: `records.json holds a home record this build cannot read (<stream> of
+node <origin> at seq <n>): its format is newer than this build's, or it is
+damaged; start the build that wrote it, or move records.json aside`, and the
+same for a journal. It is printed as every refused start is, and the node
+exits 1. A record that arrives from a peer is not classed this way: it is
+checked (section 3) and, whatever its format, refused alone.
+
+Not covered: the containers. records.json's `SystemSnapshot` and each
+record's wire `Op` are still read by the wire codec's decoders, which panic on
+a type they do not expect. The wire IR is frozen (plan §3), so a change there
+comes with a wire amendment and a new protocol.
+
+### 11. Tests (part 2), each begun red
+
+Built on 2026-09-25 against glade `02e2a9e`. Each test was run against the code
+with the part it guards switched off, by one edit in a copy of the sources;
+the message is what that run printed.
+
+| Test | Proves | Red first |
+| --- | --- | --- |
+| `mesh`: `a_third_nodes_records_are_deferred_until_its_hello_and_reported` | over real iroh, three nodes: A's pull from B takes B's own record and defers C's two, keeping none, with the line `deferred 2 home record(s) of node <C> on dir.principals from peer <B>: not a node this node knows`; once A has met C by a HELLO, B's push of C's records lands them; a record under B's id that B did not sign, in that push, is refused with `refused 1 home record(s) of node <B> on dir.principals from peer <B>: (<B>,1) does not verify: its signature does not verify` | with a round that takes every origin: "C's is kept nowhere", left `[Op { … }]`, right `[]`; with HELLO recording no one: "B's own record lands", left `[]` |
+| `peer`: `pull_sync_defers_a_home_chain_whose_origin_is_not_known` | the library's sync driver defers a `home` chain whose origin the puller does not know, whole, and keeps none of it; the known node's chain and an app zone land | with the rule off: `deferred`, left `[]`, right `[("home", "dir.principals", [], "<origin>")]` |
+| `envelope`: `format_tells_this_builds_envelope_from_an_older_record_and_from_what_it_cannot_read` | section 10's classes: this build's envelope is sealed; a record from before the step is unsigned, whatever its later fields; its envelope on an unknown stream or holding another shape, another envelope, a map whose field 1 is bytes, and bytes that are not CBOR are unknown | with unknown read as unsigned: "a stream this build does not know", left `Unsigned`, right `Unknown` |
+| `sysdir`: `a_boot_refuses_a_record_in_a_format_it_does_not_know_and_writes_nothing` | a newer build's record in records.json refuses the boot (`InvalidData`) with the message naming it; records.json is as it was, and no legacy file appears | with the record kept, as part 1 kept it (then quarantined at load): `called Result::unwrap_err() on an Ok value` |
+| `store`: `open_refuses_a_home_journal_in_a_format_it_does_not_know_and_leaves_it` | a `home` journal holding such a record refuses the open, naming the journal, and is not renamed | with no format check at open: "expected a refusal, got Ok(())" |
+| `tests/assembled_path`: `both_roots_refuse_a_store_in_a_newer_format_with_a_clear_message` | on each root, as processes: exit 1, the message on stderr, no panic, records.json as it was | with neither refusal: "glade-node (HandWritten) still ran after 20s: the start was not refused" |
+
+Changed, and passing: the `pull_sync` calls in `peer`'s and `iroh_carrier`'s
+tests pass a puller that knows every node; `refused`, in
+`tests/assembled_path`, keeps its checks over a new `ended`. Every two-node
+test now runs with D9 on: each node's records reach the other, whose HELLO it
+verified.
+
+What they do not prove: Windows and Linux; four nodes; a relay; a round that a
+link's close cuts short midway (its report is made, as for a round's end).
+
+### Named gaps (4.1b part 2)
+
+- **Third nodes, as ruled (question 1).** A configured peer cannot introduce a
+  node: its records, bindings included, are deferred at every pull until this
+  node meets it, so the door's introductions (4.2b) never fire. Nothing the
+  slice runs has a third node.
+- **The known set lives for the run.** A restart knows no peer until each
+  links again. What the node already holds stays, checked again at open
+  (question 2).
+- **A deferred push waits for the next pull**, at the next connect: nothing
+  asks sooner. A long-lived link learns nothing more of a node it met after
+  the link's own pull.
+- **The report is one line per chain per round.** A peer that keeps a third
+  node's chain prints its line at every pull.
+- **The containers**: records.json's `SystemSnapshot` and each record's wire
+  `Op` are still read by the wire codec's decoders, which panic on a type they
+  do not expect (section 10).
+- A record in an unknown format that arrives from a peer is refused like any
+  other that does not verify; only the stores on disk refuse the start.
+
+### Default-path changes (4.1b part 2)
+
+1. A peer's `home` record is taken only from this node or a node whose HELLO
+   it has verified this run; any other node's chain is deferred for the round,
+   kept nowhere, and asked for again at the next pull.
+2. Each round, a pull or a push, reports each chain it deferred or refused,
+   one line each, on stderr (the door's reporter, so the assembled root's
+   console): `deferred N home record(s) of node <origin> on <stream> from peer
+   <peer>: not a node this node knows`, or `refused N … : <reason>`.
+3. A start whose records.json, or a `home` journal, holds a record in a format
+   this build does not know is refused: exit 1, with `<file> holds a home
+   record this build cannot read (<stream> of node <origin> at seq <n>): its
+   format is newer than this build's, or it is damaged; start the build that
+   wrote it, or move <file> aside`. Before, part 1 set such a record aside as
+   unsigned, or quarantined it and dropped it at the next save.
+4. The legacy form and every flow with no peer see nothing new: the desk's
+   next restart prints part 1's lines.
+
+### Measured (4.1b part 2)
+
+2026-09-25, Apple M3 Pro, Rust 1.96.0, on the final tree:
+
+- **The gate** passes all 8 components, with 297 node tests on each path,
+  where there were 291: the six new tests of section 11. rustfmt: glade-node
+  299 hunks, one below part 1's 300, from a line this part rewrote (a
+  `pull_sync` call in `iroh_carrier.rs`); the baseline is lowered to 299, and
+  no line this part wrote is a deviation. glade-wire 43. clippy 11 and 7. The
+  contracts gate passes, unchanged.
+- **The replay**, from `glade-wz/grazel` as grazel starts the node, each
+  instance in a scratch home:
+  - **Part 1's store, then this build** (as the lane owner asked). Part 1's
+    default binary (inode 401046031) ran twice (`tab-a`'s Hello and 22 s,
+    `tab-b` and 3 s), leaving 31 signed records. This build's first start
+    printed part 1's lines exactly, `+0 record(s), 12 unchanged` for each app,
+    with nothing set aside and nothing on stderr; it added the claim and its
+    renewal (33 records), and `tab-a` minted nothing, being known. A second
+    start was the same. (Its first start took 1.12 s, the first run of a new
+    binary file on macOS; the second 0.14 s.)
+  - **The 4.3 store, then this build**: the desk's case, should it not restart
+    before landing. The 4.3-era instance was rebuilt byte for byte from part
+    1's replay (its legacy file and journal moved back). This build printed
+    part 1's first-start lines exactly: `set aside 31 unsigned record(s) in
+    records.legacy-2026-09-24.json`, `+12` and `+10`, `set aside 1 journal(s)
+    of the served store's home share (31 record(s)) …`, `ws-razel` at epoch 1,
+    and the next start `+0`. So every record a 4.3 build wrote reads as
+    unsigned, not unknown.
+  - **A newer format.** Into a copy of the first instance, one record of this
+    build's envelope on a stream it does not know (`dir.recovery-keys`). Both
+    roots exited 1 with the line, the assembled root after its own line:
+
+    ```text
+    $R/home/sys/grazel/records.json holds a home record this build cannot read (dir.recovery-keys of node 9c3d3d5304fa8aa10cd2689c8b82a6e9cadc135da6180a30c9555e723409d90e at seq 0): its format is newer than this build's, or it is damaged; start the build that wrote it, or move $R/home/sys/grazel/records.json aside
+    ```
+
+    records.json was unchanged. On a copy, part 1's binary started instead,
+    printed `quarantined 1 record(s) at load`, and dropped the record from
+    records.json at its next save.
+- **Downstream**, against the default binary (part 1, inode 401046031, not
+  rebuilt), through the shims: client-rs 25 + 10, client-ts 48, grip-share
+  19, grazel 29 + 3, glade-gyld 233 (1 ignored) + 33, glade-gwz 9 + 7. All at
+  baseline.
+
+**Size**, in lines added and removed in `.rs` files, doc comments included:
+
+- production: +292/−53, net +239;
+  - D9: `mesh.rs` +152/−28, `peer.rs` +17/−3, `signing.rs` +15/−7,
+    `transport.rs` +7, `claims.rs` +1/−1;
+  - the hardening: `envelope.rs` +45/−4, `sysdir.rs` +19/−8, and `store.rs`
+    +36/−2, of which 25 are `StoreError`'s text, which D9's report uses;
+- tests: +350/−12, net +338;
+- beside them, `check.sh`'s baseline.

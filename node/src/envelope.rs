@@ -10,6 +10,8 @@
 //! 4.1b)".
 
 use std::fmt;
+use std::io;
+use std::path::Path;
 
 use glade_signer_api::{Purpose, SignatureStatus};
 use glade_wire::cbor::{self, Cbor};
@@ -80,10 +82,49 @@ fn open(payload: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
     canonical.then(|| (record.clone(), sig.clone()))
 }
 
-/// Whether `payload` is an envelope at all, signed or not: what a record
-/// written before plan Step 4.1b is not.
-pub fn is_envelope(payload: &[u8]) -> bool {
-    open(payload).is_some()
+/// What a `home` payload read from disk is to this build (plan Step 4.1b's
+/// part 2): what it may check, what D8 sets aside, and what it must not
+/// guess at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Format {
+    /// This build's envelope, on a directory stream, holding a record of
+    /// that stream's kind: [`verify`] checks it.
+    Sealed,
+    /// A map whose field 1 is text: the shape of every record written before
+    /// plan Step 4.1b, whose kinds were only ever added, never changed.
+    Unsigned,
+    /// Anything else: another envelope, a stream or a kind this build does
+    /// not know, a map whose field 1 is bytes, bytes that are not CBOR. A
+    /// newer build's format, or damage; the start is refused.
+    Unknown,
+}
+
+/// The [`Format`] of `op`'s payload.
+pub fn format(op: &Op) -> Format {
+    if let Some((record, _)) = open(&op.payload) {
+        let known = kind(&op.glade_id).is_some_and(|fields| is_kind(&record, fields));
+        return match known {
+            true => Format::Sealed,
+            false => Format::Unknown,
+        };
+    }
+    let Some(Cbor::Map(fields)) = parse(&op.payload) else {
+        return Format::Unknown;
+    };
+    match fields.iter().find(|(key, _)| *key == 1) {
+        Some((_, Cbor::Text(_))) => Format::Unsigned,
+        _ => Format::Unknown,
+    }
+}
+
+/// The refusal of a start that met `op` in `file` in a [`Format::Unknown`]:
+/// it names the file, the stream, the origin and the seq, and what to do.
+pub fn unreadable(file: &Path, op: &Op) -> io::Error {
+    let (file, stream, origin, seq) = (file.display(), &op.glade_id, &op.origin, op.seq);
+    let why = format!(
+        "{file} holds a home record this build cannot read ({stream} of node {origin} at seq {seq}): its format is newer than this build's, or it is damaged; start the build that wrote it, or move {file} aside"
+    );
+    io::Error::new(io::ErrorKind::InvalidData, why)
 }
 
 /// The record `payload` carries: the envelope's, or the payload itself when
@@ -270,6 +311,26 @@ pub(crate) mod testing {
         let origin = crate::transport::hex(&identity.node_id);
         let appended = Registry::sealed(identity).append_returning(record, &origin);
         appended.expect("a sealed registry appends as its own node")
+    }
+
+    /// What a newer build might write, as 4.1c's recovery-key record could
+    /// be: this build's envelope, sealed by the node whose key is `seed`, on
+    /// a stream this build does not know.
+    pub(crate) fn newer(seed: [u8; 32]) -> Op {
+        let identity = NodeIdentity::from_key(seed);
+        let record = Cbor::Map(vec![(1, Cbor::Text("recovery".into()))]);
+        let op = Op {
+            share: HOME.into(),
+            glade_id: "dir.recovery-keys".into(),
+            origin: crate::transport::hex(&identity.node_id),
+            shape: Shape::Log,
+            payload: cbor::encode(&record),
+            ..Op::default()
+        };
+        Op {
+            payload: seal(&identity, &op),
+            ..op
+        }
     }
 }
 
@@ -537,6 +598,60 @@ mod tests {
         ]));
         assert!(!is_kind(&texts, kind(G_GRANTS).unwrap()), "verbs are text");
         assert!(!directory_stream("dir.elsewhere"));
+    }
+
+    /// Part 2's hardening: `format` tells this build's envelope from a record
+    /// written before the step, and both from what this build cannot read:
+    /// its envelope on a stream it does not know or holding another shape,
+    /// another envelope, a map whose field 1 is bytes, and bytes that are not
+    /// CBOR. A record from before the step is known by its field 1, text,
+    /// whatever its other fields.
+    #[test]
+    fn format_tells_this_builds_envelope_from_an_older_record_and_from_what_it_cannot_read() {
+        let (sealed, _) = chain();
+        let with = |payload: Vec<u8>| Op {
+            payload,
+            ..sealed.clone()
+        };
+        let older = with(claim(1).encode());
+        let text = |t: &str| Cbor::Text(t.into());
+        let wider = with(cbor::encode(&Cbor::Map(vec![
+            (1, text("n")),
+            (9, Cbor::Int(1)),
+        ])));
+        assert_eq!(format(&sealed), Format::Sealed);
+        assert_eq!(format(&older), Format::Unsigned, "a record before the step");
+        assert_eq!(
+            format(&wider),
+            Format::Unsigned,
+            "whatever its later fields"
+        );
+        let identity = NodeIdentity::from_key(SEED);
+        let resealed = |op: Op| Op {
+            payload: seal(&identity, &op),
+            ..op
+        };
+        let elsewhere = resealed(Op {
+            glade_id: "dir.recovery-keys".into(),
+            ..older
+        });
+        let reshaped = resealed(wider);
+        let v2 = with(cbor::encode(&Cbor::Map(vec![
+            (1, Cbor::Bytes(claim(1).encode())),
+            (2, Cbor::Bytes(vec![0; 64])),
+            (3, Cbor::Int(2)),
+        ])));
+        let bytes_first = with(cbor::encode(&Cbor::Map(vec![(1, Cbor::Bytes(vec![1]))])));
+        let unknown = [
+            ("a stream this build does not know", elsewhere),
+            ("its envelope holding another shape", reshaped),
+            ("another envelope", v2),
+            ("a map whose field 1 is bytes", bytes_first),
+            ("bytes that are not CBOR", with(vec![0xff, 0x00])),
+        ];
+        for (what, op) in unknown {
+            assert_eq!(format(&op), Format::Unknown, "{what}");
+        }
     }
 
     /// The checked decoder reads what the codec writes, and answers `None`,

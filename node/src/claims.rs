@@ -303,7 +303,7 @@ pub(crate) async fn publish(shared: &Arc<Shared>, dir: MutexGuard<'_, DirAuthori
     }
     let from = shared.next.fetch_add(1, Ordering::SeqCst);
     for op in &ops {
-        crate::mesh::ingest_and_fanout(shared, from, op.clone()).await;
+        let _ = crate::mesh::ingest_and_fanout(shared, from, op.clone()).await;
     }
     drop(dir);
     crate::mesh::push_home(shared, ops).await;

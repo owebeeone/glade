@@ -32,15 +32,16 @@ use crate::envelope;
 use crate::frame::Frame;
 use crate::grants::{refusal, READ_SUBSCRIBE};
 use crate::iroh_carrier::{PeerAddr, PeerEndpoint, PeerLink};
-use crate::peer::{read_frame, write_frame, OPS_PER_CHUNK};
+use crate::peer::{read_frame, write_frame, SyncOutcome, OPS_PER_CHUNK};
 use crate::registry::HOME;
 use crate::router::SessionId;
 use crate::server::{send, Server, Shared};
 use crate::session::{heads_map, missing_for, refused_subscribe};
-use crate::store::{Append, Store};
+use crate::signing::NodeSigner;
+use crate::store::{Append, Store, StoreError};
 use crate::sysdir::now_ms;
 use crate::tasks::Site;
-use crate::transport::Door;
+use crate::transport::{key_of, Door};
 
 fn other<E: Into<Box<dyn std::error::Error + Send + Sync>>>(e: E) -> io::Error {
     io::Error::new(io::ErrorKind::Other, e)
@@ -70,6 +71,21 @@ pub struct Mesh {
     /// served store before the first accept, then fed each transport record
     /// that lands there.
     pub(crate) door: Option<Arc<Door>>,
+    /// D9's known set (plan Step 4.1b's part 2): this node, and each node a
+    /// link's HELLO has proved since the mesh started. A peer's `home`
+    /// record from any other node is deferred ([`Round`]).
+    pub(crate) signer: NodeSigner,
+}
+
+impl Mesh {
+    /// Report `line` where the node reports its peers: through the door, so
+    /// the assembled root puts it on its console; with no door, on stderr.
+    fn report(&self, line: &str) {
+        match &self.door {
+            Some(door) => door.report(line),
+            None => eprintln!("{line}"),
+        }
+    }
 }
 
 /// The mesh's lasting handle on its endpoint, which a composition root that
@@ -172,6 +188,7 @@ impl Server {
             links: Mutex::new(BTreeMap::new()),
             forwarded: Mutex::new(BTreeSet::new()),
             door,
+            signer: NodeSigner::new(Some(*endpoint.identity())),
         });
         self.shared
             .mesh
@@ -216,8 +233,10 @@ async fn run_link(shared: Arc<Shared>, mesh: Arc<Mesh>, link: PeerLink, dialed: 
     let PeerLink { peer, conn, send: s0_send, recv: s0_recv } = link;
     let peer_hex = hex_id(&peer.peer_id);
     // The node its HELLO proved, which every stream of the link serves (the
-    // grant check's holder, plan Step 4.3).
+    // grant check's holder, plan Step 4.3), and which may write this node's
+    // directory from now on (D9's known set, plan Step 4.1b's part 2).
     let node = peer.peer_id;
+    mesh.signer.authenticated(node);
     mesh.links.lock().await.insert(peer_hex.clone(), conn.clone());
 
     // Unlink on close, whoever closes first.
@@ -245,7 +264,9 @@ async fn run_link(shared: Arc<Shared>, mesh: Arc<Mesh>, link: PeerLink, dialed: 
     // Our home-share pull: the dialer rides stream 0 (the acceptor's stream-0
     // handler above serves it); the acceptor opens its own stream.
     if dialed {
-        pull_home(&shared, s0_send, s0_recv).await
+        pull_home(&shared, &mesh, node, s0_send, s0_recv)
+            .await
+            .map(drop)
     } else {
         // Stream 0 on the acceptor side is the DIALER's pull channel: serve it.
         {
@@ -255,7 +276,7 @@ async fn run_link(shared: Arc<Shared>, mesh: Arc<Mesh>, link: PeerLink, dialed: 
             });
         }
         let (send, recv) = conn.open_bi().await.map_err(other)?;
-        pull_home(&shared, send, recv).await
+        pull_home(&shared, &mesh, node, send, recv).await.map(drop)
     }
 }
 
@@ -265,8 +286,8 @@ async fn run_link(shared: Arc<Shared>, mesh: Arc<Mesh>, link: PeerLink, dialed: 
 /// `ExchangeReq` = a forwarded exchange (this node is the claim holder — the
 /// attached authority answers, one stream one exchange, `exchange.rs`);
 /// `Ops` = a peer's home-share PUSH (freshly-minted directory records, the B9
-/// step) — scoped ingest, home ops only, one frame per stream. `node` is the
-/// peer, as its HELLO proved it.
+/// step) — scoped ingest, home ops only, one frame per stream, one [`Round`].
+/// `node` is the peer, as its HELLO proved it.
 async fn handle_peer_stream(
     shared: Arc<Shared>,
     node: [u8; 32],
@@ -280,12 +301,14 @@ async fn handle_peer_stream(
             crate::exchange::serve_peer_exchange(shared, node, send, recv, x).await
         }
         Frame::Ops(o) => {
-            let from = shared.next.fetch_add(1, Ordering::SeqCst);
-            for op in o.ops {
-                if op.share == HOME {
-                    ingest_and_fanout(&shared, from, op).await;
-                }
+            let Some(mesh) = shared.mesh.get().cloned() else {
+                return Ok(());
+            };
+            let mut round = Round::new(&shared, &mesh, node);
+            for op in o.ops.into_iter().filter(|op| op.share == HOME) {
+                round.take(op).await;
             }
+            round.end();
             Ok(())
         }
         _ => Ok(()), // unknown opener: drop the stream, never the connection
@@ -471,7 +494,7 @@ async fn run_forward(shared: &Arc<Shared>, conn: Connection, share: &str, glade_
                 // Scoped ingest: this stream carries ONE zone's interest — the
                 // holder can't use it to push any other zone into our replica.
                 if op.share == share && op.glade_id == glade_id && op.key == key {
-                    ingest_and_fanout(shared, from_sid, op).await;
+                    let _ = ingest_and_fanout(shared, from_sid, op).await;
                 }
             }
         }
@@ -517,30 +540,126 @@ async fn serve_home(shared: &Arc<Shared>, send: &mut SendStream, their: Heads) -
 /// directory update reaches a live `dir.workspaces` subscription with no
 /// re-request (the B9 step). Non-home ops on this stream are dropped: the
 /// pull asked for the directory, a peer can't use it to push app content.
-async fn pull_home(shared: &Arc<Shared>, mut send: SendStream, mut recv: RecvStream) -> io::Result<()> {
+/// The pull is one [`Round`], whose outcome it returns.
+async fn pull_home(
+    shared: &Arc<Shared>,
+    mesh: &Mesh,
+    peer: [u8; 32],
+    mut send: SendStream,
+    mut recv: RecvStream,
+) -> io::Result<SyncOutcome> {
     let ours: Vec<StreamHeads> = {
         let st = shared.store.lock().await;
         st.all_heads().into_iter().filter(|sh| sh.share == HOME).collect()
     };
     write_frame(&mut send, &Frame::Heads(Heads { streams: ours })).await?;
-    // A fresh session id no local session holds: fan-out excludes only the
-    // ingesting link, never a real subscriber.
-    let from_sid = shared.next.fetch_add(1, Ordering::SeqCst);
-    loop {
+    let mut round = Round::new(shared, mesh, peer);
+    let ended = loop {
         let frame = match read_frame(&mut recv).await {
             Ok(f) => f,
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break, // peer closed = done
-            Err(e) => return Err(e),
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break Ok(()), // peer closed = done
+            Err(e) => break Err(e),
         };
         if let Frame::Ops(ops) = frame {
-            for op in ops.ops {
-                if op.share == HOME {
-                    ingest_and_fanout(shared, from_sid, op).await;
-                }
+            for op in ops.ops.into_iter().filter(|op| op.share == HOME) {
+                round.take(op).await;
+            }
+        }
+    };
+    let outcome = round.end();
+    ended.map(|()| outcome)
+}
+
+/// One round of a peer's `home` records, a pull or one push (plan Step 4.1b's
+/// part 2; `GladeNodeSigning.md` D9). A record is taken only from a node this
+/// node knows, itself or one whose HELLO it has verified this run. Another
+/// node's chain is deferred for the round: never stored or folded, and asked
+/// for again at the next pull, whose heads lack it. A chain the store refuses
+/// is cut short too, since each later op chains on the one before. At the
+/// round's end each chain cut short is reported, a line each.
+struct Round<'a> {
+    shared: &'a Arc<Shared>,
+    mesh: &'a Mesh,
+    peer: [u8; 32],
+    /// A fresh session id no local session holds: fan-out excludes only the
+    /// ingesting link, never a real subscriber.
+    from: SessionId,
+    outcome: SyncOutcome,
+    /// Each chain cut short, by (stream, origin): why, and how many of its
+    /// ops were not taken.
+    cut: BTreeMap<(String, String), (Cut, usize)>,
+}
+
+/// Why a round cut a chain short.
+enum Cut {
+    /// Its origin is not a node this node knows (D9).
+    Deferred,
+    /// The store refused one of its ops, for this reason.
+    Refused(String),
+}
+
+impl<'a> Round<'a> {
+    fn new(shared: &'a Arc<Shared>, mesh: &'a Mesh, peer: [u8; 32]) -> Round<'a> {
+        let from = shared.next.fetch_add(1, Ordering::SeqCst);
+        let (outcome, cut) = (SyncOutcome::default(), BTreeMap::new());
+        Round {
+            shared,
+            mesh,
+            peer,
+            from,
+            outcome,
+            cut,
+        }
+    }
+
+    /// Take `op`, a `home` op the peer sent, unless its chain is cut short.
+    async fn take(&mut self, op: Op) {
+        let chain = (op.glade_id.clone(), op.origin.clone());
+        if let Some((_, missed)) = self.cut.get_mut(&chain) {
+            *missed += 1;
+            return;
+        }
+        let known = key_of(&op.origin).is_some_and(|node| self.mesh.signer.knows(&node));
+        if !known {
+            self.cut.insert(chain, (Cut::Deferred, 1));
+            return;
+        }
+        match ingest_and_fanout(self.shared, self.from, op).await {
+            Ok(_) => self.outcome.applied += 1,
+            Err(e) => {
+                self.cut.insert(chain, (Cut::Refused(e.to_string()), 1));
             }
         }
     }
-    Ok(())
+
+    /// End the round: report each chain cut short, and hand back what the
+    /// round took, refused and deferred.
+    fn end(self) -> SyncOutcome {
+        let Round {
+            mesh,
+            peer,
+            mut outcome,
+            cut,
+            ..
+        } = self;
+        let peer = hex_id(&peer);
+        for ((stream, origin), (why, n)) in cut {
+            let head = format!("{n} home record(s) of node {origin} on {stream} from peer {peer}");
+            let chain = (HOME.to_string(), stream, Vec::new(), origin);
+            let line = match why {
+                Cut::Deferred => {
+                    outcome.deferred.push(chain);
+                    format!("deferred {head}: not a node this node knows")
+                }
+                Cut::Refused(why) => {
+                    outcome.rejected.push(chain);
+                    format!("refused {head}: {why}")
+                }
+            };
+            mesh.report(&line);
+        }
+        outcome
+    }
 }
 
 /// Land one peer-ingested op in the local replica (same chain checks as any
@@ -548,8 +667,12 @@ async fn pull_home(shared: &Arc<Shared>, mut send: SendStream, mut recv: RecvStr
 /// duplicate ops fan out to no one — the fold only ever sees the valid set.
 /// The cut is held from the append until the fan-out is queued, so a local
 /// subscriber gets the op once, after its ack (R4, client-writes plan Step
-/// 2.2).
-pub(crate) async fn ingest_and_fanout(shared: &Arc<Shared>, from: SessionId, op: Op) {
+/// 2.2). Returns the store's answer.
+pub(crate) async fn ingest_and_fanout(
+    shared: &Arc<Shared>,
+    from: SessionId,
+    op: Op,
+) -> Result<Append, StoreError> {
     let (share, glade_id, key) = (op.share.clone(), op.glade_id.clone(), op.key.clone());
     let _cut = shared.cut.lock().await;
     let res = shared.store.lock().await.append(op.clone());
@@ -567,6 +690,7 @@ pub(crate) async fn ingest_and_fanout(shared: &Arc<Shared>, from: SessionId, op:
             }
         }
     }
+    res
 }
 
 /// Close the revoking node's live link, if it rides the key it revoked (plan
@@ -622,7 +746,7 @@ pub fn directory_knows(store: &Store, share: &str) -> bool {
 mod tests {
     use super::*;
     use crate::claims::testing;
-    use crate::registry::{Record, RegistryApi, G_CLAIMS};
+    use crate::registry::{Record, RegistryApi, G_CLAIMS, G_PRINCIPALS};
     use crate::sysdata::{CapabilityGrant, CapabilityRevocation, ServeClaim, WorkspaceEntry};
     use crate::sysdir::{boot_at, now_ms};
     use std::path::PathBuf;
@@ -967,7 +1091,8 @@ mod tests {
             Record::TransportRevoke(sign_revocation(&A_SEED, &endpoint_of(A_KEY))),
         );
         let from = b.shared.next.fetch_add(1, Ordering::SeqCst);
-        ingest_and_fanout(&b.shared, from, revoked).await;
+        let landed = ingest_and_fanout(&b.shared, from, revoked).await;
+        assert!(matches!(landed, Ok(Append::Appended)), "{landed:?}");
         for _ in 0..500 {
             if links(&b).await == 0 {
                 break;
@@ -1011,6 +1136,85 @@ mod tests {
         );
         assert_eq!(*b_lines.lock().unwrap(), [line]);
         assert_eq!(links(&b).await, 0);
+    }
+
+    // ---- D9's known set (plan Step 4.1b's part 2), over real iroh ----------
+
+    const C_SEED: [u8; 32] = [27; 32];
+    const C_KEY: [u8; 32] = [28; 32];
+
+    /// A principal's record.
+    fn principal(name: &str) -> Record {
+        let principal = name.into();
+        Record::Principal(crate::sysdata::PrincipalRecord { principal })
+    }
+
+    /// Plan Step 4.1b's part 2 (D9). B holds its own record and two of C's,
+    /// a node A has not met. A's pull from B takes B's record and defers C's
+    /// chain, kept nowhere, with one line. Once A has met C, by a HELLO, B's
+    /// push of C's records lands them; and a record under B's id that B did
+    /// not sign, in the same push, is refused, with one line.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_third_nodes_records_are_deferred_until_its_hello_and_reported() {
+        let c_identity = crate::peer::NodeIdentity::from_key(C_SEED);
+        let c_id = hex_id(&c_identity.node_id);
+        let mut c_records = crate::registry::Registry::sealed(c_identity);
+        let c_ops: Vec<Op> = ["c0", "c1"]
+            .into_iter()
+            .map(|name| c_records.append_returning(principal(name), &c_id).unwrap())
+            .collect();
+        let b_op = signed(B_SEED, principal("b"));
+        let records = [c_ops.clone(), vec![b_op.clone()]].concat();
+        let a_keys = [endpoint_of(A_KEY)];
+        let (b, _, at_b) = behind_door("d9-b", (B_SEED, B_KEY), &a_keys, &records).await;
+        let (_c, _, at_c) = behind_door("d9-c", (C_SEED, C_KEY), &a_keys, &[]).await;
+        let known = [endpoint_of(B_KEY), endpoint_of(C_KEY)];
+        let (a, a_lines, _) = behind_door("d9-a", (A_SEED, A_KEY), &known, &[]).await;
+        let held = |st: &Store, origin: &str| st.scan(HOME, G_PRINCIPALS, &[], origin, -1);
+        let (a_id, b_id) = (hex_id(&node_of(A_SEED)), hex_id(&node_of(B_SEED)));
+
+        a.connect_peer(&at_b).await.unwrap();
+        {
+            let st = a.shared.store.lock().await;
+            let b_held = std::slice::from_ref(&b_op);
+            assert_eq!(held(&st, &b_id), b_held, "B's own record lands");
+            assert_eq!(held(&st, &c_id), [], "C's is kept nowhere");
+        }
+        let deferred = format!(
+            "deferred 2 home record(s) of node {c_id} on dir.principals from peer {b_id}: not a node this node knows"
+        );
+        assert_eq!(*a_lines.lock().unwrap(), std::slice::from_ref(&deferred));
+
+        a.connect_peer(&at_c).await.unwrap();
+        let bare = Op {
+            seq: 1,
+            prev: Some(crate::chain::op_hash(&b_op).to_vec()),
+            payload: principal("b1").encode(),
+            ..b_op.clone()
+        };
+        let forged = Op {
+            payload: crate::envelope::seal(&c_identity, &bare),
+            ..bare
+        };
+        let mesh = b.shared.mesh.get().unwrap();
+        let conn = mesh.links.lock().await.get(&a_id).cloned().unwrap();
+        let (mut send, _recv) = conn.open_bi().await.unwrap();
+        let ops = [vec![forged], c_ops].concat();
+        let pushed = Frame::Ops(Ops { ops, pri: None });
+        write_frame(&mut send, &pushed).await.unwrap();
+        tokio::io::AsyncWriteExt::shutdown(&mut send).await.unwrap();
+        wait_for(&a, |st| held(st, &c_id).len() == 2, "C's records at A").await;
+        let refused = format!(
+            "refused 1 home record(s) of node {b_id} on dir.principals from peer {b_id}: ({b_id},1) does not verify: its signature does not verify"
+        );
+        for _ in 0..500 {
+            if a_lines.lock().unwrap().len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(*a_lines.lock().unwrap(), [deferred, refused]);
+        assert_eq!(held(&*a.shared.store.lock().await, &b_id), [b_op]);
     }
 
     // ---- the s-discovery golden path, end to end ---------------------------

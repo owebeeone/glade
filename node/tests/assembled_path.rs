@@ -35,8 +35,8 @@ use glade_node::sysdata::{NodeRecord, ServeClaim};
 use glade_node::sysdir::{boot_at, now_ms};
 use glade_node::transport::Bound;
 use glade_node::ws;
-use glade_wire::cbor;
-use glade_wire::generated::{Hello, Op, Subscribe};
+use glade_wire::cbor::{self, Cbor};
+use glade_wire::generated::{Hello, Op, Shape, Subscribe};
 
 const VARIABLE: &str = "GLADE_NODE_ASSEMBLED";
 
@@ -86,6 +86,15 @@ fn glade_node(home: &Path, root: Root, args: &[&str]) -> Command {
 /// A node asked for `root` must be refused: it exits within the bound, and
 /// nothing is written under `home`. Returns its exit status and stderr.
 fn refused(home: &Path, root: Root, args: &[&str]) -> (ExitStatus, String) {
+    let (status, stderr) = ended(home, root, args);
+    let written: Vec<_> = std::fs::read_dir(home).unwrap().collect();
+    assert!(written.is_empty(), "written under GLADE_HOME: {written:?}");
+    (status, stderr)
+}
+
+/// A node asked for `root` must end by itself, within the bound. Returns its
+/// exit status and stderr.
+fn ended(home: &Path, root: Root, args: &[&str]) -> (ExitStatus, String) {
     let mut node = glade_node(home, root, args)
         .spawn()
         .expect("spawn glade-node");
@@ -107,8 +116,6 @@ fn refused(home: &Path, root: Root, args: &[&str]) -> (ExitStatus, String) {
         .unwrap()
         .read_to_string(&mut stderr)
         .unwrap();
-    let written: Vec<_> = std::fs::read_dir(home).unwrap().collect();
-    assert!(written.is_empty(), "written under GLADE_HOME: {written:?}");
     (status, stderr)
 }
 
@@ -705,6 +712,52 @@ fn both_roots_set_an_unsigned_instance_aside_and_serve_signed() {
         let (lines, stderr) = start_and_stop(&home, root, &args);
         assert_eq!(kinds(&lines), again, "{root:?}: {lines:?}, {stderr}");
         assert_eq!(lines[3], "app x registered (+0 record(s), 2 unchanged)");
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Plan Step 4.1b's part 2's hardening, on each root: an instance whose
+/// records.json holds a record a newer build might write (this build's
+/// envelope, signed by the node, on a stream this build does not know). The
+/// start is refused: the node exits 1 and says on stderr which record it
+/// cannot read and what to do, with no panic, and records.json is as it was.
+#[test]
+fn both_roots_refuse_a_store_in_a_newer_format_with_a_clear_message() {
+    let dir = scratch("newer");
+    let home = dir.join("glade-home");
+    for (root, name) in [(Root::HandWritten, "h"), (Root::Assembled, "a")] {
+        let instance = home.join("sys").join(name);
+        let boot = boot_at(instance.clone(), "local").unwrap();
+        let (identity, node) = (boot.identity().unwrap(), boot.node_id.clone());
+        let mut snapshot = boot.registry.snapshot();
+        drop(boot);
+        let record = Cbor::Map(vec![(1, Cbor::Text("recovery".into()))]);
+        let op = Op {
+            share: HOME.into(),
+            glade_id: "dir.recovery-keys".into(),
+            origin: node.clone(),
+            shape: Shape::Log,
+            payload: cbor::encode(&record),
+            ..Op::default()
+        };
+        let op = Op {
+            payload: envelope::seal(&identity, &op),
+            ..op
+        };
+        snapshot.records.push(cbor::encode(&op.to_cbor()));
+        BlobStore::new(&instance).save(&snapshot).unwrap();
+        let written = std::fs::read(instance.join("records.json")).unwrap();
+
+        let args = ["--profile", "local", "--name", name, "0"];
+        let (status, stderr) = ended(&home, root, &args);
+        assert_eq!(status.code(), Some(1), "{root:?}: {stderr}");
+        let named = format!(
+            "holds a home record this build cannot read (dir.recovery-keys of node {node} at seq 0)"
+        );
+        assert!(stderr.contains(&named), "{root:?}: {stderr}");
+        assert!(!stderr.contains("panicked"), "{root:?}: {stderr}");
+        let now = std::fs::read(instance.join("records.json")).unwrap();
+        assert_eq!(now, written, "{root:?}: records.json as it was");
     }
     std::fs::remove_dir_all(&dir).unwrap();
 }
