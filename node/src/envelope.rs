@@ -19,8 +19,8 @@ use glade_wire::generated::{Op, Shape};
 
 use crate::peer::NodeIdentity;
 use crate::registry::{
-    G_BINDINGS, G_BINDING_RETRACTIONS, G_CLAIMS, G_GRANTS, G_NODES, G_PRINCIPALS, G_REVOCATIONS,
-    G_SERVICES, G_TRANSPORT_BINDINGS, G_TRANSPORT_REVOCATIONS, G_WORKSPACES, HOME,
+    G_BINDINGS, G_BINDING_RETRACTIONS, G_CLAIMS, G_GRANTS, G_NODES, G_PRINCIPALS, G_RECOVERY_KEYS,
+    G_REVOCATIONS, G_SERVICES, G_TRANSPORT_BINDINGS, G_TRANSPORT_REVOCATIONS, G_WORKSPACES, HOME,
 };
 use crate::signing;
 use crate::sysdata::SignedRecord;
@@ -70,8 +70,9 @@ pub fn seal(identity: &NodeIdentity, op: &Op) -> Vec<u8> {
 }
 
 /// The record and the signature `payload` holds, if it is an envelope:
-/// exactly `{1: bytes, 2: 64 bytes}`, canonically encoded.
-fn open(payload: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+/// exactly `{1: bytes, 2: 64 bytes}`, canonically encoded. local.json's
+/// overlay is sealed in the same form (plan Step 4.1c, `overlay.rs`).
+pub(crate) fn open(payload: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
     let Some(Cbor::Map(fields)) = parse(payload) else {
         return None;
     };
@@ -191,7 +192,7 @@ enum Field {
 fn kind(glade_id: &str) -> Option<&'static [Field]> {
     use Field::{Bytes, Int, Text, Texts};
     let fields: &'static [Field] = match glade_id {
-        G_NODES | G_REVOCATIONS | G_BINDING_RETRACTIONS => &[Text, Text],
+        G_NODES | G_REVOCATIONS | G_BINDING_RETRACTIONS | G_RECOVERY_KEYS => &[Text, Text],
         G_WORKSPACES | G_GRANTS => &[Text, Text, Texts],
         G_CLAIMS => &[Text, Text, Int, Int],
         G_BINDINGS => &[Text, Text, Text, Text, Text, Text],
@@ -315,15 +316,15 @@ pub(crate) mod testing {
         appended.expect("a sealed registry appends as its own node")
     }
 
-    /// What a newer build might write, as 4.1c's recovery-key record could
-    /// be: this build's envelope, sealed by the node whose key is `seed`, on
-    /// a stream this build does not know.
+    /// What a newer build might write, as a record of rotation (plan Step
+    /// 5.1's gap) could be: this build's envelope, sealed by the node whose
+    /// key is `seed`, on a stream this build does not know.
     pub(crate) fn newer(seed: [u8; 32]) -> Op {
         let identity = NodeIdentity::from_key(seed);
         let record = Cbor::Map(vec![(1, Cbor::Text("recovery".into()))]);
         let op = Op {
             share: HOME.into(),
-            glade_id: "dir.recovery-keys".into(),
+            glade_id: "dir.key-rotations".into(),
             origin: crate::transport::hex(&identity.node_id),
             shape: Shape::Log,
             payload: cbor::encode(&record),
@@ -343,8 +344,8 @@ mod tests {
     use crate::registry::{Record, Registry};
     use crate::sysdata::{
         BindingDecl, BindingRetraction, CapabilityGrant, CapabilityRevocation, NodeRecord,
-        NodeTransportBinding, NodeTransportRevocation, PrincipalRecord, ServeClaim,
-        ServiceDefinition, WorkspaceEntry,
+        NodeRecoveryKey, NodeTransportBinding, NodeTransportRevocation, PrincipalRecord,
+        ServeClaim, ServiceDefinition, WorkspaceEntry,
     };
     use ed25519_dalek::{Signature, SigningKey};
 
@@ -577,6 +578,14 @@ mod tests {
                 }
                 .to_cbor(),
             ),
+            (
+                G_RECOVERY_KEYS,
+                NodeRecoveryKey {
+                    node: text("n"),
+                    recovery_key: text("k"),
+                }
+                .to_cbor(),
+            ),
         ];
         for (stream, record) in &records {
             let bytes = cbor::encode(record);
@@ -634,7 +643,7 @@ mod tests {
             ..op
         };
         let elsewhere = resealed(Op {
-            glade_id: "dir.recovery-keys".into(),
+            glade_id: "dir.key-rotations".into(),
             ..older
         });
         let reshaped = resealed(wider);

@@ -200,6 +200,13 @@ mod unix {
         TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok()
     }
 
+    /// A stderr line a clean run may print: the assembled root's name, and
+    /// plan Step 4.1c's warning of a node with no recovery key committed.
+    fn expected(line: &str) -> bool {
+        line.starts_with("glade-node: composition root")
+            || line.starts_with(glade_node::recovery::NOT_COMMITTED)
+    }
+
     /// The UDP port of a `peer <endpoint-id> <ip:port>` line's value.
     fn udp_port(peer: &str) -> u16 {
         peer.rsplit(':').next().unwrap().parse().unwrap()
@@ -244,10 +251,7 @@ mod unix {
                 Some(0),
                 "{name} after {signal}: {status}, stderr {stderr}"
             );
-            let unexpected: Vec<&str> = stderr
-                .lines()
-                .filter(|l| !l.starts_with("glade-node: composition root"))
-                .collect();
+            let unexpected: Vec<&str> = stderr.lines().filter(|l| !expected(l)).collect();
             assert_eq!(unexpected, Vec::<&str>::new(), "{name}'s stderr");
             assert!(!lock.exists(), "{name} released its instance lock");
             assert!(
@@ -282,10 +286,7 @@ mod unix {
         a.signal("-TERM");
         let (status, stderr) = a.wait();
         assert_eq!(status.code(), Some(0), "{status}, stderr {stderr}");
-        let unexpected: Vec<&str> = stderr
-            .lines()
-            .filter(|l| !l.starts_with("glade-node: composition root"))
-            .collect();
+        let unexpected: Vec<&str> = stderr.lines().filter(|l| !expected(l)).collect();
         assert_eq!(unexpected, Vec::<&str>::new(), "the dial was cancelled");
         assert!(
             !a.lines.iter().any(|l| l.starts_with("listening ")),

@@ -28,7 +28,7 @@
 //! by value, so what is left in the engine's slots owns nothing.
 
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -46,10 +46,11 @@ use crate::grants::{CLIENT_GRANTS_ENFORCED, GRANTS_UNAVAILABLE};
 use crate::iroh_carrier::{PeerEndpoint, PeerEntry};
 use crate::mesh::{release_links, EndpointSlot};
 use crate::peer::NodeIdentity;
+use crate::recovery;
 use crate::registry::HOME;
 use crate::server::{accept_clients, Server, Shared};
 use crate::signing::NodeSigner;
-use crate::sysdir::{boot_at, instance_dir, Boot, Profile};
+use crate::sysdir::{boot_at_with, instance_dir, Boot, Profile};
 use crate::tasks::{self, Inbox};
 use crate::transport::{Door, EndpointKey};
 
@@ -191,7 +192,8 @@ impl Instance {
     }
 
     fn boot(start: &NodeStart, at: &InstanceAt) -> io::Result<Instance> {
-        let boot = boot_at(at.dir.clone(), &at.operator)?;
+        let recovery_out = start.settings.recovery_out.as_deref().map(Path::new);
+        let boot = boot_at_with(at.dir.clone(), &at.operator, recovery_out)?;
         let entries = start
             .settings
             .peers
@@ -212,6 +214,9 @@ impl Instance {
             .console
             .out(&format!("instance {}", boot.dir.display()));
         start.console.out(&format!("node {}", boot.node_id));
+        if let Some(committed) = &boot.recovery {
+            start.console.out(&committed.to_string());
+        }
         if let Some(aside) = &boot.set_aside {
             start.console.out(&aside.to_string());
         }
@@ -225,6 +230,14 @@ impl Instance {
         }
         if boot.registry.policy_quarantined() {
             start.console.out(GRANTS_UNAVAILABLE);
+        }
+        // Plan Step 4.1c's two warnings, as the hand-written root prints them.
+        if let Some(discarded) = &boot.overlay.discarded {
+            start.console.err(discarded);
+        }
+        let program = start.settings.program.as_deref();
+        if let Some(warning) = recovery::warning(&boot, program) {
+            start.console.err(&warning);
         }
         Ok(Instance {
             slot: Arc::new(Mutex::new(Some(boot))),

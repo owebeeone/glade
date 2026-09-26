@@ -257,6 +257,26 @@ impl NodeTransportRevocation {
 }
 
 #[derive(Clone, Debug, PartialEq, Default)]
+pub struct NodeRecoveryKey {
+    pub node: String,
+    pub recovery_key: String,
+}
+impl NodeRecoveryKey {
+    pub fn to_cbor(&self) -> Cbor {
+        Cbor::Map(vec![
+            (1, Cbor::Text(self.node.clone())),
+            (2, Cbor::Text(self.recovery_key.clone())),
+        ])
+    }
+    pub fn from_cbor(c: &Cbor) -> Self {
+        Self {
+            node: c.get(1).text(),
+            recovery_key: c.get(2).text(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Default)]
 pub struct SignedRecord {
     pub record: Vec<u8>,
     pub sig: Vec<u8>,

@@ -225,10 +225,13 @@ async fn a_node_links_to_a_peer_and_stops_clean_with_its_ports_free() {
         !lock.exists(),
         "A's instance lock is released with its storage"
     );
+    // Nothing on stderr but plan Step 4.1c's warning of a node with no
+    // recovery key committed.
+    let warned = format!("stderr: {}", glade_node::recovery::NOT_COMMITTED);
     let stderr: Vec<String> = a_lines
         .all()
         .into_iter()
-        .filter(|l| l.starts_with("stderr:"))
+        .filter(|l| l.starts_with("stderr:") && !l.starts_with(&warned))
         .collect();
     assert_eq!(stderr, Vec::<String>::new());
 

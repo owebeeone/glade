@@ -82,7 +82,10 @@ shares nothing, by pointer or by behaviour, and two nodes meet only through the
 fake network whose addresses they bind. A `#[lazy]` slot is Shaku's `OnceLock`,
 so a concurrent first resolution constructs once per scope. Construction is
 eager unless a binding is overridden or `#[lazy]`; a test composition overrides
-every provider marked real above, and a process-wide counter shows none built.
+every provider marked real above, and the recorder it binds as its construction
+observer (`Constructions`, which the module binds to `Unobserved`) sees none
+built. A process-wide counter did this until the process-globals plan's Step
+4.1 (glade `a1f97ee`).
 
 ## The assembled path: real now, Phase 4 next, what 3.3 and 3.4 build on
 
@@ -347,7 +350,7 @@ stores are the same on both paths.
 | Store | Where | Holds | Written by | Read by | Port it would stand behind |
 | --- | --- | --- | --- | --- | --- |
 | `records.json`, through `BlobStore` (`StoreApi`) | the instance directory | this node's own directory records as one snapshot: the fold's ops and heads | first-boot presence (`sysdir::boot_at`); app registration (`run()`, and on the assembled path `Records::register` in the `Assembly` step); `claims.rs`'s mints after adoption | boot (`Registry::from_snapshot`, verify-as-ingest) | the persistence port, `SnapshotStore` |
-| the served store, `store::Store` | `<instance>/cache/store/`, or the second positional (a temp directory in the legacy form) | every op the node serves, in per-(share, origin) op logs: its own records (seeded from records.json at adoption, then published), peers' records, clients' ops | `Server` (`Frame::Ops`); the mesh (pull, push, forward); `claims::publish` | every serve path; the peer pull announces its heads | the operation-store port, `DurableOperationStore` |
+| the served store, `store::Store` | `<instance>/cache/store/`, or the second positional, which the legacy form requires (the owner's ruling of 2026-09-26; it once defaulted to a temp directory) | every op the node serves, in per-(share, origin) op logs: its own records (seeded from records.json at adoption, then published), peers' records, clients' ops | `Server` (`Frame::Ops`); the mesh (pull, push, forward); `claims::publish` | every serve path; the peer pull announces its heads | the operation-store port, `DurableOperationStore` |
 
 On the assembled path `Records` is the record host over records.json until
 `Storage` adopts the instance. In the journeys, `Records` persists through a
@@ -3602,7 +3605,7 @@ run on real iroh over loopback in `iroh_carrier`'s tests, each bounded at
 | `iroh_carrier`: `a_frame_read_in_two_parts_arrives_whole` | from a raw dialer: another first word is refused with `Transport("not a carrier link")`, and the port accepts the next; a receive dropped with half a frame keeps it, and that frame and the next arrive whole | with no check of the first word: "another word is refused", left `None`; with a receive that keeps no part: "the dropped receive kept its part", left `Err(FrameTooLarge)`, right `Ok(Some([97, 98, 99, 100, 101, 102]))` |
 | `iroh_carrier`: `a_torn_frame_is_never_followed_by_another` | a 4 MiB send past the peer's window, dropped part-way; the next send answers `Closed`, and nothing arrives after the torn frame | with the torn mark ignored: "the link ended instead", left `Err(Elapsed(()))`: the next send waited behind the torn frame |
 | `iroh_carrier`: `a_link_outlives_a_port_dropped_without_close` | with both ports dropped unclosed, a frame still crosses their link | with a link that holds no endpoint: "the transport went with its port", left `Ok(Err(Transport("connection lost")))` |
-| `tests/assembly_registration`: `an_assembly_with_nothing_overridden_builds_its_real_providers_and_they_refuse`, changed | the assembled path builds `IrohCarrier` for the peer role, counted as before, and lent no key it refuses to bind | on HEAD's `assembly.rs`: left `Err(Transport("the iroh CarrierPort adapter is not built yet (plan Phase 4)"))`, right `Err(Transport("the iroh adapter was lent no endpoint key"))` |
+| `tests/assembly_registration`: `an_assembly_with_nothing_overridden_builds_its_real_providers_and_they_refuse`, changed | the assembled path builds `IrohCarrier` for the peer role, which the test's construction observer records (a process-wide counter counted it then), and lent no key it refuses to bind | on HEAD's `assembly.rs`: left `Err(Transport("the iroh CarrierPort adapter is not built yet (plan Phase 4)"))`, right `Err(Transport("the iroh adapter was lent no endpoint key"))` |
 | the module's `compile_fail` doctests, three changed | a cycle, two peers and a carrier asked for by port type still fail to compile, with `IrohCarrier` where `PendingIrohAdapter` was | none: they guard the module. Each body, built as an example on a scratch copy, failed with its recorded code and no other: E0277 (the missing binding, unchanged), E0275, E0119, E0277 |
 | contracts: `ca_005_each_link_names_the_far_ends_transport_identity` and `rejects_a_link_that_names_its_own_end`; node: `ca_005_the_fake_network_names_each_far_end` | the changed probe on both fakes, whose `bind` answers the address it was asked for | none: they pass unchanged |
 
@@ -5127,3 +5130,328 @@ What they do not prove:
 - production: +72/−21, net +51, of which 24 lines are code:
   `claims.rs` +51/−6, `bin/glade-node.rs` +13/−10, `lifecycle.rs` +8/−5;
 - tests: +159/−13: `claims.rs` +104/−4, `tests/assembled_path.rs` +55/−9.
+
+## Custody and the local overlay's check (plan Step 4.1c)
+
+Design addition, 2026-09-25, written before the code against glade `01514b4`,
+parked, and revised on 2026-09-26 against glade `a1f97ee` for the owner's rule
+of no process globals (glade's `AGENTS.md`; `dev-docs/ProcessGlobalsPlan.md` at
+the glade-wz root), whose Steps 2.1 and 4.1 landed in between. The red runs
+and the measured figures were filled in afterwards. The rulings:
+`GladeNodeSigning.md` D10, ruled (a), a recovery key; D7's
+`glade/v1/local-overlay\0` tag; D11's 4.1c row, about 250 lines. The plan's
+Step 4.1 asks that recovery material be "minted at first setup and written
+where the operator names, offline", and its section 3 that 4.1 "mints recovery
+material and stops": rotation stays 5.1's gap.
+
+Nothing changes in the wire, the contracts or the dependencies. The IR gains
+one record kind, and `sysdata.rs` is regenerated from it. The code is in two
+new modules, `node/src/recovery.rs` and `node/src/overlay.rs`, with the boot's
+calls in `sysdir.rs` and each root's lines.
+
+### 1. The recovery key
+
+- A separate Ed25519 key, from the operating system's randomness
+  (`signing::random_seed`), never derived from `node.key`.
+- **The commitment** is a new record kind in the node's own chain, on a new
+  stream, `dir.recovery-keys`: `NodeRecoveryKey`, fields 1 `node` and 2
+  `recovery_key`, each 64 lower-case hex digits. Like every `home` record it
+  is sealed by the `origin-op` envelope (4.1b), which is what proves it. It
+  carries no signature of its own: the transport binding's has one because
+  it was minted before `home` records were signed.
+- **The secret half**, the key's 32-byte seed, the form `node.key` holds, is
+  written to the file the operator names and nowhere else. The node keeps no
+  copy.
+- **Committed** means the node's own chain holds a `NodeRecoveryKey` naming
+  it (`Registry::recovery_key`). One per node: the command refuses a second.
+  Replacing a lost one is rotation's (5.1).
+- Nothing reads the key until rotation exists. The commitment only has to be
+  made while the node key is trusted.
+
+### 2. The one-shot command
+
+`glade-node recovery --name <name> --out <path>`, on the stopped instance
+`<root>/sys/<name>`. `<root>` is the instance root, `GLADE_HOME`, else
+`$HOME/.glade` (`sysdir::instance_root`), which the binary reads once at its
+entry point and hands to the command, as it hands it to a start. The command
+reads no environment.
+
+1. Both flags are required; anything else is refused with the usage.
+2. A name with no instance (no `node.key`) is refused: the command commits for
+   an instance that has booted.
+3. `--out` is checked (section 3) before anything is written.
+4. It boots the instance as a start does (`sysdir::boot_at`): it takes the
+   instance lock, which a running node holds, so it is refused then ("stop the
+   node first"). It loads and verifies records.json, and makes any write a
+   start would.
+5. If the node has already committed a key, it refuses, naming the key, and
+   writes nothing.
+6. It mints the key and writes the secret (section 3). Then it appends the
+   commitment and saves records.json, in one acceptance (SP-L1).
+7. It prints `node <id>`, then `recovery key <hex> committed; wrote its secret
+   to <path>; this node keeps no copy: move the file offline now`, and exits
+   0. The line names no mode: off Unix the file has none of its own.
+
+- **The file is written before the commitment.** A crash between the two
+  leaves a key that nothing commits, and the command can be run again with
+  another path. It never leaves a commitment with no key. If the save fails,
+  the command exits 1 and says the file is not known to be committed. It
+  does not delete the file: a save whose outcome is unknown may have landed.
+- **It starts no node**, so it runs before the composition root is chosen,
+  and `GLADE_NODE_ASSEMBLED` does not apply to it.
+- **The entry point reads the arguments once.** `start` reads them and hands
+  them to the command or to the composition root it runs, where each root
+  read its own. So the allowlist's permanent `env::args` entry counts one
+  read, where it counted two.
+- The served store takes the commitment at the next start's adoption
+  (`seed_registry`), and peers pull it from there.
+
+### 3. The file
+
+- **The path is named on the command line only, and is absolute.** Resolving
+  a relative one would read the working directory, which only a program's
+  entry point may do; a relative path is refused. Its directory must exist,
+  and symbolic links in the path are resolved.
+- **Refused inside GLADE_HOME**, the instance root, compared by path
+  components once both paths are resolved.
+- **Never written over.** A path where anything exists is refused. The file is
+  then created exclusively (`create_new`), so one that appears in between is
+  refused too.
+- **Mode 0600** on Unix, as `node.key`. Off Unix it gets default permissions
+  and no check, as `node.key` does (F5).
+- **Synced**, with its directory entry, before the commitment is saved.
+
+### 4. At a first boot: `--recovery-out <path>`
+
+- Both roots take `--recovery-out <path>` in the booted form. The path is
+  checked as in section 3 before anything is written.
+- At a first boot, the boot that mints the node's presence, the node mints the
+  key, writes the secret, and appends the commitment in the same save as its
+  presence. After `node`, both roots print the `recovery key ... committed`
+  line of section 2.
+- At a later boot the start is refused before records.json is written:
+  `--recovery-out is taken at a node's first boot only, and <dir> has booted:
+  stop it and run glade-node recovery --name <name> --out <path>`.
+- The legacy form ignores it, as it ignores `--app` and `--peer`.
+
+### 5. Until the commitment exists: the warning
+
+- Each start of a booted node whose chain holds no commitment prints one line
+  on stderr after its boot lines, then starts as before, so grazel is
+  untouched. Both roots print it at the same point.
+- It says exactly what to run, from the instance directory
+  (`<root>/sys/<name>`, under the root the entry point handed down) and the
+  path of the running program:
+
+  `no recovery key is committed for this node: stop it, then run
+  GLADE_HOME=<root> <program> recovery --name <name> --out <an absolute path
+  outside GLADE_HOME>`
+
+- **The program's path** is read once at the binary's entry point
+  (`std::env::current_exe`, then its links resolved) and handed down: to
+  `run` as an argument, and to the assembled root in `Settings.program`, as
+  the instance root travels in `Settings.instance_root`. A caller that hands
+  none, as a test's settings do, gets `glade-node` in its place. Read below
+  the entry point, it would name whatever program the library runs in.
+- A path holding a character a shell would split or expand is single-quoted.
+- It sets `GLADE_HOME`, which overrides `HOME` (`sysdir::instance_root`), so
+  the command reaches the same instance whatever `HOME` is.
+- The desk: grazel runs the node with `GLADE_HOME=<data>/sys`
+  (`grazel/src/lib.rs:236-241`), from grazel's directory, as
+  `../glade/node/target/debug/glade-node`.
+
+### 6. The local overlay's check (D7)
+
+- `local.json` (class 3, never shipped) holds the canonical CBOR of a
+  `SignedRecord`: `record` is the overlay, and `sig` is 64 bytes.
+- **The overlay** is the canonical CBOR of a map of assertions numbered from 1.
+  This build knows none, so the only overlay it applies is the empty map.
+- **`sig`** is the node key's Ed25519 signature, checked strictly, over
+  `glade/v1/local-overlay\0` then `record` (`Purpose::LocalOverlay`). A
+  signature by another key, or made for another purpose, fails.
+- **No local.json**: the fail-closed defaults, and nothing is said. Nothing
+  writes one yet.
+- **A local.json that fails any part** (unreadable, not that envelope, the
+  signature, an assertion this build does not know, bytes not canonical):
+  every assertion is discarded to its fail-closed default, the start goes on,
+  and both roots print one stderr line: `<path>: <why>; its assertions are
+  discarded to their fail-closed defaults`.
+- Nothing writes local.json: the first assertion that needs one brings the
+  writer. The check moves out of `sysdir.rs`, which is past 1,000 lines, into
+  `overlay.rs`.
+
+### 7. Compatibility
+
+- **The desk** warns at each start until the owner runs the command (section
+  5). Nothing else it prints changes.
+- **A downgrade** to a build before this one, today's default binary
+  (`a1f97ee`) included, still starts the instance until the command has run.
+  Once the commitment exists, it refuses to start: `.../records.json holds a
+  home record this build cannot read (dir.recovery-keys of node <id> at seq
+  0): ...`. That is 4.1b part 2's hardening against records a build does not
+  know (Measured).
+- **An older peer** refuses the commitment when it is pushed or pulled (`not a
+  directory stream`), and keeps the rest of the node's `home`. The desk has no
+  peer.
+- Four tests used `dir.recovery-keys` as a stream no build knew, through
+  `envelope::testing::newer` and two fixtures of their own. They now use
+  `dir.key-rotations`.
+
+### 8. Tests, each begun red
+
+Built on 2026-09-26 and 2026-09-27 against glade `a1f97ee` (`2a2cb12` changes
+only the allowlist file). The eight tests use this step's API, so they were
+run in two sources-only copies of the final tree, each with the part a test
+guards switched off by one edit: six in the first copy, and in the second the
+GLADE_HOME check and the first boot's mint, which in the first would have
+turned another test red before its own part. The message is what each red run
+printed. `<key>` stands for a recovery key.
+
+| Test | Proves | Red first |
+| --- | --- | --- |
+| `overlay`: `local_json_is_taken_only_as_this_nodes_empty_overlay_under_its_tag` | the empty overlay, sealed by this node under the local-overlay tag, is taken; each flaw is refused for its own reason: a byte of the signature changed, another purpose's tag, another node's key, the overlay bare, an assertion this build does not know, an empty map encoded otherwise than canonically | with the signature not checked: "its signature is not this node's", `left: Ok(LocalOverlay)`, `right: Err("its signature is not this node's")` |
+| `recovery`: `the_command_commits_the_key_and_writes_its_secret_only_where_named` | the command prints `node <id>` and the committed line; the next boot verifies the commitment in the node's own chain and does not warn; the file holds 32 bytes whose public key is the committed one; no file in the instance holds the secret; a second run is refused, naming the key, and writes nothing | with the commitment not saved: `left: None`, `right: Some("<key>")` |
+| `recovery`: `the_command_refuses_any_other_place_or_instance_and_writes_nothing` | refused, each for its reason: a path inside GLADE_HOME, one inside the instance, a relative one, an existing file, a missing directory, a name with no instance, a flag missing, an unknown argument, and a running node ("stop the node first"); records.json and the offline directory are as they were | with the GLADE_HOME check off: `called Result::unwrap_err() on an Ok value`, the command having committed and written the secret inside GLADE_HOME |
+| `recovery`: `a_first_boot_takes_recovery_out_and_a_later_boot_is_refused_it` | a first boot given a path inside GLADE_HOME is refused before anything is written; given one outside, it commits the key with its presence and writes the secret; a later boot given one is refused before records.json is written, and writes no file | with a later boot not refused: `called Result::unwrap_err() on an Ok value: ()` |
+| `recovery::tests::unix`: `the_secret_is_written_0600` | the secret's mode | with no mode given: `left: 420`, `right: 384` (0644 and 0600) |
+| `assembled_path`: `both_roots_warn_until_a_recovery_key_is_committed` | on each root, the warning word for word, naming the instance root the entry point read and the program's resolved path; the command's two lines and a 32-byte file; the next start says nothing of it | with no warning: the assertion on the hand-written root's stderr, which was empty |
+| `assembled_path`: `both_roots_take_recovery_out_at_a_first_boot_only` | on each root: `instance`, `node`, `recovery`, `registry`, `peer`, `listening`, the third the committed line with the key records.json holds; no warning; a later start given the flag exits 1 with the refusal, and writes no file | with a first boot that mints nothing: `left: ["instance", "node", "registry", "peer", "listening"]`, `right: ["instance", "node", "recovery", "registry", "peer", "listening"]` |
+| `assembled_path`: `both_roots_discard_a_local_json_that_fails_its_check` | on each root, a local.json holding `{}` is discarded, with the line naming it, and the node starts | with local.json never checked: the assertion on the hand-written root's stderr, which was empty |
+
+Changed and passing:
+
+- `tests/stop_signal.rs`'s two clean-stop tests and `tests/lifecycle.rs`'s
+  linked-peer test allow the warning on stderr, as they allow the assembled
+  root's name.
+- `tests/instance_root.rs` passes no `--recovery-out` to `sysdir::boot`.
+- The kind censuses name the new kind: `envelope`'s, and `tests/assembly`'s
+  list of the streams the directory hosts.
+- The four fixtures that named `dir.recovery-keys` as an unknown stream now
+  name `dir.key-rotations` (section 7).
+
+What they do not prove:
+
+- A save that fails after the secret is written: the command's message, and a
+  first boot's file left unused.
+- Off Unix: the file's permissions (F5), and the directory sync, a no-op
+  there.
+- Single-quoting: no test path holds a character a shell would split.
+- A relative GLADE_HOME, which the check resolves as the file system does.
+- The warning as grazel forwards it, prefixed `[node] `: the replay runs the
+  node alone.
+- An older peer taking the commitment.
+- Windows and Linux.
+
+### Named gaps (4.1c)
+
+- **Nothing reads the recovery key.** Rotation is 5.1's gap, and until it
+  exists a lost key cannot be replaced: the command commits one per node.
+- **An unused secret file.** A save that fails after the secret is written
+  leaves a file nothing commits, and the command says so. A first boot that
+  fails at that point leaves one too, and the next first boot given the same
+  path is refused, since the file exists.
+- **The secret is not zeroed in memory**; the command's process ends at once.
+- **The command boots as a start does**: it makes the writes a start would
+  (a set-aside, a binding) and prints none of a start's lines.
+- **`current_exe` is outside the checker's list.** It is read once, at the
+  entry point, and the process-globals checker has no pattern for it (the
+  plan's section 6 names such blind spots).
+- **An older build cannot start an instance** that has committed a key.
+- **Nothing writes local.json**, so the check's accepting path is reached only
+  by tests. An assertion this build does not know discards the whole file:
+  per-assertion defaults come with the first assertion.
+- **The budget.** D11 estimated about 250 lines, tests included; this step is
+  about 1,000 (Measured), about half of it tests. The process-globals rule
+  added the entry-point plumbing and the absolute-path check.
+
+### Default-path changes (4.1c)
+
+1. A booted start whose node has committed no recovery key prints one line on
+   stderr after its boot lines, and starts as before. The desk prints it at
+   every start until the owner runs the command; grazel forwards it as
+   `[node] no recovery key is committed for this node: ...`.
+2. `glade-node recovery --name NAME --out PATH` runs the command. A first
+   argument `recovery` no longer starts a node.
+3. `--recovery-out PATH` is a flag of the booted form. It was two positionals.
+4. A local.json that fails its check prints one line on stderr. The desk has
+   none.
+5. After the command, a start says nothing of it, records.json holds one more
+   record (314 bytes, on `dir.recovery-keys`), and a build before this one
+   refuses the instance.
+6. The binary reads its arguments once, in `start`, where each root read its
+   own, and its own path once, as its roots start. The allowlist's `env::args`
+   entry counts one read; `env::var`'s reason names the command.
+
+### Questions for the owner (4.1c)
+
+1. **An absolute `--out`** (section 3). Recommend as built: the rule keeps the
+   working directory at the entry point, and the operator names an offline
+   place anyway. The other choice reads the working directory once at the
+   entry point (`env::current_dir`, a new permanent entry) and resolves a
+   relative path against it.
+2. **One recovery key per node** (section 1). Recommend as built: replacing a
+   lost key needs rotation's rules (5.1). The other choice lets a later
+   commitment supersede the first, which needs a rule for which counts before
+   anything reads them.
+3. **The file holds the bare 32-byte seed**, as `node.key` does. Recommend as
+   built; 5.1 can wrap it. The other choice is a self-describing file naming
+   the node and the public key.
+4. **`--recovery-out` at a later boot** (section 4) is refused, as the ruling
+   says "at first boot". The other choice takes it whenever the node has no
+   key, which the command already does.
+5. **When the desk runs the command**: once the owner means to stay on this
+   build, since an older one then refuses the instance (section 7).
+
+### Measured (4.1c)
+
+2026-09-27, Apple M3 Pro, Rust 1.96.0, on the final tree:
+
+- **The gate** passes all 9 components, in 94 s from an empty scratch target,
+  with 326 node tests on each path, across 16 test binaries, where there were
+  318: the eight new tests.
+  - rustfmt: glade-node 295 hunks, below its baseline of 296. The `use` block
+    this change rewrote in `registry.rs` was one of the 296; no line it wrote
+    is a deviation. glade-wire 43.
+  - clippy: glade-node 11 warnings and glade-wire 7, at their baselines.
+  - process-globals: 51 files, 3 permanent entries, 0 debt, nothing new.
+  - The contracts gate passes, untouched.
+- **The regeneration.** The generator at taut `7a5f616` reproduces
+  `a1f97ee`'s `sysdata.rs` byte for byte; after the IR change, `--legacy-codec`,
+  it adds the new kind's 20 lines and nothing else.
+- **Time.** The recovery and overlay unit tests take about 0.03 s. Each
+  both-roots test takes about 1.1 s.
+- **The replay**, on a stand-in laid out as grazel lays out the desk: data
+  directory `$S/desk/instances/5173`, `GLADE_HOME=<data>/sys`, the instance
+  `<GLADE_HOME>/sys/grazel`, started from grazel's directory with the desk's
+  two app files (`--profile local --name grazel --app apps/grazel-app.glade
+  --app apps/gyld-app.glade 0`). This build ran by a relative path, as grazel
+  runs the desk's binary. Each start lived 11 s past `listening` and was
+  stopped. `$S` is the scratch directory:
+
+  | Start | Lines | stderr |
+  | --- | --- | --- |
+  | today's default binary (inode 404917081), the first boot | `registry ready (home served: true)` after the two `app` lines (`+12`, `+10 record(s), 2 unchanged`), `ws-razel` serving twice, `listening` | nothing |
+  | this build, 1 and 2 | the same, `+0 record(s), 12 unchanged` for each app | one line, the warning: `no recovery key is committed for this node: stop it, then run GLADE_HOME=$S/desk/instances/5173/sys $S/bin/glade-node recovery --name grazel --out <an absolute path outside GLADE_HOME>`, the binary's path resolved from the relative one it ran by |
+  | the command, as the warning says, `--out $S/offline/grazel-recovery` | exit 0: `node <id>`, `recovery key <key> committed; wrote its secret to $S/offline/grazel-recovery; this node keeps no copy: move the file offline now`; the file `-rw-------`, 32 bytes | nothing |
+  | the command again | exit 1: `node <id> has committed recovery key <key> already, and commits one`; no second file | that line |
+  | this build, after the command | the same lines | nothing |
+  | today's binary, after the command | refused, exit 1 | `.../records.json holds a home record this build cannot read (dir.recovery-keys of node <id> at seq 0): its format is newer than this build's, or it is damaged; start the build that wrote it, or move .../records.json aside` |
+
+  records.json then held 42 records at revision 22, one of them the
+  commitment: 314 bytes, seq 0 of the node's own `dir.recovery-keys` chain.
+- **Downstream**, against the default binary (inode 404917081, not rebuilt):
+  client-rs 25 + 10 + 1, client-ts 48, grip-share 19, at baseline. grazel's,
+  glade-gwz's and glade-gyld's suites were not run, as asked.
+
+**Size**, in lines added and removed in `.rs` files, doc comments included:
+
+- production: +551/−57, net +494, about 340 of the added lines code, the rest
+  doc comments: `recovery.rs` +263, new; `overlay.rs` +90, new;
+  `bin/glade-node.rs` +74/−15; `sysdir.rs` +46/−27; `sysdata.rs` +20
+  (generated); `registry.rs` +20/−2; `lifecycle.rs` +16/−3; `envelope.rs`
+  +10/−9; `assembly.rs` +10/−1; `lib.rs` +2;
+- tests: +449/−19: `recovery.rs` +212, `tests/assembled_path.rs` +151/−2,
+  `overlay.rs` +56, `envelope.rs` +11/−3, `tests/stop_signal.rs` +9/−8,
+  `tests/lifecycle.rs` +4/−1, `tests/assembly/main.rs` +3/−2,
+  `tests/instance_root.rs`, `sysdir.rs` and `store.rs` +1/−1 each;
+- beside them, the IR +11 and the allowlist +3/−3.

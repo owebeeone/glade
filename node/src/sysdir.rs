@@ -29,8 +29,12 @@
 //! node, so it signs what it appends and loads only records that verify. A
 //! boot that finds unsigned records, written before the step, sets them
 //! aside once (D8); among them are any under the id the key had before
-//! 4.1a, `sha256(node.key)`. The class-3 self-signature is not checked until
-//! 4.1c.
+//! 4.1a, `sha256(node.key)`.
+//!
+//! Plan Step 4.1c: the class-3 self-signature is checked under D7's
+//! `local-overlay` tag (`overlay.rs`), and a first boot given `--recovery-out`
+//! commits the node's recovery key in the save that writes its presence
+//! (`recovery.rs`).
 //!
 //! Plan Step 4.2: `endpoint.key` is the iroh endpoint's seed, kept apart from
 //! `node.key` so the identity survives the transport key's replacement. The
@@ -50,7 +54,9 @@ use glade_wire::cbor;
 use glade_wire::generated::Op;
 
 use crate::envelope::{self, Format};
+use crate::overlay::{self, Checked};
 use crate::peer::NodeIdentity;
+use crate::recovery::{self, Committed};
 use crate::registry::{BlobStore, Record, Registry, RegistryApi, StoreApi, HOME};
 use crate::signing;
 use crate::store::unused_path;
@@ -165,6 +171,11 @@ pub struct Boot {
     pub set_aside: Option<SetAside>,
     /// What this boot did to the node's transport bindings (plan Step 4.2).
     pub rebound: Rebound,
+    /// What the class-3 check made of `local.json` (plan Step 4.1c).
+    pub overlay: Checked,
+    /// The recovery key a first boot given `--recovery-out` committed (plan
+    /// Step 4.1c).
+    pub recovery: Option<Committed>,
     /// The class-1 node key, an Ed25519 seed — kept in memory ONLY to sign as
     /// this node ([`Boot::identity`]); never shipped, never in any snapshot.
     seed: [u8; 32],
@@ -212,15 +223,17 @@ impl Boot {
 }
 
 /// Boot a node for `profile` under the instance root `root`, optionally
-/// overriding the instance name and the operator. See [`boot_at`].
+/// overriding the instance name and the operator, and taking
+/// `--recovery-out`. See [`boot_at_with`].
 pub fn boot(
     root: &Path,
     profile: Profile,
     name: Option<&str>,
     operator: Option<&str>,
+    recovery_out: Option<&Path>,
 ) -> io::Result<Boot> {
     let dir = instance_dir(root, profile, name);
-    boot_at(dir, operator.unwrap_or("local"))
+    boot_at_with(dir, operator.unwrap_or("local"), recovery_out)
 }
 
 /// Where [`boot`] puts the instance for `profile`, or for `name` when given:
@@ -233,6 +246,19 @@ pub fn instance_dir(root: &Path, profile: Profile, name: Option<&str>) -> PathBu
 /// Run the load-validation ladder at an explicit instance dir (tests pass a
 /// temp dir — no `GLADE_HOME` env race). Class order: 1 → 2 → 3 → 4.
 pub fn boot_at(dir: PathBuf, operator: &str) -> io::Result<Boot> {
+    boot_at_with(dir, operator, None)
+}
+
+/// [`boot_at`], taking `--recovery-out` (plan Step 4.1c): at a first boot the
+/// node commits a recovery key, and writes its secret to `recovery_out`, in
+/// the save that writes its presence; a later boot given one is refused
+/// before records.json is written. The path is checked before anything is
+/// written, against the instance root `dir` lives under
+/// (`recovery::check_out`).
+pub fn boot_at_with(dir: PathBuf, operator: &str, recovery_out: Option<&Path>) -> io::Result<Boot> {
+    let root = recovery::root_of(&dir);
+    let recovery_out = recovery_out.map(|out| recovery::check_out(root, out));
+    let recovery_out = recovery_out.transpose()?;
     fs::create_dir_all(dir.join("cache"))?; // class 4: cache/ present, never load-bearing
     let lock = InstanceLock::acquire(dir.join("instance.lock"))?;
 
@@ -251,12 +277,15 @@ pub fn boot_at(dir: PathBuf, operator: &str) -> io::Result<Boot> {
     let (mut registry, rejected) = Registry::from_snapshot_as(&snap, identity);
 
     // ---- class 3: local.json (node-self-signature, fail-closed) ------------
-    load_local_json(&dir); // structural in M-LIMP; failures discard to defaults
+    // A file that fails its check is discarded to the fail-closed defaults,
+    // and the roots say so (plan Step 4.1c).
+    let overlay = overlay::load(&dir, &identity);
 
     // ---- class 1 <-> class 2 identity match / first-boot presence ----------
     // Our derived NodeId must correspond to our own NodeRecord. Absent it, this
     // is a first boot: write presence (K1) — an ATTRIBUTED append, not setConfig.
     let mut changed = set_aside.is_some();
+    let mut recovery = None;
     if !registry.has_node(&node_id) {
         registry
             .append(Record::Node(NodeRecord { node_id: node_id.clone(), operator: operator.into() }), &node_id)
@@ -269,7 +298,17 @@ pub fn boot_at(dir: PathBuf, operator: &str) -> io::Result<Boot> {
                 &node_id,
             )
             .map_err(reg_io)?;
+        // The recovery key (plan Step 4.1c): its secret written first, then
+        // its commitment saved with the presence.
+        if let Some(out) = &recovery_out {
+            let (record, committed) = recovery::mint(&node_id, out)?;
+            let recovered = registry.append(Record::Recovery(record), &node_id);
+            recovered.map_err(reg_io)?;
+            recovery = Some(committed);
+        }
         changed = true;
+    } else if let Some(out) = &recovery_out {
+        return Err(recovery::not_first_boot(&dir, out));
     }
     // The endpoint key bound to this node, and any key it replaced revoked
     // (plan Step 4.2), in the same save.
@@ -288,6 +327,8 @@ pub fn boot_at(dir: PathBuf, operator: &str) -> io::Result<Boot> {
         rejected,
         set_aside,
         rebound,
+        overlay,
+        recovery,
         seed,
         endpoint,
         _lock: lock,
@@ -456,28 +497,6 @@ mod platform {
     /// file: a named gap (`GladeNodeAssembly.md`, "Hardening").
     pub(super) fn names(_path: &Path, _file: &fs::File) -> io::Result<bool> {
         Ok(true)
-    }
-}
-
-/// Class 3 — node-private assertions (authority overlay, suspect marks, resume
-/// vectors). Node-self-signed; a failed check discards each item to its
-/// declared MOST-restrictive default, never to "off". Structural in M-LIMP
-/// (there are no overlay items yet); the fail-closed rule is the wall.
-fn load_local_json(dir: &Path) -> LocalOverlay {
-    let path = dir.join("local.json");
-    match fs::read(&path) {
-        Ok(_bytes) => LocalOverlay::fail_closed(), // self-sig verify TODO -> defaults for now
-        Err(_) => LocalOverlay::fail_closed(),
-    }
-}
-
-/// The node-private authority overlay. It only ever NARROWS granted rights, so
-/// tamper cannot exceed a grant; every field has a fail-closed default.
-#[derive(Debug, PartialEq)]
-pub struct LocalOverlay;
-impl LocalOverlay {
-    fn fail_closed() -> LocalOverlay {
-        LocalOverlay
     }
 }
 
@@ -713,7 +732,7 @@ mod tests {
         let err = boot_at(dir.clone(), "gianni").map(|_| ()).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         let named = format!(
-            "holds a home record this build cannot read (dir.recovery-keys of node {node} at seq 0)"
+            "holds a home record this build cannot read (dir.key-rotations of node {node} at seq 0)"
         );
         assert!(err.to_string().contains(&named), "{err}");
         assert_eq!(fs::read(dir.join("records.json")).unwrap(), written);

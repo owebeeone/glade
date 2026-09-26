@@ -50,7 +50,7 @@ fn a_boot_given_an_instance_root_uses_it_and_not_the_environments() {
     std::env::set_var("GLADE_HOME", &decoy);
     std::env::set_var("HOME", &decoy);
 
-    let node = boot(&root, Profile::Local, Some("t"), None).unwrap();
+    let node = boot(&root, Profile::Local, Some("t"), None, None).unwrap();
     assert_eq!(node.dir, root.join("sys").join("t"));
     assert!(node.dir.join("node.key").is_file(), "booted there");
     drop(node);

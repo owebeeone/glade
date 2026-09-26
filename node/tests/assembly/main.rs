@@ -37,8 +37,8 @@ use glade_node::assembly::{
 use glade_node::registry::{Record, RegistryError, HOME};
 use glade_node::sysdata::{
     BindingDecl, BindingRetraction, CapabilityGrant, CapabilityRevocation, NodeRecord,
-    NodeTransportBinding, NodeTransportRevocation, PrincipalRecord, ServeClaim, ServiceDefinition,
-    WorkspaceEntry,
+    NodeRecoveryKey, NodeTransportBinding, NodeTransportRevocation, PrincipalRecord, ServeClaim,
+    ServiceDefinition, WorkspaceEntry,
 };
 use glade_signer_api::SignerPort;
 use glade_wire::cbor;
@@ -428,6 +428,7 @@ fn the_directory_profile_hosts_every_directory_record_kind_and_nothing_else() {
         Record::Principal(PrincipalRecord { principal: s() }),
         Record::Transport(NodeTransportBinding::default()),
         Record::TransportRevoke(NodeTransportRevocation::default()),
+        Record::Recovery(NodeRecoveryKey::default()),
     ];
     assert_eq!(DirectoryRules.share(), HOME);
     for record in &kinds {

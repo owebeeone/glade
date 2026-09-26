@@ -258,13 +258,21 @@ pub struct Settings {
     /// by the composition root. `None`, as a test's settings leave it, boots
     /// nothing: `NodeStart::from_settings` refuses a booted start without it.
     pub instance_root: Option<PathBuf>,
+    /// `--recovery-out PATH` (plan Step 4.1c): where a first boot writes the
+    /// secret of the recovery key it commits.
+    pub recovery_out: Option<String>,
+    /// The running program's path, which the recovery warning names (plan
+    /// Step 4.1c), read once by the composition root, as the instance root
+    /// is. `None` names `glade-node`.
+    pub program: Option<PathBuf>,
 }
 
 impl Settings {
     /// Parse the arguments after the program name exactly as the hand-written
     /// root does: an unknown `--profile` is no profile, a flag given no value
     /// reads as absent, and anything that is not a flag is positional. The
-    /// instance root is not an argument; the composition root sets it.
+    /// instance root and the program's path are not arguments; the
+    /// composition root sets them.
     pub fn from_args(args: impl IntoIterator<Item = String>) -> Settings {
         let mut settings = Settings::default();
         let mut args = args.into_iter();
@@ -274,6 +282,7 @@ impl Settings {
                 "--name" => settings.name = args.next(),
                 "--operator" => settings.operator = args.next(),
                 "--app" => settings.apps.extend(args.next()),
+                "--recovery-out" => settings.recovery_out = args.next(),
                 "--peer" => settings.peers.extend(args.next()),
                 "--enforce-client-grants" => settings.enforce_client_grants = true,
                 _ => settings.positional.push(arg),

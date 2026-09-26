@@ -57,6 +57,27 @@
 //! to stderr as the author reads it, `<FILE>: line N: ...` for a file that
 //! breaks a rule, and exits 1.
 //!
+//! **The recovery key** (plan Step 4.1c; `GladeNodeSigning.md` D10 (a)). A
+//! booted node that has committed no recovery key says, on stderr after its
+//! boot lines, exactly what to run, and starts: `no recovery key is committed
+//! for this node: stop it, then run GLADE_HOME=<root> <program> recovery
+//! --name <name> --out <an absolute path outside GLADE_HOME>`. That is the
+//! third form, a one-shot command on the stopped instance: `glade-node
+//! recovery --name NAME --out PATH` commits a recovery key in the node's
+//! chain, writes its secret to the new file PATH (absolute, outside
+//! `GLADE_HOME`, 0600) and nowhere else, prints `node <id>` and `recovery key
+//! <hex> committed; ...`, and exits. It starts no node, so
+//! `GLADE_NODE_ASSEMBLED` does not apply to it. A new node can take
+//! `--recovery-out PATH` in the booted form instead: its first boot commits the
+//! key in the save that writes its presence, and prints that line after
+//! `node`; any later boot given it is refused. A `local.json` that fails its
+//! check (plan Step 4.1c) is discarded to its fail-closed defaults, with a
+//! line on stderr, and the node starts.
+//!
+//! The program reads its arguments, `GLADE_HOME` and `HOME`, and its own path
+//! once, at its entry point, and passes them down: nothing below reads the
+//! environment (the owner's rule of no process globals, glade's `AGENTS.md`).
+//!
 //! Either form binds 127.0.0.1:<port> (0 = OS-assigned) and prints
 //! `listening <port>` so a parent process can read the actual port.
 //!
@@ -86,7 +107,7 @@
 
 use std::ffi::OsString;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -94,6 +115,7 @@ use glade_node::assembly::{Settings, ASSEMBLED_ROOT_LINE};
 use glade_node::grants::{CLIENT_GRANTS_ENFORCED, GRANTS_UNAVAILABLE};
 use glade_node::iroh_carrier::{PeerEndpoint, PeerEntry};
 use glade_node::lifecycle::{conclude, node_plan, Console, NodeStart, StdConsole};
+use glade_node::recovery;
 use glade_node::registry::{RegistryApi, StoreApi, HOME};
 use glade_node::server::Server;
 use glade_node::sysdir::{boot, instance_root, Profile};
@@ -108,7 +130,8 @@ const ASSEMBLED: &str = "GLADE_NODE_ASSEMBLED";
 const USAGE: &str = "usage: glade-node <port> <store_dir> (the legacy form requires its \
     store directory), or glade-node --profile local|peer|server [--name NAME] \
     [--operator OP] [--app FILE.glade]... [--peer ID[@IP:PORT]]... \
-    [--enforce-client-grants] [port] [store_dir]";
+    [--enforce-client-grants] [--recovery-out PATH] [port] [store_dir], or \
+    glade-node recovery --name NAME --out PATH";
 
 /// The refusal of a legacy start with no store directory: the usage line on
 /// stderr, and exit 1, as every refused start.
@@ -117,8 +140,8 @@ fn usage() -> std::io::Error {
 }
 
 /// The instance root: `GLADE_HOME`, else `$HOME/.glade`. Each composition
-/// root reads the two variables here, once, as it starts, and passes the root
-/// down; nothing below it reads them.
+/// root, and the recovery command, reads the two variables here, once, as it
+/// starts, and passes the root down; nothing below it reads them.
 fn instance_root_from_env() -> PathBuf {
     let glade_home = std::env::var("GLADE_HOME").ok();
     let home = std::env::var("HOME").ok();
@@ -141,12 +164,31 @@ fn assembled(value: Option<OsString>) -> std::io::Result<bool> {
     }
 }
 
-/// Start the node from the composition root the environment chooses.
+/// The running program's path, its links resolved, read once here and passed
+/// down: the recovery warning names it (plan Step 4.1c). Read below the entry
+/// point, it would name whatever program the library runs in.
+fn program_path() -> Option<PathBuf> {
+    let program = std::env::current_exe().ok()?;
+    Some(std::fs::canonicalize(&program).unwrap_or(program))
+}
+
+/// Run the recovery command, or start the node from the composition root the
+/// environment chooses. The process's arguments are read here, once, and
+/// handed to whichever runs.
 async fn start() -> std::io::Result<ExitCode> {
-    if assembled(std::env::var_os(ASSEMBLED))? {
-        return run_assembled().await;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "recovery") {
+        let root = instance_root_from_env();
+        for line in recovery::command(&root, args.into_iter().skip(1))? {
+            println!("{line}");
+        }
+        return Ok(ExitCode::SUCCESS);
     }
-    run().await.map(|()| ExitCode::SUCCESS)
+    let program = program_path();
+    if assembled(std::env::var_os(ASSEMBLED))? {
+        return run_assembled(args, program).await;
+    }
+    run(args, program).await.map(|()| ExitCode::SUCCESS)
 }
 
 /// Runs the node, and prints a failure with `Display`, its message as written
@@ -164,16 +206,17 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run() -> std::io::Result<()> {
+async fn run(args: Vec<String>, program: Option<PathBuf>) -> std::io::Result<()> {
     let mut profile: Option<Profile> = None;
     let mut name: Option<String> = None;
     let mut operator: Option<String> = None;
     let mut apps: Vec<String> = Vec::new();
     let mut peers: Vec<String> = Vec::new();
     let mut enforce_client_grants = false;
+    let mut recovery_out: Option<String> = None;
     let mut positional: Vec<String> = Vec::new();
 
-    let mut args = std::env::args().skip(1);
+    let mut args = args.into_iter();
     while let Some(a) = args.next() {
         match a.as_str() {
             "--profile" => profile = args.next().and_then(|s| Profile::parse(&s)),
@@ -182,6 +225,7 @@ async fn run() -> std::io::Result<()> {
             "--app" => apps.extend(args.next()),
             "--peer" => peers.extend(args.next()),
             "--enforce-client-grants" => enforce_client_grants = true,
+            "--recovery-out" => recovery_out = args.next(),
             _ => positional.push(a),
         }
     }
@@ -197,9 +241,14 @@ async fn run() -> std::io::Result<()> {
         // nothing.
         let decls = glade_node::appdecl::load_all(&apps)?;
         let profile = profile.unwrap_or(Profile::Local);
-        let mut node = boot(&root, profile, name.as_deref(), operator.as_deref())?;
+        let recovery_out = recovery_out.as_deref().map(Path::new);
+        let (name, operator) = (name.as_deref(), operator.as_deref());
+        let mut node = boot(&root, profile, name, operator, recovery_out)?;
         println!("instance {}", node.dir.display());
         println!("node {}", node.node_id);
+        if let Some(committed) = &node.recovery {
+            println!("{committed}");
+        }
         if let Some(aside) = &node.set_aside {
             println!("{aside}");
         }
@@ -211,6 +260,14 @@ async fn run() -> std::io::Result<()> {
         }
         if node.registry.policy_quarantined() {
             println!("{GRANTS_UNAVAILABLE}");
+        }
+        // Plan Step 4.1c: a local.json that failed its check, and a node with
+        // no recovery key committed, are said on stderr; the start goes on.
+        if let Some(discarded) = &node.overlay.discarded {
+            eprintln!("{discarded}");
+        }
+        if let Some(warning) = recovery::warning(&node, program.as_deref()) {
+            eprintln!("{warning}");
         }
         // ---- app registration (GDL-037): <app>.glade loaded as data --------
         // Ordinary attributed appends under this node's chain, diffed against
@@ -300,15 +357,17 @@ async fn run() -> std::io::Result<()> {
 
 /// The assembled composition root (plan Steps 3.2 and 3.3): `run`'s start,
 /// step for step, as the sdax plan `glade_node::lifecycle::node_plan`, which
-/// owns every acquisition and every task. The root parses the arguments,
-/// reads the instance root into the settings, and loads every `--app` file,
-/// then waits on the plan where `run` waits on `server.run`. A stop signal
+/// owns every acquisition and every task. The root parses the arguments
+/// `start` read, puts the instance root and the program's path into the
+/// settings, and loads every `--app` file, then waits on the plan where `run`
+/// waits on `server.run`. A stop signal
 /// asks the plan to shut down; the report decides the exit status.
-async fn run_assembled() -> std::io::Result<ExitCode> {
+async fn run_assembled(args: Vec<String>, program: Option<PathBuf>) -> std::io::Result<ExitCode> {
     eprintln!("{ASSEMBLED_ROOT_LINE}");
     let settings = Settings {
         instance_root: Some(instance_root_from_env()),
-        ..Settings::from_args(std::env::args().skip(1))
+        program,
+        ..Settings::from_args(args)
     };
     // The legacy form requires its store directory: refused, as `run`
     // refuses it, before the plan starts.

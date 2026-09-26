@@ -33,8 +33,9 @@ use crate::grants::Policy;
 use crate::peer::NodeIdentity;
 use crate::records_file::{self, FileError, RecordsFile};
 use crate::sysdata::{
-    BindingDecl, BindingRetraction, CapabilityGrant, CapabilityRevocation, NodeRecord, NodeTransportBinding,
-    NodeTransportRevocation, PrincipalRecord, ServeClaim, ServiceDefinition, SystemSnapshot, WorkspaceEntry,
+    BindingDecl, BindingRetraction, CapabilityGrant, CapabilityRevocation, NodeRecord,
+    NodeRecoveryKey, NodeTransportBinding, NodeTransportRevocation, PrincipalRecord, ServeClaim,
+    ServiceDefinition, SystemSnapshot, WorkspaceEntry,
 };
 use crate::transport::{self, TransportFold};
 
@@ -63,6 +64,9 @@ pub const G_PRINCIPALS: &str = "dir.principals";
 // bound and revoked in its own chain (`transport.rs`).
 pub const G_TRANSPORT_BINDINGS: &str = "dir.transport-bindings";
 pub const G_TRANSPORT_REVOCATIONS: &str = "dir.transport-revocations";
+// The recovery key (plan Step 4.1c): the public half a node commits to, in its
+// own chain (`recovery.rs`).
+pub const G_RECOVERY_KEYS: &str = "dir.recovery-keys";
 
 /// One home-share record (WD §2). Each variant folds by its own semantics; the
 /// enum is the append surface so `append` stays typed and the glade-id/shape
@@ -80,6 +84,7 @@ pub enum Record {
     Principal(PrincipalRecord),
     Transport(NodeTransportBinding),
     TransportRevoke(NodeTransportRevocation),
+    Recovery(NodeRecoveryKey),
 }
 
 impl Record {
@@ -97,6 +102,7 @@ impl Record {
             Record::Principal(_) => G_PRINCIPALS,
             Record::Transport(_) => G_TRANSPORT_BINDINGS,
             Record::TransportRevoke(_) => G_TRANSPORT_REVOCATIONS,
+            Record::Recovery(_) => G_RECOVERY_KEYS,
         }
     }
 
@@ -126,6 +132,7 @@ impl Record {
             Record::Principal(r) => r.to_cbor(),
             Record::Transport(r) => r.to_cbor(),
             Record::TransportRevoke(r) => r.to_cbor(),
+            Record::Recovery(r) => r.to_cbor(),
         };
         cbor::encode(&c)
     }
@@ -580,6 +587,17 @@ impl Registry {
             .map(|o| o.lamport + 1)
             .max()
             .unwrap_or(0)
+    }
+
+    /// The recovery key `node` has committed to (plan Step 4.1c;
+    /// `GladeNodeSigning.md` D10 (a)), in hex: the first `NodeRecoveryKey` in
+    /// its own chain that names it. `None` until it has committed one.
+    pub fn recovery_key(&self, node: &str) -> Option<String> {
+        let own = self.fold_iter(G_RECOVERY_KEYS);
+        let own = own.into_iter().filter(|o| o.origin == node);
+        let keys = own.map(|o| envelope::record(o, NodeRecoveryKey::from_cbor));
+        let ours = keys.filter(|key| key.node == node);
+        ours.map(|key| key.recovery_key).next()
     }
 
     /// The transport-binding fold of this registry's records (plan Step 4.2):

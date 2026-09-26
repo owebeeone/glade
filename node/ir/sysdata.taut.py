@@ -148,6 +148,17 @@ SCHEMA = schema(
         F("endpoint_id", 2, STR),
         F("sig", 3, BYTES)),
 
+    # ---- the recovery key (plan Step 4.1c) ----------------------------------
+    # The ruling key_custody = recovery_keys, as GladeNodeSigning.md D10 (a)
+    # builds it: node N commits to the public half of a separate Ed25519
+    # recovery key, a record in N's own chain on dir.recovery-keys. `node`
+    # and `recovery_key` are 64 lower-case hex digits. The origin-op envelope
+    # that seals the op is its proof; the secret half is written where the
+    # operator names, and N keeps no copy. Nothing reads it until rotation.
+    Msg("NodeRecoveryKey",
+        F("node", 1, STR),
+        F("recovery_key", 2, STR)),
+
     # ---- the signed envelope (plan Step 4.1b) --------------------------------
     # GladeNodeSigning.md D4 (c): every home-share op's payload is one of
     # these, sealed by the op's origin. `record` is the canonical CBOR of the

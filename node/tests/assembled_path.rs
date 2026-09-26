@@ -17,6 +17,9 @@
 //! tests check plan Step 4.2's endpoint key (one id across starts, and a
 //! replaced key's binding revoked), and start each root on an instance written
 //! before plan Step 4.1b signed its records, and on a damaged records.json.
+//! Three check plan Step 4.1c on each root: the warning until a recovery key
+//! is committed and the command it names, `--recovery-out` at a first boot
+//! only, and a `local.json` that fails its check.
 //! Every file goes under a fresh directory in the system temp dir, and the node
 //! runs with `GLADE_HOME` and `HOME` pointed there: `~/.glade` is never touched.
 
@@ -32,6 +35,7 @@ use glade_node::envelope;
 use glade_node::frame::Frame;
 use glade_node::grants::CLIENT_GRANTS_ENFORCED;
 use glade_node::mesh::who_serves;
+use glade_node::recovery::NOT_COMMITTED;
 use glade_node::registry::{BlobStore, Record, Registry, RegistryApi, StoreApi, HOME};
 use glade_node::store::Store;
 use glade_node::sysdata::{NodeRecord, ServeClaim};
@@ -848,7 +852,7 @@ fn both_roots_refuse_a_store_in_a_newer_format_with_a_clear_message() {
         let record = Cbor::Map(vec![(1, Cbor::Text("recovery".into()))]);
         let op = Op {
             share: HOME.into(),
-            glade_id: "dir.recovery-keys".into(),
+            glade_id: "dir.key-rotations".into(),
             origin: node.clone(),
             shape: Shape::Log,
             payload: cbor::encode(&record),
@@ -866,7 +870,7 @@ fn both_roots_refuse_a_store_in_a_newer_format_with_a_clear_message() {
         let (status, stderr) = ended(&home, root, &args);
         assert_eq!(status.code(), Some(1), "{root:?}: {stderr}");
         let named = format!(
-            "holds a home record this build cannot read (dir.recovery-keys of node {node} at seq 0)"
+            "holds a home record this build cannot read (dir.key-rotations of node {node} at seq 0)"
         );
         assert!(stderr.contains(&named), "{root:?}: {stderr}");
         assert!(!stderr.contains("panicked"), "{root:?}: {stderr}");
@@ -904,6 +908,151 @@ fn both_roots_refuse_a_damaged_records_json_with_a_clear_message() {
         assert!(!stderr.contains("panicked"), "{root:?}: {stderr}");
         let now = std::fs::read(&records).unwrap();
         assert_eq!(now, torn, "{root:?}: records.json as it was");
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A command asked of `glade-node` under `root`, run to its end: its exit
+/// status, its stdout lines, and its stderr.
+fn command(home: &Path, root: Root, args: &[&str]) -> (ExitStatus, Vec<String>, String) {
+    let ran = glade_node(home, root, args)
+        .output()
+        .expect("run glade-node");
+    let stdout = String::from_utf8(ran.stdout).unwrap();
+    let lines = stdout.lines().map(str::to_owned).collect();
+    (ran.status, lines, String::from_utf8(ran.stderr).unwrap())
+}
+
+/// The recovery key the node `node` of the instance at `instance` has
+/// committed, as records.json holds it.
+fn committed_key(instance: &Path, node: &str) -> Option<String> {
+    let saved = BlobStore::new(instance).load().unwrap();
+    Registry::from_snapshot(&saved).0.recovery_key(node)
+}
+
+/// Plan Step 4.1c (`GladeNodeSigning.md` D10 (a)), on each root: a booted
+/// node that has committed no recovery key says on stderr exactly what to
+/// run, under the instance root the entry point read, and starts. The
+/// command it names, run on the stopped instance, commits the key and writes
+/// its secret where it was told, and the next start says nothing of it.
+#[test]
+fn both_roots_warn_until_a_recovery_key_is_committed() {
+    let dir = scratch("recovery");
+    let home = dir.join("glade-home");
+    let program = std::fs::canonicalize(env!("CARGO_BIN_EXE_glade-node")).unwrap();
+    for (root, name) in [(Root::HandWritten, "h"), (Root::Assembled, "a")] {
+        let args = ["--profile", "local", "--name", name, "0"];
+        let (lines, stderr) = start_and_stop(&home, root, &args);
+        let warning = format!(
+            "{NOT_COMMITTED}: stop it, then run GLADE_HOME={} {} recovery --name {name} --out <an absolute path outside GLADE_HOME>",
+            home.display(),
+            program.display()
+        );
+        assert!(stderr.lines().any(|l| l == warning), "{root:?}: {stderr}");
+
+        let out = dir.join(format!("{name}.recovery"));
+        let asked = ["recovery", "--name", name, "--out", out.to_str().unwrap()];
+        let (status, said, stderr) = command(&home, root, &asked);
+        assert_eq!(status.code(), Some(0), "{root:?}: {stderr}");
+        let node = lines[1].strip_prefix("node ").unwrap();
+        let instance = home.join("sys").join(name);
+        let key = committed_key(&instance, node).expect("committed");
+        let file = std::fs::canonicalize(&out).unwrap();
+        let committed = format!(
+            "recovery key {key} committed; wrote its secret to {}; this node keeps no copy: move the file offline now",
+            file.display()
+        );
+        assert_eq!(said, [format!("node {node}"), committed], "{root:?}");
+        assert_eq!(std::fs::metadata(&out).unwrap().len(), 32, "{root:?}");
+
+        let (_, stderr) = start_and_stop(&home, root, &args);
+        assert!(!stderr.contains(NOT_COMMITTED), "{root:?}: {stderr}");
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Plan Step 4.1c, on each root: a first boot given `--recovery-out` commits
+/// the key in the save that writes its presence, says so after `node`,
+/// writes the secret there, and does not warn. A later start given the flag
+/// is refused, and writes no file.
+#[test]
+fn both_roots_take_recovery_out_at_a_first_boot_only() {
+    let dir = scratch("recovery-out");
+    let home = dir.join("glade-home");
+    for (root, name) in [(Root::HandWritten, "h"), (Root::Assembled, "a")] {
+        let out = dir.join(format!("{name}.recovery"));
+        let out = out.to_str().unwrap();
+        let args = [
+            "--profile",
+            "local",
+            "--name",
+            name,
+            "--recovery-out",
+            out,
+            "0",
+        ];
+        let (lines, stderr) = start_and_stop(&home, root, &args);
+        let expected = [
+            "instance",
+            "node",
+            "recovery",
+            "registry",
+            "peer",
+            "listening",
+        ];
+        assert_eq!(kinds(&lines), expected, "{root:?}: {lines:?}, {stderr}");
+        let node = lines[1].strip_prefix("node ").unwrap();
+        let instance = home.join("sys").join(name);
+        let key = committed_key(&instance, node).expect("committed");
+        let file = std::fs::canonicalize(out).unwrap();
+        let committed = format!(
+            "recovery key {key} committed; wrote its secret to {}; this node keeps no copy: move the file offline now",
+            file.display()
+        );
+        assert_eq!(lines[2], committed, "{root:?}");
+        assert!(!stderr.contains(NOT_COMMITTED), "{root:?}: {stderr}");
+
+        let again = dir.join(format!("{name}.again"));
+        let again = again.to_str().unwrap();
+        let args = [
+            "--profile",
+            "local",
+            "--name",
+            name,
+            "--recovery-out",
+            again,
+            "0",
+        ];
+        let (status, stderr) = ended(&home, root, &args);
+        assert_eq!(status.code(), Some(1), "{root:?}: {stderr}");
+        let first_only = "--recovery-out is taken at a node's first boot only";
+        assert!(stderr.contains(first_only), "{root:?}: {stderr}");
+        assert!(!Path::new(again).exists(), "{root:?}: no file written");
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Plan Step 4.1c (D7), on each root: a `local.json` that fails its check,
+/// here one that is not a signed overlay, is discarded to its fail-closed
+/// defaults. The start says so on stderr, naming the file, and goes on. Until
+/// the step the file was read and never checked, and nothing was said.
+#[test]
+fn both_roots_discard_a_local_json_that_fails_its_check() {
+    let dir = scratch("local-json");
+    let home = dir.join("glade-home");
+    for (root, name) in [(Root::HandWritten, "h"), (Root::Assembled, "a")] {
+        let instance = home.join("sys").join(name);
+        std::fs::create_dir_all(&instance).unwrap();
+        let local = instance.join("local.json");
+        std::fs::write(&local, "{}").unwrap();
+        let args = ["--profile", "local", "--name", name, "0"];
+        let (lines, stderr) = start_and_stop(&home, root, &args);
+        let discarded = format!(
+            "{}: not a signed overlay; its assertions are discarded to their fail-closed defaults",
+            local.display()
+        );
+        assert!(stderr.lines().any(|l| l == discarded), "{root:?}: {stderr}");
+        assert_eq!(kinds(&lines).last(), Some(&"listening"), "{root:?}");
     }
     std::fs::remove_dir_all(&dir).unwrap();
 }

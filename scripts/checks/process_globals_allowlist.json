@@ -4,10 +4,10 @@
   "roots": ["node/src/lib.rs", "node/src/bin/glade-node.rs", "wire-rs/src/lib.rs", "contracts/*/src/lib.rs", "client-rs/src/lib.rs"],
   "test_features": ["conformance"],
   "entries": [
-    {"path": "node/src/bin/glade-node.rs", "kind": "env", "name": "env::args", "count": 2, "disposition": "permanent",
-     "reason": "Each composition root reads the process's arguments once, at its entry point, and passes them down: run parses them itself, and run_assembled parses them into Settings (Settings::from_args)."},
+    {"path": "node/src/bin/glade-node.rs", "kind": "env", "name": "env::args", "disposition": "permanent",
+     "reason": "The program reads its arguments once, at its entry point (start), and hands them to what it runs: the recovery command (plan Step 4.1c), run, which parses them itself, or run_assembled, which parses them into Settings (Settings::from_args)."},
     {"path": "node/src/bin/glade-node.rs", "kind": "env", "name": "env::var", "count": 2, "disposition": "permanent",
-     "reason": "GLADE_HOME and HOME, read once as each composition root starts (instance_root_from_env) and passed down as the instance root: into sysdir::boot for the hand-written root, and through Settings for the assembled one. Nothing below the entry point reads them (ProcessGlobalsPlan Step 2.1; a read at a program's entry point is permanent, owner's ruling of 2026-09-26)."},
+     "reason": "GLADE_HOME and HOME, read once as each composition root starts, or as the recovery command runs (instance_root_from_env), and passed down as the instance root: into sysdir::boot for the hand-written root, through Settings for the assembled one, and into recovery::command. Nothing below the entry point reads them (ProcessGlobalsPlan Step 2.1; a read at a program's entry point is permanent, owner's ruling of 2026-09-26)."},
     {"path": "node/src/bin/glade-node.rs", "kind": "env", "name": "env::var_os", "disposition": "permanent",
      "reason": "GLADE_NODE_ASSEMBLED chooses the composition root at the entry point, read once before anything else runs."}
   ]

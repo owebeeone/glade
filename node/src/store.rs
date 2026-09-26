@@ -708,7 +708,7 @@ mod tests {
         };
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         let named = format!(
-            "{} holds a home record this build cannot read (dir.recovery-keys of node",
+            "{} holds a home record this build cannot read (dir.key-rotations of node",
             journal.display()
         );
         assert!(err.to_string().starts_with(&named), "{err}");
