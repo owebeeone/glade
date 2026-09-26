@@ -3,9 +3,10 @@
 //!
 //! - DI-E01 (`arch1/DependencyInjectionEvaluation.md:133`): one fake selection
 //!   reaches every consumer, by `Arc::ptr_eq` and by behaviour, and no real
-//!   provider is constructed. The construction counter is process-wide, so no
-//!   test in this binary may build an assembly with a real provider left in
-//!   it; the positive control, which does, is `tests/assembly_registration.rs`.
+//!   provider is constructed. Each test node binds a construction observer of
+//!   its own, `fakes::Recorder`, which sees only that node's scope; the
+//!   positive control, which leaves the real providers in, is
+//!   `tests/assembly_registration.rs`.
 //! - DI-E02 (`:134`): one scope hands out one occurrence per binding, sibling
 //!   scopes share nothing, and a concurrent first resolution of a `#[lazy]`
 //!   binding constructs once.
@@ -29,8 +30,8 @@ use glade_clock_api::ClockPort;
 use glade_grant_api::{Denial, GrantPort, Holder};
 use glade_node::appdecl::parse;
 use glade_node::assembly::{
-    real_providers_constructed, Admission, ClientCarrier, Clock, Config, Directory, DirectoryRules,
-    Grants, HostError, NodeAssembly, PeerCarrier, RecordHost, RecordHostPort, RecordProfile,
+    Admission, ClientCarrier, Clock, Config, Constructions, Directory, DirectoryRules, Grants,
+    HostError, NodeAssembly, PeerCarrier, RecordHost, RecordHostPort, RecordProfile,
     RecordProfilePort, RecordTransport, Records, Sessions, Settings, Signer, TransportPort,
 };
 use glade_node::registry::{Record, RegistryError, HOME};
@@ -44,12 +45,17 @@ use glade_wire::cbor;
 use glade_wire::generated::{Op, Shape};
 use shaku::{HasComponent, ModuleBuilder};
 
-use fakes::{run, FakeClock, FakeNet, FixedSettings, KeyedTestSigner, MemGrants};
+use fakes::{
+    real_providers_constructed, run, FakeClock, FakeNet, FixedSettings, KeyedTestSigner, MemGrants,
+    Recorder,
+};
 
 /// Every provider the assembled path binds as real, overridden, except the
-/// signer, which a test adds (once as a value, once as a counting factory).
+/// signer, which a test adds (once as a value, once as a counting factory),
+/// and the construction observer, a recorder of this node's own.
 fn builder(net: &Arc<FakeNet>, clock: &FakeClock) -> ModuleBuilder<NodeAssembly> {
     NodeAssembly::builder()
+        .with_component_override::<dyn Constructions>(Box::new(Recorder::default()))
         .with_component_override::<dyn Config>(Box::new(FixedSettings(Settings::default())))
         .with_component_override::<dyn Clock>(Box::new(clock.clone()))
         .with_component_override::<dyn PeerCarrier>(Box::new(net.port()))
@@ -173,7 +179,7 @@ fn one_clock_substitution_reaches_the_directory_and_admission() {
         "the lease lapsed at 1_600"
     );
     assert_eq!(admission.admit(&alice(), "read", "ws-a").at_ms, 1_600);
-    assert_eq!(real_providers_constructed(), 0);
+    assert_eq!(real_providers_constructed(&node), Vec::<&str>::new());
 }
 
 /// DI-E01 for the carriers, and the recipes' role rule: each role is its own
@@ -202,7 +208,7 @@ fn each_carrier_role_is_its_own_occurrence_and_the_record_transport_rides_the_pe
         bind(&sessions.client(), "a-client").is_ok(),
         "the client role is another port"
     );
-    assert_eq!(real_providers_constructed(), 0);
+    assert_eq!(real_providers_constructed(&node), Vec::<&str>::new());
 }
 
 /// DI-E01 for the record host, its profile and its transport: the directory
@@ -224,7 +230,7 @@ fn one_record_host_selection_reaches_the_directory() {
     let again = directory.register(&decl, "n1").expect("registered again");
     assert_eq!((first.appended, first.unchanged), (1, 0));
     assert_eq!((again.appended, again.unchanged), (0, 1));
-    assert_eq!(real_providers_constructed(), 0);
+    assert_eq!(real_providers_constructed(&node), Vec::<&str>::new());
 }
 
 /// DI-E01 for the grant binding: admission consults the one fold selected.
@@ -239,7 +245,7 @@ fn one_grant_selection_reaches_admission() {
         admission.admit(&eve, "read", "ws-a").outcome,
         Err(Denial::Revoked)
     );
-    assert_eq!(real_providers_constructed(), 0);
+    assert_eq!(real_providers_constructed(&node), Vec::<&str>::new());
 }
 
 /// DI-E01's second half: resolving every binding and participant, the lazy
@@ -261,7 +267,7 @@ fn a_test_composition_constructs_no_real_provider() {
     assert_eq!(profile_of(&node).share(), HOME);
     let signed = signer_of(&node).sign(glade_signer_api::Purpose::PeerHello, b"hello");
     assert!(signed.is_ok());
-    assert_eq!(real_providers_constructed(), 0);
+    assert_eq!(real_providers_constructed(&node), Vec::<&str>::new());
 }
 
 /// DI-E02, first claim: every resolution of a binding from one scope is one
@@ -328,7 +334,9 @@ fn sibling_scopes_share_nothing_and_meet_only_through_the_network() {
     assert_eq!(run(link.recv()), Ok(Some(b"two".to_vec())));
     assert_eq!(run(link.recv()), Ok(None), "the push closes its link");
     assert_eq!(dir_b.serves("ws-a").unwrap(), None);
-    assert_eq!(real_providers_constructed(), 0);
+    for node in [&a, &b] {
+        assert_eq!(real_providers_constructed(node), Vec::<&str>::new());
+    }
 }
 
 /// A test node whose `#[lazy]` signer is built by a factory that counts its
@@ -377,7 +385,9 @@ fn a_concurrent_first_access_of_a_lazy_binding_constructs_once_per_scope() {
         !Arc::ptr_eq(&a1, &b1),
         "sibling scopes shared an occurrence"
     );
-    assert_eq!(real_providers_constructed(), 0);
+    for node in [&a, &b] {
+        assert_eq!(real_providers_constructed(node), Vec::<&str>::new());
+    }
 }
 
 /// `DirectoryRules` is the directory profile: the home share, and a stream

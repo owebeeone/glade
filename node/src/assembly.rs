@@ -16,6 +16,7 @@
 //! | grant | [`Grants`] | `GrantPort` | [`PolicyView`], the node's fold (plan Step 4.3) |
 //! | signer | [`Signer`] | `SignerPort` | [`NodeSigner`], Ed25519 (plan Step 4.1a) |
 //! | configuration | [`Config`] | [`ConfigPort`] | [`CommandLine`] |
+//! | construction observer | [`Constructions`] | none: told of each real provider built | [`Unobserved`] |
 //!
 //! Every port is bridged by a facade declared here, `trait F: Port +
 //! shaku::Interface` with `impl<T: Port + 'static> F for T {}`, so no port
@@ -42,7 +43,9 @@
 //! ```
 //!
 //! A missing binding does not compile (E0277): the directory facade, with
-//! neither its clock nor its record host bound.
+//! neither its clock nor its record host bound. The modules after it bind the
+//! construction observer, [`Unobserved`], which every real provider needs, so
+//! each fails only for the reason it shows.
 //!
 //! ```compile_fail,E0277
 //! use glade_node::assembly::DirectoryFacade;
@@ -67,7 +70,7 @@
 //! use std::sync::Arc;
 //!
 //! use glade_node::assembly::{
-//!     CarrierTransport, RecordHost, RecordProfile, RecordProfilePort, Records,
+//!     CarrierTransport, RecordHost, RecordProfile, RecordProfilePort, Records, Unobserved,
 //! };
 //! use glade_node::iroh_carrier::IrohCarrier;
 //! use shaku::Component;
@@ -91,7 +94,7 @@
 //!
 //! shaku::module! {
 //!     Cyclic {
-//!         components = [DirectoryAsProfile, Records, CarrierTransport, IrohCarrier],
+//!         components = [DirectoryAsProfile, Records, CarrierTransport, IrohCarrier, Unobserved],
 //!         providers = []
 //!     }
 //! }
@@ -105,13 +108,13 @@
 //! peer role.
 //!
 //! ```compile_fail,E0119
-//! use glade_node::assembly::PeerCarrier;
+//! use glade_node::assembly::{Constructions, PeerCarrier, Unobserved};
 //! use glade_node::iroh_carrier::IrohCarrier;
-//! use shaku::{Component, Module, ModuleBuildContext};
+//! use shaku::{Component, HasComponent, Module, ModuleBuildContext};
 //!
 //! struct SecondPeerAdapter;
 //!
-//! impl<M: Module> Component<M> for SecondPeerAdapter {
+//! impl<M: Module + HasComponent<dyn Constructions>> Component<M> for SecondPeerAdapter {
 //!     type Interface = dyn PeerCarrier;
 //!     type Parameters = ();
 //!
@@ -122,7 +125,7 @@
 //!
 //! shaku::module! {
 //!     TwoPeers {
-//!         components = [IrohCarrier, SecondPeerAdapter],
+//!         components = [IrohCarrier, SecondPeerAdapter, Unobserved],
 //!         providers = []
 //!     }
 //! }
@@ -139,7 +142,7 @@
 //! use std::sync::Arc;
 //!
 //! use glade_carrier_api::CarrierPort;
-//! use glade_node::assembly::PendingWebSocketAdapter;
+//! use glade_node::assembly::{PendingWebSocketAdapter, Unobserved};
 //! use glade_node::iroh_carrier::IrohCarrier;
 //! use shaku::Component;
 //!
@@ -156,7 +159,7 @@
 //!
 //! shaku::module! {
 //!     ByPortType {
-//!         components = [IrohCarrier, PendingWebSocketAdapter, AnyCarrierRelay],
+//!         components = [IrohCarrier, PendingWebSocketAdapter, AnyCarrierRelay, Unobserved],
 //!         providers = []
 //!     }
 //! }
@@ -166,11 +169,11 @@
 //! }
 //! ```
 
+use std::any::type_name;
 use std::fmt;
 use std::future::ready;
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use glade_carrier_api::{
@@ -201,19 +204,37 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-static REAL_PROVIDERS: AtomicUsize = AtomicUsize::new(0);
+// ---- construction -----------------------------------------------------------
 
-/// How many real providers `NodeAssembly` modules have constructed in this
-/// process: the system clock, the command line, the record host as the
-/// module builds it, the iroh carrier, the pending WebSocket adapter, the
-/// grant fold and the node signer. A test composition overrides each of them,
-/// so it adds nothing here (DI-E01).
-pub fn real_providers_constructed() -> usize {
-    REAL_PROVIDERS.load(Ordering::SeqCst)
+/// The construction observer binding's interface. Each real provider tells
+/// it, with its type's name, as the module constructs it: the system clock,
+/// the command line, the record host as the module builds it, the iroh
+/// carrier, the pending WebSocket adapter, the grant fold and the node signer.
+/// The module binds [`Unobserved`]. A test composition binds a recorder of its
+/// own, which sees only its own scope, and overrides every real provider, so
+/// its recorder sees none (DI-E01).
+pub trait Constructions: shaku::Interface {
+    /// The real provider `provider`, by its type's name, was constructed.
+    fn constructed(&self, provider: &'static str);
 }
 
-fn constructed() {
-    REAL_PROVIDERS.fetch_add(1, Ordering::SeqCst);
+/// The construction observer the module binds: it keeps nothing.
+#[derive(Component)]
+#[shaku(interface = Constructions)]
+pub struct Unobserved;
+
+impl Constructions for Unobserved {
+    fn constructed(&self, _provider: &'static str) {}
+}
+
+/// Tell the scope's construction observer that the real provider `P` was
+/// constructed.
+fn constructed<M, P>(context: &mut ModuleBuildContext<M>)
+where
+    M: Module + HasComponent<dyn Constructions>,
+{
+    let observer = <M as HasComponent<dyn Constructions>>::build_component(context);
+    observer.constructed(type_name::<P>());
 }
 
 // ---- configuration --------------------------------------------------------
@@ -437,12 +458,12 @@ impl ClockPort for SystemClock {
     }
 }
 
-impl<M: Module> Component<M> for SystemClock {
+impl<M: Module + HasComponent<dyn Constructions>> Component<M> for SystemClock {
     type Interface = dyn Clock;
     type Parameters = ();
 
-    fn build(_: &mut ModuleBuildContext<M>, _: ()) -> Box<dyn Clock> {
-        constructed();
+    fn build(context: &mut ModuleBuildContext<M>, _: ()) -> Box<dyn Clock> {
+        constructed::<M, SystemClock>(context);
         Box::new(SystemClock)
     }
 }
@@ -457,12 +478,12 @@ impl ConfigPort for CommandLine {
     }
 }
 
-impl<M: Module> Component<M> for CommandLine {
+impl<M: Module + HasComponent<dyn Constructions>> Component<M> for CommandLine {
     type Interface = dyn Config;
     type Parameters = Settings;
 
-    fn build(_: &mut ModuleBuildContext<M>, settings: Settings) -> Box<dyn Config> {
-        constructed();
+    fn build(context: &mut ModuleBuildContext<M>, settings: Settings) -> Box<dyn Config> {
+        constructed::<M, CommandLine>(context);
         Box::new(CommandLine(settings))
     }
 }
@@ -620,13 +641,16 @@ impl RecordHost for Records {
 
 impl<M> Component<M> for Records
 where
-    M: Module + HasComponent<dyn RecordProfile> + HasComponent<dyn RecordTransport>,
+    M: Module
+        + HasComponent<dyn RecordProfile>
+        + HasComponent<dyn RecordTransport>
+        + HasComponent<dyn Constructions>,
 {
     type Interface = dyn RecordHost;
     type Parameters = InstanceSlot;
 
     fn build(context: &mut ModuleBuildContext<M>, slot: InstanceSlot) -> Box<dyn RecordHost> {
-        constructed();
+        constructed::<M, Records>(context);
         let profile = <M as HasComponent<dyn RecordProfile>>::build_component(context);
         let transport = <M as HasComponent<dyn RecordTransport>>::build_component(context);
         Box::new(Records {
@@ -709,12 +733,15 @@ impl CarrierPort for PendingCarrier {
 /// as this component's parameters. Neither root lends one yet, so the peer
 /// role refuses to bind and fails closed: the node's peer transport is still
 /// the `PeerEndpoint` the root binds and `Server::enable_mesh` runs.
-impl<M: Module> Component<M> for IrohCarrier {
+impl<M: Module + HasComponent<dyn Constructions>> Component<M> for IrohCarrier {
     type Interface = dyn PeerCarrier;
     type Parameters = Option<EndpointKey>;
 
-    fn build(_: &mut ModuleBuildContext<M>, key: Option<EndpointKey>) -> Box<dyn PeerCarrier> {
-        constructed();
+    fn build(
+        context: &mut ModuleBuildContext<M>,
+        key: Option<EndpointKey>,
+    ) -> Box<dyn PeerCarrier> {
+        constructed::<M, IrohCarrier>(context);
         Box::new(IrohCarrier::new(key))
     }
 }
@@ -724,12 +751,12 @@ impl<M: Module> Component<M> for IrohCarrier {
 /// arrive through the TCP listener the root binds and `Server::run` serves.
 pub struct PendingWebSocketAdapter;
 
-impl<M: Module> Component<M> for PendingWebSocketAdapter {
+impl<M: Module + HasComponent<dyn Constructions>> Component<M> for PendingWebSocketAdapter {
     type Interface = dyn ClientCarrier;
     type Parameters = ();
 
-    fn build(_: &mut ModuleBuildContext<M>, _: ()) -> Box<dyn ClientCarrier> {
-        constructed();
+    fn build(context: &mut ModuleBuildContext<M>, _: ()) -> Box<dyn ClientCarrier> {
+        constructed::<M, PendingWebSocketAdapter>(context);
         Box::new(PendingCarrier {
             adapter: "WebSocket",
         })
@@ -741,12 +768,12 @@ impl<M: Module> Component<M> for PendingWebSocketAdapter {
 /// `Unavailable` and fails closed (GR-003). The module registers the app files
 /// and is dropped before the node serves; the served node checks the view its
 /// `Server` holds, which adopting the instance fills.
-impl<M: Module> Component<M> for PolicyView {
+impl<M: Module + HasComponent<dyn Constructions>> Component<M> for PolicyView {
     type Interface = dyn Grants;
     type Parameters = ();
 
-    fn build(_: &mut ModuleBuildContext<M>, _: ()) -> Box<dyn Grants> {
-        constructed();
+    fn build(context: &mut ModuleBuildContext<M>, _: ()) -> Box<dyn Grants> {
+        constructed::<M, PolicyView>(context);
         Box::new(PolicyView::unavailable())
     }
 }
@@ -758,12 +785,15 @@ impl<M: Module> Component<M> for PolicyView {
 /// zeros. No consumer resolves it yet: plan Step 4.1b signs and checks
 /// `home` records with the node's own functions, and D9's known set (4.1b's
 /// part 2) is to be its first.
-impl<M: Module> Component<M> for NodeSigner {
+impl<M: Module + HasComponent<dyn Constructions>> Component<M> for NodeSigner {
     type Interface = dyn Signer;
     type Parameters = Option<NodeIdentity>;
 
-    fn build(_: &mut ModuleBuildContext<M>, identity: Option<NodeIdentity>) -> Box<dyn Signer> {
-        constructed();
+    fn build(
+        context: &mut ModuleBuildContext<M>,
+        identity: Option<NodeIdentity>,
+    ) -> Box<dyn Signer> {
+        constructed::<M, NodeSigner>(context);
         Box::new(NodeSigner::new(identity))
     }
 }
@@ -898,6 +928,7 @@ impl Sessions for RoleSessions {
 module! {
     pub NodeAssembly {
         components = [
+            Unobserved,
             CommandLine,
             SystemClock,
             DirectoryRules,

@@ -15,9 +15,11 @@
 //! invariants. It then asserts the same order on the simulated trace, where
 //! the static tests read it from the declaration.
 
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::UNIX_EPOCH;
 
-use glade_node::assembly::{real_providers_constructed, Settings};
+use glade_node::assembly::Settings;
 use glade_node::lifecycle::{node, node_plan, Console, NodeStart};
 use sdax::{Request, Script};
 use sdax_testkit::eol::{is_cleanup_end, is_cleanup_start};
@@ -47,12 +49,19 @@ impl Console for Kept {
     }
 }
 
-/// A booted start: the shape with every node in use. No body runs, so
-/// nothing is written under its instance root.
-fn booted(console: Arc<Kept>) -> NodeStart {
+/// A fresh instance root for one test, which nothing creates unless a step
+/// boots the instance.
+fn unbooted(test: &str) -> PathBuf {
+    let nanos = UNIX_EPOCH.elapsed().unwrap().as_nanos();
+    let name = format!("glade-node-{test}-{}-{nanos}", std::process::id());
+    std::env::temp_dir().join(name)
+}
+
+/// A booted start under `root`: the shape with every node in use.
+fn booted(console: Arc<Kept>, root: &Path) -> NodeStart {
     let args = ["--profile", "local", "--name", "order", "0"];
     let settings = Settings {
-        instance_root: Some(std::env::temp_dir().join("glade-node-release-order")),
+        instance_root: Some(root.to_path_buf()),
         ..Settings::from_args(args.map(String::from))
     };
     NodeStart::from_settings(settings, Vec::new(), console).expect("a booted start")
@@ -180,10 +189,10 @@ fn sdax_testkit_finds_no_violation_in_the_declaration() {
 /// ended before the cleanup of what it drains into begins.
 #[test]
 fn a_simulated_stop_releases_in_that_order() {
-    let console = Arc::new(Kept::default());
+    let (console, root) = (Arc::new(Kept::default()), unbooted("order-simulated"));
     let plan = node_plan();
     let script = Script::new().at(1.0, Request::Shutdown);
-    let driven = ScriptedDriver::run_with_input(&plan, booted(console.clone()), &script)
+    let driven = ScriptedDriver::run_with_input(&plan, booted(console.clone(), &root), &script)
         .expect("the plan simulates");
     assert_eq!(driven.problems(), None);
     assert!(driven.report.is_clean(), "{}", driven.report);
@@ -203,16 +212,17 @@ fn a_simulated_stop_releases_in_that_order() {
     assert_eq!(*console.0.lock().unwrap(), Vec::<String>::new());
 }
 
-/// Inspecting and simulating run no body: no provider was constructed and
-/// nothing was said. If a body had run, the order above would be a fact about
-/// that run and not about the declaration.
+/// Inspecting and simulating run no body: no plan step ran. `Instance`, which
+/// every other step needs, never booted the instance, so its root does not
+/// exist, and nothing was said. If a body had run, the order above would be a
+/// fact about that run and not about the declaration.
 #[test]
 fn asserting_the_order_runs_no_body() {
-    let console = Arc::new(Kept::default());
+    let (console, root) = (Arc::new(Kept::default()), unbooted("order-no-body"));
     let plan = node_plan();
     let _ = plan.inspect().release_order();
     let script = Script::new().at(1.0, Request::Shutdown);
-    let _ = ScriptedDriver::run_with_input(&plan, booted(console.clone()), &script);
-    assert_eq!(real_providers_constructed(), 0);
+    let _ = ScriptedDriver::run_with_input(&plan, booted(console.clone(), &root), &script);
+    assert!(!root.exists(), "a step booted: {}", root.display());
     assert_eq!(*console.0.lock().unwrap(), Vec::<String>::new());
 }

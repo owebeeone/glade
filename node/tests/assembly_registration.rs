@@ -1,15 +1,18 @@
-//! The positive control for `tests/assembly`: the construction counter that
-//! binary reads as zero is paid for. Built with nothing overridden,
-//! `NodeAssembly` constructs its real providers: the eager ones when it is
-//! built, the `#[lazy]` ones when first resolved, and none twice. And a real
-//! provider built without the handle the composition root acquires refuses:
-//! it never acquires one itself (no constructor fallback to real I/O,
-//! `arch1/RuntimeAndAssurance.md:73-76`).
-//!
-//! A test binary of its own, because the counter is process-wide: the binary
-//! that asserts zero must never share a process with this one. One test, so
-//! the readings cannot interleave.
+//! The positive control for `tests/assembly`: the construction observer that
+//! binary's test nodes read as empty is paid for. Built with nothing
+//! overridden but its observer, a recorder of this test's own,
+//! `NodeAssembly` constructs its real providers, and each tells the recorder:
+//! the eager ones when it is built, the `#[lazy]` ones when first resolved,
+//! and none twice. And a real provider built without the handle the
+//! composition root acquires refuses: it never acquires one itself (no
+//! constructor fallback to real I/O, `arch1/RuntimeAndAssurance.md:73-76`).
 
+// Step 3.2's fakes, shared with `tests/assembly`: this binary uses the recorder.
+#[allow(dead_code)]
+#[path = "assembly/fakes.rs"]
+mod fakes;
+
+use std::any::type_name;
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::pin::pin;
@@ -19,13 +22,19 @@ use std::task::{Context, Poll, Waker};
 use glade_carrier_api::{CarrierAddr, CarrierConfig, CarrierError, CarrierPort};
 use glade_grant_api::{Denial, Holder};
 use glade_node::assembly::{
-    real_providers_constructed, Admission, ClientCarrier, Directory, Grants, HostError,
-    NodeAssembly, PeerCarrier, RecordHost, RecordHostPort, Sessions, Signer,
+    Admission, ClientCarrier, CommandLine, Constructions, Directory, Grants, HostError,
+    NodeAssembly, PeerCarrier, PendingWebSocketAdapter, RecordHost, RecordHostPort, Records,
+    Sessions, Signer, SystemClock,
 };
+use glade_node::grants::PolicyView;
+use glade_node::iroh_carrier::IrohCarrier;
 use glade_node::registry::{Record, HOME};
+use glade_node::signing::NodeSigner;
 use glade_node::sysdata::NodeRecord;
 use glade_signer_api::{Purpose, SignError};
 use shaku::HasComponent;
+
+use fakes::{real_providers_constructed, Recorder};
 
 /// The carriers, lent nothing, answer at once; one poll is enough.
 fn now<T>(future: impl Future<Output = T>) -> T {
@@ -37,24 +46,30 @@ fn now<T>(future: impl Future<Output = T>) -> T {
 
 #[test]
 fn an_assembly_with_nothing_overridden_builds_its_real_providers_and_they_refuse() {
-    assert_eq!(real_providers_constructed(), 0);
+    let node = NodeAssembly::builder()
+        .with_component_override::<dyn Constructions>(Box::new(Recorder::default()))
+        .build();
 
-    // Eager: the command line, the system clock, the iroh adapter (which the
-    // record transport rides) and the record host.
-    let node = NodeAssembly::builder().build();
-    assert_eq!(real_providers_constructed(), 4);
+    // Eager, in the module's order: the command line, the system clock, the
+    // iroh adapter (which the record transport rides) and the record host.
+    let mut built = vec![
+        type_name::<CommandLine>(),
+        type_name::<SystemClock>(),
+        type_name::<IrohCarrier>(),
+        type_name::<Records>(),
+    ];
+    assert_eq!(real_providers_constructed(&node), built);
 
     // Lazy: each is built on its first resolution, and only then.
     let sessions: Arc<dyn Sessions> = node.resolve();
-    assert_eq!(
-        real_providers_constructed(),
-        5,
-        "the pending websocket adapter"
-    );
+    built.push(type_name::<PendingWebSocketAdapter>());
+    assert_eq!(real_providers_constructed(&node), built, "the websocket");
     let admission: Arc<dyn Admission> = node.resolve();
-    assert_eq!(real_providers_constructed(), 6, "the pending grant fold");
+    built.push(type_name::<PolicyView>());
+    assert_eq!(real_providers_constructed(&node), built, "the grant fold");
     let signer: Arc<dyn Signer> = node.resolve();
-    assert_eq!(real_providers_constructed(), 7, "the node signer");
+    built.push(type_name::<NodeSigner>());
+    assert_eq!(real_providers_constructed(&node), built, "the node signer");
 
     // One scope, one occurrence: resolving again builds nothing more.
     let _: Arc<dyn Directory> = node.resolve();
@@ -62,7 +77,7 @@ fn an_assembly_with_nothing_overridden_builds_its_real_providers_and_they_refuse
     let _: Arc<dyn ClientCarrier> = node.resolve();
     let _: Arc<dyn Grants> = node.resolve();
     let _: Arc<dyn Signer> = node.resolve();
-    assert_eq!(real_providers_constructed(), 7);
+    assert_eq!(real_providers_constructed(&node), built);
 
     // No instance was lent, so the record host refuses. It does not boot one.
     let host: Arc<dyn RecordHost> = node.resolve();

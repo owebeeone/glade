@@ -2,8 +2,10 @@
 //! Each runs its contract's conformance suite in `conformance.rs`. None is a
 //! transport, a time source, a registry or cryptography, and each says what it
 //! does not prove. The in-memory store and registry are not here: they are the
-//! node's own `Registry` over `MemStore`, built by `Records::in_memory`.
+//! node's own `Registry` over `MemStore`, built by `Records::in_memory`. Last,
+//! the construction observer each composition binds, and its reader.
 
+use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::{poll_fn, Future};
 use std::pin::pin;
@@ -17,10 +19,11 @@ use glade_carrier_api::{
 use glade_clock_api::ClockPort;
 use glade_grant_api::conformance::{self as grant_conformance, Record as GrantRecord};
 use glade_grant_api::{admits, Denial, GrantPort, Holder};
-use glade_node::assembly::{ConfigPort, Settings};
+use glade_node::assembly::{ConfigPort, Constructions, NodeAssembly, Settings};
 use glade_signer_api::{
     NodeId, Purpose, SignError, SignatureStatus, SignerPort, VerificationError,
 };
+use shaku::HasComponent;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -442,4 +445,26 @@ impl ConfigPort for FixedSettings {
     fn settings(&self) -> &Settings {
         &self.0
     }
+}
+
+/// The construction observer a test composition binds: it keeps the type name
+/// of each real provider its own scope constructed, in order, and sees no
+/// other scope. It proves only what the providers report.
+#[derive(Default)]
+pub struct Recorder(Mutex<Vec<&'static str>>);
+
+impl Constructions for Recorder {
+    fn constructed(&self, provider: &'static str) {
+        lock(&self.0).push(provider);
+    }
+}
+
+/// The real providers `node`'s scope has constructed, in order, as its own
+/// [`Recorder`] saw them.
+pub fn real_providers_constructed(node: &NodeAssembly) -> Vec<&'static str> {
+    let observer: Arc<dyn Constructions> = node.resolve();
+    let observer: &dyn Any = &*observer;
+    let recorder = observer.downcast_ref::<Recorder>();
+    let seen = lock(&recorder.expect("the composition binds a Recorder").0);
+    seen.clone()
 }

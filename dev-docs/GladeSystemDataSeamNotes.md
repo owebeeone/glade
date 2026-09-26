@@ -66,7 +66,7 @@ nothing here changes an existing trace.
 
    | Invocation | Sysdir boot | Touches on disk |
    | --- | --- | --- |
-   | `glade-node <port> [store_dir]` (legacy, no flags) | none | only `store_dir` (default: a temp dir); NEVER `~/.glade` |
+   | `glade-node <port> <store_dir>` (legacy: neither `--profile` nor `--name`) | none | only `store_dir`, which is required (owner, 2026-09-26: without it the start is refused with the usage line and exit 1, having written nothing; it defaulted to a temp dir every such node shared); NEVER `~/.glade` |
    | `glade-node --profile P [--name N] [--operator O] [port] [store_dir]` | yes | `$GLADE_HOME` else `$HOME/.glade`, at `sys/<name>/` (+ `store_dir`, default `sys/<name>/cache/store/`) |
 
    `--name` alone also opts in (profile defaults to `local`). Tests that boot

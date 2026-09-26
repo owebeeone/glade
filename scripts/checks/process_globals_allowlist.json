@@ -4,10 +4,8 @@
   "roots": ["node/src/lib.rs", "node/src/bin/glade-node.rs", "wire-rs/src/lib.rs", "contracts/*/src/lib.rs", "client-rs/src/lib.rs"],
   "test_features": ["conformance"],
   "entries": [
-    {"path": "node/src/assembly.rs", "kind": "static", "name": "REAL_PROVIDERS", "disposition": "debt",
-     "reason": "Counts the real providers NodeAssembly modules construct, so tests/assembly_registration.rs can see which were built; production code carries state that only a test reads. Give the test an observer of its own (ProcessGlobalsPlan Step 4.1)."},
     {"path": "node/src/bin/glade-node.rs", "kind": "env", "name": "env::args", "count": 2, "disposition": "permanent",
-     "reason": "The hand-written composition root reads the process's arguments once, at its entry point, and passes them down."},
+     "reason": "Each composition root reads the process's arguments once, at its entry point, and passes them down: run parses them itself, and run_assembled parses them into Settings (Settings::from_args)."},
     {"path": "node/src/bin/glade-node.rs", "kind": "env", "name": "env::var", "count": 2, "disposition": "permanent",
      "reason": "GLADE_HOME and HOME, read once as each composition root starts (instance_root_from_env) and passed down as the instance root: into sysdir::boot for the hand-written root, and through Settings for the assembled one. Nothing below the entry point reads them (ProcessGlobalsPlan Step 2.1; a read at a program's entry point is permanent, owner's ruling of 2026-09-26)."},
     {"path": "node/src/bin/glade-node.rs", "kind": "env", "name": "env::var_os", "disposition": "permanent",
