@@ -5455,3 +5455,786 @@ What they do not prove:
   `tests/lifecycle.rs` +4/−1, `tests/assembly/main.rs` +3/−2,
   `tests/instance_root.rs`, `sysdir.rs` and `store.rs` +1/−1 each;
 - beside them, the IR +11 and the allowlist +3/−3.
+
+## Relay configuration and the first crossing (plan Step 4.5)
+
+Design addition, 2026-09-27, written before the code against glade `1ce4b46`
+(glade-wz root `9aa40d3`). The red runs and the measured figures are filled in
+afterwards. The spec is plan Step 4.5 with its run notes, and these rulings:
+
+- `relay_posture = community_dev_only` (2026-09-22): n0's relays for the slice,
+  `RelayMode::Default`, with `Custom(RelayMap)` the later switch; no
+  address-lookup service; peers named directly; "the relay is a configuration
+  value".
+- The owner, 2026-09-24: no NAT or firewall checks; the two LAN machines, the Pi
+  and dabeest, with n0's relays configured; the path iroh picks is noted, not
+  measured.
+- The owner, 2026-09-25, on 4.2b's question 3: 4.5's configuration prints a
+  node's endpoint id without serving. Since the door, the accepting node must
+  name the dialer's key, so both machines need each other's id before either
+  starts.
+- The portmapper note (glade `1192bf2`): off since the loopback fix; 4.5 decides
+  it with the bind address and the relay mode.
+- The owner, 2026-09-25, on 4.2c: the mesh moves onto the carrier port in 4.5b,
+  not here. So the mesh stays on `PeerEndpoint`, and the configuration reaches
+  both.
+
+4.2 has landed (4.2a, 4.2b, 4.2c), so the plan's alternative, a crossing run
+before the door on a private id, does not arise: the door is the lock the relay
+ruling asked for. The plan's rule stands anyway: endpoint ids stay in
+configuration files at 0600 and out of logs.
+
+Nothing changes in the wire, the IR, the contracts or the dependencies: no
+crate is added, and no `Cargo.lock` line moves.
+
+**The step comes in two parts and a run.**
+
+- **Part 1, the configuration** (sections 1 to 7): the file, the endpoint's
+  recipe, the portmapper, the `endpoint-id` command, and endpoint ids out of
+  logs.
+- **Part 2, the notes** (section 8): the lines a node prints about its relay,
+  its links' paths and its `home` rounds, which the crossing reads.
+- **The crossing** (sections 9 and 10), on the Pi and dabeest, after part 2.
+
+### 1. What does not change: every profile, and the owner's desk
+
+The desk runs grazel, which starts the node as `--profile local --name grazel
+--app apps/grazel-app.glade --app apps/gyld-app.glade 9099`, with
+`GLADE_HOME=<data>/sys` (`grazel/src/lib.rs:256-271`, `src/main.rs:108-111`).
+It passes no `--peer`, and it will pass no `--config`.
+
+**No file means today's network, on every profile.** A profile picks the
+default instance name and nothing else, as `sysdir.rs` says ("a deployment
+label only"). The network comes from the file alone.
+
+| Profile | Default instance | With no `--config` |
+| --- | --- | --- |
+| `local` | `glade-local` | the endpoint binds `127.0.0.1:0` alone; relays off; portmapper off; no address lookup; peers only from `--peer` |
+| `peer` | `glade-peer` | the same |
+| `server` | `glade-server` | the same |
+
+- For that default, the endpoint builder's calls are today's, call for call:
+  `presets::Minimal`, the key, the ALPN, the door's hook, the portmapper
+  disabled, the IP transports cleared, `bind_addr(127.0.0.1:0)`. No relay call
+  is made, so iroh has no relay transport, and its net report has no relay to
+  probe.
+- The websocket listener stays on `127.0.0.1:<port>`, whatever the file says.
+  The file configures the iroh endpoint only.
+- So the desk still binds loopback alone and contacts no relay. Its one visible
+  change is a log line: the `peer` line names the endpoint by a tag, not the
+  full id (section 7).
+- Tests pin it (section 11): the default is loopback with relays off; the
+  recipe maps `off` to `RelayMode::Disabled`; no production code names iroh's
+  environment readers; `an_endpoint_listens_on_loopback_alone` stays.
+- The replay before the desk's restart runs the rebuilt binary on a stand-in
+  laid out as grazel lays out the desk, and lists its sockets with `lsof`: UDP
+  and TCP on `127.0.0.1` alone, and no TCP connection leaving the machine.
+- No test binds beyond loopback, and no test contacts a relay. So the Mac's
+  firewall has nothing to ask, and n0 hears nothing from the Mac.
+
+### 2. The configuration file
+
+**Named on the command line.** The booted form takes `--config <path>`. The
+path must be absolute: resolving a relative one would read the working
+directory, which only a program's entry point may do (4.1c's rule for
+`--out`). The legacy form ignores the flag, as it ignores `--peer`.
+
+**Loaded before anything is written.** Both roots load the file after the
+`--app` files and before the instance boots. A file that cannot be read, is
+readable by others, or has one bad line refuses the start with exit 1, as a
+bad app file does. The instance is not created and nothing is written.
+
+**The 0600 rule.** On Unix the file is refused if group or others have any
+access (`mode & 0o077`), with the message `<path> is group/world-accessible
+(mode 644) — refusing`, as for `node.key`. This holds whatever the file
+contains. Off Unix there is no check (F5), as for the key files. The check
+sits in a braced platform module of its own, as `sysdir.rs`'s does.
+
+**The format** is lines, like the app files. A `#` starts a comment that runs to
+the end of its line, and blank lines are skipped. There are three keywords:
+
+| Line | Means | At most | When absent |
+| --- | --- | --- | --- |
+| `relay off` | no relay: `RelayMode::Disabled` | one `relay` line | `off` |
+| `relay n0` | n0's production relays: `RelayMode::Default` | | |
+| `bind <ip:port>` | the endpoint binds this socket address; port 0 lets the OS choose | one IPv4 and one IPv6 | `127.0.0.1:0` alone |
+| `peer <endpoint-id>` | admit this key on first contact; dial nothing | | no peers |
+| `peer <endpoint-id>@<ip:port>` | admit it, and dial it at that address | | |
+| `peer <endpoint-id>@<relay-url>` | admit it, and dial it through that relay | | |
+
+- An endpoint id is 64 lower-case hex digits, and a key iroh accepts as an
+  Ed25519 point. That is checked at load, with iroh's own type.
+- A relay URL is written as the node prints it, for example
+  `https://aps1-1.relay.n0.iroh.link./`. It must be one of the four relays
+  `relay n0` names: n0's production map, as iroh defines it
+  (`defaults::prod`). A peer's relay URL needs `relay n0`. Under `relay off`
+  it is refused, since the endpoint would have no relay to send through.
+- Lines naming one endpoint id merge into one entry: admitted once, and dialed
+  once at every address they name. iroh then chooses among them.
+- `--peer` flags take the same three forms and join the file's entries after
+  them. A malformed flag now refuses the start at load, where it printed a
+  line and was skipped.
+- Anything else refuses the start: an unknown keyword; a second `relay` line;
+  `relay` with any other word; a second IPv4 or IPv6 `bind`; a bad socket
+  address, id or URL.
+- `relay` takes no URL list. `Custom(RelayMap)` is the ruling's later switch,
+  and waits for a relay of our own (question 6).
+
+**Messages never echo a line.** An error names the file and the line number,
+`<path>: line 3: expected <endpoint-id>, <endpoint-id>@<ip:port> or
+<endpoint-id>@<relay-url>`. A bad `--peer` flag is named by its place,
+`--peer entry 2: …`. So no message prints an id.
+
+An example, the Pi's file for the crossing's run 2 (section 10):
+
+```text
+# plan Step 4.5, run 2: n0's relays, the Wi-Fi address, dabeest admitted
+relay n0
+bind 10.1.1.236:4545
+peer <dabeest's endpoint id>
+```
+
+### 3. Where each value comes from
+
+The node reads nothing from the environment below its entry point (glade's
+`AGENTS.md`, "No process globals"; `scripts/checks/check_process_globals.py`).
+The file path arrives with the arguments, which `start` reads once. So the
+allowlist does not change: `env::args` stays one read, and `env::var` two.
+
+| Value | Comes from | With no file | Read |
+| --- | --- | --- | --- |
+| relay mode | the file's `relay` line | off | by the root, before boot |
+| bind addresses | the file's `bind` lines | `127.0.0.1:0` | by the root, before boot |
+| peers | the file's `peer` lines, then `--peer` flags | none | by the root, before boot |
+| the file's path | `--config`, among the arguments | none | once, in `start`, the entry point |
+| the instance root | `GLADE_HOME`, else `$HOME/.glade` | as today | once, at the entry point |
+| the endpoint key | `<instance>/endpoint.key` (4.2a) | minted at the first boot, or by `endpoint-id` (section 6) | by the boot, or the command |
+| portmapper | nowhere: always off (section 5) | off | never |
+| address lookup | nowhere: none | none | never |
+| proxies for iroh's builder | nowhere | none | never |
+
+**What the node never asks iroh to do**, because each reads the environment or
+adds a lookup service:
+
+- `presets::N0` adds n0's pkarr and DNS lookups, which the ruling excludes. It
+  also sets its relay mode through `default_relay_mode()`.
+- `default_relay_mode()` and `force_staging_infra()` read
+  `IROH_FORCE_STAGING_RELAYS` (iroh 1.2 `src/endpoint.rs:2030-2047`). The node
+  names `RelayMode::Default` itself.
+- `Builder::proxy_from_env()` reads `HTTP_PROXY`, `http_proxy`, `HTTPS_PROXY`
+  and `https_proxy` (`:1871-1901`).
+
+A source test keeps these names out of `src/` (section 11). grazel hands the
+node its whole start-up environment, so this matters: a variable in the
+owner's shell must not steer the node's relays.
+
+**What iroh's dependencies still read.** The process-globals checker scans
+glade's code, not its dependencies (`dev-docs/ProcessGlobalsPlan.md` §6). Two
+reads are therefore named gaps:
+
+- With relays on, iroh's net report makes its HTTPS probes and captive-portal
+  check with `reqwest` clients that iroh gives no proxy. `reqwest` then reads
+  the system proxy as it builds each client (through `hyper-util`'s
+  `Matcher::from_system`): `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`,
+  `NO_PROXY`, their lower-case forms and `REQUEST_METHOD`, and on macOS and
+  Windows the system's proxy settings.
+- Every bind builds iroh's DNS resolver from the system's DNS configuration
+  (`with_system_defaults`). On Windows, it finds the hosts file through
+  `SystemRoot`. With relays off the resolver resolves nothing. With `relay
+  n0` it resolves the relay hosts.
+
+### 4. `ConfigPort` and the endpoint's recipe
+
+**The shape.** The file is parsed into a carrier-free value in a new module,
+`node/src/netconf.rs`. No iroh type crosses it (LBT-004), and `ConfigPort`
+hands it out:
+
+```rust
+pub struct Network {
+    pub relays: Relays,          // off unless the file says `relay n0`
+    pub bind: Vec<SocketAddr>,   // at most one per family; [127.0.0.1:0] by default
+    pub peers: Vec<PeerEntry>,   // the file's, then --peer's, one per key
+}
+pub enum Relays { Off, N0 }
+pub struct PeerEntry { pub key: [u8; 32], pub via: Vec<Via> }  // no via: admit only
+pub enum Via { Ip(SocketAddr), Relay(String) }                 // the URL as checked at load
+
+pub trait ConfigPort: Send + Sync {
+    fn settings(&self) -> &Settings;
+    fn network(&self) -> &Network;   // new
+}
+```
+
+- `Settings` gains `config`, the `--config` path, and `network`, which the root
+  fills by loading the file before it builds `NodeStart`. `Settings.peers`
+  stays the raw `--peer` flags, which the load merges in. `CommandLine` still
+  reads nothing: it hands back what the root gave it.
+- 4.2b's `PeerEntry` in `iroh_carrier.rs` gives way to this one. `PeerAddr`
+  stays the endpoint's own dialable address, and converts into a dial target
+  with one `Via::Ip`, so the tests that dial a `PeerAddr` are unchanged.
+- `ConfigPort` stays node-local. The 3.2 note said it would move to
+  `glade/contracts` at 4.5, when a second consumer needed it. Its consumers
+  are the two roots and the iroh adapter, all in glade-node, so there is still
+  no second crate (question 5).
+
+**The recipe.** `bind_endpoint` (`iroh_carrier.rs:75-94`) takes the network
+with the key, the door and the ALPN:
+
+- `presets::Minimal`, the key, the ALPN and the door's hook, as today;
+- `portmapper_config(PortmapperConfig::Disabled)`, always (section 5);
+- `clear_ip_transports()`, then `bind_addr(addr)` for each `bind` address, so
+  nothing binds that the file does not name, and no pre-bound `[::]` returns;
+- `relay_mode(RelayMode::Default)` for `relay n0`, and no relay call for
+  `off`;
+- no `address_lookup`, no `proxy_url` and no `net_report_config`, so the net
+  report keeps iroh's defaults (question 7).
+
+**The dial.** A dial target becomes `EndpointAddr::from_parts(id, addrs)`, with
+`TransportAddr::Ip` for an address and `TransportAddr::Relay` for a relay URL.
+Before a path is chosen, iroh sends a connection's first packets to every
+address it knows (`remote_state.rs`, "sending datagram to all known paths").
+So a target naming only a relay URL makes the connection begin through that
+relay. The door's hook and HELLO's exporter bytes work unchanged over a relay
+path: it is the same QUIC connection.
+
+**The `peer` line's address** is the address as bound, from `bound_sockets()`,
+IPv4 first. `loopback_addr` (`:129-138`) rewrote it to `127.0.0.1`, which is
+wrong for any other bind. For the default bind the line prints the same address
+as before.
+
+**The iroh adapter** (4.2c) binds the socket that `CarrierConfig::local` names,
+as `<ip:port>` or as `<endpoint-id>@<ip:port>`. It ignores the id: the address
+names where, and the lent key says who. That makes CA-004's re-bind real on
+iroh, where it was vacuous (4.2c's named gap). The adapter gets no relay mode
+here, and no root lends it a key. Both wait for 4.5b.
+
+### 5. The portmapper
+
+**Decision: off in every configuration, with no switch in the file.**
+
+- On one LAN it adds nothing. Both machines sit behind one router, and iroh
+  reaches the other side's Wi-Fi address directly.
+- It asks the router, over UPnP, PCP or NAT-PMP, to open an external port to
+  the node. That exposes the node beyond the LAN, and the owner deferred NAT
+  work.
+- It opens a UDP socket on every interface and multicasts SSDP. That is what
+  raised the Mac's firewall dialogs (iroh's own documentation says so,
+  `src/portmapper.rs:26-31`).
+- The cost is direct paths across NATs that iroh's hole punching alone cannot
+  open. That belongs to the two-network check after Phase 4.
+
+The alternatives are in question 3: a `portmapper on` line, or compiling it
+out.
+
+### 6. Printing a node's endpoint id without serving
+
+`glade-node endpoint-id --name <name>` is a one-shot command beside
+`recovery`. It is chosen by its first argument, runs before a composition root
+is chosen, and starts no node. It takes the instance `<root>/sys/<name>`,
+under the root the entry point read.
+
+- **The key exists:** the command checks its mode, as the boot does, reads its
+  32 bytes and prints the id. It takes no lock and writes nothing, so it works
+  while the node runs. The key cannot change under a running node, since
+  replacing one means stopping the node first (4.2a, section 5).
+- **No key yet:** the command creates the instance directory, takes the
+  instance lock, and mints `endpoint.key` at 0600 from the OS's randomness,
+  with the boot's own helper. It then prints the id and releases the lock. The
+  lock is refused only if a node holds the instance while its key is missing,
+  and then the command says to stop the node.
+- **It mints nothing else**: no `node.key`, no records.json. The first start
+  then binds the key it finds, as a boot binds any key its node has not bound
+  (4.2a, section 5).
+- **Output:** exactly one line on stdout, the 64 hex digits, so a pipe can carry
+  it. A refusal goes to stderr, with exit 1.
+- **Where it lives:** a new module, `node/src/endpoint_id.rs`, over
+  `sysdir.rs`'s key and lock helpers made `pub(crate)`. `sysdir.rs` is past
+  1,000 lines.
+- A first argument `endpoint-id` no longer starts a node. The legacy form's
+  first positional is a port, so nothing that ran before is lost.
+
+**How the Pi and dabeest exchange ids before their first start.** Each machine
+mints its key with the command, then the lane owner pipes each id from one
+machine into a file on the other, through the Mac. The names are section 10's,
+written out for each machine, not expanded on the Mac:
+
+```text
+$PI  "GLADE_HOME=$S/home $B endpoint-id --name pi45"  | $DAB "umask 077; cat > $S/pi45.id"
+$DAB "GLADE_HOME=$W/home $B endpoint-id --name dab45" | $PI  "umask 077; cat > $S/dab45.id"
+```
+
+An id is then on its own machine and in a file on the other, and in the Mac's
+pipe for a moment. It never reaches a terminal, a log or the lane owner's
+transcript. The two ends are compared by tag: the first 10 hex digits of the
+file on one machine, against the command's output cut to 10 on the other. Each
+machine then writes its configuration file with `umask 077`, taking the id from
+the file with `$(cat …)`.
+
+### 7. Endpoint ids out of logs
+
+**The tag.** A line that must name an endpoint names it by the first 10 hex
+digits of its id. That is iroh's own short form (`PublicKey::fmt_short`).
+Ten digits are enough to match a refusal to a line of the file, and no use for
+dialing. The full id comes only from `endpoint-id`, the files and the store.
+
+| Line | Before | After |
+| --- | --- | --- |
+| the endpoint (both roots) | `peer <endpoint-id> 127.0.0.1:<port>` | `peer <tag> <address as bound>` |
+| a refusal (the door) | `peer refused: endpoint <endpoint-id>: <reason>` | `peer refused: endpoint <tag>: <reason>` |
+| a failed dial | `peer <the --peer text>: <error>` | `peer <tag>@<ip:port or relay-url>: <error>` |
+| a bad entry | `peer <the --peer text>: expected …` | `--peer entry N: expected …`, or `<path>: line N: …` |
+| `EndpointKey`'s `Debug` | the id | the tag |
+
+- `peer-connected <node-id>` and every line naming a node id are unchanged.
+  Node ids are not the relay's lock.
+- The tests that dialed through the `peer` line (`tests/assembled_path.rs`,
+  `tests/lifecycle.rs`, `tests/stop_signal.rs`) take the full id from
+  `endpoint-id`, or from an in-process boot as they already do for the dialer,
+  and the address from the `peer` line.
+- **Still holding the id, by design:** the configuration files (0600), the
+  `*.id` files of section 6, `endpoint.key`, and records.json with the served
+  store's `home` journal. The last two carry the binding record (4.2a). They
+  replicate only to linked peers, and they take the umask's mode (named gaps).
+
+### 8. The notes the crossing reads (part 2)
+
+A node that is linked, or has relays on, notes on stdout what iroh does. These
+are ordinary status lines, like `peer-connected`: on the hand-written root they
+go to stdout, and on the assembled one to the console's `out`. The mesh gets
+this reporter beside the door's refusal reporter. A node with no peers and
+relays off prints none, so the desk prints none.
+
+| Line | When | Printed by |
+| --- | --- | --- |
+| `relay <url>` | a home relay connects, or the home relay changes | a node with `relay n0` |
+| `relay <url> not connected: <error>` | its connection fails or drops | the same |
+| `link <node-id> via relay <url>, rtt <n> ms` | at HELLO, and whenever iroh selects another path | both ends of a link |
+| `link <node-id> via direct <ip:port>, rtt <n> ms` | the same | the same |
+| `link <node-id> closed` | the link's connection ends | both ends |
+| `home round with node <id>: <n> record(s) in <ms> ms` | this node's pull from that peer ends | both ends |
+
+- **iroh's types stay in the adapter** (`IrohGladeMapping.md` §7.6).
+  `iroh_carrier.rs` describes a path, a selected `TransportAddr` and its RTT
+  estimate, and reads the home relay's status (`Endpoint::home_relay_status`,
+  a `Watcher` iroh re-exports). The mesh sees only text and numbers.
+- **The link's watch** rides the existing `Site::Unlink` task
+  (`mesh.rs:289-294`). It already waits for the connection to close. It now
+  also reads `Connection::paths()` every 250 ms and notes a change of the
+  selected path. iroh's change stream, `path_events`, needs the `Stream` trait
+  from a crate the node does not depend on directly. A poll needs none.
+- **The relay's watch** is one task per endpoint, a new `Site::RelayWatch`
+  owned by `Sessions`. It is spawned only with `relay n0`.
+- **The home round** is timed around `pull_home` (`:603`) with `Instant`. The
+  dialer's `peer-connected` still follows its own pull.
+- A `link … closed` line soon after the peer's stop shows a close that reached
+  the peer. One about 30 s later shows a peer that died, since that is iroh's
+  idle limit on a relay path (15 s on a direct one).
+
+### 9. What n0's relays can see
+
+This comes from the protocols (iroh 1.2 and iroh-relay 1.2) and is not observed.
+It is set out in the plan's terms, with what goes beyond them. "The relay" is
+the node's home relay unless a line says otherwise.
+
+**Endpoint ids.**
+
+- Each node's own id, proved by a signature when it connects to its home relay
+  (`iroh-relay` `protos/handshake.rs`).
+- For every datagram it relays: the sender's id and the receiver's id. So n0
+  knows which ids talk to which: that the Pi's endpoint and dabeest's talk.
+- A dialer that names a relay other than its own home relay connects to that
+  relay too, and shows it the same.
+- `endpoint.key` is stable across starts (4.2a). So n0 can follow a node by its
+  id across restarts and networks. The crossing's keys are made for the run and
+  deleted after it.
+
+**IP addresses.**
+
+- The home relay sees the public address and TCP port of the node's relay
+  connection, a WebSocket over TLS on 443.
+- Every relay the net report probes sees the node's public address. Through
+  QUIC address discovery (QAD, on its own ALPN and with no id), it also sees
+  the node's public UDP address and port, the NAT mapping, and tells the node.
+- On one LAN, both nodes show the same public address, so n0 can tell they sit
+  together.
+
+**Timing.**
+
+- When each node connects to and leaves its relay, with a ping every 15 s
+  (`relay/actor.rs:74`).
+- The time of every relayed datagram.
+- The net report runs every 20 to 26 s (`socket.rs:1999-2003`). At start, and
+  in a full report every 5 minutes (`net_report.rs:132`), it probes all four
+  relays, over QAD and HTTPS. In between it reads the node's address from the
+  one QAD connection it keeps open, with a keep-alive every 25 s.
+
+**Volume.**
+
+- The size and count of every relayed datagram, each way.
+- Once a direct path is selected, the link's data leaves the relay. But the
+  relay path stays open beside it, and iroh pings a path idle for 5 s
+  (`socket.rs:109`). So n0 still sees a small datagram between the two ids
+  every few seconds for as long as the link lives.
+
+**Beyond the four:**
+
+- A connection's first packets, when they cross the relay, are protected only by
+  keys any observer can derive (QUIC, RFC 9001 §5.2). The relay can therefore
+  read the TLS ClientHello they carry, and in it the ALPN, `glade/node/3`: that
+  these two ids speak Glade's node protocol, version 3. iroh stopped sending
+  the SNI after 1.0.3, so nothing else in it names Glade.
+- The captive-portal check, at the first report, is a plain `GET
+  http://<relay-host>/generate_204` with a header `X-Iroh-Challenge:
+  ts_<host>`. It carries no id, but anyone on the path sees it.
+- The relay hosts are resolved through the machine's resolver. The authoritative
+  servers for `iroh.link` see the resolver's lookups.
+
+**Not visible to n0:** node ids, HELLO, the binding that ties an endpoint id to
+a node id, every `home` record and share, and app data. All of these ride
+TLS 1.3 inside QUIC, keyed to the two endpoint keys.
+
+### 10. The crossing on the Pi and dabeest
+
+**The machines**, as read on 2026-09-27 (read only):
+
+| | the Pi | dabeest |
+| --- | --- | --- |
+| reached by | `ssh -o BatchMode=yes gianni@10.1.1.236`, with Gianni's agent socket as `SSH_AUTH_SOCK` | `ssh -o BatchMode=yes -o ClearAllForwardings=yes gianni@dabeest` |
+| system | Raspberry Pi 5, Debian 13 aarch64, 4 cores, 7.9 GiB | Windows 11, MinGW bash (MSYS) |
+| Rust | 1.96.0 | 1.98.1, with `CARGO_HOME=/c/Users/gianni/.cargo RUSTUP_HOME=/c/Users/gianni/.rustup` |
+| work area | `~/git/glade-wz` (glade at `1192bf2`) | `/e/git/glade-wz` (glade at `63a5799`) |
+| address | `wlan0` `10.1.1.236/16`, gateway `10.1.1.1`; IPv6 unique-local only | Wi-Fi `10.1.1.239`, gateway `10.1.1.1`; also WSL `172.19.80.1` and an idle Tailscale adapter |
+| space | 9.3 GB free (84% used) | 904 GB free on `E:` |
+| clock | NTP synchronised | within a second of the Pi and the Mac |
+| UDP 4545 | free | free |
+| helpers | `python3`, `timeout`, `ss` | `python` (Python 3.13 in `AppData/Local/Programs`), `timeout`, `taskkill`, `tasklist` |
+
+Addresses come from DHCP and are read again at the run.
+
+**Roles.** The Pi accepts and dabeest dials, in every run. The Pi admits
+dabeest's key, and dabeest names the Pi's key and the Pi's relay. The Pi is
+the one stopped cleanly, because the assembled root stops on SIGTERM there. On
+Windows it stops on Ctrl-C alone, which an ssh session cannot send, so
+dabeest's node is always ended by force. Both run the assembled root
+(`GLADE_NODE_ASSEMBLED=1`) as profile `peer`, with instances `pi45` and
+`dab45`.
+
+**Two runs.**
+
+- **Run 1, the relay alone.** Both nodes bind `127.0.0.1:0` with `relay n0`. A
+  loopback socket cannot reach the other machine, so HELLO, the round and
+  everything after cross n0's relay. That is the plan's "through the relay",
+  with nothing listening on the LAN. QAD cannot leave a loopback socket, so
+  each node should find its relay through the HTTPS probes. If one finds
+  none, run 1 is recorded as not possible and run 2 stands alone.
+- **Run 2, iroh's choice.** Both bind their Wi-Fi address on UDP 4545, with
+  `relay n0`, and dabeest still dials through the Pi's relay alone. iroh may
+  then find the LAN path by hole punching. The run notes whether it does and
+  when, as the owner ruled.
+
+**Names used below.** `$PI` and `$DAB` are the two ssh commands above. On the
+Pi, `S=$HOME/git/glade-wz/scratch/4.5` and `B=$S/target/debug/glade-node`. On
+dabeest, `S=/e/git/glade-wz/scratch/4.5`, `W=E:/git/glade-wz/scratch/4.5` and
+`B=$S/target/debug/glade-node.exe`, and each command starts with the two Cargo
+variables and `PATH=/c/Users/gianni/.cargo/bin:$PATH`. A path given to the
+native Windows binary is written `E:/…`, never `/e/…`. Everything the run makes
+is under `$S`, and nothing else on either machine is touched: not the rest of
+`scratch/`, not the siblings' checkouts.
+
+**0. Preconditions (read only).** Both machines answer. Their clocks agree with
+the Mac's within a second (`date -u +%s.%N`). A binding is judged at the
+reader's clock with no margin (4.2a, section 4), so skew matters from run 2
+on. UDP 4545 is free on both (`ss -lunH 'sport = :4545'`; `netstat -ano -p udp
+| grep ':4545 '`). No `glade-node` process runs on either (`pgrep -af
+glade-node`; `tasklist //FI "IMAGENAME eq glade-node.exe"`).
+
+**1. The code.** Once part 2 has landed, the lane owner pushes glade's `main`
+to GitHub under the owner's standing rule and notes the commit `<sha>`. Each
+machine runs `git -C <its glade> pull --ff-only`, and `git rev-parse HEAD` must
+print `<sha>`. Only glade is pulled.
+
+**2. Build, then the node suite.** Both use a target of their own under `$S`:
+
+```text
+Pi:      cd ~/git/glade-wz/glade && mkdir -p $S \
+         && CARGO_TARGET_DIR=$S/target cargo build --locked --manifest-path node/Cargo.toml --bin glade-node \
+         && CARGO_TARGET_DIR=$S/target cargo test --locked --manifest-path node/Cargo.toml
+dabeest: the same from /e/git/glade-wz/glade, the build and then the suite, one heavy job at a time
+```
+
+Expected: every suite passes on the Pi, which holds the siblings. dabeest passes
+every suite but `binding_census` and `shipped_app_files`, which need the
+siblings, and `stop_signal` has no tests there. No test contacts a relay. If the
+Pi's sibling checkouts are behind GitHub, those two suites may fail there for
+that reason alone, and the record says so rather than pulling more than glade.
+
+**3. The ids**, as section 6 shows: minted, piped across, and compared by tag. A
+small line-stamper, `$S/stamp.py`, is written on each machine. It prefixes each
+line with the machine's UTC time in seconds to the millisecond.
+
+**4. Run 1.**
+
+1. Write the Pi's file with `umask 077`: `relay n0`, `bind 127.0.0.1:0`, and
+   `peer $(cat $S/dab45.id)`.
+2. Start the Pi, from the Mac in the background, so its ssh session holds it:
+   `$PI "cd $S && GLADE_HOME=$S/home GLADE_NODE_ASSEMBLED=1 timeout
+   --preserve-status -s TERM 420 $B --profile peer --name pi45 --config
+   $S/pi45-1.conf 0 2>&1 | python3 -u stamp.py > pi45-1.log; echo exit
+   \${PIPESTATUS[0]} >> pi45-1.log"`. Every start carries such a `timeout`,
+   so nothing outlives the run.
+3. Wait up to 30 s for its `relay <url>` line, and read the URL. A URL is not
+   an id, so it may appear on the screen.
+4. Write dabeest's file with `umask 077`: `relay n0`, `bind 127.0.0.1:0`, and
+   `peer $(cat $S/pi45.id)@<url>`.
+5. Start dabeest the same way, `timeout 240`, `--config $W/dab45-1.conf`,
+   through Python 3.13's full path, into `dab45-1.log`.
+6. Watch for 120 s: dabeest's `peer-connected`, both `link` lines, and both
+   `home round` lines. The path should stay `via relay`.
+7. dabeest's `timeout` ends its node by force. The Pi should note `link …
+   closed` about 30 s later: a peer that died, at iroh's idle limit for a relay
+   path. Then the Pi's own `timeout` sends SIGTERM, and it exits 0.
+
+**5. Run 2**, on the same instances. The Pi's fold now holds dabeest's binding,
+so the door admits dabeest by record, not by first contact.
+
+1. Write the Pi's file, with `umask 077` as before: `relay n0`, `bind
+   10.1.1.236:4545`, and the same `peer` line admitting dabeest. Start it as in
+   run 1, with `timeout 600`, into `pi45-2.log`, and read its `relay` line
+   again.
+2. Write dabeest's file: `relay n0`, `bind 10.1.1.239:4545`, and `peer $(cat
+   $S/pi45.id)@<url>`. No LAN address is named. Start it with `timeout 600`,
+   into `dab45-2.log`.
+3. Watch for 120 s. Note each `link … via …` line, with its time and RTT, and
+   the path selected at the end.
+4. **Port release after close.** SIGTERM the Pi's node alone: `$PI "pkill
+   -TERM -f '^$S/target/debug/glade-node '"`. The anchor keeps the signal off
+   the `timeout` that holds it. Record the exit status and the time from the
+   signal to the exit. `ss -lunH 'sport = :4545'` must print nothing at once.
+   dabeest must note `link … closed` within about a second, not after 15 to
+   30 s.
+5. Start the Pi again on the same file. Its `peer … 10.1.1.236:4545` line
+   shows the port bound again. Stop it with SIGTERM, then end dabeest (its
+   `timeout`, or `taskkill //F //IM glade-node.exe`).
+
+On dabeest, the first bind of a Wi-Fi address may raise a Windows Defender
+Firewall prompt on the console, or, with no one to answer it, leave inbound
+traffic to the new program blocked. The run changes no firewall setting on
+either machine, and notes the path iroh picks either way. dabeest dials, so
+its own outbound packets should open the return path for hole punching.
+
+**6. Teardown.**
+
+- No `glade-node` process is left on either machine: `pgrep -af "$S/target"` on
+  the Pi and `tasklist` on dabeest. Anything found under `$S` is killed. UDP
+  4545 is free on both.
+- No log names an endpoint id. On each machine, `grep -c -F -f` with each id
+  file, and with each node's own `endpoint-id` output, finds 0 lines in every
+  `*.log`.
+- The logs are copied to the Mac's scratch space for the record. They hold node
+  ids, the relay URL and LAN addresses, and no endpoint id. The public address
+  that QAD reflected is never printed by the node, so it cannot be in them.
+- `rm -rf $S` on both machines: the instances, both keys, the files, the logs
+  and the build. The ids n0 saw now belong to keys that no longer exist.
+
+**What is recorded**, in this note as "Measured (4.5)", and in a line under
+plan Step 4.5:
+
+| Item | Run 1 | Run 2 |
+| --- | --- | --- |
+| commit, machines, Rust | | |
+| each node's home relay (`relay` line) | | |
+| HELLO: dabeest's `peer` line to its `link` line, and the Pi's `link` line | | |
+| the path at HELLO, and its RTT | | |
+| each `home round`: records and time | | |
+| later path changes: when, to what, RTT | | |
+| the path selected at 120 s | | |
+| the Pi's `link … closed` after dabeest is ended by force | | |
+| the Pi's stop: exit status, time to exit, UDP 4545 free | | |
+| dabeest's `link … closed` after the Pi's stop | | |
+| the Pi's restart binds 4545 | | |
+| no log holds an endpoint id | | |
+| what n0 could see (section 9), with what the run showed of it | | |
+
+If n0's relays refuse iroh 1.2 (the community tier serves the latest stable
+release only), the `relay … not connected: <error>` line is the record, and the
+run stops there. The `version_pin` ruling says what follows.
+
+### 11. Tests, each begun red
+
+Each test will be run first against the code with the part it guards switched
+off, in a scratch copy, and the message it prints is recorded. The "red
+against" column says what is switched off.
+
+**Part 1.**
+
+| Test | Proves | Red against |
+| --- | --- | --- |
+| `netconf`: `no_file_is_loopback_with_relays_off_and_no_peers` | the default network: `[127.0.0.1:0]`, `Off`, no peers | a default with `N0` |
+| `netconf`: `the_file_takes_relay_bind_and_peer_lines` | each form parses, the relay URL as the node prints it included; lines for one key merge; comments and blank lines are skipped | a parser that knows no `@<relay-url>` form |
+| `netconf`: `each_bad_line_is_refused_by_its_number_and_never_echoed` | refused, each for its reason, naming the line and holding no id: an unknown keyword, a second `relay`, `relay` with a URL, a second IPv4 `bind`, a bad socket, an upper-case or short id, a key iroh rejects, a relay URL under `relay off`, one that is not n0's | a parser that skips bad lines |
+| `netconf::unix`: `a_config_file_others_can_read_is_refused` | 0640 and 0644 are refused, naming the file; 0600 is taken | no mode check |
+| `netconf`: `a_relative_config_path_is_refused` | the path must be absolute | a load that opens any path |
+| `iroh_carrier`: `the_recipe_maps_off_to_disabled_and_n0_to_the_production_relays` | pure: `Off` gives `RelayMode::Disabled`, and `N0` gives `RelayMode::Default`, whose map is `defaults::prod` | `N0` mapped to `Staging` |
+| `iroh_carrier`: `an_endpoint_binds_where_its_network_says` | on loopback: a fixed free port is the one bound, and the `peer` line's address is the bound one | a recipe that ignores `bind` |
+| `iroh_carrier`: `an_endpoint_listens_on_loopback_alone` (kept) | now over `Network::default()` | a default binding `0.0.0.0` |
+| `iroh_carrier`: `a_dial_target_names_each_address_it_was_given` | pure: `Via::Ip` and `Via::Relay` become one `EndpointAddr` with both | a target that drops the relay |
+| `iroh_carrier`: `an_iroh_port_binds_where_its_config_says` | `IrohCarrier` binds `local`'s socket, so CA-004's re-bind lands at `b`'s own address | the adapter's loopback-anywhere bind |
+| `iroh_carrier`: `no_production_code_names_irohs_environment_readers` | a source check over `src/`: no `presets::N0`, `N0DisableRelay`, `default_relay_mode`, `force_staging_infra` or `proxy_from_env` | `presets::N0` put back in `bind_endpoint` |
+| `endpoint_id`: `the_command_mints_a_key_that_the_first_start_binds` | on a new instance: one line of 64 hex digits; `endpoint.key` at 0600; no `node.key`, no records.json; the first boot binds that key | the command absent: its name read as a positional |
+| `endpoint_id`: `the_command_reads_a_running_nodes_key_and_writes_nothing` | with the instance held by a boot: the same id, nothing written, no lock taken; a group-readable key is refused | a command that takes the lock to read |
+| `tests/assembled_path`: `both_roots_take_their_network_from_the_config_file` | B's file admits A, and A's file dials B at `127.0.0.1`: they link. B with no file refuses A | `--config` ignored |
+| `tests/assembled_path`: `both_roots_refuse_a_bad_config_file_before_writing` | a group-readable file, and one bad line: exit 1, the message, and no instance directory | a load after the boot |
+| `tests/assembled_path`: `no_line_names_an_endpoint_id` | two linked nodes and a refused third: none of the three ids is in any line; the tags are | today's lines |
+
+Changed and passing: the door tests' refusal lines carry the tag; the
+two-node tests take ids from `endpoint-id` or an in-process boot; 4.2b's
+`a_peer_entry_names_a_key_and_perhaps_where_to_dial_it` moves to `netconf`.
+
+**Part 2.**
+
+| Test | Proves | Red against |
+| --- | --- | --- |
+| `iroh_carrier`: `a_path_is_described_by_where_it_goes` | pure: a relay `TransportAddr` reads `via relay <url>`, an IP one `via direct <ip:port>` | none: it guards the text |
+| `mesh`: `each_end_notes_its_link_at_hello_and_its_close` | over real iroh on loopback: both ends note `link <node> via direct 127.0.0.1:<port>, rtt …` at HELLO, and `link <node> closed` when the other closes | no notes |
+| `mesh`: `each_end_notes_its_home_round` | both ends note `home round with node <id>: <n> record(s) …`, `n` being the peer's `home` records at that moment | no note |
+| `tests/lifecycle`: `a_node_links_to_a_peer_and_stops_clean_with_its_ports_free` (extended) | the notes reach the assembled console's `out`, and the stop is still clean | the notes sent nowhere |
+
+**What they do not prove:** a relay path, the `relay` line and the relay's
+watch. No test reaches a relay: n0's would be reached from the Mac, and a
+local one needs iroh's `test-utils` server and a TLS bypass the node must never
+carry. The crossing is their evidence. Nor do they prove Windows' file modes
+(F5), hole punching, or two networks.
+
+**The gate** (`glade/node/check.sh`) must pass all 9 components:
+
+- the node's tests on both paths, 326 plus the new ones;
+- rustfmt at or below its baseline of 295, with no deviation in a line this
+  step writes; clippy at 11 and 7;
+- process-globals at 3 permanent entries, 0 debt, nothing new;
+- confinement with no new crate; the contracts gate unchanged, 89 tests.
+
+Beside the gate: the six downstream suites at baseline against the rebuilt
+binary, and the desk's replay (section 1) with `lsof`.
+
+### 12. Size and the split
+
+Estimated, in `.rs` lines with doc comments:
+
+| Part | Production | Tests |
+| --- | --- | --- |
+| 1: `netconf.rs` about 190 (new); `iroh_carrier.rs` about 110 (the recipe, the dial target, the load-time check with iroh's types, the bound address, the adapter's `local`); `endpoint_id.rs` about 50 (new); the roots about 60; `assembly.rs` about 20; `transport.rs` and `sysdir.rs` about 10 | about 440 | about 550 |
+| 2: `iroh_carrier.rs` about 70 (the path and the relay status); `mesh.rs` about 70 (the reporter, the link's watch, the round's note, the relay's watch); `tasks.rs` and the roots about 20 | about 160 | about 200 |
+
+About 600 production lines in all, over the ~450 brief. Hence the split. Each
+part is one commit through gwz, gated, with the desk's replay. The crossing
+follows part 2 and adds no code: its record goes into this note and the plan.
+Part 1 also carries the plan's two one-line notes, in the glade-wz root's
+commit, that the ruling of 2026-09-22 governs:
+`dev-docs/IrohGladeMapping.md:420-426` (self-host for the first slice) and
+`dev-docs/glade/GladeDiscoveryModel.md:198` (the public iroh relay).
+
+### Named gaps (4.5)
+
+- **The relay path has no automated test**, only the crossing (section 11).
+- **iroh's dependencies read the environment** when relays are on: the proxy
+  variables through `reqwest`, and, on Windows, `SystemRoot` through the DNS
+  resolver (section 3). The checker does not scan dependencies.
+- **n0 reads the ALPN and the pairing** of ids, beyond the plan's four (section
+  9).
+- **A stable endpoint key is a stable handle for n0.** It is replaced only by
+  hand (4.2a). The crossing's keys are deleted after the run.
+- **With relays on, anyone who learns an endpoint id can reach its door
+  through n0.** The door refuses an unknown key after the TLS handshake, so
+  each such attempt costs a handshake.
+- **Off Unix**, the configuration file's mode is not checked (F5).
+- **records.json and the served store's `home` journal** carry the endpoint id
+  in the binding (4.2a), and they, with the instance directory, take the
+  umask's mode.
+- **`--peer` puts ids in argv**, which other local users can read with `ps`
+  (question 4).
+- **A dialer's relay URL goes stale** if the acceptor's home relay changes,
+  after a network change for example. There is no lookup service, by ruling.
+- **A lost link is not dialed again**, as today: `--peer` and the file's dial
+  entries are dialed once, at the start.
+- **Windows stops by force over ssh**, so dabeest's release is not observed.
+- **The notes are lines, not `node.status`.** Metrics and path events reach
+  `node.status` through bindings later (`IrohGladeMapping.md` §7.6).
+- **The 4.2c gap stays for 4.5b:** the adapter still waits for its first word
+  without a bound.
+
+### Default-path changes (4.5)
+
+1. `--config <absolute path>` is a flag of the booted form. With none, a node's
+   network is as before on every profile.
+2. `glade-node endpoint-id --name NAME` is a command. A first argument
+   `endpoint-id` no longer starts a node.
+3. Lines name an endpoint by a 10-digit tag (section 7). The desk's `peer` line
+   changes that way, and its address is the bound one, `127.0.0.1:<port>` as
+   before.
+4. A malformed `--peer` entry refuses the start, where it printed a line and
+   was skipped.
+5. `IrohCarrier` binds where `CarrierConfig::local` says. No root binds it.
+6. Part 2: a linked node prints `link` and `home round` lines, and a node with
+   `relay n0` prints `relay` lines. The desk prints none.
+
+**What the owner's desk sees at its next restart:** the `peer` line's endpoint
+id becomes a 10-digit tag. Nothing else changes: it binds loopback alone,
+contacts no relay, opens no portmapper socket, writes no new file and prints
+nothing new on stderr.
+
+### Questions for the owner (4.5)
+
+1. **The file.** Recommend `--config <absolute path>` on the booted form, in a
+   line format like the app files' (`relay`, `bind`, `peer`), at 0600, and
+   refused whole, before anything is written, on any bad line. Alternatives: a
+   fixed `network.conf` in the instance directory, found without a flag but
+   putting a hand-edited file in glade's system tree; or TOML, which needs a
+   new crate.
+2. **What a profile does.** Recommend nothing new: every profile, given no
+   file, binds `127.0.0.1:0` alone with relays off, and a profile still picks
+   only the instance name. The alternative gives `peer` and `server` n0's
+   relays and every interface by default. grazel's `--mode peer` would then
+   reach n0 and listen beyond the Mac.
+3. **The portmapper.** Recommend off in every configuration, with no switch
+   (section 5). Alternatives: a `portmapper on` line, which asks the router
+   to open an external port; or compiling it out (`default-features = false`
+   on iroh). That drops the portmapper crates from the lock, and makes the
+   async witness's `--locked` stale again.
+4. **Endpoint ids outside the file.**
+   - In lines, recommend iroh's short form, 10 hex digits, with the full id
+     only from `endpoint-id`. Alternatives: no endpoint named at all, so a
+     refusal cannot be matched to a line of the file; or the full id, against
+     the plan.
+   - On the command line, recommend keeping `--peer`, which tests and
+     one-machine runs use, noting that argv is readable by other local users.
+     The crossing uses files only. The alternative retires `--peer`, and every
+     two-node test writes a file.
+5. **`ConfigPort` stays in glade-node.** Recommend so: all its consumers are
+   there (section 4). The alternative is a `config-api` contract crate with a
+   conformance suite now, as the 3.2 note expected.
+6. **n0 only.** Recommend that `relay` take `off` or `n0`, and that a peer's
+   relay URL be one of n0's four. `Custom(RelayMap)` waits for a relay of our
+   own. The alternative takes any relay URL and a `relay <url>…` map now, with
+   no relay to test them against.
+7. **The net report.** Recommend iroh's defaults: QAD, the HTTPS latency probes
+   and the plain-HTTP captive-portal check. Run 1 needs the HTTPS probes. The
+   alternative, `NetReportConfig::minimal()`, sends n0 less, but a node whose
+   QUIC cannot reach n0 (run 1's included) then finds no relay.
+8. **The notes** (section 8). Recommend that the node print them, so the node
+   itself notes the path iroh picks, here and in 4.6. The alternative is an
+   ignored test that embeds the node and reads iroh's paths, leaving the node
+   silent. It would be a second composition that must track both roots.
+9. **The runs.** Recommend run 1 (loopback binds, the relay alone), then run
+   2 (Wi-Fi binds, iroh's choice), with the Pi accepting, dabeest dialing, and
+   fresh scratch instances deleted afterwards. The alternative is run 2 alone,
+   where HELLO and the round may already ride the LAN path, so "through the
+   relay" goes unshown.
+10. **The done-when's list.** Plan Step 4.5 says n0 sees endpoint ids, IP
+    addresses, timing and volume, "nothing else". It can also read the ALPN,
+    `glade/node/3`, in each connection's first packets, and it sees which ids
+    talk to which. Recommend naming both in the record and changing nothing:
+    our own relay, the ruling's later switch, is the remedy. The alternative
+    is an ALPN that names nothing, which hides the protocol's name but not the
+    pairing.
+11. **The split.** Recommend part 1, then part 2, then the crossing, each gated
+    and replayed. The alternative is one commit of about 600 production lines.
