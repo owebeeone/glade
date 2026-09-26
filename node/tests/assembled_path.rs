@@ -3,8 +3,10 @@
 //! unset starts the hand-written root; `1` starts the assembled root, which
 //! resolves its bindings from `glade_node::assembly::NodeAssembly`; any other
 //! value refuses to start, exits 1, names the variable and writes nothing.
-//! Either root starts a node that prints the same lines. One test starts each
-//! root on an instance whose `home` claim lapsed while its node was stopped.
+//! Either root starts a node that prints the same lines, refuses the legacy
+//! form without its store directory, and boots under `GLADE_HOME`, else
+//! `$HOME/.glade`. One test starts each root on an instance whose `home`
+//! claim lapsed while its node was stopped.
 //!
 //! Each test sets or removes the variable on the node it spawns, so it reads
 //! the same whichever way the suite runs (the node gate runs it both ways).
@@ -96,9 +98,12 @@ fn refused(home: &Path, root: Root, args: &[&str]) -> (ExitStatus, String) {
 /// A node asked for `root` must end by itself, within the bound. Returns its
 /// exit status and stderr.
 fn ended(home: &Path, root: Root, args: &[&str]) -> (ExitStatus, String) {
-    let mut node = glade_node(home, root, args)
-        .spawn()
-        .expect("spawn glade-node");
+    ended_as(glade_node(home, root, args), root)
+}
+
+/// `ended`, for a node `command` spawns.
+fn ended_as(mut command: Command, root: Root) -> (ExitStatus, String) {
+    let mut node = command.spawn().expect("spawn glade-node");
     let deadline = Instant::now() + BOUND;
     let status = loop {
         if let Some(status) = node.try_wait().unwrap() {
@@ -129,9 +134,12 @@ struct Running {
 
 impl Running {
     fn start(home: &Path, root: Root, args: &[&str]) -> Running {
-        let mut node = glade_node(home, root, args)
-            .spawn()
-            .expect("spawn glade-node");
+        Running::start_as(glade_node(home, root, args), root)
+    }
+
+    /// `start`, for a node `command` spawns.
+    fn start_as(mut command: Command, root: Root) -> Running {
+        let mut node = command.spawn().expect("spawn glade-node");
         let stdout = node.stdout.take().unwrap();
         let (tx, rx) = mpsc::channel();
         let reader = std::thread::spawn(move || {
@@ -185,7 +193,12 @@ impl Running {
 /// Start a node, read its stdout up to its `listening <port>` line, then stop
 /// it. Returns the stdout lines read and everything it wrote to stderr.
 fn start_and_stop(home: &Path, root: Root, args: &[&str]) -> (Vec<String>, String) {
-    let node = Running::start(home, root, args);
+    start_and_stop_as(glade_node(home, root, args), root)
+}
+
+/// `start_and_stop`, for a node `command` spawns.
+fn start_and_stop_as(command: Command, root: Root) -> (Vec<String>, String) {
+    let node = Running::start_as(command, root);
     let lines = node.lines.clone();
     (lines, node.stop())
 }
@@ -244,6 +257,61 @@ fn both_roots_start_the_legacy_form_alike() {
         written.is_empty(),
         "the legacy form wrote under GLADE_HOME: {written:?}"
     );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The legacy form requires its store directory (the owner's ruling of
+/// 2026-09-26). Started with only a port, each root prints the usage line,
+/// exits 1 as every refused start does, and writes nothing: not under
+/// `GLADE_HOME`, and not in its temp dir, where the form once stored.
+#[test]
+fn both_roots_refuse_the_legacy_form_without_its_store_directory() {
+    let dir = scratch("legacy-no-store");
+    let (home, tmp) = (dir.join("glade-home"), dir.join("tmp"));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let usage =
+        "usage: glade-node <port> <store_dir> (the legacy form requires its store directory)";
+    for root in [Root::HandWritten, Root::Assembled] {
+        let mut command = glade_node(&home, root, &["0"]);
+        command.env("TMPDIR", &tmp);
+        let (status, stderr) = ended_as(command, root);
+        assert_eq!(status.code(), Some(1), "{root:?}: {stderr}");
+        let said = stderr.lines().any(|line| line.starts_with(usage));
+        assert!(said, "{root:?}: no usage line: {stderr}");
+        for place in [&home, &tmp] {
+            let written: Vec<_> = std::fs::read_dir(place).unwrap().collect();
+            assert!(written.is_empty(), "{root:?} wrote {written:?}");
+        }
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Each root reads the instance root as it starts, as before: `GLADE_HOME`
+/// when it is set, whatever `HOME` says, and `$HOME/.glade` when it is not.
+/// The other tests give the two one directory, so they cannot tell.
+#[test]
+fn both_roots_boot_under_glade_home_else_home_dot_glade() {
+    let dir = scratch("instance-root");
+    let (glade_home, home) = (dir.join("glade-home"), dir.join("home"));
+    std::fs::create_dir_all(&home).unwrap();
+    let instance = |lines: &[String]| lines[0].strip_prefix("instance ").map(PathBuf::from);
+    for (root, name) in [(Root::HandWritten, "h"), (Root::Assembled, "a")] {
+        let args = ["--profile", "local", "--name", name, "0"];
+        let mut command = glade_node(&glade_home, root, &args);
+        command.env("HOME", &home);
+        let (lines, stderr) = start_and_stop_as(command, root);
+        let expected = glade_home.join("sys").join(name);
+        assert_eq!(instance(&lines), Some(expected), "{root:?}: {stderr}");
+        let written: Vec<_> = std::fs::read_dir(&home).unwrap().collect();
+        assert!(written.is_empty(), "{root:?} wrote under HOME: {written:?}");
+
+        let mut command = glade_node(&glade_home, root, &args);
+        command.env_remove("GLADE_HOME").env("HOME", &home);
+        let (lines, stderr) = start_and_stop_as(command, root);
+        let expected = home.join(".glade").join("sys").join(name);
+        assert_eq!(instance(&lines), Some(expected), "{root:?}: {stderr}");
+        std::fs::remove_dir_all(home.join(".glade")).unwrap();
+    }
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

@@ -169,6 +169,7 @@
 use std::fmt;
 use std::future::ready;
 use std::io;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -218,7 +219,8 @@ fn constructed() {
 // ---- configuration --------------------------------------------------------
 
 /// What `glade-node`'s command line says: its flags, then the positional port
-/// and app-data store directory.
+/// and app-data store directory. And the instance root, which the composition
+/// root reads from its environment.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Settings {
     pub profile: Option<Profile>,
@@ -230,12 +232,18 @@ pub struct Settings {
     /// against the grant fold too. Off by default.
     pub enforce_client_grants: bool,
     pub positional: Vec<String>,
+    /// Where the booted form's instance lives, `<root>/sys/<name>`:
+    /// `GLADE_HOME`, else `$HOME/.glade` (`sysdir::instance_root`), read once
+    /// by the composition root. `None`, as a test's settings leave it, boots
+    /// nothing: `NodeStart::from_settings` refuses a booted start without it.
+    pub instance_root: Option<PathBuf>,
 }
 
 impl Settings {
     /// Parse the arguments after the program name exactly as the hand-written
     /// root does: an unknown `--profile` is no profile, a flag given no value
-    /// reads as absent, and anything that is not a flag is positional.
+    /// reads as absent, and anything that is not a flag is positional. The
+    /// instance root is not an argument; the composition root sets it.
     pub fn from_args(args: impl IntoIterator<Item = String>) -> Settings {
         let mut settings = Settings::default();
         let mut args = args.into_iter();

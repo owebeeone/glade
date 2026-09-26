@@ -1,19 +1,25 @@
-//! `glade-node [PORT] [STORE_DIR]` — run a glade node (GLP-0005 + GDL-036).
+//! `glade-node PORT STORE_DIR`, or `glade-node --profile ... [PORT] [STORE_DIR]`
+//! — run a glade node (GLP-0005 + GDL-036).
 //!
 //! Two invocation forms:
 //!
-//! **Legacy serve form** (no flags): `glade-node <port> [store_dir]` — the
-//! pre-seam contract, byte-for-byte: serve the app-data carrier from
-//! `store_dir` (default: a temp dir), NO sysdir boot, NO `~/.glade` access.
-//! The grip-share integration suite spawns this form (concurrently — a global
-//! singleton lock here would collide, and tests must never write $HOME).
+//! **Legacy serve form** (neither `--profile` nor `--name`): `glade-node
+//! <port> <store_dir>` — the pre-seam contract, but for one change: the store
+//! directory is REQUIRED (the owner's ruling of 2026-09-26). Serve the
+//! app-data carrier from `store_dir`, NO sysdir boot, NO `~/.glade` access.
+//! Started without `store_dir`, the node prints the usage line to stderr and
+//! exits 1, having written nothing; it once stored in a temp dir that every
+//! such node shared, unlocked. The grip-share integration suite spawns this
+//! form (concurrently — a global singleton lock here would collide, and tests
+//! must never write $HOME).
 //!
 //! **Booted profile form** (opt-in): `glade-node --profile local|peer|server
 //! [--name NAME] [--operator OP] [--app FILE.glade]... [--peer ID[@IP:PORT]]...
 //! [--enforce-client-grants] [PORT] [STORE_DIR]` —
 //! reads every `--app` file, then boots the system-data instance (GDL-036): acquires
 //! `~/.glade/sys/<name>/` (the profile picks the default name; `--name`
-//! overrides; `GLADE_HOME` overrides `$HOME/.glade`), runs the load-validation
+//! overrides; `GLADE_HOME` overrides `$HOME/.glade`, and each composition root
+//! reads the two once, as it starts, and passes the root down), runs the load-validation
 //! ladder (the first boot after plan Step 4.1b also sets aside, once, the
 //! unsigned records written before it, and prints `set aside …` after
 //! `node`), materialises the RegistryApi fold, and writes its own presence and
@@ -80,6 +86,7 @@
 
 use std::ffi::OsString;
 use std::io::Write;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -89,13 +96,34 @@ use glade_node::iroh_carrier::{PeerEndpoint, PeerEntry};
 use glade_node::lifecycle::{conclude, node_plan, Console, NodeStart, StdConsole};
 use glade_node::registry::{RegistryApi, StoreApi, HOME};
 use glade_node::server::Server;
-use glade_node::sysdir::{boot, Profile};
+use glade_node::sysdir::{boot, instance_root, Profile};
 use glade_node::transport::Door;
 use sdax_tokio::{PlanStart, TokioRuntime};
 use tokio::net::TcpListener;
 
 /// The variable that chooses the composition root.
 const ASSEMBLED: &str = "GLADE_NODE_ASSEMBLED";
+
+/// The line a start the command line cannot run is refused with.
+const USAGE: &str = "usage: glade-node <port> <store_dir> (the legacy form requires its \
+    store directory), or glade-node --profile local|peer|server [--name NAME] \
+    [--operator OP] [--app FILE.glade]... [--peer ID[@IP:PORT]]... \
+    [--enforce-client-grants] [port] [store_dir]";
+
+/// The refusal of a legacy start with no store directory: the usage line on
+/// stderr, and exit 1, as every refused start.
+fn usage() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, USAGE)
+}
+
+/// The instance root: `GLADE_HOME`, else `$HOME/.glade`. Each composition
+/// root reads the two variables here, once, as it starts, and passes the root
+/// down; nothing below it reads them.
+fn instance_root_from_env() -> PathBuf {
+    let glade_home = std::env::var("GLADE_HOME").ok();
+    let home = std::env::var("HOME").ok();
+    instance_root(glade_home, home)
+}
 
 /// Which composition root starts the node: `GLADE_NODE_ASSEMBLED` unset is
 /// the hand-written one, `1` the assembled one, and anything else is refused.
@@ -158,6 +186,7 @@ async fn run() -> std::io::Result<()> {
         }
     }
     let port: u16 = positional.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let root = instance_root_from_env();
 
     // ---- sysdir boot is OPT-IN (GDL-036) ------------------------------------
     // Only an explicit --profile/--name boots the system-data instance; the
@@ -167,7 +196,8 @@ async fn run() -> std::io::Result<()> {
         // before `boot` opens the instance (L1-14): a refused start writes
         // nothing.
         let decls = glade_node::appdecl::load_all(&apps)?;
-        let mut node = boot(profile.unwrap_or(Profile::Local), name.as_deref(), operator.as_deref())?;
+        let profile = profile.unwrap_or(Profile::Local);
+        let mut node = boot(&root, profile, name.as_deref(), operator.as_deref())?;
         println!("instance {}", node.dir.display());
         println!("node {}", node.node_id);
         if let Some(aside) = &node.set_aside {
@@ -207,11 +237,16 @@ async fn run() -> std::io::Result<()> {
     // ---- serve app data (unchanged carrier) --------------------------------
     // App-data store dir: the second positional; else, when booted, a `store/`
     // under the instance's class-4 cache (rebuildable, never load-bearing for
-    // system data); else the legacy temp-dir default.
-    let dir = positional.get(1).cloned().unwrap_or_else(|| match &booted {
-        Some((node, _)) => node.dir.join("cache").join("store").to_string_lossy().into_owned(),
-        None => std::env::temp_dir().join("glade-node-bin").to_string_lossy().into_owned(),
-    });
+    // system data). The legacy form requires it: without it the start is
+    // refused here, having read and written nothing.
+    let dir = match (positional.get(1), &booted) {
+        (Some(dir), _) => dir.clone(),
+        (None, Some((node, _))) => {
+            let store = node.dir.join("cache").join("store");
+            store.to_string_lossy().into_owned()
+        }
+        (None, None) => return Err(usage()),
+    };
 
     let server = Server::open(&dir)?;
     if let Some(aside) = server.set_aside().await {
@@ -265,13 +300,21 @@ async fn run() -> std::io::Result<()> {
 
 /// The assembled composition root (plan Steps 3.2 and 3.3): `run`'s start,
 /// step for step, as the sdax plan `glade_node::lifecycle::node_plan`, which
-/// owns every acquisition and every task. The root parses the arguments and
-/// loads every `--app` file, then waits on the plan where `run` waits on
-/// `server.run`. A stop signal asks the plan to shut down; the report decides
-/// the exit status.
+/// owns every acquisition and every task. The root parses the arguments,
+/// reads the instance root into the settings, and loads every `--app` file,
+/// then waits on the plan where `run` waits on `server.run`. A stop signal
+/// asks the plan to shut down; the report decides the exit status.
 async fn run_assembled() -> std::io::Result<ExitCode> {
     eprintln!("{ASSEMBLED_ROOT_LINE}");
-    let settings = Settings::from_args(std::env::args().skip(1));
+    let settings = Settings {
+        instance_root: Some(instance_root_from_env()),
+        ..Settings::from_args(std::env::args().skip(1))
+    };
+    // The legacy form requires its store directory: refused, as `run`
+    // refuses it, before the plan starts.
+    if !settings.booted() && settings.store_dir().is_none() {
+        return Err(usage());
+    }
     // Every `--app` file is loaded, and two naming one app are refused,
     // before the plan boots the instance (L1-14): a refused start writes
     // nothing.
@@ -281,7 +324,7 @@ async fn run_assembled() -> std::io::Result<ExitCode> {
         Vec::new()
     };
     let console: Arc<dyn Console> = Arc::new(StdConsole);
-    let start = NodeStart::from_settings(settings, decls, console.clone());
+    let start = NodeStart::from_settings(settings, decls, console.clone())?;
     let mut stop = stop_signal::StopSignal::install()?;
     let runtime = Arc::new(TokioRuntime::new(tokio::runtime::Handle::current()));
     let mut running = node_plan().start(runtime, start);

@@ -47,11 +47,15 @@ impl Console for Kept {
     }
 }
 
-/// A booted start: the shape with every node in use.
+/// A booted start: the shape with every node in use. No body runs, so
+/// nothing is written under its instance root.
 fn booted(console: Arc<Kept>) -> NodeStart {
     let args = ["--profile", "local", "--name", "order", "0"];
-    let settings = Settings::from_args(args.map(String::from));
-    NodeStart::from_settings(settings, Vec::new(), console)
+    let settings = Settings {
+        instance_root: Some(std::env::temp_dir().join("glade-node-release-order")),
+        ..Settings::from_args(args.map(String::from))
+    };
+    NodeStart::from_settings(settings, Vec::new(), console).expect("a booted start")
 }
 
 /// The architecture's constraints hold as `before`: each drainer's cleanup

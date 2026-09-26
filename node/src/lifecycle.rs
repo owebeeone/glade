@@ -128,25 +128,35 @@ pub struct NodeStart {
 
 impl NodeStart {
     /// As the binary starts: the booted form (`--profile` or `--name`) boots
-    /// where `sysdir::boot` would, under `GLADE_HOME`.
+    /// where `sysdir::boot` would, under the settings' instance root. A booted
+    /// start whose settings carry no root is refused; it is never looked for
+    /// in the environment.
     pub fn from_settings(
         settings: Settings,
         decls: Vec<AppDecl>,
         console: Arc<dyn Console>,
-    ) -> NodeStart {
-        let instance = settings.booted().then(|| InstanceAt {
-            dir: instance_dir(
-                settings.profile.unwrap_or(Profile::Local),
-                settings.name.as_deref(),
-            ),
-            operator: settings.operator.clone().unwrap_or_else(|| "local".into()),
-        });
-        NodeStart {
+    ) -> io::Result<NodeStart> {
+        let instance = match (settings.booted(), &settings.instance_root) {
+            (false, _) => None,
+            (true, Some(root)) => Some(InstanceAt {
+                dir: instance_dir(
+                    root,
+                    settings.profile.unwrap_or(Profile::Local),
+                    settings.name.as_deref(),
+                ),
+                operator: settings.operator.clone().unwrap_or_else(|| "local".into()),
+            }),
+            (true, None) => {
+                let why = "a booted start needs the instance root its composition root reads";
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, why));
+            }
+        };
+        Ok(NodeStart {
             settings,
             decls,
             instance,
             console,
-        }
+        })
     }
 }
 
@@ -238,12 +248,17 @@ struct Storage {
 
 impl Storage {
     /// Open the store, give its tasks to the two owners, adopt the instance,
-    /// and say whether `home` is served.
+    /// and say whether `home` is served. The legacy form requires its store
+    /// directory (the owner's ruling of 2026-09-26): without one, nothing is
+    /// opened.
     async fn open(start: &NodeStart, instance: &Instance) -> io::Result<Storage> {
         let dir = match (start.settings.store_dir(), &instance.booted) {
             (Some(dir), _) => PathBuf::from(dir),
             (None, Some(booted)) => booted.dir.join("cache").join("store"),
-            (None, None) => std::env::temp_dir().join("glade-node-bin"),
+            (None, None) => {
+                let why = "the legacy form requires its store directory";
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, why));
+            }
         };
         let server = Server::open(&dir)?;
         if let Some(aside) = server.set_aside().await {

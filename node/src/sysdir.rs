@@ -1,9 +1,11 @@
 //! On-disk instance layout + the load-validation ladder (GDL-036).
 //!
-//! A node lives under `$HOME/.glade/sys/<name>/` (`GLADE_HOME` overrides
-//! `$HOME/.glade` for tests). The launch **profile** picks a default instance
-//! name; profiles are DEPLOYMENT labels, not protocol types — no trace ever
-//! sees a profile name.
+//! A node lives under `<root>/sys/<name>/`. The instance root is
+//! `$HOME/.glade`, or `GLADE_HOME` when set (tests set it); `glade-node`
+//! reads both once, at its entry point, and passes the root in
+//! ([`instance_root`]). This module reads no environment. The launch
+//! **profile** picks a default instance name; profiles are DEPLOYMENT labels,
+//! not protocol types — no trace ever sees a profile name.
 //!
 //! | file            | trust class                              | ships |
 //! |-----------------|------------------------------------------|-------|
@@ -86,13 +88,15 @@ impl Profile {
     }
 }
 
-/// `$GLADE_HOME`, else `$HOME/.glade`. Tests must set `GLADE_HOME` to a temp
-/// dir — the real `~/.glade` is never touched.
-pub fn glade_home() -> PathBuf {
-    if let Ok(h) = std::env::var("GLADE_HOME") {
+/// The instance root, from the values of `GLADE_HOME` and `HOME` that a
+/// composition root read once, at its entry point: `GLADE_HOME`, else
+/// `$HOME/.glade`, else `./.glade`. Tests pass a temp dir — the real
+/// `~/.glade` is never touched.
+pub fn instance_root(glade_home: Option<String>, home: Option<String>) -> PathBuf {
+    if let Some(h) = glade_home {
         return PathBuf::from(h);
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    let home = home.unwrap_or_else(|| ".".into());
     PathBuf::from(home).join(".glade")
 }
 
@@ -207,17 +211,23 @@ impl Boot {
     }
 }
 
-/// Boot a node for `profile`, optionally overriding the instance name and the
-/// operator. Resolves the instance dir under [`glade_home`]. See [`boot_at`].
-pub fn boot(profile: Profile, name: Option<&str>, operator: Option<&str>) -> io::Result<Boot> {
-    boot_at(instance_dir(profile, name), operator.unwrap_or("local"))
+/// Boot a node for `profile` under the instance root `root`, optionally
+/// overriding the instance name and the operator. See [`boot_at`].
+pub fn boot(
+    root: &Path,
+    profile: Profile,
+    name: Option<&str>,
+    operator: Option<&str>,
+) -> io::Result<Boot> {
+    let dir = instance_dir(root, profile, name);
+    boot_at(dir, operator.unwrap_or("local"))
 }
 
 /// Where [`boot`] puts the instance for `profile`, or for `name` when given:
-/// `<glade_home>/sys/<name>`.
-pub fn instance_dir(profile: Profile, name: Option<&str>) -> PathBuf {
+/// `<root>/sys/<name>`.
+pub fn instance_dir(root: &Path, profile: Profile, name: Option<&str>) -> PathBuf {
     let name = name.unwrap_or_else(|| profile.default_name());
-    glade_home().join("sys").join(name)
+    root.join("sys").join(name)
 }
 
 /// Run the load-validation ladder at an explicit instance dir (tests pass a
@@ -968,6 +978,20 @@ mod tests {
         assert_eq!(Profile::Server.default_name(), "glade-server");
         assert_eq!(Profile::parse("peer"), Some(Profile::Peer));
         assert_eq!(Profile::parse("nope"), None);
+    }
+
+    /// The instance root is `GLADE_HOME` when given, else `$HOME/.glade`, else
+    /// `./.glade`, from the values handed in; an instance lives under it.
+    #[test]
+    fn the_instance_root_is_glade_home_else_home_dot_glade() {
+        let (glade_home, home) = (Some("/g".to_owned()), Some("/h".to_owned()));
+        assert_eq!(instance_root(glade_home, home.clone()), Path::new("/g"));
+        assert_eq!(instance_root(None, home), Path::new("/h").join(".glade"));
+        assert_eq!(instance_root(None, None), Path::new(".").join(".glade"));
+        let sys = Path::new("/r").join("sys");
+        let named = |name| instance_dir(Path::new("/r"), Profile::Peer, name);
+        assert_eq!(named(None), sys.join("glade-peer"));
+        assert_eq!(named(Some("n")), sys.join("n"));
     }
 
     // small helper: how many nodes the operator has (presence-count assertion).

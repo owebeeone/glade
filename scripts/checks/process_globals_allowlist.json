@@ -8,13 +8,9 @@
      "reason": "Counts the real providers NodeAssembly modules construct, so tests/assembly_registration.rs can see which were built; production code carries state that only a test reads. Give the test an observer of its own (ProcessGlobalsPlan Step 4.1)."},
     {"path": "node/src/bin/glade-node.rs", "kind": "env", "name": "env::args", "count": 2, "disposition": "permanent",
      "reason": "The hand-written composition root reads the process's arguments once, at its entry point, and passes them down."},
-    {"path": "node/src/bin/glade-node.rs", "kind": "env", "name": "env::temp_dir", "disposition": "debt",
-     "reason": "The legacy form's default store directory is the process temp dir, read where it is used; take it from the settings the root builds, as the booted form does (ProcessGlobalsPlan Step 2.1)."},
+    {"path": "node/src/bin/glade-node.rs", "kind": "env", "name": "env::var", "count": 2, "disposition": "permanent",
+     "reason": "GLADE_HOME and HOME, read once as each composition root starts (instance_root_from_env) and passed down as the instance root: into sysdir::boot for the hand-written root, and through Settings for the assembled one. Nothing below the entry point reads them (ProcessGlobalsPlan Step 2.1; a read at a program's entry point is permanent, owner's ruling of 2026-09-26)."},
     {"path": "node/src/bin/glade-node.rs", "kind": "env", "name": "env::var_os", "disposition": "permanent",
-     "reason": "GLADE_NODE_ASSEMBLED chooses the composition root at the entry point, read once before anything else runs."},
-    {"path": "node/src/lifecycle.rs", "kind": "env", "name": "env::temp_dir", "disposition": "debt",
-     "reason": "The assembled root's legacy default store directory is the process temp dir, read where it is used; take it from Settings (ProcessGlobalsPlan Step 2.1)."},
-    {"path": "node/src/sysdir.rs", "kind": "env", "name": "env::var", "count": 2, "disposition": "debt",
-     "reason": "glade_home() reads GLADE_HOME and HOME at the point of use; both roots should read them once and pass the instance root in (ProcessGlobalsPlan Step 2.1)."}
+     "reason": "GLADE_NODE_ASSEMBLED chooses the composition root at the entry point, read once before anything else runs."}
   ]
 }

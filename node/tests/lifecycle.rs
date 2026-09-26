@@ -284,6 +284,32 @@ async fn a_dialer_its_peer_does_not_know_is_refused_and_reported() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// The legacy form requires its store directory (the owner's ruling of
+/// 2026-09-26). A plan started without one fails at `Storage`, before it
+/// opens a store or binds a port, and its fault says why; it once served from
+/// the temp dir.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_legacy_form_without_its_store_directory_fails_at_storage() {
+    let lines = Arc::new(Lines::default());
+    let start = NodeStart {
+        settings: Settings::from_args(["0".to_owned()]),
+        decls: Vec::new(),
+        instance: None,
+        console: lines.clone(),
+    };
+    let mut run = node_plan().start(runtime(), start);
+    let steady = tokio::time::timeout(BOUND, run.ready()).await;
+    let started = steady.expect("the plan settles in time").is_ok();
+    assert!(!started, "the plan started: {:?}", lines.all());
+    let report = tokio::time::timeout(BOUND, run)
+        .await
+        .expect("ends in time");
+    let faults: Vec<String> = report.faults.iter().map(|f| f.kind.to_string()).collect();
+    let why = "the legacy form requires its store directory".to_owned();
+    assert_eq!(faults, [why], "{}", shown(&report));
+    assert_eq!(lines.all(), Vec::<String>::new());
+}
+
 /// The legacy form (no instance, no mesh) runs the same plan: it binds only
 /// its listener, prints only `listening`, and stops clean with the port free.
 #[tokio::test(flavor = "multi_thread")]
