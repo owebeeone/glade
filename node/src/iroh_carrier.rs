@@ -60,7 +60,7 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey, T
 
 use crate::assembly::{LinkNotes, PathSeen, RelayState};
 use crate::netconf::{Network, PeerEntry, Relays, Via};
-use crate::peer::{hello_accept, hello_dial, Channel, NodeIdentity, PeerHello};
+use crate::peer::{hello_accept, hello_dial, spelled, Channel, NodeIdentity, PeerHello};
 use crate::transport::{hex, key_of, tag, Door, EndpointKey};
 
 /// ALPN for the glade node<->node protocol 3 (`peer::PROTOCOL`, plan Step
@@ -646,14 +646,6 @@ async fn first_stream(conn: &Connection) -> Result<(SendStream, RecvStream), Car
         return Err(transport("not a carrier link"));
     }
     Ok((send, recv))
-}
-
-/// A bound as a line says it: `10 s` for whole seconds, else milliseconds.
-fn spelled(bound: Duration) -> String {
-    match bound.subsec_nanos() {
-        0 => format!("{} s", bound.as_secs()),
-        _ => format!("{} ms", bound.as_millis()),
-    }
 }
 
 /// The sockets a carrier address names to bind, `<ip:port>[,<ip:port>]`, at

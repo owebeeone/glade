@@ -7338,6 +7338,68 @@ As built, beside the design:
 The in-memory HELLO tests (`peer.rs:436-626`) move onto the in-memory link pair and prove what they
 proved.
 
+**Part 2, as built** on 2026-09-27 against glade `f895aca`, red in one sources-only copy of the final
+tree (glade's `node`, `wire-rs` and `contracts`), the part each test guards switched off and put back
+before the next: by one edit, or by a few where the switch is the design's alternative (conversations
+sending on the link themselves). The message is what the red run printed.
+
+| Test | Red first |
+| --- | --- |
+| `conversation`: `conversations_interleave_on_one_link_and_end_apart` | every conversation of an end taking its first number, so the peer reads one: `a0: its own frames, in order`, `left: ["Subscribe(…)", "ExchangeReq(…)", "a0.0"]`, `right: ["a0.0"]` |
+| `conversation`: `a_conversation_dropped_before_its_end_is_reset` | a drop that sends END: `the conversation ended`, `left: UnexpectedEof`, `right: ConnectionReset` |
+| `conversation`: `a_conversation_cancelled_mid_send_never_ends_its_link` | each conversation sending on the link itself, from a task its drop aborts: the aborted 4 MiB frame, torn, ended the link, and the far end handed on no conversation after it: `called Option::unwrap() on a None value` |
+| `conversation`: `a_slow_conversation_holds_its_queue_and_one_let_go_holds_nothing` | an unbounded queue: `the reader went past a full queue`; a conversation let go whose queue stays open and unread: `within 5 s: Elapsed(())` |
+| `conversation`: `the_hundred_and_first_conversation_is_reset` | no cap: `within 5 s: Elapsed(())`, the 101st unanswered |
+| `conversation`: `the_links_end_ends_every_conversation_with_an_error` | the link's end read as a clean end: `the dialer's: the conversation ended`, `left: UnexpectedEof`, `right: ConnectionAborted` |
+| `peer`: `a_hello_on_a_link_binds_its_transport_session` | a binding of fixed bytes: `a HELLO replayed from another link: PeerHello { … }` |
+| `peer`: `a_hello_of_another_protocol_is_refused_on_a_link` | the protocol check switched off: `a HELLO of protocol 4 taken: PeerHello { … }` |
+| `peer`: `a_link_without_an_endpoint_key_or_a_binding_cannot_hello` | zeros taken for a missing key byte and a missing binding: `an 8-byte key: the dialer completed HELLO: PeerHello { … }` |
+| `peer`: `hello_on_a_link_is_bounded` | no bound (a day): `within 5 s: Elapsed(())` |
+| `peer`: `hello_on_a_link_exchanges_identities` (moved) | no WELCOME sent: `called Result::unwrap() on an Err value: Custom { kind: TimedOut, error: "no WELCOME within 10 s" }` |
+| `peer`: `a_tampered_hello_is_refused_on_a_link` (moved) | the signature check switched off: `a flipped signature byte: accepted` |
+| `peer`: `a_hello_replayed_from_another_link_is_refused` (moved) | a binding of fixed bytes: `replayed onto Channel { … exported: [4, …] }: accepted` |
+| `peer`: `a_reflected_hello_is_refused_on_a_link` (moved) | the role left out of the transcript: `the dialer took its own HELLO back` |
+| `peer`: `a_hello_on_a_link_completes_only_for_a_node_bound_to_its_endpoint_key` (moved) | the door's HELLO check switched off: `unknown: Ok(PeerHello { … })`, `left: true`, `right: false` |
+
+The first red run of `a_hello_replayed_from_another_link_is_refused` stayed green: its HELLO was
+signed over the test's channel, not recorded from a link, so a fixed binding could not make the
+replay verify. It now records the `NodeHello` a link's dial sends, as the iroh test does, and that
+red is the one above.
+
+As built, beside the design:
+
+- **Public.** `conversation` is a `pub` module of `pub` items, where the design sketched `pub(crate)`,
+  so the library builds with no caller until part 3 and no dead-code warning. `peer.rs` gains
+  `hello_dial_link`, `hello_accept_link`, `HELLO_LABEL` (`glade/v1/peer-hello`) and `HELLO_WITHIN`
+  (10 s), public as `hello_dial` is.
+- **A conversation takes its number when its first frame is queued**, under the one lock that queues
+  it, so each end's numbers reach the peer rising. Numbered at `open`, two tasks could queue their
+  first frames out of order, and the peer would drop the lower number as a conversation that is
+  over. So a conversation this end opens sends before it receives: a receive before its first frame
+  is refused (`InvalidInput`), and one dropped or ended before any frame sends nothing.
+- **The tasks** start through a spawner the caller gives, `Spawn`, told which task each is
+  (`LinkTask::Writer`, `Reader`, `Inbound`), so part 3 places them at the node's sites; part 2 adds no
+  `Site`. `Linked::start(link, node, dialed, max, spawn, handler)`; `Linked::end()` refuses every
+  later send and queues the close behind what is queued.
+- **A receive answers** `UnexpectedEof` after the peer's END, `ConnectionReset` after its RESET, and
+  `ConnectionAborted` after the link's end; a send over the limit, header included, `InvalidInput`.
+- **A conversation is forgotten** once both ends are done with it, or at once when this end resets it.
+  A frame of an unknown kind ends the link, as one too short for its header does.
+- **The reader holds the link's state weakly**: a link whose `Linked` and conversations are all dropped
+  closes, its writer's queue closed.
+- **HELLO on a link** reports the acceptor's refusals through the door, as `PeerEndpoint::accept` does
+  on a stream, its bound's among them: `peer refused: endpoint <tag>: HELLO refused: no HELLO within
+  10 s`. The dialer's bound answers `TimedOut`, `no WELCOME within 10 s`. A link that names no 32-byte
+  key is refused `HELLO refused: the link names no endpoint key`, one that binds no session `HELLO
+  refused: the link binds no session`, neither reported: there is no key to name, and no HELLO yet.
+- **`spelled`**, the words for a bound, moved from the adapter to `peer.rs`, so both bounds speak
+  alike; the adapter's lines are unchanged.
+- **The stream HELLO's tests stay** while the running node speaks it, until part 4. The five rules of
+  its in-memory tests are proven again on links by five tests of their own, sharing two case tables
+  (`tampered`, `doors`) with them; part 4 removes the stream's.
+- **The in-memory link pair** (`conversation::testing`) is test code: two tokio channels, each end
+  naming the other's key, and under HELLO's label the test channel's bytes.
+
 **Part 3** (the move):
 
 | Test | Proves | Red against |
@@ -7566,3 +7628,39 @@ parts, then 4.5's crossing again.
   `tests/assembly` +34/−2, `tests/journeys/faults.rs` +15/−3;
 - beside them, one line in each policy file: `channel_binding` in the contracts' `CarrierLink` row,
   and CA-001..006 in the node's reason text.
+
+### Measured (4.5b, part 2)
+
+2026-09-27, Apple M3 Pro, Rust 1.96.0, on the final tree (glade `f895aca` plus part 2):
+
+- **The gate** passes all 9 components, in 108 s from an empty scratch target, with 401 node tests on
+  each path across 17 test binaries, where there were 386: `conversation` 6 and `peer` 9, the design's
+  four and the five moved.
+  - rustfmt: glade-node 293 hunks and glade-wire 43, at their baselines; no hunk is new or gone.
+  - clippy: glade-node 11 warnings and glade-wire 7, at their baselines, none at a line this part
+    wrote.
+  - process-globals: 55 files (the new module), 3 permanent entries, 0 debt, nothing new.
+  - confinement: no new crate; each `Cargo.toml` and `Cargo.lock` untouched. The contracts gate
+    passes, untouched, with 94 tests.
+- **Nothing reached beyond loopback.** The two iroh tests bind `127.0.0.1` alone; the rest run on the
+  in-memory pair.
+- **Time.** The six `conversation` tests and the sixteen `peer::hello_tests` take 0.41 s together, in
+  each of 5 runs; the library's 272 tests take 3.3 s, CA-004 still the longest (part 1's record).
+- **The replay**, as in part 1, on one scratch instance: today's binary (inode 408222621), this build
+  (inode 408521518, copied from the gate's scratch target), today's again, and this build again. The
+  four starts printed the same lines apart from ports, line for line, but for the first boot's two
+  `app` lines, which count the records it seeds (`+12 record(s), 0 unchanged` and `+10 record(s), 2
+  unchanged`, then `+0 record(s), 12 unchanged` each); `peer 53336a4858 127.0.0.1:<port>` each time,
+  nothing after `listening`, the recovery warning alone on stderr, and UDP and TCP on `127.0.0.1`
+  alone (`lsof`). Nothing a running node does calls the new code.
+
+**Size**, in lines added and removed in `.rs` files, doc comments included:
+
+- production: +628/−10, of which +424/−7 are code: `conversation.rs` +457, new (297 code, 121
+  comments); `peer.rs` +169/−1 (125 code); `iroh_carrier.rs` +1/−9, `spelled` moved out; `lib.rs` +1.
+  The design's estimate was about 280 (240 and 45). Beyond it: the numbering on the first frame,
+  each conversation's forgetting, the markers, the reader's and the writer's ends, and HELLO's
+  channel, bare frames, bound and report, each with its words;
+- tests: +834/−28: `conversation.rs` +437 (the in-memory pair and the iroh helpers 154, the six tests
+  283) and `peer.rs` +397/−28 (the four designed, the five moved, their helpers, and the two case
+  tables taken out of the stream tests).

@@ -10,6 +10,7 @@ pub mod appdecl;
 pub mod assembly;
 pub mod chain;
 pub mod claims;
+pub mod conversation;
 pub mod echo;
 pub mod endpoint_id;
 pub mod envelope;
