@@ -13,6 +13,7 @@
 //! the process's environment, working directory or path: the binary reads
 //! what it needs once, at its entry point, and hands it in.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::fs;
 use std::io::{self, Write};
@@ -206,24 +207,36 @@ fn write_secret(path: &Path, seed: &[u8; 32]) -> io::Result<()> {
 /// The line a start prints after its boot lines while `boot`'s node has
 /// committed no recovery key: exactly what to run for this instance, under
 /// the instance root it was booted from. `program` is the running program's
-/// path, which the binary read at its entry point; without one, the line
-/// names `glade-node`. `None` once a key is committed.
+/// path, which the binary read at its entry point, written by
+/// [`program_word`]; without one, the line names `glade-node`. Each path is
+/// quoted by [`shell`]. `None` once a key is committed.
 pub fn warning(boot: &Boot, program: Option<&Path>) -> Option<String> {
     if boot.registry.recovery_key(&boot.node_id).is_some() {
         return None;
     }
     let name = boot.dir.file_name().unwrap_or_default().to_string_lossy();
     let root = root_of(&boot.dir).display().to_string();
-    let program = program.map_or_else(|| "glade-node".into(), |p| p.display().to_string());
-    let (root, program, name) = (shell(&root), shell(&program), shell(&name));
+    let program = program.map_or_else(|| "glade-node".into(), program_word);
+    let (root, name) = (shell(&root), shell(&name));
     Some(format!(
         "{NOT_COMMITTED}: stop it, then run GLADE_HOME={root} {program} recovery --name {name} --out <an absolute path outside GLADE_HOME>"
     ))
 }
 
+/// The running program's path as [`warning`] writes it: without Windows'
+/// verbatim prefix, which `fs::canonicalize` gives a path there (F11), and
+/// quoted as a POSIX shell reads it back.
+pub fn program_word(program: &Path) -> String {
+    let path = program.display().to_string();
+    if platform::VERBATIM_PREFIX {
+        return shell(&without_verbatim(&path));
+    }
+    shell(&path)
+}
+
 /// `word` as a POSIX shell reads it back: as it is when no character in it is
 /// one a shell splits or expands, else single-quoted.
-fn shell(word: &str) -> String {
+pub fn shell(word: &str) -> String {
     let plain = |c: char| c.is_ascii_alphanumeric() || "/._-+=:,@%".contains(c);
     if !word.is_empty() && word.chars().all(plain) {
         return word.to_owned();
@@ -231,14 +244,46 @@ fn shell(word: &str) -> String {
     format!("'{}'", word.replace('\'', r"'\''"))
 }
 
-// A new file's mode is a Unix notion. Each platform's branch is one braced
-// module, so the condition encloses the whole section.
+/// `path` without Windows' verbatim prefix `\\?\` where it reads the same
+/// without it (F11): `\\?\E:\a` is `E:\a`, and `\\?\UNC\host\share\a` is
+/// `\\host\share\a`. It is kept where it is needed: another verbatim form
+/// (a volume or a device), 260 characters or more, a `/`, or a name that
+/// ends in `.` or a space, which Windows would read differently without
+/// it. Only text, so it is the same on every platform, and tested on each;
+/// where it applies is `platform`'s.
+fn without_verbatim(path: &str) -> Cow<'_, str> {
+    let same = |plain: &str| {
+        let trimmed = |name: &str| name.ends_with('.') || name.ends_with(' ');
+        plain.len() < 260 && !plain.contains('/') && !plain.split('\\').any(trimmed)
+    };
+    if let Some(share) = path.strip_prefix(r"\\?\UNC\") {
+        let plain = format!(r"\\{share}");
+        if same(&plain) {
+            return Cow::Owned(plain);
+        }
+    } else if let Some(plain) = path.strip_prefix(r"\\?\") {
+        let drive = plain.as_bytes();
+        let lettered = drive.len() > 2 && drive[0].is_ascii_alphabetic() && &drive[1..3] == b":\\";
+        if lettered && same(plain) {
+            return Cow::Borrowed(plain);
+        }
+    }
+    Cow::Borrowed(path)
+}
+
+// A new file's mode is a Unix notion, and a verbatim path a Windows one. Each
+// platform's branch is one braced module, so the condition encloses the
+// whole section.
 #[cfg(unix)]
 mod platform {
     use std::fs::{File, OpenOptions};
     use std::io;
     use std::os::unix::fs::OpenOptionsExt;
     use std::path::Path;
+
+    /// Whether the program's path may begin with Windows' verbatim prefix
+    /// (F11): not here, where `\\?\` would be part of a name.
+    pub(super) const VERBATIM_PREFIX: bool = false;
 
     /// A new file at `path`, mode 0600; one already there is refused.
     pub(super) fn create_new(path: &Path) -> io::Result<File> {
@@ -253,6 +298,10 @@ mod platform {
     use std::fs::{File, OpenOptions};
     use std::io;
     use std::path::Path;
+
+    /// Whether the program's path may begin with Windows' verbatim prefix
+    /// (F11): it may, as `fs::canonicalize` gives one on Windows, `\\?\E:\…`.
+    pub(super) const VERBATIM_PREFIX: bool = true;
 
     /// A new file at `path`, with the platform's default permissions, as
     /// `node.key` gets off Unix; one already there is refused.
@@ -482,6 +531,65 @@ mod tests {
         assert!(err.to_string().starts_with(first_only), "{err}");
         assert_eq!(fs::read(dir.join("records.json")).unwrap(), records);
         assert!(!again.exists(), "no file written");
+    }
+
+    /// F11: Windows' verbatim prefix comes off a path that reads the same
+    /// without it, a drive's or a share's, on every platform, for it is only
+    /// text. It stays on a path that needs it: a volume's or a device's
+    /// verbatim path, one of 260 characters or more, one holding a `/`, and
+    /// one with a name ending in `.` or a space, which Windows would trim.
+    /// A path without the prefix, from either platform, is as it was.
+    #[test]
+    fn the_verbatim_prefix_comes_off_a_path_that_reads_the_same_without_it() {
+        let dabeest = r"E:\git\glade-wz\scratch\4.5\target\debug\glade-node.exe";
+        let prefixed = format!(r"\\?\{dabeest}");
+        let share = r"\\?\UNC\host\share\bin\glade-node.exe";
+        assert_eq!(without_verbatim(&prefixed), dabeest);
+        assert_eq!(without_verbatim(share), r"\\host\share\bin\glade-node.exe");
+
+        let longest = format!(r"\\?\E:\{}", "n".repeat(256));
+        assert_eq!(without_verbatim(&longest), &longest[4..], "259 characters");
+        let too_long = format!(r"\\?\E:\{}", "n".repeat(257));
+        let kept = [
+            r"\\?\Volume{6f1c}\bin\glade-node.exe",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume3\glade-node.exe",
+            r"\\?\E:\bin.\glade-node.exe",
+            r"\\?\E:\bin \glade-node.exe",
+            r"\\?\E:\bin/x\glade-node.exe",
+            r"\\?\UNC\host\share\bin.\glade-node.exe",
+            r"\\?\E:",
+            too_long.as_str(),
+        ];
+        let unprefixed = [dabeest, r"\\host\share\x", "/usr/local/bin/glade-node", ""];
+        for path in kept.into_iter().chain(unprefixed) {
+            assert_eq!(without_verbatim(path), path, "{path}");
+        }
+    }
+
+    /// A word the warning writes is as a POSIX shell reads it back: bare
+    /// when it holds only characters a shell leaves alone, else in single
+    /// quotes, a `'` in it written `'\''`. So a Windows path, which holds
+    /// `\`, is quoted; and the running program's path is quoted after the
+    /// verbatim prefix is taken off where this platform gives one (F11).
+    #[test]
+    fn the_warning_quotes_a_word_as_a_posix_shell_reads_it_back() {
+        let bare = "/usr/local/bin/glade-node";
+        assert_eq!(shell(bare), bare);
+        assert_eq!(shell("x+y=z:1,a@b%c"), "x+y=z:1,a@b%c");
+        assert_eq!(shell(""), "''");
+        assert_eq!(shell("/a b/glade-node"), "'/a b/glade-node'");
+        assert_eq!(shell(r"E:\bin\glade-node.exe"), r"'E:\bin\glade-node.exe'");
+        assert_eq!(shell("it's"), r"'it'\''s'");
+        assert_eq!(shell("$HOME"), "'$HOME'");
+
+        let program = Path::new(r"\\?\E:\bin\glade-node.exe");
+        let written = if platform::VERBATIM_PREFIX {
+            r"'E:\bin\glade-node.exe'"
+        } else {
+            r"'\\?\E:\bin\glade-node.exe'"
+        };
+        assert_eq!(program_word(program), written);
+        assert_eq!(program_word(Path::new(bare)), bare);
     }
 
     // File modes are a Unix notion. A braced module, so the condition

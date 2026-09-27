@@ -81,7 +81,9 @@
 //! booted node that has committed no recovery key says, on stderr after its
 //! boot lines, exactly what to run, and starts: `no recovery key is committed
 //! for this node: stop it, then run GLADE_HOME=<root> <program> recovery
-//! --name <name> --out <an absolute path outside GLADE_HOME>`. That is the
+//! --name <name> --out <an absolute path outside GLADE_HOME>`, each path
+//! quoted as a POSIX shell reads it back, and the program named without the
+//! verbatim prefix `\\?\` it has on Windows (F11). That is the
 //! third form, a one-shot command on the stopped instance: `glade-node
 //! recovery --name NAME --out PATH` commits a recovery key in the node's
 //! chain, writes its secret to the new file PATH (absolute, outside

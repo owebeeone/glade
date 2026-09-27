@@ -43,7 +43,7 @@ use glade_node::envelope;
 use glade_node::frame::Frame;
 use glade_node::grants::CLIENT_GRANTS_ENFORCED;
 use glade_node::mesh::who_serves;
-use glade_node::recovery::NOT_COMMITTED;
+use glade_node::recovery::{program_word, shell, NOT_COMMITTED};
 use glade_node::registry::{BlobStore, Record, Registry, RegistryApi, StoreApi, HOME};
 use glade_node::store::Store;
 use glade_node::sysdata::{NodeRecord, ServeClaim};
@@ -1350,7 +1350,12 @@ fn committed_key(instance: &Path, node: &str) -> Option<String> {
 /// node that has committed no recovery key says on stderr exactly what to
 /// run, under the instance root the entry point read, and starts. The
 /// command it names, run on the stopped instance, commits the key and writes
-/// its secret where it was told, and the next start says nothing of it.
+/// its secret where it was told, and the next start says nothing of it. The
+/// line's two paths are written as the node writes them (F11): quoted by
+/// `recovery::shell`, and the program by `recovery::program_word`, without
+/// the verbatim prefix Windows' canonical path carries. So on Windows, where
+/// each holds `\`, both are quoted, and on Unix the line is as plain as its
+/// paths are.
 #[test]
 fn both_roots_warn_until_a_recovery_key_is_committed() {
     let dir = scratch("recovery");
@@ -1361,8 +1366,8 @@ fn both_roots_warn_until_a_recovery_key_is_committed() {
         let (lines, stderr) = start_and_stop(&home, root, &args);
         let warning = format!(
             "{NOT_COMMITTED}: stop it, then run GLADE_HOME={} {} recovery --name {name} --out <an absolute path outside GLADE_HOME>",
-            home.display(),
-            program.display()
+            shell(&home.display().to_string()),
+            program_word(&program)
         );
         assert!(stderr.lines().any(|l| l == warning), "{root:?}: {stderr}");
 
