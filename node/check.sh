@@ -108,7 +108,7 @@ confinement_all_targets='node'
 # starts clean. A name here that is no longer in scope fails the component, as
 # a stale entry.
 style_dispositions='
-glade-node  gap:293  gap:11
+glade-node  gap:283  gap:11
 glade-wire  gap:43   gap:7
 '
 
