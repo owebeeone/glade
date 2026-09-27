@@ -227,8 +227,9 @@ impl Boot {
 }
 
 /// Boot a node for `profile` under the instance root `root`, optionally
-/// overriding the instance name and the operator, and taking
-/// `--recovery-out` and the node's lease. See [`boot_at_with`].
+/// overriding the instance name, which `named_instance` checks, and the
+/// operator, and taking `--recovery-out` and the node's lease. See
+/// [`boot_at_with`].
 pub fn boot(
     root: &Path,
     profile: Profile,
@@ -237,15 +238,32 @@ pub fn boot(
     recovery_out: Option<&Path>,
     lease_ms: i64,
 ) -> io::Result<Boot> {
-    let dir = instance_dir(root, profile, name);
+    let dir = instance_dir(root, profile, name)?;
     boot_at_with(dir, operator.unwrap_or("local"), recovery_out, lease_ms)
 }
 
 /// Where [`boot`] puts the instance for `profile`, or for `name` when given:
-/// `<root>/sys/<name>`.
-pub fn instance_dir(root: &Path, profile: Profile, name: Option<&str>) -> PathBuf {
-    let name = name.unwrap_or_else(|| profile.default_name());
-    root.join("sys").join(name)
+/// `<root>/sys/<name>`, once `named_instance` has checked the name.
+pub fn instance_dir(root: &Path, profile: Profile, name: Option<&str>) -> io::Result<PathBuf> {
+    named_instance(root, name.unwrap_or_else(|| profile.default_name()))
+}
+
+/// The instance `<root>/sys/<name>` (F9, the owner's ruling of 2026-09-27):
+/// `name` must match `[A-Za-z0-9._-]{1,63}` and be neither `.` nor `..`, so
+/// the path names a directory in `<root>/sys` and nowhere else. Any other
+/// name is refused (`InvalidInput`), quoted as given, before anything is
+/// written: both roots' boots, `glade-node recovery` and `glade-node
+/// endpoint-id` take their instance here.
+pub(crate) fn named_instance(root: &Path, name: &str) -> io::Result<PathBuf> {
+    let allowed = |c: char| c.is_ascii_alphanumeric() || "._-".contains(c);
+    let fits = (1..=63).contains(&name.len()) && name.chars().all(allowed);
+    if !fits || name == "." || name == ".." {
+        let why = format!(
+            "--name {name:?}: an instance name must match [A-Za-z0-9._-]{{1,63}} and be neither . nor .."
+        );
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, why));
+    }
+    Ok(root.join("sys").join(name))
 }
 
 /// Run the load-validation ladder at an explicit instance dir (tests pass a
@@ -1026,9 +1044,69 @@ mod tests {
         assert_eq!(instance_root(None, home), Path::new("/h").join(".glade"));
         assert_eq!(instance_root(None, None), Path::new(".").join(".glade"));
         let sys = Path::new("/r").join("sys");
-        let named = |name| instance_dir(Path::new("/r"), Profile::Peer, name);
+        let named = |name| instance_dir(Path::new("/r"), Profile::Peer, name).unwrap();
         assert_eq!(named(None), sys.join("glade-peer"));
         assert_eq!(named(Some("n")), sys.join("n"));
+    }
+
+    /// F9 (the owner's ruling of 2026-09-27): an instance name matches
+    /// `[A-Za-z0-9._-]{1,63}` and is neither `.` nor `..`, so
+    /// `<root>/sys/<name>` is a directory in `<root>/sys`; the profiles'
+    /// default names are such names. Any other is refused (`InvalidInput`),
+    /// the message quoting what was given: one that climbs out, the empty
+    /// name, a separator of either platform, a drive's colon, a space,
+    /// a letter outside ASCII, a NUL and 64 characters.
+    #[test]
+    fn an_instance_name_is_checked() {
+        let root = Path::new("/r");
+        let longest = "n".repeat(63);
+        let names = ["grazel", "gwzit", "A.b_c-9", "...", ".x", "x."];
+        for name in names.into_iter().chain([longest.as_str()]) {
+            let dir = named_instance(root, name);
+            assert_eq!(dir.unwrap(), root.join("sys").join(name), "{name:?}");
+        }
+        for profile in [Profile::Local, Profile::Peer, Profile::Server] {
+            let dir = instance_dir(root, profile, None).unwrap();
+            assert_eq!(dir, root.join("sys").join(profile.default_name()));
+        }
+        let too_long = "n".repeat(64);
+        let climbing = ["..", ".", "../x", "/r", "a/b", "a\\b", "c:x"];
+        let others = ["", "a b", "é", "a\0", too_long.as_str()];
+        for name in climbing.into_iter().chain(others) {
+            let err = named_instance(root, name).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{name:?}");
+            let said = format!(
+                "--name {name:?}: an instance name must match [A-Za-z0-9._-]{{1,63}} and be neither . nor .."
+            );
+            assert_eq!(err.to_string(), said);
+            let unnamed = instance_dir(root, Profile::Local, Some(name));
+            assert_eq!(unnamed.unwrap_err().to_string(), said);
+        }
+    }
+
+    /// F9: a boot named outside `<root>/sys`, here `../../outside`, is
+    /// refused before anything is written: nothing appears under the root or
+    /// beside it. Before the check, the boot made its instance beside the
+    /// root, at `<root>/../outside`, and a `sys` in the root on its way.
+    #[test]
+    fn a_boot_named_outside_sys_is_refused_and_writes_nothing() {
+        let base = fresh("named-outside");
+        let root = base.join("root");
+        fs::create_dir_all(&root).unwrap();
+        let named = Some("../../outside");
+        let booted = boot(&root, Profile::Local, named, None, None, LEASE_TTL_MS);
+        let err = booted.map(|_| ()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+        let names = |dir: &Path| -> Vec<String> {
+            let entries = fs::read_dir(dir).unwrap();
+            let name = |entry: io::Result<fs::DirEntry>| entry.unwrap().file_name();
+            entries
+                .map(|entry| name(entry).to_string_lossy().into_owned())
+                .collect()
+        };
+        assert_eq!(names(&base), ["root"], "nothing beside the root");
+        assert_eq!(names(&root), Vec::<String>::new(), "nothing under it");
+        fs::remove_dir_all(&base).unwrap();
     }
 
     // small helper: how many nodes the operator has (presence-count assertion).

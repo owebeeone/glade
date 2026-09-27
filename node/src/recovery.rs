@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use crate::registry::{entry_sync, Record, Registry, RegistryApi};
 use crate::signing;
 use crate::sysdata::NodeRecoveryKey;
-use crate::sysdir::{boot_at, Boot};
+use crate::sysdir::{boot_at, named_instance, Boot};
 use crate::transport::hex;
 
 /// How the line a start prints begins while its node has committed no
@@ -53,13 +53,14 @@ impl fmt::Display for Committed {
 
 /// `glade-node recovery --name <name> --out <path>`: commit a recovery key for
 /// the stopped instance `<root>/sys/<name>`, `root` being the instance root
-/// the binary read at its entry point. Returns the lines to print. It boots
-/// the instance as a start does, so it takes the instance lock, and writes
-/// the secret before it saves the commitment.
+/// the binary read at its entry point, and `name` one a boot takes (F9,
+/// `sysdir::named_instance`). Returns the lines to print. It boots the
+/// instance as a start does, so it takes the instance lock, and writes the
+/// secret before it saves the commitment.
 pub fn command(root: &Path, args: impl IntoIterator<Item = String>) -> io::Result<Vec<String>> {
     let (name, out) = parse(args)?;
     let sys = root.join("sys");
-    let dir = sys.join(&name);
+    let dir = named_instance(root, &name)?;
     if !dir.join("node.key").exists() {
         let sys = sys.display();
         let why = format!("no instance {name} in {sys}: the command commits a recovery key for an instance that has booted");
@@ -415,6 +416,33 @@ mod tests {
         assert_eq!(fs::read(&taken).unwrap(), b"an older file");
         let names: Vec<_> = fs::read_dir(&offline).unwrap().collect();
         assert_eq!(names.len(), 1, "only the older file: {names:?}");
+    }
+
+    /// F9: the command takes only an instance in `<root>/sys`, named as a
+    /// boot names one. `../../beside/n`, which climbs out of a root that
+    /// holds instances to one booted beside it, is refused before anything
+    /// is read or written, and so are `..` and `.`: that instance's
+    /// records.json is as it was, and no secret is written. Before the check,
+    /// the command booted it and committed a key.
+    #[test]
+    fn the_command_refuses_a_name_outside_sys_and_writes_nothing() {
+        let (root, offline) = fresh("named-outside");
+        fs::create_dir_all(root.join("sys")).unwrap();
+        let beside = root.parent().unwrap().join("beside").join("n");
+        drop(boot_at(beside.clone(), "gianni").unwrap());
+        let records = fs::read(beside.join("records.json")).unwrap();
+        let out = offline.join("n.recovery");
+        for name in ["../../beside/n", "..", "."] {
+            let named = args(&["--name", name, "--out", out.to_str().unwrap()]);
+            let err = command(&root, named).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{name}: {err}");
+            let said = format!(
+                "--name {name:?}: an instance name must match [A-Za-z0-9._-]{{1,63}} and be neither . nor .."
+            );
+            assert_eq!(err.to_string(), said);
+        }
+        assert_eq!(fs::read(beside.join("records.json")).unwrap(), records);
+        assert!(!out.exists(), "no secret written");
     }
 
     /// `--recovery-out` at a first boot: the key is committed in the save

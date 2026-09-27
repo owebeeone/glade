@@ -135,7 +135,8 @@ impl NodeStart {
     /// As the binary starts: the booted form (`--profile` or `--name`) boots
     /// where `sysdir::boot` would, under the settings' instance root. A booted
     /// start whose settings carry no root is refused; it is never looked for
-    /// in the environment.
+    /// in the environment. So is one whose `--name` is not an instance name
+    /// (F9, `sysdir::named_instance`), before anything is written.
     pub fn from_settings(
         settings: Settings,
         decls: Vec<AppDecl>,
@@ -148,7 +149,7 @@ impl NodeStart {
                     root,
                     settings.profile.unwrap_or(Profile::Local),
                     settings.name.as_deref(),
-                ),
+                )?,
                 operator: settings.operator.clone().unwrap_or_else(|| "local".into()),
             }),
             (true, None) => {

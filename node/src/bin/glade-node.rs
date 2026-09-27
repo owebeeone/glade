@@ -22,7 +22,10 @@
 //! file that cannot be read, a bad line or a bad flag refuses the start
 //! before anything is written), then boots the system-data instance (GDL-036): acquires
 //! `~/.glade/sys/<name>/` (the profile picks the default name; `--name`
-//! overrides; `GLADE_HOME` overrides `$HOME/.glade`, and each composition root
+//! overrides, with a name that matches `[A-Za-z0-9._-]{1,63}` and is neither
+//! `.` nor `..`, or the start is refused before anything is written, as
+//! `recovery` and `endpoint-id` refuse it (F9);
+//! `GLADE_HOME` overrides `$HOME/.glade`, and each composition root
 //! reads the two once, as it starts, and passes the root down), runs the load-validation
 //! ladder (the first boot after plan Step 4.1b also sets aside, once, the
 //! unsigned records written before it, and prints `set aside …` after
