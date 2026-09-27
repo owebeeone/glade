@@ -753,3 +753,11 @@ part 3.
 10. **The split** (section 12). Recommend three parts, about 250-330, 200-280 and 130-200
     production lines, each gated and replayed. The alternative merges parts 1 and 2, about 460
     lines.
+
+**Ruled, owner, 2026-09-27 ("all recommended"):** 1 one record, `ChainCheckpoint`, is both the checkpoint and
+its anchor in `home`; 2 a checkpoint covers the whole prefix with its state carried forward, and only `dir.claims`
+is compacted; 3 the trigger is 1,000 superseded claims, a setting from the entry point checked at every tick; 4
+`dir.checkpoints` keeps the newest checkpoint of a stream; 5 a peer behind the checkpoint drops its old records
+unchecked; 6 `PROTOCOL` moves to 4; 7 the desk's first checkpoint comes automatically at the first tick past the
+threshold, keeping no copy of the dropped claims; 8 a contradicting or backward checkpoint is refused and the pair
+kept in the proofs log; 9 F1's leases stay, and 4.6 chooses what its expiry check needs; 10 three parts, in order.
