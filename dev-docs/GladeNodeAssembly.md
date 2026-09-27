@@ -7444,3 +7444,11 @@ At part 3; parts 1, 2 and 4 change nothing a running node does.
 10. **The split** (section 14). Recommend four parts, about 270, 280, +350/−330 and +20/−330
     production lines, each gated and replayed, then 4.5's crossing on the Pi and dabeest. The
     alternative folds part 4 into part 3, one commit of about +370/−660.
+
+**Ruled, owner, 2026-09-27 ("all recommended"):** 1 one link per peer, with conversations on it; 2 `CarrierLink::channel_binding(label)`
+as a required contract method, with CA-006; 3 `glade/node/3` retires, `PROTOCOL` stays 3, no compatibility window; 4 10 s over the whole
+first-word attempt, reported, and HELLO its own 10 s outside the accept loop; 5 the path and relay notes through a node-local `LinkNotes`
+port; 6 frames at most 16 MiB, served in chunks of 64 ops or 1 MiB, an op over the limit refused with a line; 7 the release wait kept
+beyond loopback; 8 one adapter per node, lent to the module and bound by `PeerCarrier`; 9 `PeerEndpoint`, `PeerLink`, `EndpointSlot`,
+the old ALPN and the stream HELLO retire, `serve_sync`/`pull_sync` stay, and the async witness is frozen at part 3's revision; 10 four
+parts, then 4.5's crossing again.
