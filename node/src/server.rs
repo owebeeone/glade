@@ -24,7 +24,7 @@ use crate::frame::Frame;
 use crate::grants::{names_a_node, no_principal, refusal, Policy, PolicyView, READ_SUBSCRIBE};
 use crate::mesh::Mesh;
 use crate::registry::HOME;
-use crate::router::{Router, SessionId};
+use crate::router::{Router, SessionId, Zone};
 use crate::session::{ack, error_frame, missing_for, op_status, refusal_frame, refused_subscribe};
 use crate::store::{Append, Store, StoreError};
 use crate::sysdata::SystemSnapshot;
@@ -210,21 +210,36 @@ async fn recheck(shared: &Arc<Shared>) {
             None => Ok(()),
         };
         if let Err(why) = verdict {
-            refused.push((sid, peers.contains_key(&sid), share, glade_id, key, why));
+            refused.push((sid, (share, glade_id, key), why));
         }
     }
-    for (sid, peer, share, glade_id, key, why) in refused {
-        shared
-            .router
-            .lock()
-            .await
-            .unsubscribe(sid, &share, &glade_id, &key);
-        let told = refusal_frame(ErrorCode::Unauthorized, why, &share, &glade_id);
-        send(shared, sid, &told).await;
-        if peer {
-            shared.out.lock().await.remove(&sid);
-            shared.admitted.lock().await.remove(&sid);
-        }
+    for (sid, zone, why) in refused {
+        refuse_subscription(shared, sid, &zone, ErrorCode::Unauthorized, why).await;
+    }
+}
+
+/// Refuse session `sid` its subscription to `zone`, with `code` and `why`
+/// (R6's form for a subscription refused after its ack): it leaves the zone
+/// in the router and is told with a lone `Error` naming the zone and no op.
+/// A peer's subscription stream carries its one zone, so a refused peer also
+/// leaves the admission table and the session table, where its writer then
+/// finishes the stream. The caller holds the cut. The re-check pass refuses
+/// so, and so does a forwarding node relaying its claim holder's refusal
+/// (F5, `mesh.rs`).
+pub(crate) async fn refuse_subscription(
+    shared: &Arc<Shared>,
+    sid: SessionId,
+    (share, glade_id, key): &Zone,
+    code: ErrorCode,
+    why: String,
+) {
+    let mut router = shared.router.lock().await;
+    router.unsubscribe(sid, share, glade_id, key);
+    drop(router);
+    send(shared, sid, &refusal_frame(code, why, share, glade_id)).await;
+    let peer = shared.admitted.lock().await.remove(&sid).is_some();
+    if peer {
+        shared.out.lock().await.remove(&sid);
     }
 }
 

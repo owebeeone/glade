@@ -37,7 +37,9 @@ use iroh::endpoint::{Connection, RecvStream, SendStream};
 use tokio::sync::Mutex;
 
 use glade_grant_api::{GrantPort, Holder};
-use glade_wire::generated::{ErrorCode, Head, Heads, Op, Ops, Priority, StreamHeads, Subscribe};
+use glade_wire::generated::{
+    Error, ErrorCode, Head, Heads, Op, Ops, Priority, StreamHeads, Subscribe,
+};
 
 use crate::envelope;
 use crate::frame::Frame;
@@ -46,8 +48,8 @@ use crate::iroh_carrier::{selected_path, PathSeen, PeerAddr, PeerEndpoint, PeerL
 use crate::netconf::{PeerEntry, Relays};
 use crate::peer::{read_frame, write_frame, SyncOutcome, OPS_PER_CHUNK};
 use crate::registry::HOME;
-use crate::router::SessionId;
-use crate::server::{send, Server, Shared};
+use crate::router::{SessionId, Zone};
+use crate::server::{refuse_subscription, send, Server, Shared};
 use crate::session::{heads_map, missing_for, refused_subscribe};
 use crate::signing::NodeSigner;
 use crate::store::{Append, Store, StoreError};
@@ -590,6 +592,8 @@ async fn serve_peer_subscribe(
 /// subscribers are then fed by the ordinary fan-out (replica serves reads,
 /// trace C5→C6). Deduped per zone: one stream carries any number of local
 /// subscribers. The forward lapses with the stream; a later subscribe retries.
+/// A refusal the claim holder sends on the stream reaches the local
+/// subscribers ([`lapse`]).
 pub(crate) async fn forward_interest(shared: &Arc<Shared>, peer: String, share: String, glade_id: String, key: Vec<u8>) {
     let Some(mesh) = shared.mesh.get().cloned() else { return };
     let zone = (share.clone(), glade_id.clone(), key.clone());
@@ -603,9 +607,33 @@ pub(crate) async fn forward_interest(shared: &Arc<Shared>, peer: String, share: 
     };
     let forward = shared.clone();
     shared.tasks.spawn(Site::ForwardInterest, async move {
-        let _ = run_forward(&forward, conn, &share, &glade_id, &key).await;
-        mesh.forwarded.lock().await.remove(&(share, glade_id, key));
+        let refused = run_forward(&forward, conn, &share, &glade_id, &key).await;
+        lapse(&forward, &mesh, &peer, zone, refused.ok().flatten()).await;
     });
+}
+
+/// A forward's end (F5, question 25; the owner's ruling of 2026-09-27). The
+/// zone leaves the forwarded set under the cut, so a subscribe registered
+/// after this forwards again, and one registered before is among those told.
+/// When the claim holder `peer` refused the read, at the subscribe (its ack
+/// named no zone) or later (its re-check pass), each local subscriber of the
+/// zone is told with a lone `Error`, the claim holder's code and its reason
+/// prefixed with who refused, and leaves the zone
+/// ([`crate::server::refuse_subscription`]). Nothing re-checks the refusal
+/// here: a subscribe made later forwards the interest again.
+async fn lapse(shared: &Arc<Shared>, mesh: &Mesh, peer: &str, zone: Zone, refused: Option<Error>) {
+    let _cut = shared.cut.lock().await;
+    mesh.forwarded.lock().await.remove(&zone);
+    let Some(refused) = refused else {
+        return;
+    };
+    let entries = shared.router.lock().await.entries();
+    let subscribers = entries.into_iter().filter(|(_, at)| *at == zone);
+    let (share, reason) = (&zone.0, &refused.message);
+    let why = format!("refused by node {peer}, which serves {share}: {reason}");
+    for (sid, _) in subscribers {
+        refuse_subscription(shared, sid, &zone, refused.code, why.clone()).await;
+    }
 }
 
 /// Close every live peer link and forget it, with the interests forwarded
@@ -625,7 +653,15 @@ pub(crate) async fn release_links(shared: &Arc<Shared>) -> usize {
     links.len()
 }
 
-async fn run_forward(shared: &Arc<Shared>, conn: Connection, share: &str, glade_id: &str, key: &[u8]) -> io::Result<()> {
+/// Run one forward until its stream ends: `Some` refusal when the claim
+/// holder refused the read, which ends it (F5).
+async fn run_forward(
+    shared: &Arc<Shared>,
+    conn: Connection,
+    share: &str,
+    glade_id: &str,
+    key: &[u8],
+) -> io::Result<Option<Error>> {
     let (mut qsend, mut recv) = conn.open_bi().await.map_err(other)?;
     let from: Vec<Head> = {
         let st = shared.store.lock().await;
@@ -645,17 +681,25 @@ async fn run_forward(shared: &Arc<Shared>, conn: Connection, share: &str, glade_
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break, // interest closed
             Err(e) => return Err(e),
         };
-        if let Frame::Ops(ops) = frame {
-            for op in ops.ops {
-                // Scoped ingest: this stream carries ONE zone's interest — the
-                // holder can't use it to push any other zone into our replica.
-                if op.share == share && op.glade_id == glade_id && op.key == key {
-                    let _ = ingest_and_fanout(shared, from_sid, op).await;
+        match frame {
+            Frame::Ops(ops) => {
+                for op in ops.ops {
+                    // Scoped ingest: this stream carries ONE zone's interest —
+                    // the holder can't use it to push any other zone into our
+                    // replica.
+                    if op.share == share && op.glade_id == glade_id && op.key == key {
+                        let _ = ingest_and_fanout(shared, from_sid, op).await;
+                    }
                 }
             }
+            // The claim holder's refusal (plan Step 4.3), after an ack that
+            // names no zone or, from its re-check pass, alone; it then
+            // finishes the stream.
+            Frame::Error(refused) => return Ok(Some(refused)),
+            _ => {}
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Respond to a peer's home-share pull: ship exactly the home-zone ops the
@@ -2236,5 +2280,96 @@ mod tests {
             "unauthorized: the grant fold is unavailable, so node {a} may not read.subscribe on ws-razel"
         );
         assert_eq!(refused_on_the_link(&t).await.message, why);
+    }
+
+    // ---- the claim holder's refusal, relayed (F5) --------------------------
+
+    /// The next frame a client of A reads, which must be a lone refusal that
+    /// names the tree zone and no op: its code and its reason.
+    async fn told(r: &mut crate::ws::WsReader) -> (ErrorCode, String) {
+        match next_frame(r, "the relayed refusal").await {
+            Frame::Error(e) => {
+                let named = (e.share.as_deref(), e.glade_id.as_deref(), e.corr.as_deref());
+                assert_eq!(named, (Some("ws-razel"), Some("ws.tree"), None));
+                (e.code, e.message)
+            }
+            other => panic!("expected the relayed refusal, got {other:?}"),
+        }
+    }
+
+    /// The next frame on `r` after a subscribe to a zone no directory knows,
+    /// which A serves locally: its ack, unless something came before it.
+    async fn bound(r: &mut crate::ws::WsReader, w: &crate::ws::WsWriter) -> Frame {
+        w.send_binary(&sub("plain", "bound")).await.unwrap();
+        next_frame(r, "the bound's ack").await
+    }
+
+    /// F5 (question 25; the owner's ruling of 2026-09-27): B grants A's node
+    /// id nothing on `ws-razel`, so it refuses A's forwarded subscribe, and
+    /// the refusal now reaches A's own subscriber of the zone. It is acked
+    /// from A's replica, as before, then told with a lone `Error`, B's code
+    /// and B's reason prefixed with who refused, and leaves A's router for
+    /// the zone. A client that subscribes later forwards the interest again,
+    /// is refused again and is told the same, and the first is not told
+    /// twice. Nothing re-checks: once B grants A, a new subscribe is served,
+    /// and the refused client, which has not subscribed again, gets nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_claim_holders_refusal_reaches_the_forwarding_nodes_subscribers() {
+        let t = two_nodes("relayed", None).await;
+        let (a, b) = (&t.a_id, &t.b_id);
+        let why = format!(
+            "refused by node {b}, which serves ws-razel: unauthorized: node {a} holds no grant of \
+             read.subscribe on ws-razel"
+        );
+        let refusal = (ErrorCode::Unauthorized, why);
+        let (mut first, first_w) = a_client(&t).await;
+        assert_eq!(told(&mut first).await, refusal);
+        forward_lapses(&t.a).await;
+        assert!(!tree_routed(&t.a).await, "A routes the zone to no one");
+
+        let (mut later, _later_w) = a_client(&t).await;
+        assert_eq!(told(&mut later).await, refusal);
+        let next = bound(&mut first, &first_w).await;
+        assert!(matches!(next, Frame::Heads(_)), "told twice: {next:?}");
+        forward_lapses(&t.a).await;
+
+        let grant = CapabilityGrant {
+            principal: t.a_id.clone(),
+            share: "ws-razel".into(),
+            verbs: vec!["read.subscribe".into()],
+        };
+        let granted = testing::accept(&t.b, vec![Record::Grant(grant)]).await;
+        granted.unwrap();
+        let (mut again, _again_w) = a_client(&t).await;
+        let got = payloads(&mut again, 2, "routed tree ops").await;
+        assert_eq!(got, [b"tree-v0".to_vec(), b"tree-v1".to_vec()]);
+        let next = bound(&mut first, &first_w).await;
+        assert!(matches!(next, Frame::Heads(_)), "served unasked: {next:?}");
+    }
+
+    /// F5, mid-stream: B's re-check pass ends A's admitted forward when a
+    /// revocation lands, and its lone refusal reaches A's subscriber, who
+    /// has had the zone's ops; the subscriber leaves A's router for the zone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_revocation_on_the_claim_holder_reaches_the_forwarding_nodes_subscribers() {
+        let t = two_nodes("relayed-revocation", Some(&["read.*"])).await;
+        let (mut rc, _wc) = a_client(&t).await;
+        assert_eq!(payloads(&mut rc, 2, "routed tree ops").await.len(), 2);
+
+        let revocation = CapabilityRevocation {
+            principal: t.a_id.clone(),
+            share: "ws-razel".into(),
+        };
+        testing::accept(&t.b, vec![Record::Revoke(revocation)])
+            .await
+            .unwrap();
+        let (a, b) = (&t.a_id, &t.b_id);
+        let why = format!(
+            "refused by node {b}, which serves ws-razel: unauthorized: node {a}'s grants on \
+             ws-razel are revoked"
+        );
+        assert_eq!(told(&mut rc).await, (ErrorCode::Unauthorized, why));
+        forward_lapses(&t.a).await;
+        assert!(!tree_routed(&t.a).await, "A routes the zone to no one");
     }
 }
