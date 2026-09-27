@@ -264,6 +264,7 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::claims::LEASE_TTL_MS;
     use crate::sysdir::boot_at_with;
 
     /// A fresh directory for one test, as `(root, offline)`: an instance root,
@@ -426,12 +427,12 @@ mod tests {
         let (root, offline) = fresh("first-boot");
         let dir = root.join("sys").join("n");
         let inside = root.join("n.recovery");
-        let err = boot_at_with(dir.clone(), "gianni", Some(&inside)).map(|_| ());
+        let err = boot_at_with(dir.clone(), "gianni", Some(&inside), LEASE_TTL_MS).map(|_| ());
         assert_eq!(err.unwrap_err().kind(), io::ErrorKind::InvalidInput);
         assert!(!dir.exists(), "nothing written");
 
         let out = offline.join("n.recovery");
-        let boot = boot_at_with(dir.clone(), "gianni", Some(&out)).unwrap();
+        let boot = boot_at_with(dir.clone(), "gianni", Some(&out), LEASE_TTL_MS).unwrap();
         let (_, key) = secret_of(&out);
         let file = fs::canonicalize(&out).unwrap();
         let committed = Some(Committed {
@@ -446,7 +447,7 @@ mod tests {
 
         let records = fs::read(dir.join("records.json")).unwrap();
         let again = offline.join("again");
-        let err = boot_at_with(dir.clone(), "gianni", Some(&again)).map(|_| ());
+        let err = boot_at_with(dir.clone(), "gianni", Some(&again), LEASE_TTL_MS).map(|_| ());
         let err = err.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         let first_only = "--recovery-out is taken at a node's first boot only";

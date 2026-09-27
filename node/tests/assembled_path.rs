@@ -6,7 +6,8 @@
 //! Either root starts a node that prints the same lines, refuses the legacy
 //! form without its store directory, and boots under `GLADE_HOME`, else
 //! `$HOME/.glade`. One test starts each root on an instance whose `home`
-//! claim lapsed while its node was stopped.
+//! claim lapsed while its node was stopped, and one reads the lease each
+//! root's claims carry by default.
 //!
 //! Each test sets or removes the variable on the node it spawns, so it reads
 //! the same whichever way the suite runs (the node gate runs it both ways).
@@ -405,6 +406,58 @@ fn both_roots_report_home_served_on_a_start_after_the_claim_lapsed() {
         let saved = BlobStore::new(&instance).load().unwrap();
         let serves = Registry::from_snapshot(&saved).0.who_serves(HOME, now_ms());
         assert_eq!(serves, Some(node), "{root:?}: records.json holds it live");
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The claims records.json at `instance` holds, in chain order: each one's
+/// share and the instant its lease ends.
+fn claims_held(instance: &Path) -> Vec<(String, i64)> {
+    let saved = BlobStore::new(instance).load().unwrap();
+    let ops = saved.records.iter();
+    let ops = ops.map(|bytes| Op::from_cbor(&cbor::decode(bytes)));
+    let claims = ops.filter(|op| op.glade_id == "dir.claims");
+    let claims = claims.map(|op| envelope::record(&op, ServeClaim::from_cbor));
+    let held = claims.map(|claim| (claim.share, claim.lease_expiry_ms));
+    held.collect()
+}
+
+/// F1 (question 32 (a), the owner's ruling of 2026-09-27), on each root: by
+/// default a node leases what it serves for five minutes. Every claim a start
+/// mints, on `home` (its first boot's and adoption's renewal) and on the
+/// workspace its app file declares, ends five minutes after it was minted.
+/// Before, each ended after 30 s. The renewal every 100 s is the same
+/// settings' other half (`claims.rs`), and `tests/lifecycle.rs` starts the
+/// assembled root on settings of its own.
+#[test]
+fn both_roots_lease_their_claims_for_five_minutes_by_default() {
+    const FIVE_MINUTES: i64 = 300_000;
+    let dir = scratch("five-minutes");
+    let home = dir.join("glade-home");
+    let app = dir.join("x.glade");
+    let text = "glade-app v1\napp x\n\
+                binding x.one value share commons latest\n\
+                workspace ws-x notes\n";
+    std::fs::write(&app, text).unwrap();
+    let app = app.display().to_string();
+    for (root, name) in [(Root::HandWritten, "h"), (Root::Assembled, "a")] {
+        let args = ["--profile", "local", "--name", name, "--app", &app, "0"];
+        let started = now_ms();
+        let (lines, stderr) = start_and_stop(&home, root, &args);
+        let ran = now_ms() - started;
+        let held = claims_held(&home.join("sys").join(name));
+        let ends: Vec<(String, i64)> = held
+            .into_iter()
+            .map(|(share, expiry)| (share, expiry - started))
+            .collect();
+        let shares: Vec<&str> = ends.iter().map(|(share, _)| share.as_str()).collect();
+        let minted = ["home", "home", "ws-x"];
+        assert_eq!(shares, minted, "{root:?}: {lines:?}, {stderr}");
+        for (share, end) in &ends {
+            let leased = (FIVE_MINUTES..=FIVE_MINUTES + ran).contains(end);
+            let said = format!("a claim on {share} ends {end} ms after the start: {ends:?}");
+            assert!(leased, "{root:?}: {said}");
+        }
     }
     std::fs::remove_dir_all(&dir).unwrap();
 }

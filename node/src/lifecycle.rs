@@ -193,7 +193,8 @@ impl Instance {
 
     fn boot(start: &NodeStart, at: &InstanceAt) -> io::Result<Instance> {
         let recovery_out = start.settings.recovery_out.as_deref().map(Path::new);
-        let boot = boot_at_with(at.dir.clone(), &at.operator, recovery_out)?;
+        let lease_ms = start.settings.leases.lease_ms;
+        let boot = boot_at_with(at.dir.clone(), &at.operator, recovery_out, lease_ms)?;
         let entries = start
             .settings
             .peers
@@ -285,8 +286,12 @@ impl Storage {
         server.own_tasks(owners)?;
         if let Some(boot) = instance.take() {
             // Adoption renews the `home` claim, which the line then reads, at
-            // the point the hand-written root prints it.
-            server.adopt_boot(boot).await?;
+            // the point the hand-written root prints it. The leases are the
+            // settings' (F1).
+            let leases = start.settings.leases;
+            server
+                .adopt_boot_tuned(boot, leases.lease_ms, leases.renew_ms)
+                .await?;
             let serves_home = server.serves(HOME).await.is_some();
             start
                 .console

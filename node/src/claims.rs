@@ -50,11 +50,33 @@ use crate::sysdata::{PrincipalRecord, ServeClaim, WorkspaceCreateReq, WorkspaceC
 use crate::sysdir::{now_ms, Boot};
 use crate::tasks::Site;
 
-/// Default serve-lease TTL — matches the 30s the traces and tests use.
-pub const LEASE_TTL_MS: i64 = 30_000;
+/// Default serve-lease TTL: five minutes (question 32 (a), the owner's ruling
+/// of 2026-09-27), where it was 30 s. Each renewal is a signed record kept
+/// until signed checkpoints land (plan Step 4.5c), so renewing less often
+/// keeps fewer.
+pub const LEASE_TTL_MS: i64 = 300_000;
 /// Default renewal cadence: a third of the TTL, so one missed renewal never
-/// lapses a healthy holder.
-pub const RENEW_EVERY_MS: u64 = 10_000;
+/// lapses a healthy holder. 100 s; it was 10 s.
+pub const RENEW_EVERY_MS: u64 = 100_000;
+
+/// The node's leases, which are its settings (question 32 (a)): how long each
+/// claim it mints lives, and how often it renews the claims of what it serves.
+/// A composition root takes them from its entry point and passes them down;
+/// the default is [`LEASE_TTL_MS`] renewed every [`RENEW_EVERY_MS`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Leases {
+    pub lease_ms: i64,
+    pub renew_ms: u64,
+}
+
+impl Default for Leases {
+    fn default() -> Leases {
+        Leases {
+            lease_ms: LEASE_TTL_MS,
+            renew_ms: RENEW_EVERY_MS,
+        }
+    }
+}
 
 fn other<E: Into<Box<dyn std::error::Error + Send + Sync>>>(e: E) -> io::Error {
     io::Error::new(io::ErrorKind::Other, e)
@@ -111,7 +133,8 @@ fn append_diffed(registry: &mut Registry, rec: Record, origin: &str) -> io::Resu
 
 impl Server {
     /// Adopt the boot instance as this server's directory-write authority
-    /// with the default lease tuning. See [`Server::adopt_boot_tuned`].
+    /// with the default [`Leases`], where a test's lease does not matter. See
+    /// [`Server::adopt_boot_tuned`], which the composition roots call.
     pub async fn adopt_boot(&self, boot: Boot) -> io::Result<usize> {
         self.adopt_boot_tuned(boot, LEASE_TTL_MS, RENEW_EVERY_MS).await
     }
@@ -121,9 +144,10 @@ impl Server {
     /// registry as the chain authority for this node's own directory writes,
     /// start the renewal set with `home` at its epoch (`home_epoch`), renew
     /// it at once, and spawn the lease-renewal loop. `lease_ms`/`renew_ms`
-    /// tune the claim TTL and renewal cadence (tests shorten them to observe
-    /// renewal live). Returns how many ops the seed newly appended. Call once,
-    /// before serving.
+    /// are the claim TTL and renewal cadence, the node's [`Leases`]: each
+    /// composition root passes the ones its entry point gave it, and tests
+    /// shorten them to observe renewal live. Returns how many ops the seed
+    /// newly appended. Call once, before serving.
     ///
     /// The renewal at once makes a `home` claim that lapsed while the node was
     /// stopped live again before any peer or client can connect. If its save
@@ -643,9 +667,9 @@ mod tests {
 
     /// An instance whose node holds its presence and a claim on `home` at
     /// epoch 1, leased until `lease_expiry_ms`: records.json written as the
-    /// node writes it, signed. A first boot leases `home` for 30 s; this lets
-    /// a test shorten the lease, or start from one that lapsed while the node
-    /// was stopped. Returns the instance dir and the node's id.
+    /// node writes it, signed. A first boot leases `home` for the node's
+    /// lease; this lets a test shorten it, or start from one that lapsed
+    /// while the node was stopped. Returns the instance dir and the node's id.
     fn instance_holding_home(name: &str, lease_expiry_ms: i64) -> (PathBuf, String) {
         use crate::registry::{BlobStore, StoreApi};
         let sys = fresh(&format!("{name}-sys"));
@@ -734,6 +758,19 @@ mod tests {
         let dir = shared.dir.get().unwrap().inner.lock().await;
         let serves = dir.boot.registry.who_serves(HOME, now_ms());
         assert_eq!(serves, Some(node), "in the adopted registry too");
+    }
+
+    /// F1 (question 32 (a), the owner's ruling of 2026-09-27): the node's
+    /// lease and its renewal are its settings, and by default a claim lives
+    /// five minutes and is renewed every 100 s, a third of that, where they
+    /// were 30 s and 10 s. The assembled root's settings start from these,
+    /// and the binary's entry point hands both roots the same.
+    #[test]
+    fn the_default_lease_is_five_minutes_renewed_every_100_s() {
+        let leases = Leases::default();
+        assert_eq!((leases.lease_ms, leases.renew_ms), (300_000, 100_000));
+        let settings = crate::assembly::Settings::default();
+        assert_eq!(settings.leases, leases, "the assembled root's settings");
     }
 
     /// Plan Step 4.1b (D8): an instance whose records.json and served store

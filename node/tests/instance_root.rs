@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
 use glade_node::assembly::Settings;
+use glade_node::claims::LEASE_TTL_MS;
 use glade_node::lifecycle::{Console, NodeStart};
 use glade_node::sysdir::{boot, Profile};
 
@@ -50,7 +51,7 @@ fn a_boot_given_an_instance_root_uses_it_and_not_the_environments() {
     std::env::set_var("GLADE_HOME", &decoy);
     std::env::set_var("HOME", &decoy);
 
-    let node = boot(&root, Profile::Local, Some("t"), None, None).unwrap();
+    let node = boot(&root, Profile::Local, Some("t"), None, None, LEASE_TTL_MS).unwrap();
     assert_eq!(node.dir, root.join("sys").join("t"));
     assert!(node.dir.join("node.key").is_file(), "booted there");
     drop(node);

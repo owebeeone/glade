@@ -186,6 +186,7 @@ use glade_wire::generated::Op;
 use shaku::{module, Component, HasComponent, Module, ModuleBuildContext};
 
 use crate::appdecl::{register, AppDecl, Registered};
+use crate::claims::Leases;
 use crate::envelope;
 use crate::grants::PolicyView;
 use crate::iroh_carrier::IrohCarrier;
@@ -265,14 +266,17 @@ pub struct Settings {
     /// Step 4.1c), read once by the composition root, as the instance root
     /// is. `None` names `glade-node`.
     pub program: Option<PathBuf>,
+    /// How long the node's claims live and how often it renews them (F1),
+    /// from the entry point: by default five minutes, renewed every 100 s.
+    pub leases: Leases,
 }
 
 impl Settings {
     /// Parse the arguments after the program name exactly as the hand-written
     /// root does: an unknown `--profile` is no profile, a flag given no value
     /// reads as absent, and anything that is not a flag is positional. The
-    /// instance root and the program's path are not arguments; the
-    /// composition root sets them.
+    /// instance root, the program's path and the leases are not arguments;
+    /// the composition root sets them.
     pub fn from_args(args: impl IntoIterator<Item = String>) -> Settings {
         let mut settings = Settings::default();
         let mut args = args.into_iter();

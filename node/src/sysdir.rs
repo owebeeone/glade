@@ -53,6 +53,7 @@ use std::path::{Path, PathBuf};
 use glade_wire::cbor;
 use glade_wire::generated::Op;
 
+use crate::claims::LEASE_TTL_MS;
 use crate::envelope::{self, Format};
 use crate::overlay::{self, Checked};
 use crate::peer::NodeIdentity;
@@ -224,16 +225,17 @@ impl Boot {
 
 /// Boot a node for `profile` under the instance root `root`, optionally
 /// overriding the instance name and the operator, and taking
-/// `--recovery-out`. See [`boot_at_with`].
+/// `--recovery-out` and the node's lease. See [`boot_at_with`].
 pub fn boot(
     root: &Path,
     profile: Profile,
     name: Option<&str>,
     operator: Option<&str>,
     recovery_out: Option<&Path>,
+    lease_ms: i64,
 ) -> io::Result<Boot> {
     let dir = instance_dir(root, profile, name);
-    boot_at_with(dir, operator.unwrap_or("local"), recovery_out)
+    boot_at_with(dir, operator.unwrap_or("local"), recovery_out, lease_ms)
 }
 
 /// Where [`boot`] puts the instance for `profile`, or for `name` when given:
@@ -244,9 +246,10 @@ pub fn instance_dir(root: &Path, profile: Profile, name: Option<&str>) -> PathBu
 }
 
 /// Run the load-validation ladder at an explicit instance dir (tests pass a
-/// temp dir — no `GLADE_HOME` env race). Class order: 1 → 2 → 3 → 4.
+/// temp dir — no `GLADE_HOME` env race), with the default lease. Class
+/// order: 1 → 2 → 3 → 4.
 pub fn boot_at(dir: PathBuf, operator: &str) -> io::Result<Boot> {
-    boot_at_with(dir, operator, None)
+    boot_at_with(dir, operator, None, LEASE_TTL_MS)
 }
 
 /// [`boot_at`], taking `--recovery-out` (plan Step 4.1c): at a first boot the
@@ -254,8 +257,14 @@ pub fn boot_at(dir: PathBuf, operator: &str) -> io::Result<Boot> {
 /// the save that writes its presence; a later boot given one is refused
 /// before records.json is written. The path is checked before anything is
 /// written, against the instance root `dir` lives under
-/// (`recovery::check_out`).
-pub fn boot_at_with(dir: PathBuf, operator: &str, recovery_out: Option<&Path>) -> io::Result<Boot> {
+/// (`recovery::check_out`). A first boot leases its claim on `home` for
+/// `lease_ms`, the node's lease (`claims::Leases`), which adoption renews.
+pub fn boot_at_with(
+    dir: PathBuf,
+    operator: &str,
+    recovery_out: Option<&Path>,
+    lease_ms: i64,
+) -> io::Result<Boot> {
     let root = recovery::root_of(&dir);
     let recovery_out = recovery_out.map(|out| recovery::check_out(root, out));
     let recovery_out = recovery_out.transpose()?;
@@ -294,7 +303,12 @@ pub fn boot_at_with(dir: PathBuf, operator: &str, recovery_out: Option<&Path>) -
             .append(
                 // Lease expiry is an ABSOLUTE wall-clock ms, stamped at write
                 // time (the clock is used to WRITE; it never enters the fold).
-                Record::Serve(ServeClaim { node: node_id.clone(), share: HOME.into(), lease_expiry_ms: now_ms() + 30_000, epoch: 1 }),
+                Record::Serve(ServeClaim {
+                    node: node_id.clone(),
+                    share: HOME.into(),
+                    lease_expiry_ms: now_ms() + lease_ms,
+                    epoch: 1,
+                }),
                 &node_id,
             )
             .map_err(reg_io)?;

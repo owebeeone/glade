@@ -1,8 +1,9 @@
 //! Part (ii) of plan Step 3.4: renewal, expiry and partial lookup, on the
-//! lease `claims.rs` mints (`LEASE_TTL_MS`, renewed every `RENEW_EVERY_MS`
-//! with the same epoch), driven by the fake clock. `claims.rs` itself is not
-//! run: its loop sleeps on tokio and stamps with `sysdir::now_ms()`, so these
-//! journeys write the records it writes, at the injected clock.
+//! lease `claims.rs` mints by default (`LEASE_TTL_MS`, renewed every
+//! `RENEW_EVERY_MS` with the same epoch; five minutes and 100 s since F1),
+//! driven by the fake clock. `claims.rs` itself is not run: its loop sleeps
+//! on tokio and stamps with `sysdir::now_ms()`, so these journeys write the
+//! records it writes, at the injected clock.
 
 use glade_carrier_api::CarrierError;
 use glade_clock_api::ClockPort;

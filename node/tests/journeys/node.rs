@@ -158,7 +158,8 @@ impl TestNode {
         self.host().append(record, &self.name).expect("appended")
     }
 
-    /// The lease `claims.rs` mints for `share`, stamped at this node's clock.
+    /// The lease `claims.rs` mints for `share` by default, stamped at this
+    /// node's clock.
     pub fn lease(&self, share: &str, epoch: i64) -> Record {
         let now = self.directory().clock().now_ms();
         Record::Serve(ServeClaim {

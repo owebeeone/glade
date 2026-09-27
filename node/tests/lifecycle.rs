@@ -9,7 +9,8 @@
 //! under a fresh temporary directory, passed explicitly, so neither reads
 //! `GLADE_HOME` and `~/.glade` is never touched. The report is read directly.
 //! `tests/stop_signal.rs` covers the same stop driven by a signal to the
-//! binary.
+//! binary. One more test (F1) starts a node on leases of its own and reads
+//! the claims its instance saved.
 //!
 //! A leaked handle does not appear in the report (the witness's README, "The
 //! socket is the only honest witness"), so the ports are checked from outside
@@ -21,8 +22,16 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
+use glade_node::appdecl::parse;
 use glade_node::assembly::Settings;
+use glade_node::cbor;
+use glade_node::claims::Leases;
+use glade_node::envelope;
 use glade_node::lifecycle::{node_plan, Console, InstanceAt, NodeStart};
+use glade_node::registry::{BlobStore, StoreApi, HOME};
+use glade_node::sysdata::ServeClaim;
+use glade_node::sysdir::now_ms;
+use glade_wire::generated::Op;
 use sdax::{Outcome, Report};
 use sdax_tokio::{PlanStart, TokioRuntime};
 
@@ -284,6 +293,76 @@ async fn a_dialer_its_peer_does_not_know_is_refused_and_reported() {
             .expect("stops in time");
         assert!(report.is_clean(), "{}", shown(&report));
     }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The claims records.json at `instance` holds, in chain order: each one's
+/// share and the instant its lease ends.
+fn claims_held(instance: &Path) -> Vec<(String, i64)> {
+    let saved = BlobStore::new(instance).load().unwrap();
+    let ops = saved.records.iter();
+    let ops = ops.map(|bytes| Op::from_cbor(&cbor::decode(bytes)));
+    let claims = ops.filter(|op| op.glade_id == "dir.claims");
+    let claims = claims.map(|op| envelope::record(&op, ServeClaim::from_cbor));
+    let held = claims.map(|claim| (claim.share, claim.lease_expiry_ms));
+    held.collect()
+}
+
+/// F1 (question 32 (a), the owner's ruling of 2026-09-27): the assembled
+/// root leases and renews as its settings say. A node whose settings give a
+/// one-minute lease renewed every 200 ms, with an app declaring a workspace,
+/// runs for a second past steady state. Every claim it minted, on `home`
+/// (its first boot's included) and on the workspace, ends a minute after it
+/// was minted, and `home` was renewed at least three times, never more often
+/// than every 200 ms. The binary's settings are the defaults, five minutes
+/// renewed every 100 s (`tests/assembled_path.rs`).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_assembled_root_leases_and_renews_as_its_settings_say() {
+    const LEASE: i64 = 60_000;
+    const RENEW: u64 = 200;
+    let dir = scratch("lifecycle-leases");
+    let lines = Arc::new(Lines::default());
+    let mut start = booted(&dir, "l", &[], &lines);
+    start.settings.leases = Leases {
+        lease_ms: LEASE,
+        renew_ms: RENEW,
+    };
+    let text = "glade-app v1\napp x\n\
+                binding x.one value share commons latest\n\
+                workspace ws-x notes\n";
+    start.settings.apps = vec!["x.glade".into()];
+    start.decls = vec![parse(text).unwrap()];
+    let started = now_ms();
+    let mut run = node_plan().start(runtime(), start);
+    let steady = tokio::time::timeout(BOUND, run.ready()).await;
+    assert_eq!(steady.ok(), Some(Ok(())), "{:?}", lines.all());
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    run.handle().shutdown();
+    let report = tokio::time::timeout(BOUND, run)
+        .await
+        .expect("stops in time");
+    assert!(report.is_clean(), "{}", shown(&report));
+    let ran = now_ms() - started;
+
+    let held = claims_held(&dir.join("sys").join("l"));
+    let ends: Vec<(String, i64)> = held
+        .into_iter()
+        .map(|(share, expiry)| (share, expiry - started))
+        .collect();
+    for (share, end) in &ends {
+        let leased = (LEASE..=LEASE + ran).contains(end);
+        let said = format!("a claim on {share} ends {end} ms after the start: {ends:?}");
+        assert!(leased, "the settings lease for {LEASE} ms: {said}");
+    }
+    assert!(ends.iter().any(|(share, _)| share == "ws-x"), "{ends:?}");
+    // The first boot's claim on `home` and adoption's renewal, then the ticks.
+    let ticks = ends.iter().filter(|(share, _)| share == HOME).count();
+    let ticks = ticks.saturating_sub(2);
+    let most = ran as u64 / RENEW;
+    assert!(
+        (3..=most).contains(&(ticks as u64)),
+        "{ticks} renewals in {ran} ms, renewing every {RENEW} ms: {ends:?}"
+    );
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

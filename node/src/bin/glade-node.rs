@@ -29,7 +29,7 @@
 //! s-boot trace). The served store opens, setting aside any `home` journal
 //! that does not verify (plan Step 4.1b; one more `set aside …` line). The
 //! registry then seeds it (the home share is an ORDINARY share, GDL-038), and
-//! the node's `home` claim is renewed, as it is every 10 s while the node runs,
+//! the node's `home` claim is renewed, as it is every 100 s while the node runs,
 //! before the node prints `registry ready (home served: …)`. The iroh peer
 //! endpoint binds with the node's directory identity and its `endpoint.key`,
 //! and accepts inbound peer links
@@ -77,6 +77,9 @@
 //! The program reads its arguments, `GLADE_HOME` and `HOME`, and its own path
 //! once, at its entry point, and passes them down: nothing below reads the
 //! environment (the owner's rule of no process globals, glade's `AGENTS.md`).
+//! The entry point also hands each root the node's leases (F1, the owner's
+//! ruling of 2026-09-27): each claim lives five minutes and is renewed every
+//! 100 s. No flag changes them.
 //!
 //! Either form binds 127.0.0.1:<port> (0 = OS-assigned) and prints
 //! `listening <port>` so a parent process can read the actual port.
@@ -112,6 +115,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use glade_node::assembly::{Settings, ASSEMBLED_ROOT_LINE};
+use glade_node::claims::Leases;
 use glade_node::grants::{CLIENT_GRANTS_ENFORCED, GRANTS_UNAVAILABLE};
 use glade_node::iroh_carrier::{PeerEndpoint, PeerEntry};
 use glade_node::lifecycle::{conclude, node_plan, Console, NodeStart, StdConsole};
@@ -174,7 +178,8 @@ fn program_path() -> Option<PathBuf> {
 
 /// Run the recovery command, or start the node from the composition root the
 /// environment chooses. The process's arguments are read here, once, and
-/// handed to whichever runs.
+/// handed to whichever runs, with the node's leases (F1): the defaults, a
+/// five-minute lease renewed every 100 s, which no flag changes.
 async fn start() -> std::io::Result<ExitCode> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().is_some_and(|arg| arg == "recovery") {
@@ -185,10 +190,11 @@ async fn start() -> std::io::Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
     let program = program_path();
+    let leases = Leases::default();
     if assembled(std::env::var_os(ASSEMBLED))? {
-        return run_assembled(args, program).await;
+        return run_assembled(args, program, leases).await;
     }
-    run(args, program).await.map(|()| ExitCode::SUCCESS)
+    run(args, program, leases).await.map(|()| ExitCode::SUCCESS)
 }
 
 /// Runs the node, and prints a failure with `Display`, its message as written
@@ -206,7 +212,7 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run(args: Vec<String>, program: Option<PathBuf>) -> std::io::Result<()> {
+async fn run(args: Vec<String>, program: Option<PathBuf>, leases: Leases) -> std::io::Result<()> {
     let mut profile: Option<Profile> = None;
     let mut name: Option<String> = None;
     let mut operator: Option<String> = None;
@@ -242,8 +248,8 @@ async fn run(args: Vec<String>, program: Option<PathBuf>) -> std::io::Result<()>
         let decls = glade_node::appdecl::load_all(&apps)?;
         let profile = profile.unwrap_or(Profile::Local);
         let recovery_out = recovery_out.as_deref().map(Path::new);
-        let (name, operator) = (name.as_deref(), operator.as_deref());
-        let mut node = boot(&root, profile, name, operator, recovery_out)?;
+        let (name, operator, lease_ms) = (name.as_deref(), operator.as_deref(), leases.lease_ms);
+        let mut node = boot(&root, profile, name, operator, recovery_out, lease_ms)?;
         println!("instance {}", node.dir.display());
         println!("node {}", node.node_id);
         if let Some(committed) = &node.recovery {
@@ -323,7 +329,8 @@ async fn run(args: Vec<String>, program: Option<PathBuf>) -> std::io::Result<()>
     // ServeClaim and renew while serving (audit F1).
     if let Some((node, workspaces)) = booted {
         let (identity, key) = (node.identity()?, node.endpoint_key());
-        server.adopt_boot(node).await?;
+        let (lease_ms, renew_ms) = (leases.lease_ms, leases.renew_ms);
+        server.adopt_boot_tuned(node, lease_ms, renew_ms).await?;
         let serves_home = server.serves(HOME).await.is_some();
         println!("registry ready (home served: {serves_home})");
         let entries: Vec<Option<PeerEntry>> = peers.iter().map(|p| PeerEntry::parse(p)).collect();
@@ -358,15 +365,20 @@ async fn run(args: Vec<String>, program: Option<PathBuf>) -> std::io::Result<()>
 /// The assembled composition root (plan Steps 3.2 and 3.3): `run`'s start,
 /// step for step, as the sdax plan `glade_node::lifecycle::node_plan`, which
 /// owns every acquisition and every task. The root parses the arguments
-/// `start` read, puts the instance root and the program's path into the
-/// settings, and loads every `--app` file, then waits on the plan where `run`
-/// waits on `server.run`. A stop signal
+/// `start` read, puts the instance root, the program's path and the leases
+/// into the settings, and loads every `--app` file, then waits on the plan
+/// where `run` waits on `server.run`. A stop signal
 /// asks the plan to shut down; the report decides the exit status.
-async fn run_assembled(args: Vec<String>, program: Option<PathBuf>) -> std::io::Result<ExitCode> {
+async fn run_assembled(
+    args: Vec<String>,
+    program: Option<PathBuf>,
+    leases: Leases,
+) -> std::io::Result<ExitCode> {
     eprintln!("{ASSEMBLED_ROOT_LINE}");
     let settings = Settings {
         instance_root: Some(instance_root_from_env()),
         program,
+        leases,
         ..Settings::from_args(args)
     };
     // The legacy form requires its store directory: refused, as `run`

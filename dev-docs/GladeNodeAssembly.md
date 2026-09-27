@@ -4995,6 +4995,12 @@ keep that epoch.
 
 ### 5. The cost
 
+**Since F1 (2026-09-27, the owner's ruling on question 32 (a)):** a claim lives five minutes and
+is renewed every 100 s by default, the node's `Leases`, which each composition root takes from its
+entry point. The figures below are at the old 30 s and 10 s. At the new defaults the desk mints
+1,728 renewal records a day (about 0.5 MB), and after a week each save rewrites about 3.5 MB once
+every 100 s. Growth is still linear; plan Step 4.5c's signed checkpoints end it.
+
 - **One more renewal record every 10 s** on every adopted node: 8,640 a day,
   each about 290 bytes signed, so about 2.5 MB a day in records.json and as
   much again in the served store's `home` journal. The desk serves one

@@ -65,8 +65,8 @@ sdax-testkit = { git = "https://github.com/owebeeone/sdax-rs", package = "sdax-t
 # Every `home` record's signature is checked as it is taken in, and each start
 # checks every record held (plan Step 4.1b). Unoptimised, a check costs about
 # 0.29 ms, and the owner's desk runs a debug build whose `home` journal grows by
-# a renewal every 10 s. These three crates build optimised even in dev (about
-# 46 us a check). Reported for the owner's review.
+# renewals every 100 s (every 10 s before F1). These three crates build
+# optimised even in dev (about 46 us a check). Reported for the owner's review.
 [profile.dev.package.curve25519-dalek]
 opt-level = 3
 
