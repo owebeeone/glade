@@ -7809,3 +7809,14 @@ The owner's ruling of 2026-09-27; each is refused as a bad frame, not a panic or
   a peer's refused answer to a forwarded one, answers `ok: false`; an unsealed registry refuses the
   record; a stored op is skipped (in records.json quarantined, closing the grant fold), a folded
   record skipped, each with one stderr line; a nested `home` payload still refuses the start (4.1b).
+
+### The node's own exchange correlation (F16)
+
+F16 (ruled 2026-09-27): the node mints its own exchange correlation. `exchange::Pending`, held in
+`Shared.pending` with its counter under the same mutex (no static), files each call handed to a local
+provider as `n<k>`, unique within the node, against the caller's session and `corr`. `handle_request`
+rewrites `req.corr` before the handler sees it; `handle_response` restores the caller's `corr` and
+delivers; a correlation not filed is dropped. A mesh-forwarded call rides its own conversation at the
+requesting node (unchanged); the claim holder files it through its synthetic session, which forgets
+its calls when it ends (`answer_forwarded` takes that wait; production passes `PROVIDER_TIMEOUT`).
+Wire, clients and handlers are unchanged: a handler still echoes `corr` 1:1.

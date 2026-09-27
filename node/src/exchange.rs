@@ -14,6 +14,7 @@
 //! reason — data, not a hang (the phase-E posture). Undeclared glade ids keep
 //! the legacy echo provider, byte-for-byte.
 
+use std::collections::BTreeMap;
 use std::io;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -95,11 +96,45 @@ pub(crate) async fn attach_provider(shared: &Arc<Shared>, sid: SessionId, share:
     send(shared, sid, &ack).await;
 }
 
+/// The calls handed to an attached provider and not yet answered, in the
+/// exchange's shared state (F16). Each is filed under a correlation this node
+/// mints, unique within the node: callers number their calls alike (every
+/// client counts from `c1`), so under theirs two calls in flight on one
+/// exchange would meet, and one caller would receive the other's reply.
+#[derive(Default)]
+pub(crate) struct Pending {
+    /// How many correlations this node has minted.
+    minted: u64,
+    /// Minted correlation -> the caller's session and its own correlation.
+    calls: BTreeMap<String, (SessionId, String)>,
+}
+
+impl Pending {
+    /// File `sid`'s call `corr`, returning the correlation the handler sees.
+    fn file(&mut self, sid: SessionId, corr: String) -> String {
+        self.minted += 1;
+        let minted = format!("n{}", self.minted);
+        self.calls.insert(minted.clone(), (sid, corr));
+        minted
+    }
+
+    /// The caller a reply on `minted` answers, filed no longer: `None` for a
+    /// correlation this node never minted, or whose call is already answered.
+    fn answered(&mut self, minted: &str) -> Option<(SessionId, String)> {
+        self.calls.remove(minted)
+    }
+
+    /// Forget every call `sid` filed: its session has ended.
+    fn forget(&mut self, sid: SessionId) {
+        self.calls.retain(|_, (caller, _)| *caller != sid);
+    }
+}
+
 /// Route one inbound `ExchangeReq` from session `sid` (trace D1/D2 · X1):
 /// the reserved `workspace.create` id → the built-in TARGET-routed handler;
 /// undeclared → the legacy echo provider; declared → the C2 decision on the
 /// SHARE, and the replica never answers regardless of what it caches.
-pub(crate) async fn handle_request(shared: &Arc<Shared>, sid: SessionId, req: ExchangeReq, echo: &mut Echo) {
+pub(crate) async fn handle_request(shared: &Arc<Shared>, sid: SessionId, mut req: ExchangeReq, echo: &mut Echo) {
     if req.glade_id == WORKSPACE_CREATE {
         handle_create(shared, sid, req).await;
         return;
@@ -121,9 +156,10 @@ pub(crate) async fn handle_request(shared: &Arc<Shared>, sid: SessionId, req: Ex
                 shared.providers.lock().await.get(&(req.share.clone(), req.glade_id.clone())).copied();
             match provider {
                 Some(psid) => {
-                    // corr → requester; the provider's ExchangeRes routes back
-                    // through handle_response. Corr preserved 1:1 (trace D2).
-                    shared.pending.lock().await.insert(req.corr.clone(), sid);
+                    // the handler sees a correlation this node minted, never
+                    // the caller's, and echoes it 1:1; handle_response routes
+                    // its ExchangeRes back on it (trace D2, F16).
+                    req.corr = shared.pending.lock().await.file(sid, req.corr);
                     send(shared, psid, &Frame::ExchangeReq(req)).await;
                 }
                 None => {
@@ -216,11 +252,13 @@ async fn create_request(
 }
 
 /// An inbound `ExchangeRes` (the attached provider answering): resolve the
-/// pending correlation and deliver to the recorded requester (trace D4/D5).
-pub(crate) async fn handle_response(shared: &Arc<Shared>, res: ExchangeRes) {
-    let target = shared.pending.lock().await.remove(&res.corr);
-    if let Some(t) = target {
-        send(shared, t, &Frame::ExchangeRes(res)).await;
+/// minted correlation and deliver to the recorded requester, under its own
+/// correlation again (trace D4/D5, F16).
+pub(crate) async fn handle_response(shared: &Arc<Shared>, mut res: ExchangeRes) {
+    let caller = shared.pending.lock().await.answered(&res.corr);
+    if let Some((sid, corr)) = caller {
+        res.corr = corr;
+        send(shared, sid, &Frame::ExchangeRes(res)).await;
     } // unknown corr: dropped — never folded, never broadcast
 }
 
@@ -294,7 +332,7 @@ pub(crate) async fn serve_peer_exchange(
             let why = refusal(&holder, &req.glade_id, &req.share, denial);
             res_err(&corr, &why).to_bytes()
         }
-        None => answer_forwarded(&shared, req).await,
+        None => answer_forwarded(&shared, req, PROVIDER_TIMEOUT).await,
     };
     conversation.send_encoded(&bytes)?;
     conversation.end();
@@ -302,8 +340,9 @@ pub(crate) async fn serve_peer_exchange(
 }
 
 /// Answer an admitted forwarded exchange through a synthetic session: the
-/// provider's `ExchangeRes`, or the timeout's, as the bytes of one frame.
-async fn answer_forwarded(shared: &Arc<Shared>, req: ExchangeReq) -> Vec<u8> {
+/// provider's `ExchangeRes`, or the timeout's after `wait`, as the bytes of
+/// one frame. The session then ends, and forgets a call it left unanswered.
+async fn answer_forwarded(shared: &Arc<Shared>, req: ExchangeReq, wait: Duration) -> Vec<u8> {
     let corr = req.corr.clone();
     let sid = shared.next.fetch_add(1, Ordering::SeqCst);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
@@ -311,17 +350,14 @@ async fn answer_forwarded(shared: &Arc<Shared>, req: ExchangeReq) -> Vec<u8> {
 
     let mut echo = Echo::new(); // undeclared ids keep the echo answer even here
     handle_request(shared, sid, req, &mut echo).await;
-    let bytes = match tokio::time::timeout(PROVIDER_TIMEOUT, rx.recv()).await {
+    let bytes = match tokio::time::timeout(wait, rx.recv()).await {
         Ok(Some(b)) => b,
         _ => res_err(&corr, "provider timeout at claim holder").to_bytes(),
     };
 
     shared.out.lock().await.remove(&sid);
-    // a never-answered pending entry must not leak (nor swallow a corr reuse):
-    let mut pending = shared.pending.lock().await;
-    if pending.get(&corr) == Some(&sid) {
-        pending.remove(&corr);
-    }
+    // a call the session filed and never saw answered must not leak.
+    shared.pending.lock().await.forget(sid);
     bytes
 }
 
@@ -379,7 +415,8 @@ mod tests {
     }
 
     /// The LOCAL leg on one node: a declared exchange surface routes to the
-    /// attached authority provider (corr preserved 1:1, response routed back),
+    /// attached authority provider (on the node's corr, 1:1; the response
+    /// routed back on the caller's own, F16),
     /// answers `ok:false` data BEFORE any provider attaches, and an UNDECLARED
     /// glade id keeps the legacy echo answer byte-for-byte.
     #[tokio::test]
@@ -416,17 +453,18 @@ mod tests {
         wp.send_binary(&sub("s", "d.ops")).await.unwrap();
         assert!(matches!(next_frame(&mut rp, "provider attach ack").await, Frame::Heads(_)));
 
-        // (3) request -> provider (corr + payload intact) -> response -> requester.
+        // (3) request -> provider (on the node's corr, F16) -> response -> requester (on its own).
         wc.send_binary(&xreq("s", "d.ops", "c1", b"workspace.status")).await.unwrap();
-        match next_frame(&mut rp, "provider receives the request").await {
+        let corr = match next_frame(&mut rp, "provider receives the request").await {
             Frame::ExchangeReq(req) => {
-                assert_eq!((req.corr.as_str(), req.payload.as_slice()), ("c1", b"workspace.status".as_slice()));
+                assert_eq!(req.payload, b"workspace.status");
+                req.corr
             }
             other => panic!("provider expected ExchangeReq, got {other:?}"),
-        }
+        };
         wp.send_binary(
             &Frame::ExchangeRes(ExchangeRes {
-                corr: "c1".into(),
+                corr,
                 ok: true,
                 payload: Some(b"12 clean".to_vec()),
                 error: None,
@@ -805,7 +843,8 @@ mod tests {
     ///       end to end (discovery C);
     ///   (c) a gwz exchange (gwz.ops) round-trips: A routes it to the claim
     ///       holder B — never answered from A's replica (fan-out asymmetry) —
-    ///       B's attached grazel provider answers, corr preserved 1:1 (D);
+    ///       B's attached grazel provider answers on B's own correlation,
+    ///       and the requester sees its own back (D, F16);
     ///   (d) an exchange against a share with no live claim answers bounded
     ///       `ok:false` data with the reason, and the session stays usable (E).
     ///
@@ -891,16 +930,17 @@ mod tests {
 
         // ---- (c) the gwz exchange round-trips through the authority ---------
         wc.send_binary(&xreq("ws-razel", "gwz.ops", "x-42", b"workspace.status")).await.unwrap();
-        match next_frame(&mut rp, "grazel receives the forwarded exchange").await {
+        let corr = match next_frame(&mut rp, "grazel receives the forwarded exchange").await {
             Frame::ExchangeReq(req) => {
-                assert_eq!(req.corr, "x-42", "correlation id preserved 1:1 across the hop");
+                assert_ne!(req.corr, "x-42", "the handler sees B's correlation");
                 assert_eq!(req.payload, b"workspace.status");
+                req.corr
             }
             other => panic!("grazel expected ExchangeReq, got {other:?}"),
-        }
+        };
         wp.send_binary(
             &Frame::ExchangeRes(ExchangeRes {
-                corr: "x-42".into(),
+                corr,
                 ok: true,
                 payload: Some(b"12 clean, 1 dirty".to_vec()),
                 error: None,
@@ -1033,5 +1073,185 @@ mod tests {
         assert_eq!(passed.unwrap(), answer(&well_formed));
         let app = forwarded("d.ops", answer(&nested));
         assert_eq!(app.unwrap(), answer(&nested));
+    }
+
+    /// One node serving the declared `d.ops` exchange on share `s`, with its
+    /// provider attached: the node's state, its port and the provider (F16).
+    async fn provided(name: &str) -> (Arc<Shared>, u16, ws::WsReader, ws::WsWriter) {
+        let decl = appdecl::parse("glade-app v0\napp demo\nservice demo d.ops\n").unwrap();
+        let (mut reg, n1) = sealed();
+        appdecl::register(&decl, &mut reg, &n1).unwrap();
+        let server = Server::open(fresh(name)).unwrap();
+        server.seed_registry(&reg.snapshot()).await;
+        let shared = server.shared.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(server.run(listener));
+        let (mut rp, wp) = ws::connect("127.0.0.1", port).await.unwrap();
+        wp.send_binary(&sub("s", "d.ops")).await.unwrap();
+        let ack = next_frame(&mut rp, "provider attach ack").await;
+        assert!(matches!(ack, Frame::Heads(_)), "{ack:?}");
+        (shared, port, rp, wp)
+    }
+
+    /// A caller's call on `d.ops`, as `corr`.
+    async fn ask(w: &ws::WsWriter, corr: &str, payload: &[u8]) {
+        let req = xreq("s", "d.ops", corr, payload);
+        w.send_binary(&req).await.unwrap();
+    }
+
+    /// The provider's answer on `corr`.
+    async fn answer(wp: &ws::WsWriter, corr: &str, payload: &[u8]) {
+        let res = ExchangeRes {
+            corr: corr.into(),
+            ok: true,
+            payload: Some(payload.to_vec()),
+            error: None,
+        };
+        let bytes = Frame::ExchangeRes(res).to_bytes();
+        wp.send_binary(&bytes).await.unwrap();
+    }
+
+    /// The provider's next frame, which must be a call.
+    async fn next_call(rp: &mut ws::WsReader, what: &str) -> ExchangeReq {
+        match next_frame(rp, what).await {
+            Frame::ExchangeReq(req) => req,
+            other => panic!("the provider expected {what}, got {other:?}"),
+        }
+    }
+
+    /// A caller's next frame, which must be a reply: its corr and payload.
+    async fn next_reply(r: &mut ws::WsReader, what: &str) -> (String, String) {
+        match next_frame(r, what).await {
+            Frame::ExchangeRes(res) => {
+                let payload = res.payload.unwrap_or_default();
+                reply(&res.corr, &String::from_utf8_lossy(&payload))
+            }
+            other => panic!("the caller expected {what}, got {other:?}"),
+        }
+    }
+
+    fn reply(corr: &str, payload: &str) -> (String, String) {
+        (corr.into(), payload.into())
+    }
+
+    /// How many calls the node holds filed, each awaiting its answer.
+    async fn filed(shared: &Arc<Shared>) -> usize {
+        shared.pending.lock().await.calls.len()
+    }
+
+    /// F16: two sessions call one exchange at once, each as `c1`, since every
+    /// client numbers its calls from `c1`. Each receives its own reply, as
+    /// `c1`. The provider answers in arrival order and the later caller is
+    /// read first: filed under a shared `c1`, it got the earlier one's reply.
+    #[tokio::test]
+    async fn two_callers_numbering_alike_each_receive_their_own_reply() {
+        let (shared, port, mut rp, wp) = provided("f16-alike").await;
+        let (mut r1, w1) = ws::connect("127.0.0.1", port).await.unwrap();
+        let (mut r2, w2) = ws::connect("127.0.0.1", port).await.unwrap();
+        ask(&w1, "c1", b"from-1").await;
+        let first = next_call(&mut rp, "the first call").await;
+        ask(&w2, "c1", b"from-2").await;
+        let second = next_call(&mut rp, "the second call").await;
+        assert_eq!(first.payload, b"from-1");
+        assert_eq!(second.payload, b"from-2");
+        answer(&wp, &first.corr, b"to-1").await;
+        answer(&wp, &second.corr, b"to-2").await;
+        let later = next_reply(&mut r2, "the later caller's reply").await;
+        assert_eq!(later, reply("c1", "to-2"));
+        let earlier = next_reply(&mut r1, "the earlier caller's reply").await;
+        assert_eq!(earlier, reply("c1", "to-1"));
+        assert_eq!(filed(&shared).await, 0, "neither is still filed");
+    }
+
+    /// F16 across the mesh: two sessions on A call `gwz.ops`, served at B, at
+    /// once, each as `c1`. A forwards each on a conversation of its own, which
+    /// keys them apart there; B files each under a correlation it mints, so
+    /// each caller receives its own reply, as `c1`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_callers_across_the_mesh_each_receive_their_own_reply() {
+        let t = attach_nodes("f16-mesh", true).await;
+        let (mut rp, wp) = (t.rp, t.wp);
+        let (mut r1, w1) = ws::connect("127.0.0.1", t.port_a).await.unwrap();
+        let (mut r2, w2) = ws::connect("127.0.0.1", t.port_a).await.unwrap();
+        let from_1 = xreq("ws-razel", "gwz.ops", "c1", b"from-1");
+        w1.send_binary(&from_1).await.unwrap();
+        let first = next_call(&mut rp, "the first forwarded call").await;
+        let from_2 = xreq("ws-razel", "gwz.ops", "c1", b"from-2");
+        w2.send_binary(&from_2).await.unwrap();
+        let second = next_call(&mut rp, "the second forwarded call").await;
+        assert_eq!(first.payload, b"from-1");
+        assert_eq!(second.payload, b"from-2");
+        answer(&wp, &first.corr, b"to-1").await;
+        answer(&wp, &second.corr, b"to-2").await;
+        let later = next_reply(&mut r2, "the later caller's reply").await;
+        assert_eq!(later, reply("c1", "to-2"));
+        let earlier = next_reply(&mut r1, "the earlier caller's reply").await;
+        assert_eq!(earlier, reply("c1", "to-1"));
+    }
+
+    /// F16: a reply on a correlation the node holds no call under is dropped
+    /// without harm: one under the caller's own `c1`, which the node never
+    /// minted, and a second answer to an answered call. The filed call still
+    /// gets its one reply, and the caller's next reply is its next call's.
+    #[tokio::test]
+    async fn a_reply_on_an_unknown_correlation_is_dropped_without_harm() {
+        let (shared, port, mut rp, wp) = provided("f16-unknown").await;
+        let (mut rc, wc) = ws::connect("127.0.0.1", port).await.unwrap();
+        ask(&wc, "c1", b"ask").await;
+        let call = next_call(&mut rp, "the call").await;
+        answer(&wp, "c1", b"stray").await;
+        answer(&wp, &call.corr, b"answer").await;
+        answer(&wp, &call.corr, b"again").await;
+        let got = next_reply(&mut rc, "the call's reply").await;
+        assert_eq!(got, reply("c1", "answer"));
+        ask(&wc, "c2", b"next").await;
+        let next = next_call(&mut rp, "the next call").await;
+        answer(&wp, &next.corr, b"answered").await;
+        let got = next_reply(&mut rc, "the next call's reply").await;
+        assert_eq!(got, reply("c2", "answered"));
+        assert_eq!(filed(&shared).await, 0);
+    }
+
+    /// F16: a forwarded call its provider never answers stays filed until its
+    /// synthetic session ends, at the timeout, and is forgotten then. The call
+    /// another caller filed before it, also as `c1`, stays filed and answered.
+    #[tokio::test]
+    async fn a_never_answered_call_is_forgotten_when_its_session_ends() {
+        let (shared, port, mut rp, wp) = provided("f16-unanswered").await;
+        let (mut rc, wc) = ws::connect("127.0.0.1", port).await.unwrap();
+        ask(&wc, "c1", b"kept").await;
+        let kept = next_call(&mut rp, "the caller's call").await;
+        let lost = ExchangeReq {
+            share: "s".into(),
+            glade_id: "d.ops".into(),
+            corr: "c1".into(),
+            payload: b"lost".to_vec(),
+        };
+        let ended = answer_forwarded(&shared, lost, Duration::from_millis(100)).await;
+        let timeout = res_err("c1", "provider timeout at claim holder");
+        assert_eq!(ended, timeout.to_bytes(), "the session ends at the timeout");
+        let call = next_call(&mut rp, "the forwarded call").await;
+        assert_eq!(call.payload, b"lost");
+        assert_eq!(filed(&shared).await, 1, "only the caller's is kept");
+        answer(&wp, &kept.corr, b"late").await;
+        let got = next_reply(&mut rc, "the kept call's reply").await;
+        assert_eq!(got, reply("c1", "late"));
+        assert_eq!(filed(&shared).await, 0);
+    }
+
+    /// F16: the handler sees a correlation the node minted, not the caller's,
+    /// and echoes it; the caller sees its own back.
+    #[tokio::test]
+    async fn a_handler_sees_the_nodes_correlation_and_the_caller_its_own() {
+        let (_, port, mut rp, wp) = provided("f16-opaque").await;
+        let (mut rc, wc) = ws::connect("127.0.0.1", port).await.unwrap();
+        ask(&wc, "c1", b"ask").await;
+        let call = next_call(&mut rp, "the call").await;
+        assert_ne!(call.corr, "c1", "the handler sees the node's correlation");
+        assert_eq!(call.payload, b"ask");
+        answer(&wp, &call.corr, b"answer").await;
+        let got = next_reply(&mut rc, "the reply").await;
+        assert_eq!(got, reply("c1", "answer"));
     }
 }

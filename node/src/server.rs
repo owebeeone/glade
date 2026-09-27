@@ -20,6 +20,7 @@ use glade_grant_api::{GrantPort, Holder};
 
 use crate::echo::Echo;
 use crate::envelope;
+use crate::exchange::Pending;
 use crate::frame::Frame;
 use crate::grants::{names_a_node, no_principal, refusal, Policy, PolicyView, READ_SUBSCRIBE};
 use crate::mesh::Mesh;
@@ -50,9 +51,10 @@ pub(crate) struct Shared {
     /// `(share, glade_id) -> session`. Exchanges route here, never to a replica
     /// (the fan-out asymmetry, `exchange.rs`).
     pub(crate) providers: Mutex<BTreeMap<(String, String), SessionId>>,
-    /// In-flight exchanges: correlation id -> the requesting session, so a
-    /// provider's `ExchangeRes` routes back 1:1 (never folded, never fanned).
-    pub(crate) pending: Mutex<BTreeMap<String, SessionId>>,
+    /// In-flight exchanges, each under a correlation this node mints, so a
+    /// provider's `ExchangeRes` routes back 1:1 to its caller (never folded,
+    /// never fanned; F16, `exchange.rs`).
+    pub(crate) pending: Mutex<Pending>,
     /// The adopted directory-write authority (`claims.rs`), set once by
     /// `adopt_boot`. `None` = a store-only node: it serves and replicates but
     /// never mints directory records of its own.
@@ -95,7 +97,7 @@ impl Server {
                 next: AtomicU64::new(1),
                 mesh: OnceLock::new(),
                 providers: Mutex::new(BTreeMap::new()),
-                pending: Mutex::new(BTreeMap::new()),
+                pending: Mutex::new(Pending::default()),
                 dir: OnceLock::new(),
                 principals: Mutex::new(BTreeMap::new()),
                 policy: PolicyView::unavailable(),
