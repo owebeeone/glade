@@ -299,6 +299,10 @@ that `Ok`, as on any `Ok` (W3). Until then B does not hold it: A's fan-out
 skips the forward that carried it (W2), and A's gap carries it to B only when
 a forward reopens (W4).
 
+**Ruled, owner, 2026-09-27 ("all recommended"):** (a) and (b) as recommended. (a) is built in both
+clients as a follow-up of the client-writes plan (`dev-docs/GladeFirstSlicePlan.md`, F6); the node
+changes nothing.
+
 ## 5. Phases and steps
 
 **Rules for every step** (`GladeClientWritesPlan.md:358-369`): one commit per

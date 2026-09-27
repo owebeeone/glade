@@ -5402,6 +5402,10 @@ What they do not prove:
 5. **When the desk runs the command**: once the owner means to stay on this
    build, since an older one then refuses the instance (section 7).
 
+**Ruled, owner, 2026-09-27 ("all recommended"):** 1 `--out` stays absolute; 2 one recovery key per
+node; 3 the file holds the bare 32-byte seed; 4 `--recovery-out` is taken at a first boot only; 5 the
+owner runs the command on the desk once he means to stay on this build.
+
 ### Measured (4.1c)
 
 2026-09-27, Apple M3 Pro, Rust 1.96.0, on the final tree:
@@ -6238,3 +6242,13 @@ nothing new on stderr.
     pairing.
 11. **The split.** Recommend part 1, then part 2, then the crossing, each gated
     and replayed. The alternative is one commit of about 600 production lines.
+
+**Ruled, owner, 2026-09-27 ("all recommended"):** 1 `--config <absolute path>` on the booted form,
+the line format, 0600, refused whole on any bad line; 2 no profile changes: given no file, every
+profile binds `127.0.0.1:0` alone with relays off; 3 the portmapper off in every configuration, with
+no switch; 4 lines name endpoints by the 10-hex short form, the full id comes only from `endpoint-id`,
+and `--peer` stays; 5 `ConfigPort` stays in glade-node; 6 `relay` takes `off` or `n0`, and a peer's
+relay URL is one of n0's four; 7 iroh's net-report defaults; 8 the node prints the notes; 9 run 1,
+then run 2, the Pi accepting and dabeest dialing, the scratch instances deleted afterwards; 10 the
+record names the ALPN and the pairing too, our own relay being the remedy; 11 part 1, part 2, then
+the crossing.

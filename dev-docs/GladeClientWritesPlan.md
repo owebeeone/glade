@@ -309,6 +309,18 @@ node's half; Steps 3.1 and 3.3 the clients'.
 "not placed", not "refused": the client keeps the op and its chain, and sends them again. Steps 3.1 and 3.3
 build it (`GladeCrossNodeWritesPlan.md`).
 
+**Ruled, owner, 2026-09-27 ("all recommended"), the open points of Phases 3 and 4** (questions 1-17 of the
+lane owner's list of 2026-09-24). Kept as built: `on_unplaced`/`onUnplaced`; outcome calls resolving at the
+node's first answer, "not placed" included; one backoff timer per zone in both clients; no time limit on an
+outcome or a subscribe's wait, a node older than Phase 2 included (callers add one); `subscribe` failing when
+the connection is gone; `subscribeOutcome`'s shape; untakeable frames logged, not thrown; a replay counting
+ops a consumer threw on; a twice-refused chain picked up afresh by the next write; gwz's output appends
+fire-and-forget, for now. To build (`dev-docs/GladeFirstSlicePlan.md`, "Follow-ups ruled 2026-09-27"):
+neither client sends past an unplaced op of its chain, the cross-node plan's point (a) (F6); client-ts
+skips an op whose resend still waits, as client-rs does (F6); client-rs resubscribes a `ShareController`
+surface whose chain a refusal stopped (F7); the node refuses `stream`-shaped client ops (F3); a format-only
+commit on glade-gwz, then `fmt --check` in its gate (F8).
+
 ## 6. The session contract
 
 Step 1.1 writes these rules, as ruled, into `glade/dev-docs/GladeSubstrateV1.md`
