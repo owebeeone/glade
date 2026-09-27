@@ -471,7 +471,9 @@ fn both_roots_lease_their_claims_for_five_minutes_by_default() {
 /// first start warns on stderr, on its line, of the seed whose share no loaded
 /// `workspace` line declares, and registers it. For the second start the file
 /// gains `revoke owner x`: the one revocation registers, and records.json's
-/// fold then grants `owner` nothing on `x` and keeps its grant on `ws-x`.
+/// fold then grants `owner` nothing on `x` and keeps its grant on `ws-x`. That
+/// start also warns, on the seed's line, that the `revoke` line cancels it
+/// (F4).
 #[test]
 fn both_roots_warn_of_a_seeds_undeclared_share_and_register_a_revoke_line() {
     let dir = scratch("revoke-line");
@@ -503,9 +505,13 @@ fn both_roots_warn_of_a_seeds_undeclared_share_and_register_a_revoke_line() {
 
         std::fs::write(&app, format!("{seeds}revoke owner x\n")).unwrap();
         let (lines, stderr) = start_and_stop(&home, root, &args);
+        let cancelled = format!(
+            "{path}: warning: line 4: `revoke owner x` on line 6 withdraws every grant of the pair, \
+             for good; the grant registers, and allows nothing"
+        );
         assert_eq!(
             warnings(&stderr),
-            [warned.as_str()],
+            [warned.as_str(), cancelled.as_str()],
             "{root:?}: the seed line stays"
         );
         let registered = "app x registered (+1 record(s), 3 unchanged)".to_string();
@@ -519,6 +525,54 @@ fn both_roots_warn_of_a_seeds_undeclared_share_and_register_a_revoke_line() {
             "{root:?}"
         );
         assert_eq!(registry.grants_for("owner", "ws-x"), ["read.*"], "{root:?}");
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// F4 (the owner's ruling of 2026-09-27), on each root: the odd spellings of
+/// a grant, a verb of just `*` and a node's id written with capitals, and a
+/// seed that another loaded file's `revoke` line cancels, are each warned on
+/// stderr, on the seed's file and line, in that order; the start goes on, and
+/// the revoking file is warned of nothing.
+#[test]
+fn both_roots_warn_of_odd_grant_spellings_and_a_seed_another_file_revokes() {
+    let dir = scratch("odd-grants");
+    let home = dir.join("glade-home");
+    let capitals = "0123456789ABCDEF".repeat(4);
+    let (seeds, revokes) = (dir.join("a.glade"), dir.join("b.glade"));
+    let text = format!(
+        "glade-app v1\napp a\nseed owner ws-x read.*,*\nseed {capitals} ws-x read.*\nworkspace ws-x notes\n"
+    );
+    std::fs::write(&seeds, text).unwrap();
+    std::fs::write(&revokes, "glade-app v1\napp b\nrevoke owner ws-x\n").unwrap();
+    let (a, b) = (seeds.display().to_string(), revokes.display().to_string());
+    let told = [
+        format!(
+            "{a}: warning: line 3: the verb `*` allows only a verb named `*`, for a pattern is \
+             written `p.*`, as `read.*` allows every verb that begins `read.`; the grant registers"
+        ),
+        format!(
+            "{a}: warning: line 4: the principal `{capitals}` is a node's id written with capitals, \
+             which names no node: a node's id is lower-case hex, and a client may claim this name; \
+             the line registers"
+        ),
+        format!(
+            "{a}: warning: line 3: `revoke owner ws-x` on line 3 of {b} withdraws every grant of the \
+             pair, for good; the grant registers, and allows nothing"
+        ),
+    ];
+    let warnings = |stderr: &str| -> Vec<String> {
+        let warned = stderr.lines().filter(|line| line.contains(": warning: "));
+        warned.map(str::to_owned).collect()
+    };
+    for (root, name) in [(Root::HandWritten, "h"), (Root::Assembled, "a")] {
+        let named = ["--profile", "local", "--name", name];
+        let apps = ["--app", &a, "--app", &b, "0"];
+        let args: Vec<&str> = named.into_iter().chain(apps).collect();
+        let (lines, stderr) = start_and_stop(&home, root, &args);
+        assert_eq!(warnings(&stderr), told, "{root:?}");
+        let registered = "app b registered (+1 record(s), 0 unchanged)".to_string();
+        assert!(lines.contains(&registered), "{root:?}: {lines:?}");
     }
     std::fs::remove_dir_all(&dir).unwrap();
 }

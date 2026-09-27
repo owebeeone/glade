@@ -62,6 +62,10 @@
 //! [`load_all`] warns on a seed whose share no `workspace` line of that start
 //! declares (plan Step 4.3's precondition 4). A `revoke` line is never warned
 //! for its share: withdrawing a grant on a share nothing serves is its use.
+//! [`load_all`] also warns on a seed a `revoke` line of that start cancels,
+//! and `parse` on the odd spellings, a verb of just `*` and a node's id
+//! written with capitals (F4, the owner's ruling of 2026-09-27). Each is a
+//! warning: the line still registers.
 
 use std::fs;
 use std::io;
@@ -177,6 +181,38 @@ fn undeclared_seed_share(share: &str) -> String {
          names a workspace share (expected on a node that reads a share another node serves)"
     )
 }
+/// What a seed whose pair a loaded `revoke` line names is told, on its line
+/// ([`load_all`]; F4, the owner's ruling of 2026-09-27): a revocation wins
+/// over every grant of its pair, made before it or after, so the seed's grant
+/// allows nothing. `at` is where the `revoke` line is: `line M`, or
+/// `line M of <file>` in another file of the start.
+fn cancelled_seed(principal: &str, share: &str, at: &str) -> String {
+    format!(
+        "`revoke {principal} {share}` on {at} withdraws every grant of the pair, for good; the \
+         grant registers, and allows nothing"
+    )
+}
+/// What a seed's verb of just `*` is told, on its line (F4): a verb that ends
+/// in `.*` is a pattern, and a lone `*` is none (`glade_grant_api::admits`).
+const LONE_STAR_VERB: &str = "the verb `*` allows only a verb named `*`, for a pattern is \
+     written `p.*`, as `read.*` allows every verb that begins `read.`; the grant registers";
+/// What a principal written as a node's id with capitals is told, on its
+/// `seed` or `revoke` line (F4): a node's id is 64 lower-case hex digits
+/// (`grants::names_a_node`), so this token names no node, and a client may
+/// claim it as its principal.
+fn capitalised_node_id(principal: &str) -> String {
+    format!(
+        "the principal `{principal}` is a node's id written with capitals, which names no node: \
+         a node's id is lower-case hex, and a client may claim this name; the line registers"
+    )
+}
+/// Whether `principal` is written as a node's id with capitals: 64 hex
+/// digits, one or more of them an upper-case letter.
+fn capitalised_hex(principal: &str) -> bool {
+    principal.len() == 64
+        && principal.bytes().all(|b| b.is_ascii_hexdigit())
+        && principal.bytes().any(|b| b.is_ascii_uppercase())
+}
 /// The authority kinds (decl surface): the share is the source of record, or
 /// the share caches external truth.
 const AUTHORITIES: [&str; 2] = ["share", "external"];
@@ -202,18 +238,22 @@ pub struct AppDecl {
     pub seeds: Vec<CapabilityGrant>,
     /// The line each seed is on, in the order of `seeds`. Parse data only:
     /// [`load_all`] reads it to warn on a seed no loaded `workspace` line
-    /// declares the share of.
+    /// declares the share of, and on one a loaded `revoke` line cancels.
     pub seed_lines: Vec<usize>,
     /// The `revoke` lines (plan Step 4.3), each the pair it withdraws every
     /// grant of.
     pub revocations: Vec<CapabilityRevocation>,
+    /// The line each `revoke` is on, in the order of `revocations`. Parse data
+    /// only: [`load_all`]'s warning on a seed it cancels names it (F4).
+    pub revocation_lines: Vec<usize>,
     pub workspaces: Vec<WorkspaceDecl>,
     /// The non-fatal channel (R10(a)): line-numbered messages about a file
     /// that still loads. `parse` fills it in file order — a `v0` header's
-    /// warning, then each binding line's zone and retention checks — then
-    /// [`load_all`] adds one per seed whose share no loaded `workspace` line
-    /// declares, and whoever loaded the file prints it (see
-    /// [`AppDecl::warning_lines`]).
+    /// warning, then each binding line's zone and retention checks, and each
+    /// `seed` or `revoke` line's odd spellings (F4) — then [`load_all`] adds
+    /// one per seed whose share no loaded `workspace` line declares, and one
+    /// per seed a loaded `revoke` line cancels, and whoever loaded the file
+    /// prints it (see [`AppDecl::warning_lines`]).
     pub warnings: Vec<String>,
 }
 
@@ -402,11 +442,20 @@ pub fn parse(text: &str) -> Result<AppDecl, String> {
                 if toks.len() != 4 {
                     return Err(format!("line {n}: `seed <principal> <share> <verb[,verb...]>`"));
                 }
-                decl.seeds.push(CapabilityGrant {
+                let seed = CapabilityGrant {
                     principal: toks[1].into(),
                     share: toks[2].into(),
                     verbs: toks[3].split(',').map(str::to_string).collect(),
-                });
+                };
+                // F4: the odd spellings, told on the line; the grant registers.
+                if capitalised_hex(&seed.principal) {
+                    let told = capitalised_node_id(&seed.principal);
+                    decl.warnings.push(format!("line {n}: {told}"));
+                }
+                if seed.verbs.iter().any(|verb| verb == "*") {
+                    decl.warnings.push(format!("line {n}: {LONE_STAR_VERB}"));
+                }
+                decl.seeds.push(seed);
                 decl.seed_lines.push(n);
             }
             "revoke" => {
@@ -418,10 +467,15 @@ pub fn parse(text: &str) -> Result<AppDecl, String> {
                 if toks.len() != 3 {
                     return Err(format!("line {n}: `revoke <principal> <share>`"));
                 }
+                if capitalised_hex(toks[1]) {
+                    let told = capitalised_node_id(toks[1]);
+                    decl.warnings.push(format!("line {n}: {told}"));
+                }
                 decl.revocations.push(CapabilityRevocation {
                     principal: toks[1].into(),
                     share: toks[2].into(),
                 });
+                decl.revocation_lines.push(n);
             }
             "workspace" => {
                 if decl.app.is_empty() {
@@ -566,8 +620,10 @@ pub fn load(path: impl AsRef<Path>) -> io::Result<AppDecl> {
 ///
 /// The files that load are then checked together: a seed whose share no
 /// `workspace` line of any of them declares is warned on its line (plan Step
-/// 4.3's precondition 4), after the file's own warnings. The files are the
-/// start's, so a seed may rely on another file's `workspace` line.
+/// 4.3's precondition 4), after the file's own warnings, and then a seed
+/// whose pair a `revoke` line of any of them names (F4). The files are the
+/// start's, so a seed may rely on another file's `workspace` line, and is
+/// cancelled by another file's `revoke` line.
 pub fn load_all<P: AsRef<Path>>(paths: &[P]) -> io::Result<Vec<AppDecl>> {
     let mut decls: Vec<AppDecl> = paths.iter().map(load).collect::<io::Result<_>>()?;
     for (later, decl) in decls.iter().enumerate() {
@@ -584,12 +640,62 @@ pub fn load_all<P: AsRef<Path>>(paths: &[P]) -> io::Result<Vec<AppDecl>> {
         }
     }
     warn_undeclared_seed_shares(&mut decls);
+    warn_cancelled_seeds(&mut decls, paths);
     Ok(decls)
+}
+
+/// Warn, on its line, each seed whose pair a `revoke` line in `decls` names:
+/// [`load_all`]'s second check over the files of one start (F4), `paths`
+/// naming them. The revocation wins over every grant of its pair, so the
+/// seed's grant allows nothing. The seed still registers.
+fn warn_cancelled_seeds<P: AsRef<Path>>(decls: &mut [AppDecl], paths: &[P]) {
+    let told: Vec<Vec<String>> = decls
+        .iter()
+        .enumerate()
+        .map(|(file, decl)| {
+            let seeds = decl.seeds.iter().zip(&decl.seed_lines);
+            let cancelled = seeds.filter_map(|(seed, n)| {
+                let at = revoke_line(decls, paths, file, seed)?;
+                let why = cancelled_seed(&seed.principal, &seed.share, &at);
+                Some(format!("line {n}: {why}"))
+            });
+            cancelled.collect()
+        })
+        .collect();
+    for (decl, told) in decls.iter_mut().zip(told) {
+        decl.warnings.extend(told);
+    }
+}
+
+/// Where a `revoke` line in `decls` names `seed`'s pair: `line M` in the
+/// seed's own file, the `file`th, else `line M of <path>` in the first other
+/// file that has one; `None` when no line does.
+fn revoke_line<P: AsRef<Path>>(
+    decls: &[AppDecl],
+    paths: &[P],
+    file: usize,
+    seed: &CapabilityGrant,
+) -> Option<String> {
+    let line_in = |decl: &AppDecl| {
+        let revokes = decl.revocations.iter().zip(&decl.revocation_lines);
+        let names = |(r, _): &(&CapabilityRevocation, &usize)| {
+            r.principal == seed.principal && r.share == seed.share
+        };
+        revokes.filter(names).map(|(_, m)| *m).next()
+    };
+    if let Some(m) = line_in(&decls[file]) {
+        return Some(format!("line {m}"));
+    }
+    let (other, m) = decls
+        .iter()
+        .enumerate()
+        .find_map(|(i, decl)| Some((i, line_in(decl)?)))?;
+    Some(format!("line {m} of {}", paths[other].as_ref().display()))
 }
 
 /// Warn, on its line, each seed whose share no `workspace` line in `decls`
 /// declares: [`load_all`]'s check over the files of one start. The seed still
-/// registers; a `revoke` line is not checked.
+/// registers; a `revoke` line's share is not checked.
 fn warn_undeclared_seed_shares(decls: &mut [AppDecl]) {
     let declared: Vec<String> = decls
         .iter()
@@ -1756,6 +1862,89 @@ mod tests {
             undeclared_seed_share("grazel"),
             "no loaded `workspace` line declares the share `grazel`; the grant registers, but a seed \
              names a workspace share (expected on a node that reads a share another node serves)"
+        );
+    }
+
+    /// F4 (the owner's ruling of 2026-09-27): a seed whose pair a `revoke`
+    /// line of the start names allows nothing, for the revocation wins over
+    /// every grant of its pair. [`load_all`]'s check warns on the seed's line,
+    /// naming the `revoke` line: by its number in the seed's own file, which
+    /// comes first, else by its number and file. A `revoke` line of another
+    /// pair warns of nothing, as grazel-app.glade's `revoke owner grazel`
+    /// beside its seeds on `ws-razel` does not, and nor does the line itself.
+    #[test]
+    fn a_seed_a_revoke_line_cancels_is_warned() {
+        let checked = |texts: &[&str]| -> Vec<Vec<String>> {
+            let mut decls: Vec<AppDecl> = texts.iter().map(|t| parse(t).unwrap()).collect();
+            warn_cancelled_seeds(&mut decls, &["a.glade", "b.glade"]);
+            decls.into_iter().map(|d| d.warnings).collect()
+        };
+        let told = |n: usize, at: &str| {
+            let why = cancelled_seed("owner", "ws-a", at);
+            format!("line {n}: {why}")
+        };
+        let none = Vec::<String>::new;
+
+        let one = v1_file("seed owner ws-a read.*\nseed owner ws-b read.*\nrevoke owner ws-a");
+        assert_eq!(checked(&[&one]), [vec![told(3, "line 5")]]);
+
+        let seeds = "glade-app v1\napp s\nseed owner ws-a read.*\n";
+        let revokes = "glade-app v1\napp r\n\nrevoke owner ws-a\n";
+        let (first, second) = (told(3, "line 4 of b.glade"), told(3, "line 4 of a.glade"));
+        assert_eq!(checked(&[seeds, revokes]), [vec![first], none()]);
+        assert_eq!(checked(&[revokes, seeds]), [none(), vec![second]]);
+        let both = v1_file("seed owner ws-a read.*\nrevoke owner ws-a");
+        let own = told(3, "line 4");
+        assert_eq!(checked(&[revokes, &both]), [none(), vec![own]]);
+
+        let grazel = "seed owner ws-razel read.*\nrevoke owner grazel\nrevoke alice ws-razel";
+        assert_eq!(checked(&[&v1_file(grazel)]), [none()]);
+        assert_eq!(
+            cancelled_seed("owner", "ws-a", "line 5"),
+            "`revoke owner ws-a` on line 5 withdraws every grant of the pair, for good; the grant \
+             registers, and allows nothing"
+        );
+    }
+
+    /// F4: the odd spellings of a grant, each told on its line in file order,
+    /// and each line still registers. A verb of just `*` is no pattern
+    /// (`glade_grant_api::admits`): it allows only a verb named `*`. A
+    /// principal of 64 hex digits with one capital or more names no node,
+    /// whose id is lower-case hex, but a name a client may claim, on a
+    /// `seed` or a `revoke` line. The spellings the format page defines warn
+    /// of nothing: `owner`, a node's id in lower case, `read.*` and
+    /// `read.subscribe`; nor does a 63-digit token with capitals, which is
+    /// no node's id.
+    #[test]
+    fn the_odd_grant_spellings_are_warned() {
+        let node = "0123456789abcdef".repeat(4);
+        let (capitals, one_capital) = (node.to_uppercase(), format!("A{}", &node[1..]));
+        let lines = [
+            "seed owner ws-a read.*,*".to_string(),
+            format!("seed {capitals} ws-a read.*"),
+            format!("revoke {one_capital} ws-b"),
+            format!("seed {node} ws-a read.subscribe,gwz.*"),
+            format!("revoke {node} ws-b"),
+            format!("seed {} ws-a read.*", &capitals[1..]),
+        ];
+        let decl = parse(&v1_file(&lines.join("\n"))).unwrap();
+        let told = [
+            format!("line 3: {LONE_STAR_VERB}"),
+            format!("line 4: {}", capitalised_node_id(&capitals)),
+            format!("line 5: {}", capitalised_node_id(&one_capital)),
+        ];
+        assert_eq!(decl.warnings, told);
+        let registered = (decl.seeds.len(), decl.revocations.len());
+        assert_eq!(registered, (4, 2), "each registers");
+        assert_eq!(
+            LONE_STAR_VERB,
+            "the verb `*` allows only a verb named `*`, for a pattern is written `p.*`, as `read.*` \
+             allows every verb that begins `read.`; the grant registers"
+        );
+        assert_eq!(
+            capitalised_node_id("P"),
+            "the principal `P` is a node's id written with capitals, which names no node: a node's \
+             id is lower-case hex, and a client may claim this name; the line registers"
         );
     }
 }

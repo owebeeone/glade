@@ -92,3 +92,17 @@ fn every_shipped_file_loads_with_no_warning() {
         assert_eq!(v0.bindings, decl.bindings, "{rel}: the header moves no declaration");
     }
 }
+
+/// The desk's start (F4, the owner's ruling of 2026-09-27): grazel passes
+/// the node both of its app files, `--app apps/grazel-app.glade --app
+/// apps/gyld-app.glade`, and `load_all` checks them together. So a `revoke`
+/// line in either could cancel a seed in the other, which loading each alone
+/// cannot show. Loaded together, neither is warned of anything.
+#[test]
+fn the_desks_two_files_load_together_with_no_warning() {
+    let files = [path(SHIPPED[0]), path(SHIPPED[2])];
+    let decls = load_all(&files).unwrap();
+    for (file, decl) in files.iter().zip(&decls) {
+        assert_eq!(decl.warning_lines(file), Vec::<String>::new());
+    }
+}

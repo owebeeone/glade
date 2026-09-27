@@ -224,6 +224,8 @@ registers nothing new.
   over every grant of that pair, made before it or after it. A later `seed` of
   the same principal and share still registers a grant, and the grant allows
   nothing. No line undoes a revocation.
+  A `seed` that a `revoke` line among the files loaded at the same start
+  cancels is warned on the seed's line, naming the `revoke` line.
 - **Its share need not be a workspace share**, and the node does not warn about
   it: a revocation names the share the grants it withdraws name, and
   withdrawing grants on a share that nothing serves is one of its uses. For
@@ -396,6 +398,11 @@ id, holds no grant.
 A verb that ends in `.*` is a pattern: `p.*` allows every verb that begins
 with `p.`. So `read.*` allows `read.subscribe`, `gwz.*` allows `gwz.ops`, and
 `gyld.*` allows `gyld.ops`. Any other verb allows only itself.
+
+Two spellings are warned on their line, and the line still registers: a verb
+of just `*`, which allows only a verb named `*`, where a pattern is written
+`p.*`; and a principal of 64 hexadecimal digits with a capital letter, which
+names no node, since a node's id is lower-case (on a `revoke` line too).
 
 ## Changing or deleting a line
 
