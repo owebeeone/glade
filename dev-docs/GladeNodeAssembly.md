@@ -6446,3 +6446,251 @@ plus part 2):
   `lifecycle.rs` +11/−6; `tasks.rs` +4/−1;
 - tests: +176/−9: `mesh.rs` +124/−4; `tests/assembled_path.rs` +20/−3;
   `tests/lifecycle.rs` +19/−2; `iroh_carrier.rs` +13.
+
+### The crossing, 2026-09-27
+
+Run by an agent for the lane owner, on glade `4a34168`, as section 10 lays out
+and under the rulings: run 1, then run 2; the Pi accepts and dabeest dials;
+fresh scratch instances, deleted afterwards; `relay n0`; no NAT or firewall
+checks, and the path iroh picks noted, not measured. Times come from
+`stamp.py`. `<Pi node>` and `<dab node>` stand for the two node ids, which
+the logs carry in full.
+
+**The machines**
+
+| | the Pi | dabeest |
+| --- | --- | --- |
+| system | Raspberry Pi 5, Debian 13 aarch64, Rust 1.96.0 | Windows 11, MSYS bash, Rust 1.98.1 (MSVC) |
+| glade | `1192bf2` to `4a34168` by `pull --ff-only`; clean | `63a5799` to `4a34168`; clean |
+| Wi-Fi | `wlan0` `10.1.1.236/16` | `10.1.1.239/16` (`ipconfig`, read before each run) |
+| before the runs | no `glade-node`; UDP 4545 free | the same; no build or other heavy job (2% load) |
+| build, `--bin glade-node`, empty target | 183.2 s | 54.0 s |
+| suite, its compile included | 301.2 s: 346 passed | 58.7 s: 335 passed |
+| failed, the siblings' (not counted) | `binding_census` 5, `shipped_app_files` 1 | the same 6 |
+| failed, counted | none | 1: `assembled_path`'s `both_roots_warn_until_a_recovery_key_is_committed` |
+
+- Per suite, the Pi's then dabeest's where they differ: the library 237 and
+  232, `assembled_path` 21 and 20 of 21, `assembly` 29,
+  `assembly_registration` 1, `durable` 15, `endpoint_id` 3 and 2,
+  `instance_root` 1, `journeys` 12, `lifecycle` 6, `one_file_per_app` 3,
+  `release_order` 7, `start_refusals` 2, `stop_signal` 4 and 0, doc-tests 5.
+  dabeest's 10 fewer are Unix-only. The Pi's 346 and 6 make the gate's 352.
+- **The Pi's siblings are behind:** grazel `c9f9c7f` (2026-09-25),
+  glade-gyld `c9ef7a6` (09-23) and glade-gwz `a079921` (09-24), where the Mac
+  has `1df2782`, `2c0a9b3` and `35b38ba`. Its `grazel-app.glade` registers
+  `unchanged: 6` where the census expects 7, and warns at lines 50 and 51.
+  Only glade was pulled, as ruled.
+- **dabeest's counted failure is 4.1c's**, which no Windows run had met (its
+  last suite ran at `63a5799`). `recovery::warning` single-quotes any word
+  with a character outside `[A-Za-z0-9/._-+=:,@%]`, so on Windows it prints
+  `GLADE_HOME='C:\Users\…\glade-home'
+  '\\?\E:\git\glade-wz\scratch\4.5\target\debug\glade-node.exe' recovery
+  --name h …`, where the test expects both paths bare. dabeest's run logs
+  carry the same warning, its program path quoted, `\\?\` and all.
+- **The clocks**, each read over one held ssh session: the Pi 87.6 ms ahead of
+  dabeest before the runs and 89.7 ms after, each to within 5 ms. The Pi's
+  times below are moved onto dabeest's clock by 89 ms.
+
+**The ids.** `endpoint-id` minted each key in a new instance (`pi45`,
+`dab45`), and each id crossed through the Mac's pipe into a 0600 file on the
+other machine, as section 6 shows. The tags agree: the Pi's `e8cd666d9c` and
+dabeest's `2d22ccf41f`, each file's first 10 digits against the other
+machine's `endpoint-id`. Each file is 65 bytes, one line of 64 lower-case hex
+digits. Each instance then held `endpoint.key` alone, 32 bytes at 0600, with
+no lock left. The Pi's instance directory took the ssh session's umask, 0775
+(section 7's named gap).
+
+**The relay.** Every start, the Pi's three and dabeest's two, took the same
+home relay, `https://usw1-1.relay.n0.iroh.link./`, 3.1 to 3.6 s after it
+began (the Pi 3.61, 3.60 and 3.62 s; dabeest 3.13 and 3.11 s). That is the URL
+dabeest dialed in both runs. No `relay … not connected` line was printed, and
+no refusal or error. At each look (`ss -tunap` and `netstat -ano`, at about
+24 s in each run, and the Pi's again at 122 s in run 1), each node held one
+TCP connection beyond loopback, from its Wi-Fi address to `5.78.69.43:443`.
+
+**Run 1: loopback binds, everything through the relay.** dabeest started
+32.0 s after the Pi. Seconds count from dabeest's start (a stamp taken just
+before its `timeout`), on its clock.
+
+| s | the Pi (accepts) | dabeest (dials) |
+| --- | --- | --- |
+| −31.9 | `peer e8cd666d9c 127.0.0.1:41438`, `listening 34101` | |
+| −28.4 | `relay https://usw1-1.relay.n0.iroh.link./` | |
+| 0.12 | | `peer 2d22ccf41f 127.0.0.1:64815` |
+| 1.56 | `link <dab node> via relay https://usw1-1.relay.n0.iroh.link./, rtt 434 ms` | |
+| 1.73 | | `link <Pi node> via relay https://usw1-1.relay.n0.iroh.link./, rtt 991 ms` |
+| 1.99 | `home round with node <dab node>: 4 record(s) in 435 ms` | |
+| 2.07 | | `home round with node <Pi node>: 4 record(s) in 348 ms`, `peer-connected <Pi node>`, `listening 57670` |
+| 3.13 | | `relay https://usw1-1.relay.n0.iroh.link./` |
+| to 122.7 | nothing: the path stayed `via relay` | nothing |
+| 240 | | ended by force by its `timeout`, `exit 124`; UDP 64815 free at the next look |
+| 275.3 | `link <dab node> closed` | |
+| the Pi's 420 | SIGTERM from its `timeout`: `exit 0`, its session ended within 15 ms of the signal; UDP 41438 free at the next look | |
+
+- **HELLO:** from dabeest's `peer` line (its endpoint bound, the dial begun)
+  to its `link` line, 1.60 s, and to the Pi's, 1.44 s; 1.73 s from dabeest's
+  start.
+- **The round trip through usw1:** 434 ms by the Pi's estimate at HELLO, and
+  the rounds took 435 and 348 ms. dabeest's 991 ms is iroh's estimate at that
+  moment, early in the connection: the node notes the RTT only at HELLO and
+  at a change of path.
+- Both UDP sockets were on `127.0.0.1` alone, so every packet of the link
+  crossed usw1. QAD could not leave loopback, and both nodes still found a
+  relay, through the HTTPS probes, as section 10 expected.
+- **The close came 35.3 s after dabeest's end**, not the 30 s section 8 gives
+  for a peer that died on a relay path. The likely reason, not shown: QUIC
+  restarts its idle timer when the Pi sends its first probe after dabeest's
+  last packet, so the 30 s begin a few seconds after the end.
+
+**Run 2: Wi-Fi binds, iroh's choice**, on the same instances. dabeest started
+17.5 s after the Pi.
+
+| s | the Pi | dabeest |
+| --- | --- | --- |
+| −17.4 | `peer e8cd666d9c 10.1.1.236:4545`, `listening 39823` | |
+| −13.9 | `relay https://usw1-1.relay.n0.iroh.link./` | |
+| 0.11 | | `peer 2d22ccf41f 10.1.1.239:4545` |
+| 1.52 | `link <dab node> via relay https://usw1-1.relay.n0.iroh.link./, rtt 426 ms` | |
+| 1.68 | | `link <Pi node> via relay https://usw1-1.relay.n0.iroh.link./, rtt 967 ms` |
+| 1.77 | `link <dab node> via direct 10.1.1.239:4545, rtt 3 ms` | |
+| 1.78 | `home round with node <dab node>: 1 record(s) in 266 ms` | `home round with node <Pi node>: 3 record(s) in 101 ms`, `peer-connected <Pi node>`, `listening 57913` |
+| 1.94 | | `link <Pi node> via direct 10.1.1.236:4545, rtt 6 ms` |
+| 3.11 | | `relay https://usw1-1.relay.n0.iroh.link./` |
+| to 122.1 | nothing: direct | nothing: direct |
+| 143.50 | SIGTERM to its PID alone, shown first to be the scratch binary under its `timeout` | |
+| 143.67 | | `link <Pi node> closed` |
+| 146.34 | `exit 0`; UDP 4545 free the same moment (`ss` empty) | |
+| 165.3 | restarted on `pi45-2.conf`: `peer e8cd666d9c 10.1.1.236:4545`, 18.9 s after the release | nothing: dabeest dials once, and the Pi only admits |
+| 181.0 | SIGTERM to its PID: `exit 0` 0.18 s later, UDP 4545 free the same moment | |
+| 197.1 | | `taskkill //PID 4940 //F`, the PID's path first shown to be the scratch binary: `exit 1`; UDP 4545 free within 0.11 s |
+
+- **HELLO:** dabeest's `peer` line to its `link` line, 1.58 s, and to the
+  Pi's, 1.41 s; 1.68 s from its start. At HELLO the path was `via relay` on
+  both ends, as in run 1: dabeest named the relay alone.
+- **Direct, and when: yes.** Each end noted `via direct` at its link watch's
+  first poll, 251 ms (the Pi) and 255 ms (dabeest) after its HELLO line, 1.8 to
+  1.9 s after dabeest's start, and it stayed direct to 122 s. dabeest's round,
+  101 ms, is under a third of run 1's relayed rounds, so it most likely ran
+  direct before the poll saw the change. That is an inference: the lines show
+  when the poll saw the path, not when iroh switched.
+- Each node's relay connection stayed open beside the direct path (at 24 s).
+- **The Pi's stop took 2.84 s** from SIGTERM to exit, within `STOP_WITHIN`
+  (10 s), where the restart, with no link, took 0.18 s. dabeest noted the close
+  0.17 s after the signal, so the close reached it at once, and the rest was
+  the Pi's own drain. Section 4's `close` allows "about three seconds on a bad
+  link"; this link was direct at 3 ms, with its relay path at about 430 ms
+  beside it, on which QUIC's closing period is plausibly reckoned (not shown).
+- **The port's release:** UDP 4545 was free the moment each Pi node exited
+  (`ss` polled every 5 ms), and the restart bound it again. dabeest's forced
+  end freed it within 0.11 s.
+
+**Firewall.** No dialog or block was seen, and nothing was changed on either
+machine. dabeest's Private profile has `NotifyOnListen` on, but no user was
+logged on at its console (`query user`, after run 2), so no dialog could be
+shown or answered. A read-only query found no firewall rule naming the
+program, before run 2 or after it. The Pi reached `10.1.1.239:4545` directly:
+dabeest dials, so its own packets to the Pi likely opened the return path, as
+section 10 expected.
+
+**What n0 could see** (section 9), with what the run showed:
+
+- **Endpoint ids.** Both keys, at usw1. Each proved its key at each of its
+  starts, the Pi's three and dabeest's two, and usw1 relayed between them in
+  both runs, so it saw which ids talk to which. dabeest's dial reached usw1
+  before dabeest had a home relay of its own (its `relay` line came 1.4 s after
+  its `link`), and usw1 then became its home relay too: one relay saw both
+  ends, and nothing passed from one relay to another. The two keys stayed the
+  same across both runs and the restart, so n0 could tie the five connections
+  together. They are deleted now.
+- **IP addresses.** Each relay connection was TCP to `5.78.69.43:443`, from
+  `10.1.1.236` and `10.1.1.239` behind the one gateway, `10.1.1.1`, so usw1 saw
+  one public address for both machines. The node printed no public address,
+  and none was looked up. In run 2 the UDP socket on the Wi-Fi address could
+  also reach n0's QAD, which reflects the NAT's mapping of UDP 4545 (not
+  observed).
+- **Timing.** Each arrival at usw1, 3.1 to 3.6 s after a start, and each
+  departure: dabeest's by force, the Pi's by SIGTERM. In run 1 every datagram
+  of the link crossed usw1: 238 s of link from HELLO to dabeest's end, and the
+  Pi's 35 s after. In run 2, only the link's first quarter of a second, then
+  the relay path's pings beside the direct one (section 9; not observed).
+- **Volume.** Not measured: no capture, as ruled. In run 1 it was all of the
+  link: HELLO, both rounds (4 and 4 records) and about four and a half minutes
+  of keep-alives. In run 2, HELLO and at most the rounds' first packets.
+- **Beyond the four**, as section 9 sets out: both runs' connections began
+  through usw1 (each end's first `link` line reads `via relay`), so their first
+  packets carried the ALPN, `glade/node/3`, past n0; and the pairing, above.
+  Not observed directly: there was no capture.
+- **Added by the run:**
+  - One relay, n0's US West, at every start. So the relayed round trip was
+    about 430 ms by the Pi's estimate, and a relayed round 348 to 435 ms.
+    `aps1-1`, section 2's example, was not chosen.
+  - A dialer needs no home relay of its own to reach its peer through the URL
+    it names.
+  - The URL did not go stale: the Pi's home relay was usw1 at all three
+    starts.
+- **Not visible to n0**, as section 9 says: node ids, HELLO, the binding, the
+  `home` records and app data.
+
+**Adaptations of the commands**
+
+1. The Pi's build ran with `PATH=$HOME/.cargo/bin:$PATH`: a non-interactive
+   ssh shell there has no `cargo`, since only `.profile` and `.bashrc` source
+   `~/.cargo/env`.
+2. `--offline` on both machines' `cargo build` and `cargo test`, to hold the
+   run to its permitted network (GitHub, and n0's relays in the runs).
+   `node/Cargo.lock` is unchanged since `63a5799`, which both machines had
+   built and tested, so every crate was cached, and nothing was fetched.
+3. `--no-fail-fast` on `cargo test`: without it cargo stops at the first
+   failing test binary, `binding_census`, which fails for its siblings, and
+   the suites after it never run.
+4. The build and the suite wrote to `$S/build.log` and `$S/suite.log`, timed
+   with `date`.
+5. Each start was preceded by `date +%s.%N > <name>.t0`, the stamp the times
+   above count from.
+6. The Pi's restart logged to `pi45-2b.log`, since the commands name no log for
+   it, so that `pi45-2.log` keeps its `exit 0`.
+7. On the Pi, process checks used an anchored or bracketed pattern (`pgrep -f
+   "^$S/target/debug/glade-node "`, `pgrep -af
+   "[/]home/gianni/git/glade-wz/scratch/4.5/target"`): a bare one matches the
+   checking shell's own command line, as it did at the preconditions.
+8. During the runs, the logs were read through a filter on each machine that
+   replaced any id the machine held with a marker. None appeared.
+9. After the Pi's SIGTERM, `/proc/<pid>` and `ss` were polled every 5 ms, to
+   time the exit and the port's release.
+10. From the Mac, dabeest's ssh ran with `-o LogLevel=ERROR`, which drops the
+    client's post-quantum warning, and both with `-o ConnectTimeout=10`.
+11. Checked, not changed: dabeest's `timeout` is MSYS's `/usr/bin/timeout`,
+    ahead of Windows' `timeout.exe` on its `PATH`; `$PY` is
+    `/c/Users/gianni/AppData/Local/Programs/Python/Python313/python.exe`
+    (3.13.5), its `python3` being the Store's stub; and
+    `CARGO_TARGET_DIR=$S/target` reaches cargo as
+    `E:/git/glade-wz/scratch/4.5/target`, since MSYS converts it.
+12. Read only, beside the commands: each node's sockets in each run, dabeest's
+    firewall rules naming the program and its console sessions, and the clock
+    offsets.
+
+**Also unexpected**
+
+- dabeest's `instance` line mixes separators,
+  `E:/git/glade-wz/scratch/4.5/home\sys\dab45`, and its recovery warning names
+  the program as `'\\?\E:\…\glade-node.exe'` (the suite's failure above).
+- The suite keeps its scratch in each machine's temp directory, outside `$S`:
+  about 150 directories on each carry the run's time (5.2 MB on the Pi), under
+  fixed names that earlier runs made too, and on dabeest one is named by PID
+  and time, left by the failing test. They were left in place, being outside
+  the named directories.
+
+**Teardown**
+
+- No process under either scratch target, and no `glade-node.exe` on dabeest.
+- UDP 4545 free on both machines.
+- No log holds an endpoint id. On each machine `grep -c -F -f` found 0 lines
+  in every `*.log`, the build and suite logs included, with the other
+  machine's id file, the machine's own id file, and its own id taken again by
+  `endpoint-id` at the teardown (identical to the first, by `cmp`). No 64-digit
+  hex string in a run log is anything but the two node ids.
+- The logs and start stamps were copied to the Mac, identical by `md5`. Then
+  `rm -rf $S` on both machines, 6.3 GB on the Pi and 6.6 GB on dabeest: the
+  instances, both keys, the configuration and id files, the logs and the
+  builds. The rest of `scratch/`, and both glade checkouts, clean at
+  `4a34168`, are as they were.
