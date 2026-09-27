@@ -16,6 +16,8 @@
 //!      and a raw `stream` op is refused (F3), its zone left empty.
 //!   6. the follow-ups ruled 2026-09-27: a `ShareController` whose chain a
 //!      refusal stopped subscribes its surface again by itself (F7).
+//!   7. a zone refused after its ack is reported, and no longer live (F13):
+//!      two linked nodes, the claim holder refusing a forwarded read (F5).
 //!
 //! Requires the node binary; the harness builds it once if absent.
 
@@ -30,7 +32,7 @@ use tokio::process::{Child, Command};
 use glade_client::hash::op_hash;
 use glade_client::supplier::{Supplier, SupplierConfig, SupplierSurface};
 use glade_client::ws::{self, Msg};
-use glade_client::{Backoff, GladeClient, OpOutcome, SubscribeOutcome};
+use glade_client::{Backoff, GladeClient, OpOutcome, SubscribeOutcome, ZoneRefusal};
 use glade_wire::cbor;
 use glade_wire::generated::{self, ErrorCode, FrameType, Head, Op, Ops, Shape};
 
@@ -83,8 +85,14 @@ impl Drop for Tmp {
 /// Read the node's `listening <port>` line (bounded), then drain stdout so the
 /// pipe never fills while it serves.
 async fn wait_listening(child: &mut Child) -> u16 {
+    listening(child).await.1
+}
+
+/// `wait_listening`, with the lines the node printed before that one.
+async fn listening(child: &mut Child) -> (Vec<String>, u16) {
     let stdout = child.stdout.take().expect("piped stdout");
     let mut lines = BufReader::new(stdout).lines();
+    let mut before = Vec::new();
     let port = tokio::time::timeout(Duration::from_secs(15), async {
         while let Some(line) = lines.next_line().await.ok().flatten() {
             if let Some(rest) = line.strip_prefix("listening ") {
@@ -92,15 +100,16 @@ async fn wait_listening(child: &mut Child) -> u16 {
                     return Some(p);
                 }
             }
+            before.push(line);
         }
         None
     })
     .await
     .ok()
-    .flatten()
-    .expect("node printed a listening port");
+    .flatten();
+    let port = port.unwrap_or_else(|| panic!("node printed no listening port, after {before:?}"));
     tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
-    port
+    (before, port)
 }
 
 /// Boot a node with grazel-app.glade (declares `service grazel gwz.ops` +
@@ -582,4 +591,111 @@ async fn a_share_controller_resubscribes_a_chain_a_refusal_stopped() {
     sup.detach_all().await;
     other.close().await;
     node.kill().await.ok();
+}
+
+// ---- 7. a zone refused after its ack (F13) ---------------------------------
+
+/// `glade-node endpoint-id --name <name>` under `tmp`'s GLADE_HOME, as an
+/// operator reads it (plan Step 4.5): the instance's endpoint id, its key
+/// minted first.
+async fn endpoint_id(tmp: &Tmp, name: &str) -> String {
+    ensure_node_built();
+    let run = Command::new(node_bin())
+        .args(["endpoint-id", "--name", name])
+        .env("GLADE_HOME", tmp.path().join("gh"))
+        .env("HOME", tmp.path().join("h"))
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    let ran = tokio::time::timeout(Duration::from_secs(15), run).await;
+    let out = ran.expect("endpoint-id in time").expect("endpoint-id ran");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+/// The instance `name` booted under `tmp`'s GLADE_HOME and HOME, with `args`
+/// before its port, 0: the node, the lines it printed before `listening
+/// <port>`, and the port.
+async fn boot_as(tmp: &Tmp, name: &str, args: &[&str]) -> (Child, Vec<String>, u16) {
+    ensure_node_built();
+    let mut child = Command::new(node_bin())
+        .args(["--profile", "local", "--name", name])
+        .args(args)
+        .arg("0")
+        .env("GLADE_HOME", tmp.path().join("gh"))
+        .env("HOME", tmp.path().join("h"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn booted glade-node");
+    let (lines, port) = listening(&mut child).await;
+    (child, lines, port)
+}
+
+/// The rest of the first of `lines` that starts `word `.
+fn said<'a>(lines: &'a [String], word: &str) -> &'a str {
+    let prefix = format!("{word} ");
+    let found = lines.iter().find_map(|line| line.strip_prefix(&prefix));
+    found.unwrap_or_else(|| panic!("no `{word}` line in {lines:?}"))
+}
+
+/// F13 (the owner's answer (a) to F5's question): a zone refused after its
+/// subscribe was acked is reported to `on_zone_refused`, and is no longer
+/// live. Two nodes on loopback, relays off (`--peer`): B loads
+/// grazel-app.glade, so it serves ws-razel, and admits A's endpoint but
+/// grants A's node nothing; A dials B. A acks a subscribe to ws-razel/ws.tree
+/// from its empty replica, and B's refusal of the forwarded read then reaches
+/// the client as an `Error` naming the zone and no op (F5). A later subscribe
+/// asks again: acked, forwarded again, and refused again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_zone_refused_after_its_ack_is_reported_and_no_longer_live() {
+    let tmp = Tmp::new("refused-after-ack");
+    let (a_id, b_id) = (endpoint_id(&tmp, "a").await, endpoint_id(&tmp, "b").await);
+    let app = manifest().join("../apps/grazel-app.glade");
+    let app = app.to_str().unwrap();
+    let (mut b, b_lines, _) = boot_as(&tmp, "b", &["--app", app, "--peer", &a_id]).await;
+    let b_node = said(&b_lines, "node");
+    // `peer <tag> <ip:port>`: where B's endpoint listens.
+    let b_at = said(&b_lines, "peer").split(' ').nth(1).unwrap();
+    let dial = format!("{b_id}@{b_at}");
+    let (mut a, a_lines, a_port) = boot_as(&tmp, "a", &["--peer", &dial]).await;
+    let round = format!("home round with node {b_node}");
+    let linked = a_lines.iter().any(|line| line.starts_with(&round));
+    assert!(linked, "A took no home round with B: {a_lines:?}");
+
+    let client = GladeClient::new("reader");
+    let at_a = format!("ws://127.0.0.1:{a_port}");
+    client.connect(&at_a).await.unwrap();
+    let mut refusals = client.on_zone_refused().await;
+    let acked = within(client.subscribe_outcome("ws-razel", "ws.tree", None)).await;
+    let empty = SubscribeOutcome::Accepted { heads: vec![] };
+    assert_eq!(acked.unwrap(), empty, "A acks from its empty replica");
+
+    let refused = within(refusals.recv()).await.expect("a zone refusal");
+    let expected = ZoneRefusal {
+        share: "ws-razel".into(),
+        glade_id: "ws.tree".into(),
+        key: vec![],
+        code: ErrorCode::Unauthorized,
+        message: refused.message.clone(),
+    };
+    assert_eq!(refused, expected);
+    let by_b = format!("refused by node {b_node}, which serves ws-razel: ");
+    assert!(refused.message.starts_with(&by_b), "{refused:?}");
+    let live = client.live("ws-razel", "ws.tree", None).await;
+    assert!(!live, "a zone refused after its ack is no longer live");
+
+    // The refusal is not kept: a later subscribe asks A again, which acks it,
+    // forwards the read again, and relays B's refusal again.
+    let again = within(client.subscribe_outcome("ws-razel", "ws.tree", None)).await;
+    assert_eq!(again.unwrap(), empty);
+    let second = within(refusals.recv()).await.expect("a second refusal");
+    assert_eq!(second, refused);
+    assert!(!client.live("ws-razel", "ws.tree", None).await);
+
+    client.close().await;
+    a.kill().await.ok();
+    b.kill().await.ok();
 }

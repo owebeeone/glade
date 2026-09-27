@@ -8,9 +8,12 @@
 //! waits for its ack, which names its zone and each origin's head there, or
 //! names none for a refusal whose reason follows (R6); then for its replay,
 //! which is in once the connection has received, or sent and had answered
-//! `Ok`, an op at or above each head (R7). Pure: no socket and no clock
-//! (LBT-008). `client.rs` feeds it the frames and tells the waiters it hands
-//! back.
+//! `Ok`, an op at or above each head (R7). The zone an ack names is live until
+//! the connection ends, or an `Error` naming no op, and no refused subscribe's
+//! reason, refuses it after its ack (F13). That `Error` names a share and
+//! stream, not a key, so it refuses each live zone of them. Pure: no socket
+//! and no clock (LBT-008). `client.rs` feeds it the frames and tells the
+//! waiters it hands back.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
@@ -284,8 +287,31 @@ pub struct Abandoned<S> {
     pub refused: Vec<Subscribed<S>>,
 }
 
-/// The subscribes waiting on the node, and the highest seq of each origin in
-/// each zone that this connection has received, or sent and had answered `Ok`.
+/// A zone refused after its subscribe was acked (F13), as `on_zone_refused`
+/// reports it: the node ended this connection's subscription with an `Error`
+/// naming no op, as a forwarding node relaying its claim holder's refusal of
+/// the read does (F5), and the grant re-check pass. The wire names the share
+/// and stream only; the key is the zone's, as the client subscribed it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ZoneRefusal {
+    pub share: String,
+    pub glade_id: String,
+    pub key: Vec<u8>,
+    pub code: ErrorCode,
+    pub message: String,
+}
+
+/// What one `Error` naming no op refused after the ack (F13): the live zones
+/// it names, and the subscribes of them still waiting for their replay.
+#[derive(Debug, PartialEq)]
+pub struct RefusedAfterAck<S> {
+    pub zones: Vec<ZoneRefusal>,
+    pub subscribes: Vec<Subscribed<S>>,
+}
+
+/// The subscribes waiting on the node, the highest seq of each origin in each
+/// zone that this connection has received, or sent and had answered `Ok`, and
+/// the zones live on it (F13).
 pub struct Subscribes<S> {
     /// Sent and not yet acked: the node acks them in the order sent.
     unacked: VecDeque<(Zone, S)>,
@@ -294,11 +320,19 @@ pub struct Subscribes<S> {
     /// Acked, waiting for the replay to reach each head the ack names (R7).
     catching: Vec<(Zone, Vec<Head>, S)>,
     seen: HashMap<(Zone, String), i64>,
+    /// Named by an ack on this connection, and not refused since (F13).
+    live: Vec<Zone>,
 }
 
 impl<S> Default for Subscribes<S> {
     fn default() -> Self {
-        Subscribes { unacked: VecDeque::new(), refused: VecDeque::new(), catching: Vec::new(), seen: HashMap::new() }
+        Subscribes {
+            unacked: VecDeque::new(),
+            refused: VecDeque::new(),
+            catching: Vec::new(),
+            seen: HashMap::new(),
+            live: Vec::new(),
+        }
     }
 }
 
@@ -312,8 +346,16 @@ impl<S> Subscribes<S> {
     /// replay, over at once if the connection has seen every head it names.
     /// One naming no zone is a refusal, which waits for its reason (R6). One
     /// naming another zone leaves no subscribe matched to its answer, so every
-    /// one waiting is abandoned.
+    /// one waiting is abandoned. Whichever it answers, the zone an ack names
+    /// is live: the node has registered the connection to it (F13).
     pub fn acked(&mut self, ack: &Heads) -> Result<Option<Subscribed<S>>, Abandoned<S>> {
+        if let Some(named) = ack.streams.first() {
+            let (share, glade_id) = (named.share.clone(), named.glade_id.clone());
+            let zone = (share, glade_id, named.key.clone());
+            if !self.live.contains(&zone) {
+                self.live.push(zone);
+            }
+        }
         let Some((zone, waiter)) = self.unacked.pop_front() else {
             return Ok(None);
         };
@@ -335,11 +377,56 @@ impl<S> Subscribes<S> {
         if status.corr.is_some() {
             return None;
         }
-        let named = |zone: &Zone| Some(&zone.0) == status.share.as_ref() && Some(&zone.1) == status.glade_id.as_ref();
+        let named = |zone: &Zone| names(status, zone);
         let at = self.refused.iter().position(|(zone, _)| named(zone))?;
         let (zone, waiter) = self.refused.remove(at)?;
         let outcome = SubscribeOutcome::Refused { code: Some(status.code), message: status.message.clone() };
         Some(Subscribed { zone, outcome, waiter })
+    }
+
+    /// F13: an `Error` naming no op, and no refused subscribe's reason (R6),
+    /// refuses zones after their ack. It names no key, so it refuses each
+    /// live zone of its share and stream: each leaves the live zones, and a
+    /// subscribe of one still waiting for its replay, which cannot come now,
+    /// is refused with the same code and reason.
+    pub fn refused_after_ack(&mut self, status: &Error) -> RefusedAfterAck<S> {
+        let reason = self.refused.iter().any(|(zone, _)| names(status, zone));
+        if status.corr.is_some() || reason {
+            let (zones, subscribes) = (Vec::new(), Vec::new());
+            return RefusedAfterAck { zones, subscribes };
+        }
+        let (zones, live): (Vec<_>, Vec<_>) = std::mem::take(&mut self.live)
+            .into_iter()
+            .partition(|zone| names(status, zone));
+        self.live = live;
+        let (waiting, catching): (Vec<_>, Vec<_>) = std::mem::take(&mut self.catching)
+            .into_iter()
+            .partition(|(zone, _, _)| names(status, zone));
+        self.catching = catching;
+        let outcome = SubscribeOutcome::Refused {
+            code: Some(status.code),
+            message: status.message.clone(),
+        };
+        let subscribes = waiting.into_iter().map(|(zone, _, waiter)| Subscribed {
+            zone,
+            outcome: outcome.clone(),
+            waiter,
+        });
+        let zones = zones.into_iter().map(|(share, glade_id, key)| ZoneRefusal {
+            share,
+            glade_id,
+            key,
+            code: status.code,
+            message: status.message.clone(),
+        });
+        let (zones, subscribes) = (zones.collect(), subscribes.collect());
+        RefusedAfterAck { zones, subscribes }
+    }
+
+    /// Whether the zone is live on this connection: named by an ack, and not
+    /// refused since (F13).
+    pub fn live(&self, zone: &Zone) -> bool {
+        self.live.contains(zone)
     }
 
     /// Ops this connection received: the subscribes whose replay they complete.
@@ -376,9 +463,10 @@ impl<S> Subscribes<S> {
     }
 
     /// The connection ended: every waiting subscribe is abandoned, and what
-    /// the connection saw goes with it.
+    /// the connection saw goes with it, its live zones too.
     pub fn ended(&mut self) -> Abandoned<S> {
         self.seen.clear();
+        self.live.clear();
         self.abandon()
     }
 
@@ -422,6 +510,12 @@ pub fn resend_delay(attempt: u32) -> Duration {
 
 fn unknown<W>(sent: Sent<W>) -> Answered<W> {
     Answered { op: sent.op, outcome: OpOutcome::Unknown, waiter: sent.waiter, newly_unplaced: false }
+}
+
+/// Whether an `Error` naming no op names `zone`: by its share and stream,
+/// since the wire's `Error` carries no key.
+fn names(status: &Error, (share, glade_id, _): &Zone) -> bool {
+    status.share.as_ref() == Some(share) && status.glade_id.as_ref() == Some(glade_id)
 }
 
 fn in_zone(op: &Op, (share, glade_id, key): &Zone) -> bool {
@@ -910,5 +1004,140 @@ mod tests {
         // What the connection saw goes with it.
         subs.sent(zone(), 3);
         assert_eq!(subs.acked(&ack(&zone(), &[("a", 5)])), Ok(None), "a new connection has seen nothing");
+    }
+
+    // ---- F13: a zone refused after its ack ---------------------------------
+
+    /// A refusal after the ack, as the node sends it (F5's forward, the grant
+    /// re-check pass): an `Error` naming the zone's share and stream, not its
+    /// key, and no op.
+    fn lone(zone: &Zone) -> Error {
+        Error {
+            code: ErrorCode::Unauthorized,
+            message: "refused by node b, which serves s: unauthorized".into(),
+            share: Some(zone.0.clone()),
+            glade_id: Some(zone.1.clone()),
+            corr: None,
+        }
+    }
+
+    /// `lone`'s refusal of `zone`, as `on_zone_refused` reports it.
+    fn refusal(zone: &Zone) -> ZoneRefusal {
+        let (share, glade_id, key) = zone.clone();
+        let code = ErrorCode::Unauthorized;
+        let message = "refused by node b, which serves s: unauthorized".into();
+        ZoneRefusal {
+            share,
+            glade_id,
+            key,
+            code,
+            message,
+        }
+    }
+
+    /// A subscribe to `zone`, acked with an empty replay, so it returns at once.
+    fn subscribed(subs: &mut Subscribes<usize>, zone: &Zone, waiter: usize) {
+        subs.sent(zone.clone(), waiter);
+        let done = subs.acked(&ack(zone, &[])).unwrap();
+        assert_eq!(done.map(|done| done.waiter), Some(waiter));
+    }
+
+    #[test]
+    fn a_lone_error_after_an_ack_refuses_its_zone() {
+        let mut subs = Subscribes::default();
+        subscribed(&mut subs, &zone(), 0);
+        assert!(subs.live(&zone()), "a zone is live from its ack");
+
+        let refused = subs.refused_after_ack(&lone(&zone()));
+        assert_eq!(refused.zones, vec![refusal(&zone())]);
+        let waiting = refused.subscribes;
+        assert!(waiting.is_empty(), "its subscribe returned at the ack");
+        assert!(!subs.live(&zone()), "a refused zone is no longer live");
+        let again = subs.refused_after_ack(&lone(&zone()));
+        assert!(again.zones.is_empty(), "told once: {again:?}");
+        // An op's status names an op, not a zone.
+        subscribed(&mut subs, &other(), 1);
+        let status = Error {
+            corr: Some("ab".into()),
+            ..lone(&other())
+        };
+        assert!(subs.refused_after_ack(&status).zones.is_empty());
+        assert!(subs.live(&other()));
+    }
+
+    #[test]
+    fn a_refusal_after_the_ack_refuses_a_subscribe_still_waiting_for_its_replay() {
+        let mut subs = Subscribes::default();
+        subs.sent(zone(), 0);
+        let acked = subs.acked(&ack(&zone(), &[("a", 5)]));
+        assert_eq!(acked, Ok(None), "its replay is not in");
+
+        let refused = subs.refused_after_ack(&lone(&zone()));
+        let (zones, subscribes) = (refused.zones, refused.subscribes);
+        let code = Some(ErrorCode::Unauthorized);
+        let message = refusal(&zone()).message;
+        let outcome = SubscribeOutcome::Refused { code, message };
+        let waiting = Subscribed {
+            zone: zone(),
+            outcome,
+            waiter: 0,
+        };
+        assert_eq!(subscribes, vec![waiting], "its replay cannot come now");
+        assert_eq!(zones, vec![refusal(&zone())]);
+        let late = subs.received(&[op_in(&zone(), "a", 5)]);
+        assert!(late.is_empty(), "none is left to complete: {late:?}");
+    }
+
+    #[test]
+    fn a_lone_error_refuses_each_live_zone_of_its_share_and_stream() {
+        let mut subs = Subscribes::default();
+        let keyed: Zone = ("s".into(), "g".into(), b"k".to_vec());
+        for (waiter, zone) in [zone(), keyed.clone(), other()].iter().enumerate() {
+            subscribed(&mut subs, zone, waiter);
+        }
+
+        // The wire names no key, so each key's zone of the stream is refused.
+        let refused = subs.refused_after_ack(&lone(&zone()));
+        assert_eq!(refused.zones, vec![refusal(&zone()), refusal(&keyed)]);
+        assert!(!subs.live(&keyed));
+        assert!(subs.live(&other()), "another stream's zone stays live");
+    }
+
+    #[test]
+    fn a_refused_subscribes_reason_comes_before_a_refusal_after_the_ack() {
+        let mut subs = Subscribes::default();
+        subscribed(&mut subs, &zone(), 0);
+        subs.sent(zone(), 1);
+        assert_eq!(subs.acked(&Heads { streams: vec![] }), Ok(None));
+
+        // The next Error with no corr for the stream is that refusal's reason
+        // (R6), and the live zone stays live.
+        let reason = lone(&zone());
+        assert!(subs.refused_after_ack(&reason).zones.is_empty());
+        assert!(subs.live(&zone()));
+        assert_eq!(subs.reason(&reason).map(|refused| refused.waiter), Some(1));
+        // With no refusal waiting for its reason, the next one refuses the zone.
+        let refused = subs.refused_after_ack(&reason);
+        assert_eq!(refused.zones, vec![refusal(&zone())]);
+    }
+
+    #[test]
+    fn a_zone_is_live_from_any_ack_naming_it_until_refused_or_the_connection_ends() {
+        let mut subs = Subscribes::default();
+        subscribed(&mut subs, &zone(), 0);
+        subs.refused_after_ack(&lone(&zone()));
+        // The client keeps no refusal: a later subscribe's ack makes it live again.
+        subscribed(&mut subs, &zone(), 1);
+        assert!(subs.live(&zone()), "live again");
+        // An ack for another zone in a subscribe's turn still names a zone the
+        // node registered.
+        subs.sent(("s".into(), "g3".into(), vec![]), 2);
+        assert!(subs.acked(&ack(&other(), &[])).is_err());
+        assert!(subs.live(&other()), "the zone an ack names is live");
+
+        subs.ended();
+        let live = [zone(), other()].iter().any(|zone| subs.live(zone));
+        assert!(!live, "no subscription outlives its connection");
+        assert!(subs.refused_after_ack(&lone(&zone())).zones.is_empty());
     }
 }

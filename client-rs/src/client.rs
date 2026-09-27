@@ -14,7 +14,9 @@
 //! by zone, and `on_unplaced` reports it (W5); no later op of its chain goes
 //! before it, and a gap refusal past it is not placed either (F6).
 //! `subscribe_outcome` returns a subscribe's heads, or its refusal and reason
-//! (R5, R6). No node internals — the wire + tokio only.
+//! (R5, R6). A zone the node refuses after its ack is reported to
+//! `on_zone_refused`, and is no longer `live` (F13). No node internals — the
+//! wire + tokio only.
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -30,7 +32,10 @@ use glade_wire::generated::{
 };
 use glade_wire::{cbor, generated};
 
-use crate::answers::{zone_of, Abandoned, Answered, Answers, OpOutcome, OpStatus, SubscribeOutcome, Subscribed, Subscribes, Zone, WAITING_BOUND};
+use crate::answers::{
+    zone_of, Abandoned, Answered, Answers, OpOutcome, OpStatus, RefusedAfterAck, SubscribeOutcome,
+    Subscribed, Subscribes, Zone, ZoneRefusal, WAITING_BOUND,
+};
 use crate::session::{require_op, shape_of, Session};
 use crate::ws::{self, Msg, WsWriter};
 
@@ -103,6 +108,7 @@ struct Inner {
     answers: Mutex<Answers<Waiter>>,
     refused_senders: Mutex<Vec<mpsc::UnboundedSender<OpStatus>>>,
     unplaced_senders: Mutex<Vec<mpsc::UnboundedSender<OpStatus>>>,
+    zone_refused_senders: Mutex<Vec<mpsc::UnboundedSender<ZoneRefusal>>>,
     closing: AtomicBool,
 }
 
@@ -150,11 +156,17 @@ impl Inner {
             }
             FrameType::Error => {
                 // R1: a status names its op by hash. An `Error` with no `corr`
-                // is a refused subscribe's reason (R6).
+                // is a refused subscribe's reason (R6), or else refuses zones
+                // after their ack (F13).
                 let status = generated::Error::from_cbor(&body);
                 let refused = self.subscribes.lock().await.reason(&status);
                 if let Some(refused) = refused {
                     let _ = refused.waiter.send(Ok(refused.outcome));
+                    return;
+                }
+                let after_ack = self.subscribes.lock().await.refused_after_ack(&status);
+                if !after_ack.zones.is_empty() {
+                    self.zones_refused(after_ack).await;
                     return;
                 }
                 let answered = {
@@ -214,6 +226,19 @@ impl Inner {
             _ => {}
         }
         tell(answered);
+    }
+
+    /// Zones the node refused after their ack (F13): `on_zone_refused` hears
+    /// of each, and a subscribe of one still waiting for its replay returns
+    /// the refusal.
+    async fn zones_refused(&self, after_ack: RefusedAfterAck<SubWaiter>) {
+        for refusal in after_ack.zones {
+            let mut senders = self.zone_refused_senders.lock().await;
+            senders.retain(|s| s.send(refusal.clone()).is_ok());
+        }
+        for subscribed in after_ack.subscribes {
+            let _ = subscribed.waiter.send(Ok(subscribed.outcome));
+        }
     }
 
     /// Subscribes whose replay is in (R7). Before each returns, its zone's
@@ -359,6 +384,7 @@ impl GladeClient {
                 answers: Mutex::new(Answers::new(WAITING_BOUND)),
                 refused_senders: Mutex::new(Vec::new()),
                 unplaced_senders: Mutex::new(Vec::new()),
+                zone_refused_senders: Mutex::new(Vec::new()),
                 closing: AtomicBool::new(false),
             }),
         }
@@ -533,6 +559,28 @@ impl GladeClient {
         let (tx, rx) = mpsc::unbounded_channel();
         self.inner.unplaced_senders.lock().await.push(tx);
         rx
+    }
+
+    /// A fresh receiver for zones the node refused after their subscribe was
+    /// acked (F13): an `Error` naming the zone and no op, as a forwarding node
+    /// relays its claim holder's refusal of the read (F5), and the grant
+    /// re-check pass sends. The node has ended the subscription: the zone is
+    /// no longer `live`, no more of its ops come, and the session keeps what
+    /// it holds of it. A subscribe of it still waiting for its replay returns
+    /// the refusal, and a later subscribe asks the node again.
+    pub async fn on_zone_refused(&self) -> mpsc::UnboundedReceiver<ZoneRefusal> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.inner.zone_refused_senders.lock().await.push(tx);
+        rx
+    }
+
+    /// Whether this connection is subscribed to the zone: an ack named it,
+    /// and the node has not refused it since (F13). No subscription outlives
+    /// its connection.
+    pub async fn live(&self, share: &str, glade_id: &str, key: Option<&[u8]>) -> bool {
+        let key = key.unwrap_or_default().to_vec();
+        let zone: Zone = (share.into(), glade_id.into(), key);
+        self.inner.subscribes.lock().await.live(&zone)
     }
 
     /// A directed request to a provider; resolves with its `ExchangeRes`

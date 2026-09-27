@@ -18,7 +18,10 @@
 //! attachment is re-established. A refused subscribe is an error (R6), so a
 //! `serve_*` fails and a reattach tries again. A refused op stops its chain
 //! until a subscribe (answer 4), so a `ShareController` whose chain a refusal
-//! stopped subscribes its surface again before its next write.
+//! stopped subscribes its surface again before its next write. A served
+//! surface the node refuses after its ack (F13) is only reported, by the
+//! client's `on_zone_refused`: its writes still go, and a reattach subscribes
+//! every serving again.
 
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};

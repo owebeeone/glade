@@ -10,7 +10,8 @@
 //!   (`on_drop` + `reconnect`). `append_outcome` / `send_ops_outcome` return
 //!   the node's answer to each op; `on_refused` reports every refusal, and
 //!   `on_unplaced` every op the node could not place. `subscribe_outcome`
-//!   returns a subscribe's heads, or its refusal and reason.
+//!   returns a subscribe's heads, or its refusal and reason; `on_zone_refused`
+//!   reports a zone refused after its ack, which `live` then no longer counts.
 //! - [`answers::Answers`] — the sent ops, kept by hash until the node's status
 //!   names them (GladeSubstrateV1 §6, R1 and R7; W5's ops not placed), and
 //!   [`answers::Subscribes`], the subscribes waiting for their ack or replay.
@@ -28,6 +29,6 @@ pub mod session;
 pub mod supplier;
 pub mod ws;
 
-pub use answers::{OpOutcome, OpStatus, SubscribeOutcome};
+pub use answers::{OpOutcome, OpStatus, SubscribeOutcome, ZoneRefusal};
 pub use client::{ExchangeOutcome, GladeClient};
 pub use supplier::{Backoff, ShareController, Supplier, SupplierConfig, SupplierSurface};
