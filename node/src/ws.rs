@@ -14,6 +14,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::Mutex;
 
+use crate::frame::frame_len;
+
 fn sha1(data: &[u8]) -> [u8; 20] {
     let mut h: [u32; 5] = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
     let ml = (data.len() as u64) * 8;
@@ -214,23 +216,26 @@ fn eof() -> std::io::Error {
 }
 
 impl WsReader {
-    /// Read one data message (binary/text payload), skipping ping/pong.
+    /// Read one data message (binary/text payload), skipping ping/pong. A
+    /// frame whose header claims more than `MAX_FRAME_BYTES` is refused
+    /// before its payload, as `InvalidData` (F15).
     pub async fn read(&mut self) -> std::io::Result<Msg> {
         loop {
             let mut h = [0u8; 2];
             self.inner.read_exact(&mut h).await?;
             let opcode = h[0] & 0x0f;
             let masked = h[1] & 0x80 != 0;
-            let mut len = (h[1] & 0x7f) as usize;
+            let mut len = u64::from(h[1] & 0x7f);
             if len == 126 {
                 let mut e = [0u8; 2];
                 self.inner.read_exact(&mut e).await?;
-                len = u16::from_be_bytes(e) as usize;
+                len = u16::from_be_bytes(e).into();
             } else if len == 127 {
                 let mut e = [0u8; 8];
                 self.inner.read_exact(&mut e).await?;
-                len = u64::from_be_bytes(e) as usize;
+                len = u64::from_be_bytes(e);
             }
+            let len = frame_len(len)?;
             let mut mask = [0u8; 4];
             if masked {
                 self.inner.read_exact(&mut mask).await?;

@@ -7,12 +7,14 @@
 //! golden corpus byte-for-byte; parity == correctness, and the same corpus
 //! pins the TypeScript codec (browser-folds premise). `checked.rs` is written
 //! by hand: it refuses a frame whose enum value the generated decode would
-//! panic on (F12).
+//! panic on (F12). So is `wellformed.rs`: it refuses bytes `cbor::decode`
+//! would panic on or recurse too deep for (F15).
 
 pub mod cbor;
 pub mod checked;
 pub mod generated;
 pub mod swmr;
+pub mod wellformed;
 
 #[cfg(test)]
 mod codec_tests {

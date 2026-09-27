@@ -1396,4 +1396,90 @@ mod tests {
             other => panic!("alice expected the sh2 op, got {other:?}"),
         }
     }
+
+    // ---- a frame the node cannot take (F15) -------------------------------
+
+    /// A Hello with no principal, as bytes.
+    fn hello() -> Vec<u8> {
+        let hello = Hello {
+            session: "s".into(),
+            protocol: 1,
+            principal: None,
+            capability: None,
+            heads: vec![],
+        };
+        Frame::Hello(hello).to_bytes()
+    }
+
+    /// A new session on `port` sends `bytes`, then a Hello: the node refuses
+    /// the frame and goes on, so the Hello is welcomed. A new client is
+    /// served too.
+    async fn refused_and_served(port: u16, bytes: &[u8], what: &str) {
+        let (mut r, w) = ws::connect("127.0.0.1", port).await.unwrap();
+        w.send_binary(bytes).await.unwrap();
+        w.send_binary(&hello()).await.unwrap();
+        let welcome = next(&mut r, &format!("the welcome after {what}")).await;
+        assert!(matches!(welcome, Frame::Welcome(_)), "{what}: {welcome:?}");
+        session(port, Some("next")).await;
+    }
+
+    /// F15: a frame nested 100,000 deep, 100 KB, overflowed the stack of the
+    /// thread decoding it and aborted the node. It is refused, and the node
+    /// serves on: the session that sent it, and a new client.
+    #[tokio::test]
+    async fn a_frame_nested_100_000_deep_is_refused_and_the_node_serves_on() {
+        let (_, port) = serving("glade-server-f15-nested").await;
+        let nested = [&hello()[..1], &[0x81].repeat(100_000), &[0x80]].concat();
+        refused_and_served(port, &nested, "a Hello nested 100,000 deep").await;
+    }
+
+    /// F15: a truncated frame, and one holding a CBOR tag, panicked the task
+    /// of the session that sent it, leaving its socket open and unread. Each
+    /// is refused, and the session goes on; a new client is served.
+    #[tokio::test]
+    async fn a_truncated_or_malformed_frame_is_refused_and_its_session_goes_on() {
+        let (_, port) = serving("glade-server-f15-malformed").await;
+        let hello = hello();
+        let tagged = [&hello[..1], &[0xc0, 0x00]].concat();
+        let truncated = &hello[..hello.len() - 1];
+        refused_and_served(port, truncated, "a truncated Hello").await;
+        refused_and_served(port, &tagged, "a Hello holding a CBOR tag").await;
+    }
+
+    /// A websocket to `port`, upgraded by hand, to write any bytes on.
+    async fn upgraded(port: u16) -> TcpStream {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut socket = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let key = ws::b64_encode(&[0u8; 16]);
+        let upgrade = format!(
+            "GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        );
+        socket.write_all(upgrade.as_bytes()).await.unwrap();
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            head.push(socket.read_u8().await.unwrap());
+        }
+        socket
+    }
+
+    /// F15: a websocket header that claims more than `MAX_FRAME_BYTES` was
+    /// allocated and waited on, or, claiming all of `u64`, panicked the
+    /// session and left its socket open. It ends that connection before its
+    /// payload, and a new client is served.
+    #[tokio::test]
+    async fn a_header_over_the_frame_limit_ends_only_its_connection() {
+        use crate::frame::MAX_FRAME_BYTES;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (_, port) = serving("glade-server-f15-oversized").await;
+        for claimed in [MAX_FRAME_BYTES as u64 + 1, u64::MAX] {
+            let mut socket = upgraded(port).await;
+            let header = [&[0x82, 0xff][..], &claimed.to_be_bytes(), &[0; 4]].concat();
+            socket.write_all(&header).await.unwrap();
+            let five = std::time::Duration::from_secs(5);
+            let read = tokio::time::timeout(five, socket.read(&mut [0; 1])).await;
+            let ended = matches!(read, Ok(Ok(0) | Err(_)));
+            assert!(ended, "a header claiming {claimed} bytes: {read:?}");
+            session(port, Some("next")).await;
+        }
+    }
 }

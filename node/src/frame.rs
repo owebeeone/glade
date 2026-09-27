@@ -4,11 +4,33 @@
 //! the frozen frame messages from `glade-wire`. Carrier-agnostic: the same
 //! bytes ride a websocket (M-LIMP) or iroh (post-LIMP).
 
+use std::io;
+
 use glade_wire::generated::{
     ChannelClose, ChannelData, ChannelOpen, Error, ExchangeReq, ExchangeRes, FrameType, Heads,
     Hello, NodeHello, NodeWelcome, Ops, Subscribe, Unsubscribe, Welcome,
 };
-use glade_wire::{cbor, checked};
+use glade_wire::{cbor, checked, wellformed};
+
+/// The most bytes a frame may hold, its tag byte included: 16 MiB, the frame
+/// limit the owner ruled for the carrier port (plan Step 4.5b, question 6).
+/// The websocket (`ws.rs`) and the peer stream (`peer::read_frame`) refuse a
+/// header that claims more (F15).
+pub const MAX_FRAME_BYTES: usize = 16 << 20;
+
+/// The length a frame's header claims, if it is at most [`MAX_FRAME_BYTES`],
+/// checked before anything is allocated for it. A longer one is refused as
+/// `InvalidData`, which ends its connection: the stream cannot be read past
+/// a body left unread.
+pub fn frame_len(claimed: u64) -> io::Result<usize> {
+    match usize::try_from(claimed) {
+        Ok(len) if len <= MAX_FRAME_BYTES => Ok(len),
+        _ => {
+            let said = format!("bad frame: {claimed} bytes, over the limit of {MAX_FRAME_BYTES}");
+            Err(io::Error::new(io::ErrorKind::InvalidData, said))
+        }
+    }
+}
 
 /// One decoded frame.
 #[derive(Clone, Debug, PartialEq)]
@@ -55,13 +77,16 @@ impl Frame {
         out
     }
 
-    /// Decode one frame, or refuse it: an empty frame, a chunk, and (F12) a
+    /// Decode one frame, or refuse it: an empty frame, a chunk, (F12) a
     /// frame whose tag, op shape, priority or error code names no value of
-    /// its enum, which the generated decode panics on (`glade_wire::checked`).
+    /// its enum, which the generated decode panics on (`glade_wire::checked`),
+    /// and (F15) a message that is truncated, malformed or nested deeper than
+    /// `glade_wire::wellformed::MAX_DEPTH`, which `cbor::decode` panics on or
+    /// overflows its stack on.
     pub fn from_bytes(bytes: &[u8]) -> Result<Frame, String> {
         let (&tag, rest) = bytes.split_first().ok_or("empty frame")?;
         let ty = checked::frame_type(tag).map_err(|e| e.to_string())?;
-        let c = cbor::decode(rest);
+        let c = wellformed::decode(rest).map_err(|e| e.to_string())?;
         checked::frame_body(ty, &c).map_err(|e| e.to_string())?;
         Ok(match ty {
             FrameType::Hello => Frame::Hello(Hello::from_cbor(&c)),

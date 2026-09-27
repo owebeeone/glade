@@ -7677,3 +7677,15 @@ parts, then 4.5's crossing again.
 - tests: +834/−28: `conversation.rs` +437 (the in-memory pair and the iroh helpers 154, the six tests
   283) and `peer.rs` +397/−28 (the four designed, the five moved, their helpers, and the two case
   tables taken out of the stream tests).
+
+### Frames the node cannot take (F15)
+
+The owner's ruling of 2026-09-27; each is refused as a bad frame, not a panic or an abort:
+- **Nesting: `MAX_DEPTH`, 32** arrays and maps (`wire-rs/src/wellformed.rs`, by hand beside
+  `checked.rs`); the wire's types nest 5 deep. `Frame::from_bytes` walks the message once,
+  without recursion, before `cbor::decode`, and refuses it too deep, truncated, with trailing
+  bytes, a tag, an indefinite or reserved length, another simple value, a non-int map key or text
+  that is not UTF-8: every case on which `cbor::decode` panics or overflows its stack.
+- **Size: `MAX_FRAME_BYTES`, 16 MiB** (`frame.rs`; question 6's limit), checked by `frame_len`
+  before allocating, in `WsReader::read` and `peer::read_frame`: a longer header ends that
+  connection or stream alone. On the websocket a refused message is skipped; its session goes on.

@@ -29,7 +29,7 @@ use glade_signer_api::{Purpose, SignatureStatus};
 use glade_wire::cbor::{self, Cbor};
 use glade_wire::generated::{Heads, NodeHello, NodeWelcome, Op, Ops, Priority};
 
-use crate::frame::Frame;
+use crate::frame::{frame_len, Frame};
 use crate::grants::READ_SUBSCRIBE;
 use crate::registry::HOME;
 use crate::session::missing_for;
@@ -55,11 +55,13 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, frame: &Frame) -> io:
 }
 
 /// Read one length-prefixed frame. A clean stream close at a frame boundary
-/// surfaces as `UnexpectedEof` — the sync loop reads that as "peer done".
+/// surfaces as `UnexpectedEof` — the sync loop reads that as "peer done". A
+/// length over `MAX_FRAME_BYTES` is refused before its body, as `InvalidData`
+/// (F15).
 pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Frame> {
     let mut len = [0u8; 4];
     r.read_exact(&mut len).await?;
-    let n = u32::from_le_bytes(len) as usize;
+    let n = frame_len(u32::from_le_bytes(len).into())?;
     let mut buf = vec![0u8; n];
     r.read_exact(&mut buf).await?;
     Frame::from_bytes(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
@@ -850,6 +852,79 @@ mod hello_tests {
             assert_eq!(refused.kind(), io::ErrorKind::InvalidData, "{value}");
             assert_eq!(refused.to_string(), format!("bad frame: unknown {value}"));
         }
+    }
+
+    /// F15, on the peer stream: a frame `read_frame` cannot decode is refused
+    /// as `InvalidData`, where decoding it panicked the task reading the
+    /// stream (a truncated frame, one holding a CBOR tag) or, nested 100,000
+    /// deep, overflowed its thread's stack and aborted the node. The stream
+    /// stays framed: the frame after each is read.
+    #[tokio::test]
+    async fn a_truncated_malformed_or_nested_frame_is_refused_as_invalid_data() {
+        let me = NodeIdentity::from_key([9u8; 32]);
+        let hello = Frame::NodeHello(NodeHello {
+            node_id: me.node_id.to_vec(),
+            protocol: PROTOCOL,
+            sig: None,
+        });
+        let good = hello.to_bytes();
+        let tag = &good[..1];
+        let tagged = "bad frame: CBOR the wire does not take (0xc0)";
+        let cases = [
+            (good[..good.len() - 1].to_vec(), "bad frame: truncated"),
+            ([tag, &[0xc0, 0x00]].concat(), tagged),
+            (
+                [tag, &[0x81].repeat(100_000), &[0x80]].concat(),
+                "bad frame: nested deeper than 32",
+            ),
+        ];
+        for (bytes, said) in cases {
+            let (mut near, mut far) = tokio::io::duplex(1 << 20);
+            for frame in [&bytes, &good] {
+                let len = (frame.len() as u32).to_le_bytes();
+                near.write_all(&len).await.unwrap();
+                near.write_all(frame).await.unwrap();
+            }
+            let refused = read_frame(&mut far).await.expect_err(said);
+            assert_eq!(refused.kind(), io::ErrorKind::InvalidData, "{said}");
+            assert_eq!(refused.to_string(), said);
+            let after = read_frame(&mut far).await.unwrap();
+            assert_eq!(after, hello, "after {said}");
+        }
+    }
+
+    /// F15: a length over `MAX_FRAME_BYTES`, by one or up to `u32::MAX`, is
+    /// refused as `InvalidData` before its body, where `read_frame` allocated
+    /// the length and waited for the body. A frame of exactly the limit is
+    /// read.
+    #[tokio::test]
+    async fn a_length_over_the_frame_limit_is_refused_before_its_body() {
+        use crate::frame::MAX_FRAME_BYTES;
+        use glade_wire::generated::ChannelData;
+        let over = MAX_FRAME_BYTES as u32 + 1;
+        for claimed in [over, u32::MAX] {
+            let (mut near, mut far) = tokio::io::duplex(64);
+            near.write_all(&claimed.to_le_bytes()).await.unwrap();
+            let read = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut far));
+            let refused = read.await.expect("refused before its body");
+            let refused = refused.expect_err("over the limit");
+            assert_eq!(refused.kind(), io::ErrorKind::InvalidData, "{claimed}");
+            let said = format!("bad frame: {claimed} bytes, over the limit of {MAX_FRAME_BYTES}");
+            assert_eq!(refused.to_string(), said);
+        }
+        // The tag, a map of two, their keys, "c", and the head of the data
+        // take 11 bytes.
+        let data = vec![7; MAX_FRAME_BYTES - 11];
+        let channel = "c".into();
+        let at_limit = Frame::ChannelData(ChannelData { channel, data }).to_bytes();
+        assert_eq!(at_limit.len(), MAX_FRAME_BYTES);
+        let (mut near, mut far) = tokio::io::duplex(MAX_FRAME_BYTES + 4);
+        let len = (MAX_FRAME_BYTES as u32).to_le_bytes();
+        near.write_all(&len).await.unwrap();
+        near.write_all(&at_limit).await.unwrap();
+        let read = read_frame(&mut far).await.unwrap();
+        let whole = matches!(read, Frame::ChannelData(c) if c.data.len() == MAX_FRAME_BYTES - 11);
+        assert!(whole, "the frame at the limit was not read whole");
     }
 
     // ---- HELLO on a carrier link (plan Step 4.5b) ------------------------

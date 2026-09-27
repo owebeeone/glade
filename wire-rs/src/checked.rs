@@ -8,8 +8,9 @@
 //! frame with an [`UnknownValue`] and goes on.
 //!
 //! It checks enum values only. A body of another shape (a missing field, a
-//! value of the wrong type) and bytes that are not CBOR still panic in the
-//! generated decode and in `cbor::decode`, as before.
+//! value of the wrong type) still panics in the generated decode, as before;
+//! bytes that are not CBOR the wire takes are [`crate::wellformed`]'s to
+//! refuse (F15).
 
 use std::fmt;
 
