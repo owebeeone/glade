@@ -2,8 +2,9 @@
 // using Node's built-in WebSocket. Frames are `[FrameType tag][CBOR body]`
 // (the frozen wire). Inbound Ops fold into the session; Subscribe is acked by a
 // Heads frame, and returns once the zone's replay is in; each op sent is
-// answered by an Error frame naming it by hash (answers.ts). Carrier detail
-// only — the convergence lives in the Session.
+// answered by an Error frame naming it by hash (answers.ts), and a zone the
+// node refuses after its ack is reported through onZoneRefused (F13). Carrier
+// detail only — the convergence lives in the Session.
 
 import { Session } from "./session.ts";
 import * as codec from "./taut/codec.ts";
@@ -11,12 +12,12 @@ import type { SchemaIndex } from "./taut/schema.ts";
 import { zoneKey, type Op } from "./store.ts";
 import { requireOpShape } from "./shapes.ts";
 import { decodeSwmrAction } from "./swmr.ts";
-import { Answers, Replays, type OpOutcome, type SubscribeOutcome, type ZoneHeads } from "./answers.ts";
+import { Answers, Replays, type OpOutcome, type SubscribeOutcome, type ZoneHeads, type ZoneRefusal } from "./answers.ts";
 import { hex } from "./bytes.ts";
 import { opHash } from "./hash.ts";
 
 // The node's answers are part of the client API surface — re-export them.
-export type { OpOutcome, SubscribeOutcome } from "./answers.ts";
+export type { OpOutcome, SubscribeOutcome, ZoneRefusal } from "./answers.ts";
 
 const TAG = {
   Hello: 0, Welcome: 1, Subscribe: 2, Unsubscribe: 3, Ops: 4, Heads: 5,
@@ -97,6 +98,7 @@ export class GladeClient {
   private replays = new Replays();
   private refusedListeners = new Set<(outcome: OpOutcome) => void>();
   private unplacedListeners = new Set<(outcome: OpOutcome) => void>();
+  private zoneRefusedListeners = new Set<(refusal: ZoneRefusal) => void>();
   /** Each zone's next resend of its unplaced ops (W5). */
   private resendTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
@@ -176,11 +178,15 @@ export class GladeClient {
       }
     } else if (tag === TAG.Error) {
       // An op's status names it by hash (R1); an Error with no corr is a
-      // refused subscribe's reason (R6).
+      // refused subscribe's reason (R6), or else refuses zones after their
+      // ack (F13).
       if (value.corr !== null) {
         this.onStatus(value.corr as string, value.code as string, value.message as string);
       } else {
-        this.replays.reason(value.share as string, value.glade_id as string, value.code as string, value.message as string);
+        const said = [value.share, value.glade_id, value.code, value.message] as [string, string, string, string];
+        if (!this.replays.reason(...said)) {
+          this.zonesRefused(this.replays.refusedAfterAck(...said));
+        }
       }
     } else if (tag === TAG.Welcome) {
       this.welcomeAcks.shift()?.();
@@ -295,6 +301,26 @@ export class GladeClient {
   onUnplaced(handler: (outcome: OpOutcome) => void): () => void {
     this.unplacedListeners.add(handler);
     return () => this.unplacedListeners.delete(handler);
+  }
+
+  /** Report each zone the node refused after its subscribe was acked (F13):
+   *  an Error naming the zone and no op, as a forwarding node relays its
+   *  claim holder's refusal of the read (F5), and the grant re-check pass
+   *  sends. The node has ended the subscription: the zone is no longer
+   *  `live`, no more of its ops come, and the session keeps what it holds of
+   *  it. A subscribe of it still waiting for its replay resolves refused, and
+   *  a later subscribe asks the node again. Returns an unsubscribe. With no
+   *  listener, a refusal goes to `console.warn`. */
+  onZoneRefused(handler: (refusal: ZoneRefusal) => void): () => void {
+    this.zoneRefusedListeners.add(handler);
+    return () => this.zoneRefusedListeners.delete(handler);
+  }
+
+  /** Whether this connection is subscribed to the zone: an ack named it, and
+   *  the node has not refused it since (F13). No subscription outlives its
+   *  connection. */
+  live(share: string, gladeId: string, key?: Uint8Array): boolean {
+    return this.replays.live(zoneKey(share, gladeId, key ?? new Uint8Array()));
   }
 
   /** Register an additional inbound-ops listener (fan-out); returns an
@@ -420,6 +446,21 @@ export class GladeClient {
     }
     for (const h of [...listeners]) {
       h(o);
+    }
+  }
+
+  /** Zones the node refused after their ack (F13), to the listeners, or with
+   *  none, to the console, as op refusals are. */
+  private zonesRefused(refusals: ZoneRefusal[]): void {
+    for (const r of refusals) {
+      if (this.zoneRefusedListeners.size === 0) {
+        const key = r.key.length > 0 ? `, key ${hex(r.key)}` : "";
+        console.warn(`[glade] zone refused after its ack: ${r.code} (${r.share}, ${r.glade_id}${key}): ${r.message}`);
+        continue;
+      }
+      for (const h of [...this.zoneRefusedListeners]) {
+        h(r);
+      }
     }
   }
 

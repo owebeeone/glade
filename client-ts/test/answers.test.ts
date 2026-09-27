@@ -12,7 +12,7 @@ import { dirname, join } from "node:path";
 
 import { loadSchema } from "../src/taut/schema.ts";
 import * as codec from "../src/taut/codec.ts";
-import { Answers, Replays, backoffMs, type OpOutcome, type SubscribeOutcome } from "../src/answers.ts";
+import { Answers, Replays, backoffMs, type OpOutcome, type SubscribeOutcome, type ZoneRefusal } from "../src/answers.ts";
 import { GladeClient } from "../src/client.ts";
 import { Session, UnresumedChain, type Op } from "../src/session.ts";
 import { zoneKey } from "../src/store.ts";
@@ -390,6 +390,11 @@ class FakeSocket {
     this.deliver(5, "Heads", { streams: [] });
     this.deliver(12, "Error", { code, message, share: "sh", glade_id: "g", corr: null });
   }
+  /** The node's refusal of ("sh", `gladeId`) after its ack (F13): an Error
+   *  naming the share and stream, no key, and no op. */
+  lone(code: string, message: string, gladeId = "g"): void {
+    this.deliver(12, "Error", { code, message, share: "sh", glade_id: gladeId, corr: null });
+  }
   /** Ops from the node: a replay, or live ops. */
   receive(ops: Op[]): void {
     this.deliver(4, "Ops", { ops, pri: null });
@@ -617,4 +622,144 @@ test("a replay a consumer throws on still counts as received", async () => {
   socket.ack([["b", 0]]);
   assert.throws(() => socket.receive(chain("b", 1)), /the binder threw/);
   await subscribed;
+});
+
+// ---- F13: a zone refused after its ack ---------------------------------------
+
+/** A refusal after the ack's reason, as a forwarding node relays its claim
+ *  holder's (F5). */
+const why = "refused by node b, which serves sh: unauthorized";
+
+/** `why`'s refusal of ("sh", `gladeId`, `key`), as onZoneRefused reports it. */
+function refusal(key = empty, gladeId = "g"): ZoneRefusal {
+  return { share: "sh", glade_id: gladeId, key, code: "unauthorized", message: why };
+}
+
+/** A subscribe to ("sh", "g", `key`), acked with an empty replay. */
+function subscribedKeyed(replays: Replays, key: Uint8Array): void {
+  replays.sent("sh", "g", key, () => {}, () => {});
+  assert.equal(replays.ack([{ share: "sh", glade_id: "g", key, heads: [] }]), true);
+}
+
+test("F13: an Error with no corr after an ack refuses its zone, once", () => {
+  const replays = new Replays();
+  const caught = subscribing(replays);
+  assert.equal(replays.ack(acked([])), true);
+  assert.equal(caught.outcome?.ok, true);
+  assert.equal(replays.live(zone), true);
+  assert.deepEqual(replays.refusedAfterAck("sh", "g", "unauthorized", why), [refusal()]);
+  assert.equal(replays.live(zone), false);
+  assert.deepEqual(replays.refusedAfterAck("sh", "g", "unauthorized", why), []);
+});
+
+test("F13: a refusal after the ack refuses a subscribe still waiting for its replay", () => {
+  const replays = new Replays();
+  const caught = subscribing(replays);
+  assert.equal(replays.ack(acked([["a", 5]])), false);
+  assert.deepEqual(replays.refusedAfterAck("sh", "g", "unauthorized", why), [refusal()]);
+  assert.deepEqual(caught.outcome, { ok: false, heads: [], code: "unauthorized", message: why });
+  // Its replay cannot come now: an op at its acked head completes nothing.
+  assert.equal(replays.reach(chain("a", 6)[5]), false);
+  assert.equal(caught.failure, undefined);
+});
+
+test("F13: an Error with no corr refuses each live zone of its share and stream", () => {
+  const replays = new Replays();
+  const k = utf8("k");
+  subscribing(replays);
+  replays.ack(acked([]));
+  subscribedKeyed(replays, k);
+  subscribing(replays, "h");
+  replays.ack(acked([], "h"));
+  // The wire names no key, so each key's zone of the stream is refused.
+  assert.deepEqual(replays.refusedAfterAck("sh", "g", "unauthorized", why), [refusal(), refusal(k)]);
+  assert.equal(replays.live(zoneKey("sh", "g", k)), false);
+  assert.equal(replays.live(zoneKey("sh", "h", empty)), true);
+});
+
+test("F13: a refused subscribe's reason comes before a refusal after the ack", () => {
+  const replays = new Replays();
+  subscribing(replays);
+  replays.ack(acked([]));
+  const refused = subscribing(replays);
+  assert.equal(replays.ack([]), false);
+  // The next Error with no corr for the stream is that refusal's reason (R6),
+  // and the live zone stays live.
+  assert.deepEqual(replays.refusedAfterAck("sh", "g", "unauthorized", why), []);
+  assert.equal(replays.live(zone), true);
+  assert.equal(replays.reason("sh", "g", "unauthorized", why), true);
+  assert.deepEqual(refused.outcome, { ok: false, heads: [], code: "unauthorized", message: why });
+  // With no refusal waiting for its reason, the next one refuses the zone.
+  assert.equal(replays.reason("sh", "g", "unauthorized", why), false);
+  assert.deepEqual(replays.refusedAfterAck("sh", "g", "unauthorized", why), [refusal()]);
+});
+
+test("F13: a zone is live from any ack naming it until refused or the connection ends", () => {
+  const replays = new Replays();
+  subscribing(replays);
+  replays.ack(acked([]));
+  replays.refusedAfterAck("sh", "g", "unauthorized", why);
+  // The client keeps no refusal: a later subscribe's ack makes it live again.
+  subscribing(replays);
+  replays.ack(acked([]));
+  assert.equal(replays.live(zone), true);
+  // An ack for another zone in a subscribe's turn still names a zone the node
+  // registered.
+  const turned = subscribing(replays, "g3");
+  replays.ack(acked([], "h"));
+  assert.match(String(turned.failure), /another zone/);
+  assert.equal(replays.live(zoneKey("sh", "h", empty)), true);
+  replays.ended();
+  assert.equal(replays.live(zone) || replays.live(zoneKey("sh", "h", empty)), false, "no subscription outlives its connection");
+  assert.deepEqual(replays.refusedAfterAck("sh", "g", "unauthorized", why), []);
+});
+
+test("F13: over the socket, a zone refused after its ack reaches onZoneRefused, and a later subscribe asks again", async () => {
+  const { client, socket } = await fakeClient("a");
+  const told: ZoneRefusal[] = [];
+  client.onZoneRefused((r) => told.push(r));
+  const first = client.subscribeOutcome("sh", "g");
+  socket.ack();
+  assert.deepEqual(await first, { ok: true, heads: [], code: "ok", message: "" });
+  assert.equal(client.live("sh", "g"), true);
+  socket.lone("unauthorized", why);
+  assert.deepEqual(told, [refusal()]);
+  assert.equal(client.live("sh", "g"), false);
+  // The refusal is not kept: a later subscribe's ack makes the zone live again.
+  const again = client.subscribeOutcome("sh", "g");
+  socket.ack();
+  assert.equal((await again).ok, true);
+  assert.equal(client.live("sh", "g"), true);
+  // Neither an op's status nor a refused subscribe's reason (R6) refuses it.
+  socket.status(chain("b", 1)[0], "unauthorized");
+  const refused = client.subscribeOutcome("sh", "g");
+  socket.refuse("unauthorized", "not granted");
+  assert.equal((await refused).message, "not granted");
+  assert.equal(told.length, 1);
+  assert.equal(client.live("sh", "g"), true);
+  socket.lone("unauthorized", why);
+  assert.deepEqual(told, [refusal(), refusal()]);
+  assert.equal(client.live("sh", "g"), false);
+});
+
+test("F13: a subscribe still waiting for its replay returns the refusal, and with no listener it goes to the console", async () => {
+  const { client, socket } = await fakeClient("a");
+  const outcome = client.subscribeOutcome("sh", "g");
+  socket.ack([["b", 0]]);
+  const plain = client.subscribe("sh", "h");
+  socket.ack([["b", 0]], "h");
+  const warn = mock.method(console, "warn", () => {});
+  try {
+    socket.lone("unauthorized", why);
+    socket.lone("unauthorized", why, "h");
+    assert.equal(warn.mock.callCount(), 2);
+    const said = String(warn.mock.calls[0].arguments[0]);
+    assert.equal(said, `[glade] zone refused after its ack: unauthorized (sh, g): ${why}`);
+  } finally {
+    warn.mock.restore();
+  }
+  assert.deepEqual(await outcome, { ok: false, heads: [], code: "unauthorized", message: why });
+  // `subscribe` never rejects on a refusal.
+  await plain;
+  assert.equal(client.live("sh", "g") || client.live("sh", "h"), false);
 });

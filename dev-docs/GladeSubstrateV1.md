@@ -446,8 +446,17 @@ chain's later ops, and sends them again in order (W5).
 **Not covered.** The peer subscribe keeps F2's race until Step 4.3's peer
 check (`mesh.rs:309`). A live subscription that 4.3's revocation pass ends
 gets `Error{Unauthorized}` alone (`GladeNodeAssembly.md`, "How a revocation
-reaches a live subscription"); these rules do not yet say how a client reads
-it.
+reaches a live subscription"), and so does a forwarding node's subscriber when
+the serving node refuses the forward (plan follow-up F5).
+
+*Amended 2026-09-27 (follow-up F13):* a client reads such an `Error`, one with no
+`corr` that answers no refused subscribe of its share and stream (R6), as a
+refusal of every zone of that stream it holds live, a zone being live from any
+ack naming it until refused or the connection ends. It tells a listener
+(`on_zone_refused` in client-rs, `onZoneRefused` in client-ts, which warns on the
+console with none), and a subscribe of such a zone still waiting for its replay
+returns refused. The session's ops, folds and chains are untouched, and a later
+subscribe asks the node again.
 
 **Where each rule comes from, and what pins it.** Each step writes its new
 tests red first. "The plan" is the plan as ruled (`GladeFirstSlicePlan.md:833`).

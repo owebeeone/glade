@@ -3,9 +3,12 @@
 // W5): the ops the client sent, kept by hash until the node's status names
 // them, and the subscribes it sent, kept until each one's answer and replay
 // are in. No op goes past an op of its chain not placed, and a gap refusal
-// past one is not placed either (follow-up F6). Pure, with no socket and no
-// clock: the client applies what an answer means to its session, its
-// listeners and its resends.
+// past one is not placed either (follow-up F6). The zone an ack names is live
+// until the connection ends, or an Error with no corr, and no refused
+// subscribe's reason, refuses it after its ack (follow-up F13). That Error
+// names a share and stream, not a key, so it refuses each live zone of them.
+// Pure, with no socket and no clock: the client applies what an answer means
+// to its session, its listeners and its resends.
 
 import { zoneKey, type Head, type Op } from "./store.ts";
 
@@ -209,6 +212,20 @@ export interface SubscribeOutcome {
   message: string;
 }
 
+/** A zone refused after its subscribe was acked (F13), as `onZoneRefused`
+ *  reports it: the node ended the connection's subscription with an Error
+ *  naming no op, as a forwarding node relaying its claim holder's refusal of
+ *  the read does (F5), and the grant re-check pass. The wire names the share
+ *  and stream only; the key is the zone's, as the ack named it. */
+export interface ZoneRefusal {
+  share: string;
+  glade_id: string;
+  key: Uint8Array;
+  /** The refusal's code, as the wire names it. */
+  code: string;
+  message: string;
+}
+
 /** One zone's heads, as an ack names them (R5). */
 export interface ZoneHeads {
   share: string;
@@ -237,6 +254,8 @@ export class Replays {
   /** Each (zone, origin)'s highest seq this connection has received, or sent
    *  and had answered Ok (R7). No client announces heads in its Hello. */
   private reached = new Map<string, number>();
+  /** The zones an ack on this connection named, and not refused since (F13). */
+  private liveZones = new Map<string, { share: string; glade_id: string; key: Uint8Array }>();
 
   /** Keep a subscribe the client sent until its answer and replay are in. */
   sent(share: string, gladeId: string, key: Uint8Array, resolve: (outcome: SubscribeOutcome) => void, reject: (failure: Error) => void): void {
@@ -244,8 +263,14 @@ export class Replays {
   }
 
   /** Take the next ack (R5, R6), which answers the oldest subscribe not yet
-   *  acked. Returns whether that subscribe's replay was in at once. */
+   *  acked. Returns whether that subscribe's replay was in at once. Whichever
+   *  subscribe it answers, the zone an ack names is live: the node has
+   *  registered the connection to it (F13). */
   ack(streams: ZoneHeads[]): boolean {
+    if (streams.length > 0) {
+      const { share, glade_id, key } = streams[0];
+      this.liveZones.set(zoneKey(share, glade_id, key), { share, glade_id, key });
+    }
     const s = this.unacked.shift();
     if (!s) {
       return false;
@@ -266,12 +291,44 @@ export class Replays {
   }
 
   /** A refused subscribe's reason: the next Error with no corr for its share
-   *  and glade id (R6). */
-  reason(share: string, gladeId: string, code: string, message: string): void {
+   *  and glade id (R6). Returns whether it was one. */
+  reason(share: string, gladeId: string, code: string, message: string): boolean {
     const at = this.refused.findIndex((s) => s.share === share && s.gladeId === gladeId);
     if (at >= 0) {
       this.refused.splice(at, 1)[0].resolve({ ok: false, heads: [], code, message });
     }
+    return at >= 0;
+  }
+
+  /** F13: an Error with no corr, and no refused subscribe's reason (R6),
+   *  refuses zones after their ack. It names no key, so it refuses each live
+   *  zone of its share and stream: each leaves the live zones, and a
+   *  subscribe of one still waiting for its replay, which cannot come now,
+   *  resolves refused with the same code and reason. Returns the refusals. */
+  refusedAfterAck(share: string, gladeId: string, code: string, message: string): ZoneRefusal[] {
+    if (this.refused.some((s) => s.share === share && s.gladeId === gladeId)) {
+      return [];
+    }
+    const refusals: ZoneRefusal[] = [];
+    for (const [zone, live] of this.liveZones) {
+      if (live.share === share && live.glade_id === gladeId) {
+        this.liveZones.delete(zone);
+        refusals.push({ ...live, code, message });
+      }
+    }
+    const zones = new Set(refusals.map((r) => zoneKey(r.share, r.glade_id, r.key)));
+    const waiting = this.replaying.filter((s) => zones.has(s.zone));
+    this.replaying = this.replaying.filter((s) => !zones.has(s.zone));
+    for (const s of waiting) {
+      s.resolve({ ok: false, heads: [], code, message });
+    }
+    return refusals;
+  }
+
+  /** Whether the zone, keyed as the store keys it, is live on this
+   *  connection: named by an ack, and not refused since (F13). */
+  live(zone: string): boolean {
+    return this.liveZones.has(zone);
   }
 
   /** An op this connection received, or sent and had answered Ok (R7).
@@ -301,10 +358,12 @@ export class Replays {
     }
   }
 
-  /** The connection ended: no ack, reason or op can come on it (R7). */
+  /** The connection ended: no ack, reason or op can come on it (R7), and no
+   *  subscription outlives it (F13). */
   ended(): void {
     this.fail("the connection ended");
     this.reached.clear();
+    this.liveZones.clear();
   }
 
   /** Settle each subscribe of `zone` whose replay is in (R7). */
