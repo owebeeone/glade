@@ -623,6 +623,44 @@ mod hello_tests {
         let refused = verdict.expect_err("the dialer took a WELCOME from an unbound node");
         assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
     }
+
+    /// F12, on the peer link: a frame holding a value its enum does not name
+    /// is refused as `InvalidData`, naming the value, where decoding it
+    /// panicked the task reading the link. A HELLO whose tag names no frame
+    /// type fails the acceptor's handshake, and an `Ops` frame holding an
+    /// unknown shape fails `read_frame`, the mesh's framed read.
+    #[tokio::test]
+    async fn a_frame_with_an_unknown_value_is_refused_as_invalid_data() {
+        use glade_wire::cbor::{self, Cbor};
+        use glade_wire::generated::Op;
+        let mut op = Op::default().to_cbor();
+        if let Cbor::Map(entries) = &mut op {
+            entries.retain(|(key, _)| *key != 9);
+            entries.push((9, Cbor::Int(9)));
+        }
+        let ops = Cbor::Map(vec![(1, Cbor::Array(vec![op])), (2, Cbor::Null)]);
+        let empty = cbor::encode(&Cbor::Map(vec![]));
+        let hello = [&[15][..], &empty].concat();
+        let shaped = [&[4][..], &cbor::encode(&ops)].concat();
+        let cases = [(hello, "frame type 15", true), (shaped, "shape 9", false)];
+        for (bytes, value, handshake) in cases {
+            let (a, b) = tokio::io::duplex(4096);
+            let ((_ar, mut aw), (mut br, mut bw)) = (split(a), split(b));
+            let len = (bytes.len() as u32).to_le_bytes();
+            aw.write_all(&len).await.unwrap();
+            aw.write_all(&bytes).await.unwrap();
+            let me = NodeIdentity::from_key([9u8; 32]);
+            let refused = if handshake {
+                let accepted = hello_accept(&mut br, &mut bw, &me, &CHANNEL, None).await;
+                accepted.map(|_| ())
+            } else {
+                read_frame(&mut br).await.map(|_| ())
+            };
+            let refused = refused.expect_err(value);
+            assert_eq!(refused.kind(), io::ErrorKind::InvalidData, "{value}");
+            assert_eq!(refused.to_string(), format!("bad frame: unknown {value}"));
+        }
+    }
 }
 
 #[cfg(test)]

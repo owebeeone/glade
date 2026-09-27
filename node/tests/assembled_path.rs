@@ -25,8 +25,10 @@
 //! anything is written, and no line naming an endpoint id; every test that
 //! needs an id reads it with `glade-node endpoint-id`, as an operator does.
 //! One checks F9: a `--name` that is not an instance name is refused before
-//! anything is written. The last checks F10: a test that fails while its node
-//! runs leaves no node running, and its failure is the one reported.
+//! anything is written. One checks F10: a test that fails while its node
+//! runs leaves no node running, and its failure is the one reported. The
+//! last checks F12: a client's frame holding a value its enum does not name
+//! is refused, and its session serves on.
 //! Every file goes under a fresh directory in the system temp dir, and the node
 //! runs with `GLADE_HOME` and `HOME` pointed there: `~/.glade` is never touched.
 
@@ -1521,6 +1523,73 @@ fn a_node_does_not_outlive_its_failing_test() {
         let lock = home.join("sys").join(name).join("instance.lock");
         let pid = pid.unwrap();
         assert!(released(&lock), "{root:?}: node {pid} outlived its test");
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Frames holding a value their enum does not name (F12): an `Ops` frame
+/// whose op has shape 9, one with priority 3, an `Error` frame with code 7,
+/// and a frame of type 15.
+fn unknown_values() -> [Vec<u8>; 4] {
+    let with = |mut message: Cbor, key: i64, value: i64| {
+        if let Cbor::Map(entries) = &mut message {
+            entries.retain(|(k, _)| *k != key);
+            entries.push((key, Cbor::Int(value)));
+        }
+        message
+    };
+    let ops = |shape, pri| {
+        let op = with(Op::default().to_cbor(), 9, shape);
+        Cbor::Map(vec![(1, Cbor::Array(vec![op])), (2, pri)])
+    };
+    let error = with(glade_wire::generated::Error::default().to_cbor(), 1, 7);
+    let framed = |tag: u8, body: &Cbor| [&[tag][..], &cbor::encode(body)].concat();
+    [
+        framed(4, &ops(9, Cbor::Null)),
+        framed(4, &ops(0, Cbor::Int(3))),
+        framed(12, &error),
+        framed(15, &Cbor::Map(vec![])),
+    ]
+}
+
+/// F12 (the owner's ruling of 2026-09-27), on each root: a client's frame
+/// holding a value its enum does not name is refused as a bad frame, and
+/// its session serves on. Over one websocket session the node is sent the
+/// four frames of `unknown_values`, then a subscribe, which it acks; its
+/// stderr holds no panic. Before F12 the first of them panicked the
+/// session's task in `Shape::from_wire`, and the ack never came.
+#[test]
+fn both_roots_refuse_a_frame_with_an_unknown_value_and_serve_on() {
+    let dir = scratch("unknown-value");
+    let home = dir.join("glade-home");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    for (root, name) in [(Root::HandWritten, "h"), (Root::Assembled, "a")] {
+        let args = ["--profile", "local", "--name", name, "0"];
+        let node = Running::start(&home, root, &args);
+        let port = node.lines.iter().find_map(|l| l.strip_prefix("listening "));
+        let port: u16 = port.unwrap().parse().unwrap();
+        let answered = runtime.block_on(async {
+            let (mut r, w) = ws::connect("127.0.0.1", port).await.unwrap();
+            for bad in unknown_values() {
+                w.send_binary(&bad).await.unwrap();
+            }
+            let subscribe = Subscribe {
+                share: "ws-x".into(),
+                glade_id: "x.one".into(),
+                key: None,
+                from: None,
+            };
+            let subscribe = Frame::Subscribe(subscribe).to_bytes();
+            w.send_binary(&subscribe).await.unwrap();
+            ws_next(&mut r).await
+        });
+        let stderr = node.stop();
+        let acked = matches!(answered, Frame::Heads(_));
+        assert!(acked, "{root:?}: {answered:?}");
+        assert!(!stderr.contains("panicked"), "{root:?}: {stderr}");
     }
     std::fs::remove_dir_all(&dir).unwrap();
 }

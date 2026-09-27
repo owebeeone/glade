@@ -5,9 +5,12 @@
 //! `python -m taut.corpus.glade_build` — do not edit them by hand. The
 //! conformance tests below prove this crate reproduces taut's Python-authored
 //! golden corpus byte-for-byte; parity == correctness, and the same corpus
-//! pins the TypeScript codec (browser-folds premise).
+//! pins the TypeScript codec (browser-folds premise). `checked.rs` is written
+//! by hand: it refuses a frame whose enum value the generated decode would
+//! panic on (F12).
 
 pub mod cbor;
+pub mod checked;
 pub mod generated;
 pub mod swmr;
 
