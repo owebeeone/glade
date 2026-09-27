@@ -303,11 +303,13 @@ impl fmt::Display for Refusal {
 /// accept and at HELLO, against the transport records it holds, which are
 /// its served store's `home` share with every peer's records, and the keys
 /// its operator configured (`--peer`). The endpoint's accept hook and the
-/// mesh share it; the mesh feeds it each record that lands.
+/// mesh share it; the mesh feeds it each record that lands. Beside its
+/// refusals it carries where the mesh's status lines go (plan Step 4.5).
 pub struct Door {
     configured: BTreeSet<[u8; 32]>,
     fold: Mutex<TransportFold>,
     report: Box<dyn Fn(&str) + Send + Sync>,
+    status: Box<dyn Fn(&str) + Send + Sync>,
 }
 
 impl fmt::Debug for Door {
@@ -321,7 +323,8 @@ impl fmt::Debug for Door {
 
 impl Door {
     /// A door that admits `configured` keys on first contact, and reports
-    /// each refusal to `report`: a stderr line, for the node.
+    /// each refusal to `report`: a stderr line, for the node. The mesh's
+    /// status lines go nowhere until [`Door::with_status`] says where.
     pub fn new(
         configured: impl IntoIterator<Item = [u8; 32]>,
         report: impl Fn(&str) + Send + Sync + 'static,
@@ -332,7 +335,15 @@ impl Door {
             configured,
             fold,
             report,
+            status: Box::new(|_: &str| {}),
         }
+    }
+
+    /// This door, with the mesh's status lines (plan Step 4.5: the notes the
+    /// crossing reads) going to `status`: stdout, for the node.
+    pub fn with_status(self, status: impl Fn(&str) + Send + Sync + 'static) -> Door {
+        let status = Box::new(status);
+        Door { status, ..self }
     }
 
     fn fold(&self) -> std::sync::MutexGuard<'_, TransportFold> {
@@ -373,6 +384,11 @@ impl Door {
     /// Report a refusal of the key `endpoint`, by its tag, with its reason.
     pub fn refused(&self, endpoint: &[u8; 32], why: &dyn fmt::Display) {
         (self.report)(&format!("peer refused: endpoint {}: {why}", tag(endpoint)));
+    }
+
+    /// Put `line`, one of the mesh's status lines, where the node's go.
+    pub fn status(&self, line: &str) {
+        (self.status)(line);
     }
 }
 

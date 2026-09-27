@@ -97,13 +97,16 @@ pub trait Console: Send + Sync {
 }
 
 /// The binary's console. Stdout is flushed after every line, as the
-/// `listening` line must reach a parent process that waits for it.
+/// `listening` line must reach a parent process that waits for it. A line
+/// stdout cannot take, its reader gone, is dropped: the notes come after
+/// `listening` (plan Step 4.5), which is where a parent may stop reading,
+/// and a status line never stops the node.
 pub struct StdConsole;
 
 impl Console for StdConsole {
     fn out(&self, line: &str) {
-        println!("{line}");
-        let _ = io::stdout().flush();
+        let mut stdout = io::stdout().lock();
+        let _ = writeln!(stdout, "{line}").and_then(|()| stdout.flush());
     }
 
     fn err(&self, line: &str) {
@@ -179,8 +182,9 @@ struct Booted {
     node_id: String,
     identity: NodeIdentity,
     endpoint: EndpointKey,
-    /// The endpoint's door (plan Step 4.2b): the network's peer keys, and
-    /// refusals reported on the console's stderr.
+    /// The endpoint's door (plan Step 4.2b): the network's peer keys,
+    /// refusals reported on the console's stderr, and the mesh's status lines
+    /// on its `out` (plan Step 4.5).
     door: Arc<Door>,
     /// Where the endpoint binds and its relays (plan Step 4.5).
     network: Network,
@@ -200,8 +204,9 @@ impl Instance {
         let boot = boot_at_with(at.dir.clone(), &at.operator, recovery_out, lease_ms)?;
         let network = start.settings.network.clone();
         let keys = network.peers.iter().map(|entry| entry.key);
-        let console = start.console.clone();
+        let (console, noting) = (start.console.clone(), start.console.clone());
         let door = Door::new(keys, move |line: &str| console.err(line));
+        let door = door.with_status(move |line: &str| noting.out(line));
         let booted = Booted {
             dir: boot.dir.clone(),
             node_id: boot.node_id.clone(),

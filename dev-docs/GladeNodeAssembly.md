@@ -5850,6 +5850,31 @@ relays off prints none, so the desk prints none.
   the peer. One about 30 s later shows a peer that died, since that is iroh's
   idle limit on a relay path (15 s on a direct one).
 
+**As built** (part 2):
+
+- The reporter rides the door, beside its refusal reporter:
+  `Door::with_status(sink)`, and `Door::status(line)`, which the mesh calls.
+  The hand-written root points it at stdout, the assembled root at its
+  console's `out`; a door built without it, as the tests' are, notes
+  nowhere.
+- A note stdout cannot take is dropped. The notes come after `listening`,
+  which is where a parent may stop reading, and `println!` panics on a
+  closed pipe: in the first full run, an acceptor whose stdout the test no
+  longer read panicked in its link's task, and its dialer's round failed.
+  The hand-written root's sink and the assembled root's `StdConsole::out`
+  now write with `writeln!` and drop an error. grazel drains the node's
+  stdout, so the desk loses nothing.
+- The `link` note at HELLO needs a path iroh has selected by then; if none
+  is yet, the link's watch notes it within 250 ms. On loopback both ends
+  had one at once.
+- `n` in `home round` is the records the round took (`SyncOutcome::applied`),
+  noted when the pull ends well. A failed pull notes nothing: the dialer
+  reports its failed dial, as before.
+- The relay's watch holds no handle on the endpoint (iroh's watcher and its
+  close future do not), so it keeps no socket bound; it ends when the
+  endpoint closes, or with `Sessions` on the assembled root. It notes a
+  state change, not every retry: the same error twice is one line.
+
 ### 9. What n0's relays can see
 
 This comes from the protocols (iroh 1.2 and iroh-relay 1.2) and is not observed.
@@ -6123,20 +6148,34 @@ an in-process boot (`tests/lifecycle.rs`, `tests/stop_signal.rs`), and the
 address from the `peer` line; `tests/lifecycle.rs`'s start loads the network
 as a root does; `mesh`'s door helper binds `Network::default()`.
 
-**Part 2.**
+**Part 2**, built on 2026-09-27 against glade `b4e890f`, red in one
+sources-only copy of the final tree as part 1 was, each part switched off by
+one edit and put back before the next.
 
-| Test | Proves | Red against |
+| Test | Proves | Red first |
 | --- | --- | --- |
-| `iroh_carrier`: `a_path_is_described_by_where_it_goes` | pure: a relay `TransportAddr` reads `via relay <url>`, an IP one `via direct <ip:port>` | none: it guards the text |
-| `mesh`: `each_end_notes_its_link_at_hello_and_its_close` | over real iroh on loopback: both ends note `link <node> via direct 127.0.0.1:<port>, rtt …` at HELLO, and `link <node> closed` when the other closes | no notes |
-| `mesh`: `each_end_notes_its_home_round` | both ends note `home round with node <id>: <n> record(s) …`, `n` being the peer's `home` records at that moment | no note |
-| `tests/lifecycle`: `a_node_links_to_a_peer_and_stops_clean_with_its_ports_free` (extended) | the notes reach the assembled console's `out`, and the stop is still clean | the notes sent nowhere |
+| `iroh_carrier`: `a_path_is_described_by_where_it_goes` | pure: a relay `TransportAddr` reads `relay <url>`, as the node prints the URL, and an IP one `direct <ip:port>` | with iroh's `Debug` form: `left: "Relay(https://aps1-1.relay.n0.iroh.link./)"`, `right: "relay https://aps1-1.relay.n0.iroh.link./"` |
+| `mesh`: `each_end_notes_its_link_at_hello_and_its_close` | over real iroh on loopback: both ends note `link <node> via direct 127.0.0.1:<port>, rtt <n> ms`, the address the other end is bound at, and the dialed end notes `link <node> closed` once the dialer's endpoint has closed | with the notes sent nowhere: `not noted: []`; with the close's note off: `not noted: ["link <node> via direct 127.0.0.1:55703, rtt 1 ms", "home round with node <node>: 0 record(s) in 0 ms"]` |
+| `mesh`: `each_end_notes_its_home_round` | both ends note `home round with node <id>: <n> record(s) in <ms> ms`, `n` the other's `home` records the round took: B holds two of its own, A one | with the notes sent nowhere: `not noted: []`; with the round's note off: `not noted: ["link <node> via direct 127.0.0.1:56810, rtt 1 ms"]` |
+| `mesh`: `the_relay_lines_follow_the_home_relays_states` (added) | the `relay` lines, from home relay states as the adapter reads them off iroh, with no relay reached: `relay <url>` once one is connected, again after a drop and at a change of home relay; `relay <url> not connected: <error>` once for each error, where iroh reports a failure again at every retry; nothing while connecting | with no lines computed: at the third state, `left: []`, `right: ["relay https://aps1-1.relay.n0.iroh.link./"]` |
+| `tests/lifecycle`: `a_node_links_to_a_peer_and_stops_clean_with_its_ports_free` (extended) | the notes reach the assembled console's `out`: A notes its link to B and its round before `peer-connected`, and B notes `link <A> closed` once A has stopped; the stop is still clean | with the assembled root's door noting nowhere: `link, round, peer-connected: [...]`, A's lines holding neither note |
+| `tests/assembled_path`: `both_roots_refuse_an_unknown_dialer_and_admit_a_configured_one` (extended) | on each root, the linked A notes on stdout its link to B at B's address and its round, before `peer-connected` | with the hand-written root's door noting nowhere: `HandWritten: [...]`, its stdout holding neither note |
+| `tests/assembled_path`: `no_line_names_an_endpoint_id` (extended) | no node panicked, though B noted its link and its round after its `listening`, when the test no longer read its stdout | with both roots printing notes by `println!`: B's stderr held `failed printing to stdout: Broken pipe (os error 32)`, a worker thread's panic |
 
-**What they do not prove:** a relay path, the `relay` line and the relay's
-watch. No test reaches a relay: n0's would be reached from the Mac, and a
-local one needs iroh's `test-utils` server and a TLS bypass the node must never
-carry. The crossing is their evidence. Nor do they prove Windows' file modes
-(F5), hole punching, or two networks.
+The last row is a finding of the build (section 8, as built): the first full
+run failed both of those tests on the hand-written root, A's `peer-connected`
+missing, until a note stdout could not take was dropped rather than panic.
+
+**What they do not prove:** a relay path, the relay's watch, and the step
+from iroh's `RelayStatus` to the states the lines are computed from: iroh
+gives `RelayStatus` no public constructor, and a node picks a home relay
+only from relays whose probes answered, so the watch reports nothing
+without a relay that answers. No test reaches a relay: n0's would be reached
+from the Mac, and a local one needs iroh's `test-utils` server, whose crates
+are not in the lock, and a TLS bypass the node must never carry. The
+crossing is their evidence. Nor do they prove a change of selected path (on
+loopback a link has one path), Windows' file modes (F5), hole punching, or
+two networks.
 
 **The gate** (`glade/node/check.sh`) must pass all 9 components:
 
@@ -6194,6 +6233,13 @@ commit, that the ruling of 2026-09-22 governs:
   `node.status` through bindings later (`IrohGladeMapping.md` §7.6).
 - **The 4.2c gap stays for 4.5b:** the adapter still waits for its first word
   without a bound.
+- **Part 2's relay lines are tested from computed states** (section 11): the
+  step from iroh's `RelayStatus` to them, and the relay's watch, are the
+  crossing's to show.
+- **A change of selected path** is noted by a 250 ms poll, and no test sees
+  one: on loopback a link has one path.
+- **A note is dropped when stdout is not read** (section 8, as built): a
+  parent that stops reading after `listening` loses the notes after it.
 - **The adapter's release wait binds each address it had**, for an instant, to
   see that it is free (section 4, as built). Every test binds it on loopback;
   bound beyond loopback in 4.5b, its close would probe beyond loopback too. A
@@ -6359,3 +6405,44 @@ plus part 1):
 - Beside them, the two one-line notes at the glade-wz root:
   `dev-docs/IrohGladeMapping.md` §7.6 and `dev-docs/glade/GladeDiscoveryModel.md`
   (the v1 relay).
+
+### Measured (4.5, part 2)
+
+2026-09-27, Apple M3 Pro, Rust 1.96.0, on the final tree (glade `b4e890f`
+plus part 2):
+
+- **The gate** passes all 9 components, in 104 s from an empty scratch
+  target, with 352 node tests on each path, across 17 test binaries, where
+  there were 348: `iroh_carrier` 1 and `mesh` 3 new, and three tests
+  extended.
+  - rustfmt: glade-node 294 hunks and glade-wire 43, at their baselines; no
+    line this part wrote is in one.
+  - clippy: glade-node 11 warnings and glade-wire 7, at their baselines.
+  - process-globals: 53 files, 3 permanent entries, 0 debt, nothing new.
+  - confinement: no new crate; `Cargo.toml` and `Cargo.lock` untouched. The
+    contracts gate passes, untouched.
+- **Nothing reached beyond loopback.** No test binds anything but loopback,
+  and none reaches a relay: the relay lines are computed from states a test
+  writes.
+- **The notes on loopback**, from the tests: `link <node> via direct
+  127.0.0.1:<port>, rtt 1 ms` at each end at HELLO; `home round with node
+  <node>: 2 record(s) in 0 ms` and `…: 1 record(s) in 0 ms`; `link <node>
+  closed` at the dialed end within milliseconds of the dialer's close. The
+  two mesh tests passed 20 of 20 runs.
+- **The replay**, as in part 1: today's binary (inode 405499642), this build
+  (inode 405580880, from the gate's scratch target), then today's again. The
+  three starts printed the same lines apart from ports, line for line
+  (`instance`, `node`, the two `app` lines, `registry ready (home served:
+  true)`, `peer 706eed245d 127.0.0.1:<port>`, `workspace ws-razel serving`
+  twice, `listening <port>`), nothing after `listening`, and on stderr the
+  recovery warning alone. `lsof`: UDP and TCP on `127.0.0.1` alone. A node
+  with no link and no relay notes nothing.
+
+**Size**, in lines added and removed in `.rs` files, doc comments included:
+
+- production: +249/−21, net +228, of which +160/−13 are code, against
+  section 12's estimate of about 160: `mesh.rs` +105/−10; `iroh_carrier.rs`
+  +93/−1; `transport.rs` +18/−2; `bin/glade-node.rs` +18/−1;
+  `lifecycle.rs` +11/−6; `tasks.rs` +4/−1;
+- tests: +176/−9: `mesh.rs` +124/−4; `tests/assembled_path.rs` +20/−3;
+  `tests/lifecycle.rs` +19/−2; `iroh_carrier.rs` +13.

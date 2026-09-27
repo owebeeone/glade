@@ -190,7 +190,10 @@ async fn the_release_check_can_answer_still_bound() {
 /// The done-when. B is started first, admitting A's endpoint key (plan Step
 /// 4.2b); A boots, links to B with `--peer`, and is stopped: a clean report
 /// with nothing incomplete, both of A's ports free within the bound, and A's
-/// instance lock removed. B stops cleanly after it.
+/// instance lock removed. B stops cleanly after it. The notes (plan Step
+/// 4.5) reach each console's `out`: A notes its link to B at HELLO and its
+/// `home` round before `peer-connected`, and B notes the link's close once
+/// A has stopped.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_node_links_to_a_peer_and_stops_clean_with_its_ports_free() {
     let dir = scratch("lifecycle");
@@ -210,7 +213,15 @@ async fn a_node_links_to_a_peer_and_stops_clean_with_its_ports_free() {
     assert_eq!(steady.ok(), Some(Ok(())), "A steady: {:?}", a_lines.all());
 
     // A linked to B: the HELLO completed and the home share was pulled.
-    assert_eq!(a_lines.value("peer-connected"), b_lines.value("node"));
+    let b_node = b_lines.value("node");
+    assert_eq!(a_lines.value("peer-connected"), b_node);
+    let noted = a_lines.all();
+    let at = |head: &str| noted.iter().position(|line| line.starts_with(head));
+    let link = format!("link {b_node} via direct {}, rtt ", peer_address(&b_peer));
+    let round = format!("home round with node {b_node}: ");
+    let order = [at(&link), at(&round), at("peer-connected ")];
+    let ordered = order.iter().all(Option::is_some) && order.is_sorted();
+    assert!(ordered, "link, round, peer-connected: {noted:?}");
     let udp_port = peer_port(&a_lines.value("peer"));
     let tcp_port: u16 = a_lines.value("listening").parse().unwrap();
     let lock = dir.join("sys").join("a").join("instance.lock");
@@ -254,6 +265,12 @@ async fn a_node_links_to_a_peer_and_stops_clean_with_its_ports_free() {
         .filter(|l| l.starts_with("stderr:") && !l.starts_with(&warned))
         .collect();
     assert_eq!(stderr, Vec::<String>::new());
+    let closed = format!("link {} closed", a_lines.value("node"));
+    let deadline = Instant::now() + RELEASE_BOUND;
+    while !b_lines.all().contains(&closed) && Instant::now() < deadline {
+        tokio::time::sleep(POLL).await;
+    }
+    assert!(b_lines.all().contains(&closed), "{:?}", b_lines.all());
 
     b.handle().shutdown();
     let report = tokio::time::timeout(BOUND, b)

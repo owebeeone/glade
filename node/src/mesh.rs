@@ -18,12 +18,20 @@
 //! carrier and fanned out to local subscribers — the replica serves the reads.
 //! A push the store refuses as a gap starts a pull of the pusher's home share
 //! at once, one at a time per pusher (`pull_on_gap`).
+//!
+//! The notes the crossing reads (plan Step 4.5, part 2) are status lines, put
+//! where the door says (stdout for the node): each link's path at HELLO and
+//! whenever iroh selects another, its close, each `home` round's records and
+//! time, and, with `relay n0`, the home relay's state. A node with no link
+//! and no relay notes nothing.
 
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
+use std::pin::pin;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, PoisonError};
+use std::time::{Duration, Instant};
 
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use tokio::sync::Mutex;
@@ -34,8 +42,8 @@ use glade_wire::generated::{ErrorCode, Head, Heads, Op, Ops, Priority, StreamHea
 use crate::envelope;
 use crate::frame::Frame;
 use crate::grants::{refusal, READ_SUBSCRIBE};
-use crate::iroh_carrier::{PeerAddr, PeerEndpoint, PeerLink};
-use crate::netconf::PeerEntry;
+use crate::iroh_carrier::{selected_path, PathSeen, PeerAddr, PeerEndpoint, PeerLink, RelayState};
+use crate::netconf::{PeerEntry, Relays};
 use crate::peer::{read_frame, write_frame, SyncOutcome, OPS_PER_CHUNK};
 use crate::registry::HOME;
 use crate::router::SessionId;
@@ -91,6 +99,22 @@ impl Mesh {
         match &self.door {
             Some(door) => door.report(line),
             None => eprintln!("{line}"),
+        }
+    }
+
+    /// Note `line`, a status line (plan Step 4.5): through the door, which
+    /// both roots point at stdout, the assembled one through its console;
+    /// with no door, nowhere.
+    fn status(&self, line: &str) {
+        if let Some(door) = &self.door {
+            door.status(line);
+        }
+    }
+
+    /// Note the path iroh sends on to `peer`, if it has selected one.
+    fn note_path(&self, peer: &str, path: Option<&PathSeen>) {
+        if let Some(PathSeen { via, rtt_ms }) = path {
+            self.status(&format!("link {peer} via {via}, rtt {rtt_ms} ms"));
         }
     }
 
@@ -242,6 +266,18 @@ impl Server {
             .mesh
             .set(mesh.clone())
             .map_err(|_| other("mesh already enabled"))?;
+        // With n0's relays, the home relay's state is noted as it changes
+        // (plan Step 4.5), until the endpoint closes.
+        if endpoint.relays() == Relays::N0 {
+            let (noting, mut before) = (mesh.clone(), Vec::new());
+            let watch = endpoint.relay_watch(move |now| {
+                for line in relay_notes(&before, &now) {
+                    noting.status(&line);
+                }
+                before = now;
+            });
+            self.shared.tasks.spawn(Site::RelayWatch, watch);
+        }
         let shared = self.shared.clone();
         self.shared.tasks.spawn(Site::AcceptLoop, async move {
             // The accept loop holds its own endpoint clone, so the endpoint
@@ -287,13 +323,18 @@ async fn run_link(shared: Arc<Shared>, mesh: Arc<Mesh>, link: PeerLink, dialed: 
     let node = peer.peer_id;
     mesh.signer.authenticated(node);
     mesh.links.lock().await.insert(peer_hex.clone(), conn.clone());
+    // The path at HELLO (plan Step 4.5).
+    let path = selected_path(&conn);
+    mesh.note_path(&peer_hex, path.as_ref());
 
-    // Unlink on close, whoever closes first.
+    // Unlink on close, whoever closes first, noting each path iroh selects
+    // until then, and the close.
     {
         let (mesh, conn, peer_hex) = (mesh.clone(), conn.clone(), peer_hex.clone());
         shared.tasks.spawn(Site::Unlink, async move {
-            conn.closed().await;
+            watch_link(&mesh, &conn, &peer_hex, path).await;
             mesh.links.lock().await.remove(&peer_hex);
+            mesh.status(&format!("link {peer_hex} closed"));
         });
     }
 
@@ -312,10 +353,8 @@ async fn run_link(shared: Arc<Shared>, mesh: Arc<Mesh>, link: PeerLink, dialed: 
 
     // Our home-share pull: the dialer rides stream 0 (the acceptor's stream-0
     // handler above serves it); the acceptor opens its own stream.
-    if dialed {
-        pull_home(&shared, &mesh, node, s0_send, s0_recv)
-            .await
-            .map(drop)
+    let (send, recv) = if dialed {
+        (s0_send, s0_recv)
     } else {
         // Stream 0 on the acceptor side is the DIALER's pull channel: serve it.
         {
@@ -324,9 +363,65 @@ async fn run_link(shared: Arc<Shared>, mesh: Arc<Mesh>, link: PeerLink, dialed: 
                 let _ = handle_peer_stream(stream, node, s0_send, s0_recv).await;
             });
         }
-        let (send, recv) = conn.open_bi().await.map_err(other)?;
-        pull_home(&shared, &mesh, node, send, recv).await.map(drop)
+        conn.open_bi().await.map_err(other)?
+    };
+    // The round is noted with what it took and how long it ran (plan Step
+    // 4.5); the dialer's `peer-connected` follows it.
+    let began = Instant::now();
+    let pulled = pull_home(&shared, &mesh, node, send, recv).await;
+    if let Ok(round) = &pulled {
+        let (p, n, ms) = (&peer_hex, round.applied, began.elapsed().as_millis());
+        let line = format!("home round with node {p}: {n} record(s) in {ms} ms");
+        mesh.status(&line);
     }
+    pulled.map(drop)
+}
+
+/// How often a link's watch reads the path iroh sends on (plan Step 4.5).
+const PATH_POLL: Duration = Duration::from_millis(250);
+
+/// Watch `conn`, a link to `peer`, until it closes, noting each path iroh
+/// selects after `noted`, the one noted at HELLO. It reads the path every
+/// [`PATH_POLL`]: iroh's change stream needs a trait from a crate the node
+/// does not depend on, and a poll needs none.
+async fn watch_link(mesh: &Mesh, conn: &Connection, peer: &str, mut noted: Option<PathSeen>) {
+    let mut closed = pin!(conn.closed());
+    loop {
+        tokio::select! {
+            _ = &mut closed => {
+                return;
+            }
+            () = tokio::time::sleep(PATH_POLL) => {
+                let now = selected_path(conn);
+                let via = |path: &Option<PathSeen>| path.as_ref().map(|path| path.via.clone());
+                if via(&now) != via(&noted) {
+                    mesh.note_path(peer, now.as_ref());
+                    noted = now;
+                }
+            }
+        }
+    }
+}
+
+/// The `relay` lines a change of the home relays' states, from `before` to
+/// `now`, calls for (plan Step 4.5): `relay <url>` once one is connected,
+/// which covers a change of home relay, and `relay <url> not connected:
+/// <error>` once its connection has failed or dropped, each error once.
+fn relay_notes(before: &[RelayState], now: &[RelayState]) -> Vec<String> {
+    let mut lines = Vec::new();
+    for state in now {
+        let was = before.iter().find(|held| held.url == state.url);
+        if state.connected {
+            if !was.is_some_and(|was| was.connected) {
+                lines.push(format!("relay {}", state.url));
+            }
+        } else if let Some(error) = &state.error {
+            if was.is_none_or(|was| was.error.as_ref() != Some(error)) {
+                lines.push(format!("relay {} not connected: {error}", state.url));
+            }
+        }
+    }
+    lines
 }
 
 /// Serve one inbound peer stream by its first frame: `Heads` = a home-scoped
@@ -1199,19 +1294,32 @@ mod tests {
     /// starts; the door's refusal lines; its dialable address.
     async fn behind_door(
         name: &str,
-        (seed, key): ([u8; 32], [u8; 32]),
+        keys: ([u8; 32], [u8; 32]),
         configured: &[[u8; 32]],
         records: &[Op],
     ) -> (Server, Lines, PeerAddr) {
+        let (server, lines, _, addr) = noting_door(name, keys, configured, records).await;
+        (server, lines, addr)
+    }
+
+    /// [`behind_door`], its door also taking the mesh's status lines (plan
+    /// Step 4.5), which come back after its refusal lines.
+    async fn noting_door(
+        name: &str,
+        (seed, key): ([u8; 32], [u8; 32]),
+        configured: &[[u8; 32]],
+        records: &[Op],
+    ) -> (Server, Lines, Lines, PeerAddr) {
         let server = Server::open(fresh(name)).unwrap();
         for op in records {
             server.shared.store.lock().await.append(op.clone()).unwrap();
         }
-        let lines = Lines::default();
-        let sink = lines.clone();
+        let (lines, notes) = (Lines::default(), Lines::default());
+        let (sink, noting) = (lines.clone(), notes.clone());
         let door = Door::new(configured.iter().copied(), move |line: &str| {
             sink.lock().unwrap().push(line.into())
         });
+        let door = door.with_status(move |line: &str| noting.lock().unwrap().push(line.into()));
         let (identity, key) = (
             crate::peer::NodeIdentity::from_key(seed),
             crate::transport::EndpointKey::from_seed(key),
@@ -1221,7 +1329,114 @@ mod tests {
             .await
             .unwrap();
         let addr = server.enable_mesh(endpoint).await.unwrap();
-        (server, lines, addr)
+        (server, lines, notes, addr)
+    }
+
+    /// A note that begins with `head` and ends with a time, ` ms`.
+    fn timed(head: String) -> impl Fn(&str) -> bool {
+        move |line: &str| line.starts_with(&head) && line.ends_with(" ms")
+    }
+
+    /// Wait, bounded at 5 s, for a line in `lines` that `wanted` takes.
+    async fn noted(lines: &Lines, wanted: impl Fn(&str) -> bool) {
+        for _ in 0..500 {
+            if lines.lock().unwrap().iter().any(|line| wanted(line)) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("not noted: {:?}", lines.lock().unwrap());
+    }
+
+    /// Plan Step 4.5, over real iroh on loopback: each end of a link notes the
+    /// path it sends on at HELLO, `link <node> via direct <ip:port>, rtt <n>
+    /// ms`, the address the other end is bound at, and notes `link <node>
+    /// closed` once the other end has closed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn each_end_notes_its_link_at_hello_and_its_close() {
+        let (a_id, b_id) = (hex_id(&node_of(A_SEED)), hex_id(&node_of(B_SEED)));
+        let admits_a = [endpoint_of(A_KEY)];
+        let b = noting_door("notes-link-b", (B_SEED, B_KEY), &admits_a, &[]).await;
+        let (_b, _, b_notes, at_b) = b;
+        let admits_b = [endpoint_of(B_KEY)];
+        let a = noting_door("notes-link-a", (A_SEED, A_KEY), &admits_b, &[]).await;
+        let (a, _, a_notes, at_a) = a;
+        a.connect_peer(&at_b).await.expect("a link");
+        let link = |id: &str, at: &PeerAddr| format!("link {id} via direct {}, rtt ", at.socket);
+        noted(&a_notes, timed(link(&b_id, &at_b))).await;
+        noted(&b_notes, timed(link(&a_id, &at_a))).await;
+
+        let endpoint = a.shared.mesh.get().unwrap().endpoint.give_up();
+        endpoint.expect("A's endpoint").close().await;
+        let closed = format!("link {a_id} closed");
+        noted(&b_notes, |line| line == closed).await;
+    }
+
+    /// Plan Step 4.5: each end notes its `home` round when its pull from the
+    /// other ends, `home round with node <id>: <n> record(s) in <ms> ms`,
+    /// `n` being the other's `home` records it took: B holds two of its own,
+    /// and A one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn each_end_notes_its_home_round() {
+        use crate::sysdata::{NodeRecord, PrincipalRecord};
+        let (a_id, b_id) = (hex_id(&node_of(A_SEED)), hex_id(&node_of(B_SEED)));
+        let presence = |id: &str| {
+            let (node_id, operator) = (id.to_string(), "gianni".to_string());
+            Record::Node(NodeRecord { node_id, operator })
+        };
+        let principal = Record::Principal(PrincipalRecord {
+            principal: "alice".into(),
+        });
+        let b_own = [signed(B_SEED, presence(&b_id)), signed(B_SEED, principal)];
+        let a_own = [signed(A_SEED, presence(&a_id))];
+        let admits_a = [endpoint_of(A_KEY)];
+        let b = noting_door("notes-round-b", (B_SEED, B_KEY), &admits_a, &b_own).await;
+        let (_b, _, b_notes, at_b) = b;
+        let admits_b = [endpoint_of(B_KEY)];
+        let a = noting_door("notes-round-a", (A_SEED, A_KEY), &admits_b, &a_own).await;
+        let (a, _, a_notes, _) = a;
+        a.connect_peer(&at_b).await.expect("a link");
+        let round = |id: &str, n: usize| format!("home round with node {id}: {n} record(s) in ");
+        noted(&a_notes, timed(round(&b_id, 2))).await;
+        noted(&b_notes, timed(round(&a_id, 1))).await;
+    }
+
+    /// Plan Step 4.5: the `relay` lines, from home relay states as the
+    /// adapter reads them off iroh, with no relay reached: `relay <url>` once
+    /// one is connected, again after a drop and at a change of home relay,
+    /// and `relay <url> not connected: <error>` once for each error, where
+    /// iroh reports a failure again at every retry.
+    #[test]
+    fn the_relay_lines_follow_the_home_relays_states() {
+        let ap = "https://aps1-1.relay.n0.iroh.link./";
+        let eu = "https://euc1-1.relay.n0.iroh.link./";
+        let state = |url: &str, connected: bool, error: Option<&str>| {
+            let (url, error) = (url.to_string(), error.map(str::to_string));
+            vec![RelayState {
+                url,
+                connected,
+                error,
+            }]
+        };
+        let failed = |error: &str| vec![format!("relay {ap} not connected: {error}")];
+        let (reset, late) = ("connection reset", "timed out");
+        let steps = [
+            (vec![], vec![]),
+            (state(ap, false, None), vec![]),
+            (state(ap, true, None), vec![format!("relay {ap}")]),
+            (state(ap, true, None), vec![]),
+            (state(ap, false, Some(reset)), failed(reset)),
+            (state(ap, false, Some(reset)), vec![]),
+            (state(ap, false, Some(late)), failed(late)),
+            (state(ap, true, None), vec![format!("relay {ap}")]),
+            (state(eu, false, None), vec![]),
+            (state(eu, true, None), vec![format!("relay {eu}")]),
+        ];
+        let mut before = Vec::new();
+        for (now, lines) in steps {
+            assert_eq!(relay_notes(&before, &now), lines, "{now:?}");
+            before = now;
+        }
     }
 
     /// The node `seed`'s record, first on its chain, sealed by it (plan Step

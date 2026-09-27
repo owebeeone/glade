@@ -25,7 +25,9 @@
 //! the node calls none of iroh's helpers that read the environment: it names
 //! n0's production relays itself. A dial names every address its entry
 //! gives, IP or relay, and iroh chooses among them. Lines name an endpoint by
-//! its tag, never its id.
+//! its tag, never its id. For the notes the crossing reads (part 2), this
+//! module describes a link's selected path and the home relays' states as
+//! text and numbers, so iroh's types stop here.
 
 use std::fmt;
 use std::future::{ready, Future};
@@ -39,8 +41,10 @@ use glade_carrier_api::{
     CarrierAddr, CarrierConfig, CarrierError, CarrierLink, CarrierPort, PortFuture, TransportId,
 };
 use iroh::endpoint::presets;
+use iroh::endpoint::RelayStatus;
 use iroh::endpoint::{AfterHandshakeOutcome, EndpointHooks, PortmapperConfig, Side, VarInt};
 use iroh::endpoint::{Connection, ConnectionError, ReadError, RecvStream, SendStream};
+use iroh::Watcher;
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey, TransportAddr};
 
 use crate::netconf::{Network, PeerEntry, Relays, Via};
@@ -251,6 +255,8 @@ pub struct PeerEndpoint {
     endpoint: Endpoint,
     identity: NodeIdentity,
     door: Option<Arc<Door>>,
+    /// Whether the endpoint was bound with relays (plan Step 4.5).
+    relays: Relays,
 }
 
 impl PeerEndpoint {
@@ -285,6 +291,7 @@ impl PeerEndpoint {
             endpoint,
             identity,
             door: None,
+            relays: Relays::Off,
         })
     }
 
@@ -302,6 +309,7 @@ impl PeerEndpoint {
             endpoint,
             identity,
             door: Some(door),
+            relays: network.relays,
         })
     }
 
@@ -312,6 +320,42 @@ impl PeerEndpoint {
     /// The door this endpoint was bound behind, if any: the mesh feeds it.
     pub fn door(&self) -> Option<Arc<Door>> {
         self.door.clone()
+    }
+
+    /// Whether the endpoint was bound with n0's relays, whose state the mesh
+    /// then watches (plan Step 4.5).
+    pub(crate) fn relays(&self) -> Relays {
+        self.relays
+    }
+
+    /// Watch this endpoint's home relays until it closes: `seen` has their
+    /// states now, and again at each change (plan Step 4.5). iroh's status
+    /// becomes text and flags here, and the future holds no handle on the
+    /// endpoint, so it keeps no socket bound.
+    pub(crate) fn relay_watch(
+        &self,
+        mut seen: impl FnMut(Vec<RelayState>) + Send + 'static,
+    ) -> impl Future<Output = ()> + Send + 'static {
+        let mut statuses = self.endpoint.home_relay_status();
+        let closed = self.endpoint.closed();
+        async move {
+            let states = |held: &[RelayStatus]| held.iter().map(RelayState::of).collect();
+            seen(states(&statuses.get()));
+            let mut closed = std::pin::pin!(closed);
+            loop {
+                tokio::select! {
+                    () = &mut closed => {
+                        return;
+                    }
+                    changed = statuses.updated() => {
+                        let Ok(now) = changed else {
+                            return;
+                        };
+                        seen(states(&now));
+                    }
+                }
+            }
+        }
     }
 
     /// Report a refused HELLO, naming the endpoint key it came from.
@@ -366,6 +410,54 @@ impl PeerEndpoint {
     /// never goes away keeps the port bound, which is how a leaked handle shows up.
     pub async fn close(self) {
         self.endpoint.close().await;
+    }
+}
+
+// ---- the notes the crossing reads (plan Step 4.5, part 2) -------------------
+
+/// The path a link sends on, as its `link` line reads it: where it goes,
+/// `relay <url>` or `direct <ip:port>`, and iroh's round-trip estimate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PathSeen {
+    pub(crate) via: String,
+    pub(crate) rtt_ms: u128,
+}
+
+/// Where a path to `addr` goes, in a line's words.
+fn described(addr: &TransportAddr) -> String {
+    match addr {
+        TransportAddr::Relay(url) => format!("relay {url}"),
+        TransportAddr::Ip(socket) => format!("direct {socket}"),
+        other => format!("another transport, {other:?}"),
+    }
+}
+
+/// The path iroh has selected for `conn`'s data, if it has selected one.
+pub(crate) fn selected_path(conn: &Connection) -> Option<PathSeen> {
+    let paths = conn.paths();
+    let selected = paths.iter().find(|path| path.is_selected())?;
+    let via = described(selected.remote_addr());
+    let rtt_ms = selected.rtt().as_millis();
+    Some(PathSeen { via, rtt_ms })
+}
+
+/// A home relay's state, as the `relay` lines read it: its URL as the node
+/// prints it, whether the endpoint is connected to it, and while it is not,
+/// the last error, if one has been seen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RelayState {
+    pub(crate) url: String,
+    pub(crate) connected: bool,
+    pub(crate) error: Option<String>,
+}
+
+impl RelayState {
+    fn of(status: &RelayStatus) -> RelayState {
+        RelayState {
+            url: status.url().to_string(),
+            connected: status.is_connected(),
+            error: status.last_error().map(|e| e.to_string()),
+        }
     }
 }
 
@@ -825,6 +917,19 @@ mod tests {
         for url in &staging {
             assert_eq!(n0_relay(&url.to_string()), None, "{url}");
         }
+    }
+
+    /// Plan Step 4.5: a `link` line names where a path goes, `relay <url>`
+    /// for a relay path, its URL as the node prints it, and `direct
+    /// <ip:port>` for an IP one. Pure: nothing binds.
+    #[test]
+    fn a_path_is_described_by_where_it_goes() {
+        let url: RelayUrl = "https://aps1-1.relay.n0.iroh.link./".parse().unwrap();
+        let relay = described(&TransportAddr::Relay(url));
+        assert_eq!(relay, "relay https://aps1-1.relay.n0.iroh.link./");
+        let socket: SocketAddr = "10.1.1.236:4545".parse().unwrap();
+        let direct = described(&TransportAddr::Ip(socket));
+        assert_eq!(direct, "direct 10.1.1.236:4545");
     }
 
     /// Plan Step 4.5: an endpoint binds where its network says, and the

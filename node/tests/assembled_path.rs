@@ -766,8 +766,9 @@ fn both_roots_revoke_a_replaced_endpoint_keys_binding() {
 /// know. B says so on stderr, naming A's endpoint by its tag, and A's line
 /// about the failed dial, which names B by its tag and the address it
 /// dialed, carries no reason. B started again with `--peer <A's endpoint
-/// id>` admits A, which links. Each id is minted and read with `glade-node
-/// endpoint-id` before its node's first start (plan Step 4.5).
+/// id>` admits A, which links, and A notes on stdout its path to B and its
+/// `home` round before `peer-connected`. Each id is minted and read with
+/// `glade-node endpoint-id` before its node's first start (plan Step 4.5).
 #[test]
 fn both_roots_refuse_an_unknown_dialer_and_admit_a_configured_one() {
     let dir = scratch("door");
@@ -810,6 +811,14 @@ fn both_roots_refuse_an_unknown_dialer_and_admit_a_configured_one() {
             .iter()
             .find_map(|l| l.strip_prefix("peer-connected "));
         assert_eq!(linked, Some(b_id.as_str()), "{root:?}: {:?}", a_node.lines);
+        // The notes on stdout (plan Step 4.5): the link at HELLO and the
+        // round, then `peer-connected`.
+        let at = |head: &str| a_node.lines.iter().position(|l| l.starts_with(head));
+        let link = format!("link {b_id} via direct {}, rtt ", port_line(&b_node.lines));
+        let round = format!("home round with node {b_id}: ");
+        let order = [at(&link), at(&round), at("peer-connected ")];
+        let ordered = order.iter().all(Option::is_some) && order.is_sorted();
+        assert!(ordered, "{root:?}: {:?}", a_node.lines);
         drop((a_node.stop(), b_node.stop()));
     }
     std::fs::remove_dir_all(&dir).unwrap();
@@ -940,7 +949,9 @@ fn both_roots_refuse_a_bad_config_file_before_writing() {
 /// A links to B, and C, whose key B's door does not know, is refused. None
 /// of the three ids is in any line any of them printed, on stdout or
 /// stderr; where a line names an endpoint, it names it by its tag: each
-/// node's `peer` line, B's refusal of C, and C's failed dial of B.
+/// node's `peer` line, B's refusal of C, and C's failed dial of B. No node
+/// panicked, though B noted its link after this test stopped reading its
+/// stdout.
 #[test]
 fn no_line_names_an_endpoint_id() {
     let dir = scratch("no-ids");
@@ -959,6 +970,12 @@ fn no_line_names_an_endpoint_id() {
         let a_node = start(names[0], &at_b);
         let c_node = start(names[2], &at_b);
         let said = [a_node, b_node, c_node].map(|node| (node.lines.clone(), node.stop()));
+        // B noted its link to A, and its round, after its `listening`, when
+        // this test no longer read its stdout: a note it could not write
+        // stopped nothing (plan Step 4.5).
+        for (_, err) in &said {
+            assert!(!err.contains("panicked"), "{root:?}: {err}");
+        }
         for id in &ids {
             let lines = said.iter().flat_map(|(out, err)| {
                 let out = out.iter().map(String::as_str);

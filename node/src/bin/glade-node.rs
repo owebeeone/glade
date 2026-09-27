@@ -53,6 +53,14 @@
 //! starts no node (plan Step 4.5): it reads the instance's `endpoint.key`, or
 //! mints one first, and prints its id alone.
 //!
+//! A linked node notes on stdout what iroh does (plan Step 4.5): `link <node>
+//! via relay <url>|direct <ip:port>, rtt <n> ms` at HELLO and whenever iroh
+//! selects another path, `link <node> closed`, and `home round with node
+//! <node>: <n> record(s) in <ms> ms` when its pull from that peer ends. With
+//! `relay n0` it notes `relay <url>` when a home relay connects, and `relay
+//! <url> not connected: <error>` when that fails or drops. A node with no
+//! link and no relay, as the desk runs, notes nothing.
+//!
 //! Each `--app FILE.glade` is LOADED as data and REGISTERED (GDL-037): its
 //! declarations append as ordinary records, its ACL seeds compile to grant
 //! records — under this node's chain, diffed against the fold (idempotent).
@@ -214,6 +222,14 @@ async fn start() -> std::io::Result<ExitCode> {
     run(args, program, leases).await.map(|()| ExitCode::SUCCESS)
 }
 
+/// A status line of the mesh's (plan Step 4.5), on stdout. The notes come
+/// after `listening`, which is where a parent may stop reading, so a line
+/// stdout cannot take is dropped: it never stops the node, as `println!`'s
+/// panic would.
+fn noted(line: &str) {
+    let _ = writeln!(std::io::stdout(), "{line}");
+}
+
 /// Runs the node, and prints a failure with `Display`, its message as written
 /// (SUR-P3-11): returning the error from `main` would print its `Debug` form,
 /// `Error: Custom { kind: InvalidData, error: "..." }`, with the message's
@@ -356,7 +372,8 @@ async fn run(args: Vec<String>, program: Option<PathBuf>, leases: Leases) -> std
         let serves_home = server.serves(HOME).await.is_some();
         println!("registry ready (home served: {serves_home})");
         let configured = network.peers.iter().map(|entry| entry.key);
-        let door = Arc::new(Door::new(configured, |line: &str| eprintln!("{line}")));
+        let door = Door::new(configured, |line: &str| eprintln!("{line}"));
+        let door = Arc::new(door.with_status(noted));
         let endpoint = PeerEndpoint::bind_door(identity, key, door, &network).await?;
         let addr = server.enable_mesh(endpoint).await?;
         println!("peer {} {}", addr.tag(), addr.socket);
