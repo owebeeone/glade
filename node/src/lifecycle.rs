@@ -43,8 +43,8 @@ use crate::assembly::{
     CommandLine, Config, Directory, InstanceSlot, NodeAssembly, Records, Settings,
 };
 use crate::grants::{CLIENT_GRANTS_ENFORCED, GRANTS_UNAVAILABLE};
-use crate::iroh_carrier::PeerEndpoint;
-use crate::mesh::{release_links, EndpointSlot};
+use crate::iroh_carrier::{IrohCarrier, Lent, FIRST_WORD};
+use crate::mesh::{release_links, PeerPort};
 use crate::netconf::Network;
 use crate::peer::NodeIdentity;
 use crate::recovery;
@@ -64,13 +64,13 @@ pub mod node {
     pub const ASSEMBLY: &str = "Assembly";
     /// The served store, with the adopted instance inside it.
     pub const STORAGE: &str = "Storage";
-    /// The iroh endpoint (nothing in the legacy form).
+    /// The node's one peer adapter, bound (nothing in the legacy form).
     pub const PEER_CARRIER: &str = "PeerCarrier";
     /// The TCP listener the WebSocket sessions arrive on.
     pub const CLIENT_CARRIER: &str = "ClientCarrier";
-    /// Owner of the renewal loop and the pushes of minted records.
+    /// Owner of the renewal loop.
     pub const RECORDS: &str = "Records";
-    /// Owner of the links, streams, subscriptions and client sessions.
+    /// Owner of the links, conversations, subscriptions and client sessions.
     pub const SESSIONS: &str = "Sessions";
     /// The `--peer` dials.
     pub const PEERS: &str = "Peers";
@@ -189,6 +189,11 @@ struct Booted {
     door: Arc<Door>,
     /// Where the endpoint binds and its relays (plan Step 4.5).
     network: Network,
+    /// The node's one peer adapter (plan Step 4.5b), lent the endpoint key,
+    /// the door and the relays, unbound: the module holds a clone of it,
+    /// `PeerCarrier` binds it and releases it by its close, and the mesh runs
+    /// on it.
+    carrier: IrohCarrier,
 }
 
 impl Instance {
@@ -207,14 +212,22 @@ impl Instance {
         let keys = network.peers.iter().map(|entry| entry.key);
         let (console, noting) = (start.console.clone(), start.console.clone());
         let door = Door::new(keys, move |line: &str| console.err(line));
-        let door = door.with_status(move |line: &str| noting.out(line));
+        let door = Arc::new(door.with_status(move |line: &str| noting.out(line)));
+        let (key, relays) = (boot.endpoint_key(), network.relays);
+        let lent = Lent {
+            key,
+            door: Some(door.clone()),
+            relays,
+            first_word: FIRST_WORD,
+        };
         let booted = Booted {
             dir: boot.dir.clone(),
             node_id: boot.node_id.clone(),
             identity: boot.identity()?,
-            endpoint: boot.endpoint_key(),
-            door: Arc::new(door),
+            endpoint: key,
+            door,
             network,
+            carrier: IrohCarrier::new(Some(lent)),
         };
         start
             .console
@@ -364,6 +377,11 @@ impl Listener {
     }
 }
 
+/// `PeerCarrier`: the node's one peer adapter, bound on the network's sockets
+/// (plan Step 4.5b), as the mesh takes it, and the `peer` line its address
+/// gives; nothing in the legacy form.
+struct PeerBound(Option<(PeerPort, String)>);
+
 /// `Records`' handle: its inbox, until its serve body takes it.
 struct RecordsOwner(Mutex<Option<Inbox>>);
 
@@ -394,18 +412,27 @@ struct SessionsServe {
     admitted: watch::Receiver<bool>,
 }
 
-/// Plan Step 3.2's module, assembled over the acquired instance inside a
-/// step: registers each app file through the directory and returns the
-/// workspaces they declare. The module is dropped here; its record host
-/// answers `NotOpen` once `Storage` has adopted the instance. Its signer holds
-/// the instance's key (plan Step 4.1a), none in the legacy form.
-fn assemble(start: &NodeStart, instance: &Instance) -> Result<Declared, Error> {
-    let identity = instance.booted.as_ref().map(|booted| booted.identity);
-    let module = NodeAssembly::builder()
+/// Plan Step 3.2's module over the acquired instance. Its signer holds the
+/// instance's key (plan Step 4.1a), and its peer carrier is the node's one
+/// adapter (plan Step 4.5b), the booted instance's: none in the legacy form.
+fn module(start: &NodeStart, instance: &Instance) -> NodeAssembly {
+    let booted = instance.booted.as_ref();
+    let identity = booted.map(|booted| booted.identity);
+    let carrier = booted.map(|booted| booted.carrier.clone());
+    NodeAssembly::builder()
         .with_component_parameters::<CommandLine>(start.settings.clone())
         .with_component_parameters::<Records>(instance.slot.clone())
         .with_component_parameters::<NodeSigner>(identity)
-        .build();
+        .with_component_parameters::<IrohCarrier>(carrier)
+        .build()
+}
+
+/// The module, assembled over the acquired instance inside a step: registers
+/// each app file through the directory and returns the workspaces they
+/// declare. The module is dropped here; its record host answers `NotOpen`
+/// once `Storage` has adopted the instance.
+fn assemble(start: &NodeStart, instance: &Instance) -> Result<Declared, Error> {
+    let module = module(start, instance);
     let config: Arc<dyn Config> = module.resolve();
     let directory: Arc<dyn Directory> = module.resolve();
     let mut workspaces = Vec::new();
@@ -555,23 +582,24 @@ pub fn node_plan() -> Plan<(), NodeStart> {
         .acquire(
             |cx: Cx<Acquire>, (instance, _storage): (Arc<Instance>, Arc<Storage>)| async move {
                 let Some(booted) = instance.booted.as_ref() else {
-                    return Ok(cx.hold_value(EndpointSlot::empty()));
+                    return Ok(cx.hold_value(PeerBound(None)));
                 };
-                let (identity, key, door) = (booted.identity, booted.endpoint, booted.door.clone());
-                let network = booted.network.clone();
+                let (carrier, network) = (booted.carrier.clone(), booted.network.clone());
+                let door = Some(booted.door.clone());
+                let port = PeerPort::iroh(&carrier, booted.identity, &booted.endpoint, door);
                 cx.hold(move || async move {
-                    PeerEndpoint::bind_door(identity, key, door, &network)
-                        .await
-                        .map(EndpointSlot::new)
+                    let line = carrier.bind_network(&network).await?;
+                    Ok::<_, io::Error>(PeerBound(Some((port, line))))
                 })
                 .await
             },
         )
-        // `PeerEndpoint::close(self)`, on the endpoint taken out by value: the
-        // mesh shares this slot, so it holds nothing afterwards.
-        .release(|_cx: Cx<Release>, slot: Arc<EndpointSlot>| async move {
-            if let Some(endpoint) = slot.give_up() {
-                endpoint.close().await;
+        // The port's close (plan Step 4.5b): the endpoint and every link's
+        // handle, out of the one adapter every clone shares, so neither the
+        // mesh nor the module holds the address afterwards.
+        .release(|_cx: Cx<Release>, bound: Arc<PeerBound>| async move {
+            if let Some((peer, _)) = &bound.0 {
+                peer.port.close().await;
             }
             Ok(())
         });
@@ -596,7 +624,7 @@ pub fn node_plan() -> Plan<(), NodeStart> {
         .needs((storage, peer_carrier))
         .stop_within(STOP_WITHIN)
         .initialize(
-            |_cx: Cx<Start>, (storage, _peer): (Arc<Storage>, Arc<EndpointSlot>)| async move {
+            |_cx: Cx<Start>, (storage, _peer): (Arc<Storage>, Arc<PeerBound>)| async move {
                 let inbox = storage.inbox(&storage.records)?;
                 Ok(RecordsOwner(Mutex::new(Some(inbox))))
             },
@@ -612,18 +640,13 @@ pub fn node_plan() -> Plan<(), NodeStart> {
              (start, storage, peer, listener): (
                 Arc<NodeStart>,
                 Arc<Storage>,
-                Arc<EndpointSlot>,
+                Arc<PeerBound>,
                 Arc<Listener>,
             )| async move {
                 let inbox = storage.inbox(&storage.sessions)?;
-                if start.instance.is_some() {
-                    let addr = storage
-                        .server()?
-                        .enable_mesh_over(EndpointSlot::clone(&peer))
-                        .await?;
-                    start
-                        .console
-                        .out(&format!("peer {} {}", addr.tag(), addr.socket));
+                if let Some((port, line)) = &peer.0 {
+                    storage.server()?.enable_mesh(port.clone()).await?;
+                    start.console.out(line);
                 }
                 let (admit, admitted) = watch::channel(false);
                 let serve = SessionsServe {
@@ -746,6 +769,54 @@ mod tests {
         );
         drop(escaped);
         // `Server::open` writes nothing until something is appended.
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A console that keeps nothing: the boot's lines are not what the test
+    /// reads.
+    struct Quiet;
+
+    impl Console for Quiet {
+        fn out(&self, _line: &str) {}
+        fn err(&self, _line: &str) {}
+    }
+
+    /// Plan Step 4.5b (question 8): the assembled root builds the node's one
+    /// adapter from the booted instance and lends it to the module, so the
+    /// peer carrier the module resolves is that adapter. Once the booted one
+    /// is bound, as `PeerCarrier` binds it, the module's answers
+    /// `AlreadyBound`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_module_and_the_mesh_share_one_adapter() {
+        use crate::assembly::PeerCarrier;
+        use glade_carrier_api::{CarrierAddr, CarrierConfig, CarrierError, CarrierPort};
+        let dir = std::env::temp_dir().join(format!("glade-one-adapter-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let at = InstanceAt {
+            dir: dir.clone(),
+            operator: "local".into(),
+        };
+        let start = NodeStart {
+            settings: Settings::default(),
+            decls: Vec::new(),
+            instance: None,
+            console: Arc::new(Quiet),
+        };
+        let instance = Instance::boot(&start, &at).unwrap();
+        let lent: Arc<dyn PeerCarrier> = module(&start, &instance).resolve();
+        let (booted, network) = (instance.booted.as_ref().unwrap(), Network::default());
+        booted.carrier.bind_network(&network).await.unwrap();
+        let local = CarrierAddr("127.0.0.1:0".into());
+        let max_frame_bytes = std::num::NonZeroUsize::new(1 << 10).unwrap();
+        let config = CarrierConfig {
+            local,
+            max_frame_bytes,
+        };
+        let bound = lent.bind(config).await;
+        let one = matches!(bound, Err(CarrierError::AlreadyBound));
+        assert!(one, "the module's peer carrier: {bound:?}");
+        booted.carrier.close().await;
+        drop(instance.take());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

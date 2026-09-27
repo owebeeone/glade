@@ -140,8 +140,9 @@ use glade_node::assembly::{Settings, ASSEMBLED_ROOT_LINE};
 use glade_node::claims::Leases;
 use glade_node::endpoint_id;
 use glade_node::grants::{CLIENT_GRANTS_ENFORCED, GRANTS_UNAVAILABLE};
-use glade_node::iroh_carrier::PeerEndpoint;
+use glade_node::iroh_carrier::{IrohCarrier, Lent, FIRST_WORD};
 use glade_node::lifecycle::{conclude, node_plan, Console, NodeStart, StdConsole};
+use glade_node::mesh::PeerPort;
 use glade_node::netconf;
 use glade_node::recovery;
 use glade_node::registry::{RegistryApi, StoreApi, HOME};
@@ -366,10 +367,11 @@ async fn run(args: Vec<String>, program: Option<PathBuf>, leases: Leases) -> std
     // ---- peer fabric (booted forms only; the legacy form never binds it) ----
     // Adopt the boot instance (seeds the served store; the boot registry stays
     // the chain authority for this node's own directory writes — claims.rs —
-    // and the `home` claim is renewed from here on), bind iroh with the
-    // DIRECTORY identity, run the accept loop, converge with each `--peer`
-    // target, then start SERVING the declared workspaces: mint WorkspaceEntry +
-    // ServeClaim and renew while serving (audit F1).
+    // and the `home` claim is renewed from here on), bind the peer adapter,
+    // lent the endpoint key and the door (plan Step 4.5b), run the mesh on it
+    // with the DIRECTORY identity, converge with each `--peer` target, then
+    // start SERVING the declared workspaces: mint WorkspaceEntry + ServeClaim
+    // and renew while serving (audit F1).
     if let Some((node, workspaces, network)) = booted {
         let (identity, key) = (node.identity()?, node.endpoint_key());
         let (lease_ms, renew_ms) = (leases.lease_ms, leases.renew_ms);
@@ -379,9 +381,18 @@ async fn run(args: Vec<String>, program: Option<PathBuf>, leases: Leases) -> std
         let configured = network.peers.iter().map(|entry| entry.key);
         let door = Door::new(configured, |line: &str| eprintln!("{line}"));
         let door = Arc::new(door.with_status(noted));
-        let endpoint = PeerEndpoint::bind_door(identity, key, door, &network).await?;
-        let addr = server.enable_mesh(endpoint).await?;
-        println!("peer {} {}", addr.tag(), addr.socket);
+        let (relays, first_word) = (network.relays, FIRST_WORD);
+        let lent = Lent {
+            key,
+            door: Some(door.clone()),
+            relays,
+            first_word,
+        };
+        let carrier = IrohCarrier::new(Some(lent));
+        let line = carrier.bind_network(&network).await?;
+        let peer = PeerPort::iroh(&carrier, identity, &key, Some(door));
+        server.enable_mesh(peer).await?;
+        println!("{line}");
         for entry in network.peers.iter().filter(|entry| !entry.via.is_empty()) {
             match server.connect_peer(entry.clone()).await {
                 Ok(id) => println!("peer-connected {id}"),

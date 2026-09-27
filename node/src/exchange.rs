@@ -19,18 +19,16 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use iroh::endpoint::{RecvStream, SendStream};
-
 use glade_grant_api::{GrantPort, Holder};
 use glade_wire::generated::{ExchangeReq, ExchangeRes, Heads, StreamHeads};
 use glade_wire::wellformed;
 
+use crate::conversation::Conversation;
 use crate::echo::Echo;
 use crate::envelope;
 use crate::frame::Frame;
 use crate::grants::refusal;
 use crate::mesh::{route_subscribe, Route};
-use crate::peer::{read_frame, write_frame};
 use crate::registry::{BindingFold, G_BINDINGS, G_BINDING_RETRACTIONS, G_SERVICES, HOME};
 use crate::router::SessionId;
 use crate::server::{send, Shared};
@@ -226,7 +224,7 @@ pub(crate) async fn handle_response(shared: &Arc<Shared>, res: ExchangeRes) {
     } // unknown corr: dropped — never folded, never broadcast
 }
 
-/// The requesting node's Forward arm: one fresh stream on the claim holder's
+/// The requesting node's Forward arm: one conversation on the claim holder's
 /// link carries exactly one exchange; the response (or the bounded failure)
 /// is delivered to the requester as an `ExchangeRes`.
 async fn forward_exchange(shared: &Arc<Shared>, peer: String, req: ExchangeReq, requester: SessionId) {
@@ -240,13 +238,15 @@ async fn forward_exchange(shared: &Arc<Shared>, peer: String, req: ExchangeReq, 
 
 async fn try_forward(shared: &Arc<Shared>, peer: &str, req: ExchangeReq) -> io::Result<ExchangeRes> {
     let mesh = shared.mesh.get().cloned().ok_or_else(|| other("mesh not enabled"))?;
-    let conn = mesh.links.lock().await.get(peer).cloned().ok_or_else(|| other("no live peer link"))?;
+    let linked = mesh.linked(peer).await;
+    let linked = linked.ok_or_else(|| other("no live peer link"))?;
     let glade_id = req.glade_id.clone();
-    let (mut qsend, mut recv) = conn.open_bi().await.map_err(other)?;
-    write_frame(&mut qsend, &Frame::ExchangeReq(req)).await?;
-    let frame = tokio::time::timeout(FORWARD_TIMEOUT, read_frame(&mut recv))
+    let mut conversation = linked.open();
+    conversation.send(&Frame::ExchangeReq(req))?;
+    let frame = tokio::time::timeout(FORWARD_TIMEOUT, conversation.recv())
         .await
         .map_err(|_| other("timeout awaiting ExchangeRes from claim holder"))??;
+    conversation.end();
     match frame {
         Frame::ExchangeRes(res) => forwarded(&glade_id, res),
         got => Err(other(format!("expected ExchangeRes, got {got:?}"))),
@@ -268,9 +268,9 @@ fn forwarded(glade_id: &str, res: ExchangeRes) -> io::Result<ExchangeRes> {
 }
 
 /// The claim holder's side of a forwarded exchange (trace D2→D4): a synthetic
-/// session whose outbound IS the stream, so the ordinary request/response
-/// plumbing (provider lookup, pending map) serves the peer unchanged. One
-/// stream, one exchange, close.
+/// session whose outbound answers on the conversation, so the ordinary
+/// request/response plumbing (provider lookup, pending map) serves the peer
+/// unchanged. One conversation, one exchange, END.
 ///
 /// The grant check (plan Step 4.3), enforced for every peer: on a share other
 /// than `home` the exchange is asked for by its glade id, and a node the fold
@@ -280,11 +280,9 @@ fn forwarded(glade_id: &str, res: ExchangeRes) -> io::Result<ExchangeRes> {
 pub(crate) async fn serve_peer_exchange(
     shared: Arc<Shared>,
     node: [u8; 32],
-    mut qsend: SendStream,
-    _recv: RecvStream,
+    conversation: Conversation,
     req: ExchangeReq,
 ) -> io::Result<()> {
-    use tokio::io::AsyncWriteExt;
     let corr = req.corr.clone();
     let holder = Holder::Node(node);
     let refused = match req.share.as_str() {
@@ -298,10 +296,9 @@ pub(crate) async fn serve_peer_exchange(
         }
         None => answer_forwarded(&shared, req).await,
     };
-    qsend.write_all(&(bytes.len() as u32).to_le_bytes()).await?;
-    qsend.write_all(&bytes).await?;
-    qsend.flush().await?;
-    qsend.shutdown().await
+    conversation.send_encoded(&bytes)?;
+    conversation.end();
+    Ok(())
 }
 
 /// Answer an admitted forwarded exchange through a synthetic session: the
@@ -333,7 +330,7 @@ mod tests {
     use super::*;
     use crate::appdecl;
     use crate::frame::Frame;
-    use crate::iroh_carrier::PeerEndpoint;
+    use crate::mesh::testing::meshed;
     use crate::registry::{Record, Registry, RegistryApi, G_BINDINGS, G_GRANTS};
     use crate::server::Server;
     use crate::sysdata::{BindingDecl, BindingRetraction, CapabilityGrant, ServeClaim};
@@ -595,11 +592,9 @@ mod tests {
         a.adopt_boot(boot_a).await.unwrap();
         b.adopt_boot(boot_b).await.unwrap();
 
-        let ep_a = PeerEndpoint::bind_with(id_a).await.unwrap();
-        let ep_b = PeerEndpoint::bind_with(id_b).await.unwrap();
-        a.enable_mesh(ep_a).await.unwrap();
-        let addr_b = b.enable_mesh(ep_b).await.unwrap();
-        a.connect_peer(&addr_b).await.unwrap();
+        meshed(&a, id_a).await;
+        let at_b = meshed(&b, id_b).await;
+        a.connect_peer(at_b).await.unwrap();
 
         let (a_shared, b_shared) = (a.shared.clone(), b.shared.clone());
         let lis_a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -754,11 +749,9 @@ mod tests {
         a.seed_registry(&boot_a.registry.snapshot()).await;
         b.adopt_boot(boot_b).await.unwrap();
 
-        let ep_a = PeerEndpoint::bind_with(id_a).await.unwrap();
-        let ep_b = PeerEndpoint::bind_with(id_b).await.unwrap();
-        a.enable_mesh(ep_a).await.unwrap();
-        let addr_b = b.enable_mesh(ep_b).await.unwrap();
-        a.connect_peer(&addr_b).await.unwrap();
+        meshed(&a, id_a).await;
+        let at_b = meshed(&b, id_b).await;
+        a.connect_peer(at_b).await.unwrap();
 
         let a_shared = a.shared.clone();
         let lis_a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -7431,6 +7431,27 @@ the configuration, no endpoint id in any line), `tests/lifecycle` (a link, then 
 ports free; the refused dialer) and `tests/stop_signal`. These, with the three door tests of `mesh`,
 are the done-when's "the door's".
 
+**Part 3, as built** on 2026-09-28 against glade `780e751`, red in one sources-only copy of the final tree,
+the part each test guards switched off by one edit and put back before the next:
+
+| Test | Red first |
+| --- | --- |
+| `mesh`: `a_dialer_that_never_says_hello_does_not_hold_the_accept_loop` | HELLO in the accept loop, the driver spawned after it: `B still dialing after 1.00229425s` |
+| `mesh`: `a_glade_node_3_endpoint_fails_at_connect_either_way` | the adapter's endpoint offering `glade/node/3` too: `a glade/node/3 dialer connected` |
+| `mesh`: `a_forwarded_gap_crosses_in_chunks_under_the_frame_limit` | the gap in one frame: `not sent to peer <id>: an op of ws-razel ws.tree over the frame limit`, then `timed out waiting for the whole gap at A` |
+| `mesh`: `a_newer_link_outlives_the_close_of_an_older_one_to_the_same_node` | removal by node id: `each end holds the newer link`, `left: (0, 0)`, `right: (1, 1)` |
+| `lifecycle`: `the_module_and_the_mesh_share_one_adapter` | the component building an adapter of its own, unlent: `Err(Transport("the iroh adapter was lent no endpoint key"))` |
+
+As built, beside the design: the mesh takes `mesh::PeerPort` (the port, its notes, the identity, the endpoint
+id, the door, the frame limit), which `PeerPort::iroh` makes for both roots; `IrohCarrier::bind_network` binds
+the network's sockets at 16 MiB and answers the `peer` line; the component's parameters are
+`Option<IrohCarrier>`. **A link lives until it ends**, as a connection did: its reader holds its `Linked`, a
+newer link to a node takes the older's numbered entry, and a reader unlinks its own alone. **A subscription's
+writer and reader are one loop** in its conversation's task, a conversation having no halves, so
+`SubscriptionWriter` retires with `RecordPush`. Chunks are sized by each op's encoding, at most 1 MiB and the
+limit less 32 bytes; a lone op refused ends its serve with that line. `PeerEndpoint` loses the relay members
+only the mesh used. Gate 9/9, 423 tests each path; contracts 94; the desk replay matched 780e751 but ports.
+
 **Part 4** removes tests only. Each removed test's rule is held by another: `dial_and_hello_over_iroh`
 by `a_hello_on_a_link_binds_its_transport_session`; `a_protocol_2_node_fails_at_connect` by
 `a_glade_node_3_endpoint_fails_at_connect_either_way`; `sync_over_iroh` by the mesh's convergence

@@ -399,12 +399,17 @@ impl Conversation {
     /// link's limit, with its header, is refused here, and so is every frame
     /// once the link has ended.
     pub fn send(&self, frame: &Frame) -> io::Result<()> {
-        let body = frame.to_bytes();
-        if HEADER + body.len() > self.linked.max {
+        self.send_encoded(&frame.to_bytes())
+    }
+
+    /// [`Conversation::send`] for a frame already encoded, as a session's
+    /// queue holds it (plan Step 4.5b, part 3).
+    pub fn send_encoded(&self, frame: &[u8]) -> io::Result<()> {
+        if HEADER + frame.len() > self.linked.max {
             let why = "the frame is over the link's frame limit";
             return Err(io::Error::new(io::ErrorKind::InvalidInput, why));
         }
-        self.linked.put(&self.number, FRAME, &body)
+        self.linked.put(&self.number, FRAME, frame)
     }
 
     /// The next frame. `UnexpectedEof` once the peer's END is read, as a

@@ -15,7 +15,7 @@
 //! The owner is what sdax sees: its stop is bounded by the plan, and an owner
 //! that cannot finish is named in `report.incomplete`. Not one sdax instance
 //! per task: a run keeps history for every instance it ever spawned, and the
-//! node spawns per stream and per push (`dev-docs/GladeNodeAssembly.md`,
+//! node spawns per link and per conversation (`dev-docs/GladeNodeAssembly.md`,
 //! "Lifecycle (plan Step 3.3)").
 
 use std::future::Future;
@@ -32,32 +32,31 @@ pub(crate) type Task = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 /// An owner's inbox: the tasks sent to it, in order.
 pub(crate) type Inbox = mpsc::UnboundedReceiver<Task>;
 
-/// Every place the node spawns a task: the nine of `mesh.rs` and the renewal
-/// loop the plan names, and the six it does not.
+/// Every place the node spawns a task: the eight of `mesh.rs` (plan Step
+/// 4.5b's among them), the renewal loop, and the four of `exchange.rs` and
+/// `server.rs`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Site {
-    /// `mesh.rs`, `enable_mesh`: the peer accept loop.
+    /// `mesh.rs`, `enable_mesh`: the peer accept loop, which accepts only.
     AcceptLoop,
-    /// `mesh.rs`, the accept loop: one accepted link's driver.
+    /// `mesh.rs`, the accept loop: one accepted link's HELLO, bounded, then
+    /// its driver.
     AcceptedLink,
-    /// `mesh.rs`, `run_link`: unlink the link once it closes.
-    Unlink,
-    /// `mesh.rs`, `run_link`: dispatch a link's inbound streams.
-    StreamDispatch,
-    /// `mesh.rs`, the dispatcher: one inbound peer stream.
-    PeerStream,
-    /// `mesh.rs`, `run_link`: the acceptor serves the dialer's stream 0.
-    StreamZero,
-    /// `mesh.rs`, `push_home`: one push of minted records to one link.
-    RecordPush,
-    /// `mesh.rs`, `serve_peer_subscribe`: a served subscription's writer.
-    SubscriptionWriter,
+    /// `mesh.rs`, a link's start (plan Step 4.5b): its reader, the link's only
+    /// receiver, which routes its frames, notes its path and unlinks it at
+    /// its end.
+    LinkReader,
+    /// `mesh.rs`, a link's start: its writer, the link's only sender.
+    LinkWriter,
+    /// `mesh.rs`, a link's reader: one conversation the peer opened, served
+    /// as its first frame says.
+    InboundConversation,
     /// `mesh.rs`, `forward_interest`: an interest forwarded to a claim holder.
     ForwardInterest,
-    /// `mesh.rs`, `handle_peer_stream`: the pulls from a peer whose push was
+    /// `mesh.rs`, `serve_conversation`: the pulls from a peer whose push was
     /// refused as a gap (`pull_on_gap`).
     GapPull,
-    /// `mesh.rs`, `enable_mesh_over`: with `relay n0`, the watch that notes
+    /// `mesh.rs`, `enable_mesh`: with `relay n0`, the watch that notes
     /// the home relay's state (plan Step 4.5).
     RelayWatch,
     /// `claims.rs`, `adopt_boot_tuned`: the lease-renewal loop.
@@ -73,12 +72,12 @@ pub(crate) enum Site {
 }
 
 impl Site {
-    /// Whose task it is: the renewal loop and the pushes of what it and every
-    /// other mint write are `Records`'; the rest ride a link or a client
-    /// connection and are `Sessions'`.
+    /// Whose task it is: the renewal loop is `Records`' (a push of what a
+    /// mint writes only queues its frame on a link, plan Step 4.5b); the rest
+    /// ride a link or a client connection and are `Sessions'`.
     fn role(self) -> Role {
         match self {
-            Site::Renewal | Site::RecordPush => Role::Records,
+            Site::Renewal => Role::Records,
             _ => Role::Sessions,
         }
     }

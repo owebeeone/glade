@@ -324,7 +324,7 @@ fn link_channel(link: &dyn CarrierLink, own: &[u8; 32], role: Role) -> io::Resul
 }
 
 /// A carrier's refusal, as an I/O error.
-fn carried(e: CarrierError) -> io::Error {
+pub(crate) fn carried(e: CarrierError) -> io::Error {
     match e {
         CarrierError::Transport(why) => io::Error::other(why),
         other => io::Error::other(format!("{other:?}")),

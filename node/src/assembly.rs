@@ -189,7 +189,7 @@ use crate::appdecl::{register, AppDecl, Registered};
 use crate::claims::Leases;
 use crate::envelope;
 use crate::grants::PolicyView;
-use crate::iroh_carrier::{IrohCarrier, Lent};
+use crate::iroh_carrier::IrohCarrier;
 use crate::netconf::Network;
 use crate::peer::NodeIdentity;
 use crate::registry::{MemStore, Record, Registry, RegistryApi, RegistryError, StoreApi, HOME};
@@ -792,18 +792,21 @@ impl CarrierPort for PendingCarrier {
 }
 
 /// `peer_carrier_binding`'s registration: the iroh adapter (plan Step 4.2c,
-/// `iroh_carrier.rs`), bound as the composition root lends it, in this
-/// component's parameters: the endpoint key, the door, the relays and the
-/// first word's bound (plan Step 4.5b). Neither root lends it anything yet, so
-/// the peer role refuses to bind and fails closed: the node's peer transport
-/// is still the `PeerEndpoint` the root binds and `Server::enable_mesh` runs.
+/// `iroh_carrier.rs`), the node's one, lent in this component's parameters
+/// (plan Step 4.5b, part 3): the assembled root lends the adapter it built
+/// from the booted instance, which its `PeerCarrier` binds and the mesh runs
+/// on, and the module holds a clone of it. Lent none, as in the legacy form,
+/// it is an adapter lent nothing, which refuses to bind and fails closed.
 impl<M: Module + HasComponent<dyn Constructions>> Component<M> for IrohCarrier {
     type Interface = dyn PeerCarrier;
-    type Parameters = Option<Lent>;
+    type Parameters = Option<IrohCarrier>;
 
-    fn build(context: &mut ModuleBuildContext<M>, lent: Option<Lent>) -> Box<dyn PeerCarrier> {
+    fn build(
+        context: &mut ModuleBuildContext<M>,
+        lent: Option<IrohCarrier>,
+    ) -> Box<dyn PeerCarrier> {
         constructed::<M, IrohCarrier>(context);
-        Box::new(IrohCarrier::new(lent))
+        Box::new(lent.unwrap_or_else(|| IrohCarrier::new(None)))
     }
 }
 

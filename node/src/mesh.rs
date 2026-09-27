@@ -1,15 +1,15 @@
-//! The peer mesh (Lane R step 3): accept-loop wiring for the iroh carrier.
+//! The peer mesh (Lane R step 3): the node's links to its peers, over the peer
+//! carrier port (plan Step 4.5b, part 3), so two nodes actually converge. A
+//! link is one carrier link, HELLO its first frame each way; after HELLO each
+//! exchange the two nodes have is a conversation on it (`conversation.rs`),
+//! which the end that did not open it serves by its FIRST frame:
 //!
-//! R2 left `PeerEndpoint`/`PeerLink` as a library capability; this module wires
-//! it into the running node so two nodes actually converge. Per connection
-//! (after the `NodeHello` seam on stream 0):
-//!
-//! - **stream 0** carries the dialer's home-share pull (dialer sends `Heads`,
-//!   acceptor serves the gap and closes — the s-sync shape, scoped to `home`).
-//! - the **acceptor opens its own stream** and pulls the same way, so
-//!   convergence is a pull each way (GladePeerSyncNotes §4).
-//! - any further stream is dispatched by its FIRST frame: `Heads` = a sync
-//!   pull to serve, `Subscribe` = a forwarded interest (claim routing, C2/C3).
+//! - `Heads`: a home-share pull (the gap in chunks, then END — the s-sync
+//!   shape, scoped to `home`). Each end opens one at HELLO, so convergence is
+//!   a pull each way (GladePeerSyncNotes §4).
+//! - `Subscribe`: a forwarded interest (claim routing, C2/C3).
+//! - `ExchangeReq`: a forwarded exchange (`exchange.rs`).
+//! - `Ops`: a peer's push of the `home` records it minted.
 //!
 //! Connect-time anti-entropy is scoped to the HOME share on purpose: the
 //! directory replicates everywhere (WD §3 ladder 1 — every device a replica);
@@ -21,33 +21,38 @@
 //!
 //! The notes the crossing reads (plan Step 4.5, part 2) are status lines, put
 //! where the door says (stdout for the node): each link's path at HELLO and
-//! whenever iroh selects another, its close, each `home` round's records and
-//! time, and, with `relay n0`, the home relay's state. A node with no link
-//! and no relay notes nothing.
+//! whenever the carrier selects another, its close, each `home` round's
+//! records and time, and, with `relay n0`, the home relay's state. The paths
+//! and the relays' states are the port's notes (`LinkNotes`), when it has
+//! them. A node with no link and no relay notes nothing.
 
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::poll_fn;
 use std::io;
-use std::pin::pin;
-use std::sync::atomic::Ordering;
-use std::sync::{Arc, PoisonError};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock, PoisonError};
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
-use iroh::endpoint::{Connection, RecvStream, SendStream};
+use glade_carrier_api::{CarrierLink, CarrierPort, TransportId};
 use tokio::sync::Mutex;
 
 use glade_grant_api::{GrantPort, Holder};
+use glade_wire::cbor;
 use glade_wire::generated::{
     Error, ErrorCode, Head, Heads, Op, Ops, Priority, StreamHeads, Subscribe,
 };
 
-use crate::assembly::{PathSeen, RelayState};
+use crate::assembly::{LinkNotes, PathSeen, RelayState};
+use crate::conversation::{Conversation, Handler, LinkTask, Linked, Spawn, Work};
 use crate::envelope;
-use crate::frame::Frame;
+use crate::frame::{Frame, MAX_FRAME_BYTES};
 use crate::grants::{refusal, READ_SUBSCRIBE};
-use crate::iroh_carrier::{selected_path, PeerAddr, PeerEndpoint, PeerLink};
-use crate::netconf::{PeerEntry, Relays};
-use crate::peer::{read_frame, write_frame, SyncOutcome, OPS_PER_CHUNK};
+use crate::iroh_carrier::{carrier_addr, IrohCarrier};
+use crate::netconf::PeerEntry;
+use crate::peer::{carried, hello_accept_link, hello_dial_link, NodeIdentity, SyncOutcome};
+use crate::peer::{HELLO_WITHIN, OPS_PER_CHUNK};
 use crate::registry::HOME;
 use crate::router::{SessionId, Zone};
 use crate::server::{refuse_subscription, send, Server, Shared};
@@ -56,7 +61,7 @@ use crate::signing::NodeSigner;
 use crate::store::{Append, Store, StoreError};
 use crate::sysdir::now_ms;
 use crate::tasks::Site;
-use crate::transport::{key_of, Door};
+use crate::transport::{key_of, Door, EndpointKey};
 
 fn other<E: Into<Box<dyn std::error::Error + Send + Sync>>>(e: E) -> io::Error {
     io::Error::new(io::ErrorKind::Other, e)
@@ -67,24 +72,37 @@ pub(crate) fn hex_id(id: &[u8]) -> String {
     id.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-/// The node's peer fabric: the bound endpoint plus the live links, keyed by the
-/// peer's directory node id (hex). A link is a QUIC connection that survived the
-/// HELLO seam; the ServeClaim fold picks WHICH link a subscribe rides (C2).
+/// The node's peer fabric: the bound peer carrier port plus the live links,
+/// keyed by the peer's directory node id (hex). A link is a carrier link that
+/// survived the HELLO seam; the ServeClaim fold picks WHICH link a subscribe
+/// rides (C2).
 pub struct Mesh {
-    /// The bound endpoint. Accept and dial take a clone for as long as they
-    /// run; the slot itself is the mesh's only lasting handle on it.
-    pub(crate) endpoint: EndpointSlot,
+    /// The peer carrier port, bound (plan Step 4.5b): the accept loop and each
+    /// dial use it, and the composition root that bound it closes it.
+    port: Arc<dyn CarrierPort>,
+    /// What the port notes beyond the carrier contract, if it can: each link's
+    /// path and the home relays' states.
+    notes: Option<Arc<dyn LinkNotes>>,
+    /// This node's identity, which its HELLO signs with, and its endpoint
+    /// key's id, which HELLO's channel names.
+    identity: NodeIdentity,
+    endpoint: [u8; 32],
+    /// The most bytes a frame on a link holds, its header included: the limit
+    /// the port was bound with.
+    max: usize,
     /// Our directory node id (hex of the HELLO identity) — the id our own
     /// ServeClaims carry, so `who_serves == self` short-circuits to local.
     pub(crate) self_id: String,
-    /// Live peer links: directory node id (hex) -> connection.
-    pub(crate) links: Mutex<BTreeMap<String, Connection>>,
+    /// Live peer links: directory node id (hex) -> the newest link to it.
+    pub(crate) links: Mutex<BTreeMap<String, Peer>>,
+    /// The number the next link takes ([`Peer`]).
+    numbered: AtomicU64,
     /// Zones whose interest is already forwarded to a claim holder — a second
-    /// local subscriber joins the flow, it never opens a second stream.
+    /// local subscriber joins the flow, it never opens a second conversation.
     pub(crate) forwarded: Mutex<BTreeSet<(String, String, Vec<u8>)>>,
-    /// The endpoint's door (plan Step 4.2b), if it has one: loaded from the
-    /// served store before the first accept, then fed each transport record
-    /// that lands there.
+    /// The door the port was lent (plan Steps 4.2b and 4.5b), if any: loaded
+    /// from the served store before the first accept, then fed each transport
+    /// record that lands there.
     pub(crate) door: Option<Arc<Door>>,
     /// D9's known set (plan Step 4.1b's part 2): this node, and each node a
     /// link's HELLO has proved since the mesh started. A peer's `home`
@@ -114,10 +132,46 @@ impl Mesh {
         }
     }
 
-    /// Note the path iroh sends on to `peer`, if it has selected one.
+    /// Note the path the carrier sends on to `peer`, if it has selected one.
     fn note_path(&self, peer: &str, path: Option<&PathSeen>) {
         if let Some(PathSeen { via, rtt_ms }) = path {
             self.status(&format!("link {peer} via {via}, rtt {rtt_ms} ms"));
+        }
+    }
+
+    /// The path the port notes for its newest link to `remote`, if it notes
+    /// paths and has selected one.
+    fn path(&self, remote: Option<&TransportId>) -> Option<PathSeen> {
+        self.notes.as_ref()?.path(remote?)
+    }
+
+    /// Report that an op of `share`'s `glade_id` was not sent to `node`: its
+    /// frame is over the link's limit (plan Step 4.5b, question 6).
+    fn over_limit(&self, node: &[u8; 32], share: &str, glade_id: &str) {
+        let peer = hex_id(node);
+        self.report(&format!(
+            "not sent to peer {peer}: an op of {share} {glade_id} over the frame limit"
+        ));
+    }
+
+    /// How many bytes of ops a chunk holds, but for an op alone: at most
+    /// [`CHUNK_BYTES`], and room left for its frame under the link's limit.
+    fn chunk_bytes(&self) -> usize {
+        CHUNK_BYTES.min(self.max.saturating_sub(CHUNK_ROOM))
+    }
+
+    /// The conversations of the live link to `node` (hex), if it has one.
+    pub(crate) async fn linked(&self, node: &str) -> Option<Arc<Linked>> {
+        let links = self.links.lock().await;
+        links.get(node).map(|peer| peer.linked.clone())
+    }
+
+    /// Unlink `node`'s link numbered `number`, if the table still holds it:
+    /// a newer link to the node, which took its place, stays.
+    async fn unlink(&self, node: &str, number: u64) {
+        let mut links = self.links.lock().await;
+        if links.get(node).is_some_and(|peer| peer.number == number) {
+            links.remove(node);
         }
     }
 
@@ -162,37 +216,49 @@ impl Mesh {
     }
 }
 
-/// The mesh's lasting handle on its endpoint, which a composition root that
-/// acquired the endpoint shares, so its release can take the endpoint back by
-/// value for `PeerEndpoint::close(self)` (plan Step 3.3). A mesh whose root
-/// never takes it back, the hand-written root's, holds it for its lifetime.
+/// One live link in the mesh's table (plan Step 4.5b): its number, which no
+/// other link of the mesh takes, so that its end unlinks it alone and never a
+/// newer link to the same node; the carrier link, which the release closes;
+/// and its conversations.
+pub(crate) struct Peer {
+    number: u64,
+    link: Arc<dyn CarrierLink>,
+    linked: Arc<Linked>,
+}
+
+/// What a composition root hands the mesh (plan Step 4.5b): the peer carrier
+/// port, bound with frames of at most `max_frame_bytes`, and its notes, if it
+/// has them; the node's identity, and the id of the endpoint key the port was
+/// lent; and the door the port was lent, if any, which the mesh loads from
+/// the served store and feeds.
 #[derive(Clone)]
-pub(crate) struct EndpointSlot(Arc<std::sync::Mutex<Option<PeerEndpoint>>>);
+pub struct PeerPort {
+    pub port: Arc<dyn CarrierPort>,
+    pub notes: Option<Arc<dyn LinkNotes>>,
+    pub identity: NodeIdentity,
+    pub endpoint: [u8; 32],
+    pub door: Option<Arc<Door>>,
+    pub max_frame_bytes: usize,
+}
 
-impl EndpointSlot {
-    pub(crate) fn new(endpoint: PeerEndpoint) -> EndpointSlot {
-        EndpointSlot(Arc::new(std::sync::Mutex::new(Some(endpoint))))
-    }
-
-    /// A slot with no endpoint: the legacy form binds none.
-    pub(crate) fn empty() -> EndpointSlot {
-        EndpointSlot(Arc::new(std::sync::Mutex::new(None)))
-    }
-
-    /// A clone of the endpoint, for one accept loop or one dial.
-    pub(crate) fn get(&self) -> io::Result<PeerEndpoint> {
-        let held = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        held.clone().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotConnected,
-                "the peer endpoint has been released",
-            )
-        })
-    }
-
-    /// Take the endpoint out, by value. `None` once taken, or if never held.
-    pub(crate) fn give_up(&self) -> Option<PeerEndpoint> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner).take()
+impl PeerPort {
+    /// The iroh adapter `carrier`, lent `key` and `door`, as the port and as
+    /// its notes, bound as both roots bind it, with frames of at most
+    /// [`MAX_FRAME_BYTES`] ([`IrohCarrier::bind_network`]).
+    pub fn iroh(
+        carrier: &IrohCarrier,
+        identity: NodeIdentity,
+        key: &EndpointKey,
+        door: Option<Arc<Door>>,
+    ) -> PeerPort {
+        PeerPort {
+            port: Arc::new(carrier.clone()),
+            notes: Some(Arc::new(carrier.clone())),
+            identity,
+            endpoint: key.endpoint_id,
+            door,
+            max_frame_bytes: MAX_FRAME_BYTES,
+        }
     }
 }
 
@@ -240,29 +306,34 @@ pub(crate) async fn route_subscribe(shared: &Arc<Shared>, share: &str) -> Route 
 }
 
 impl Server {
-    /// Wire the peer fabric onto this node: remember the endpoint, spawn the
-    /// accept loop (hello + serve on accept). Returns the dialable address.
-    /// Call once, before `run`.
-    pub async fn enable_mesh(&self, endpoint: PeerEndpoint) -> io::Result<PeerAddr> {
-        self.enable_mesh_over(EndpointSlot::new(endpoint)).await
-    }
-
-    /// [`Server::enable_mesh`] over an endpoint the caller keeps a handle on
-    /// (the assembled root's lifecycle, which closes it by value on release).
-    pub(crate) async fn enable_mesh_over(&self, slot: EndpointSlot) -> io::Result<PeerAddr> {
-        let endpoint = slot.get()?;
-        let addr = endpoint.addr()?;
-        let door = endpoint.door();
+    /// Wire the peer fabric onto this node over `peer`, a bound port (plan
+    /// Step 4.5b): load the door from the served store, watch the home
+    /// relays' states if the port notes them, and spawn the accept loop. Call
+    /// once, before `run`.
+    pub async fn enable_mesh(&self, peer: PeerPort) -> io::Result<()> {
+        let PeerPort {
+            port,
+            notes,
+            identity,
+            endpoint,
+            door,
+            max_frame_bytes: max,
+        } = peer;
         if let Some(door) = &door {
             door.load(&*self.shared.store.lock().await);
         }
         let mesh = Arc::new(Mesh {
-            self_id: hex_id(&endpoint.identity().node_id),
-            endpoint: slot,
+            port,
+            notes,
+            identity,
+            endpoint,
+            max,
+            self_id: hex_id(&identity.node_id),
             links: Mutex::new(BTreeMap::new()),
+            numbered: AtomicU64::new(0),
             forwarded: Mutex::new(BTreeSet::new()),
             door,
-            signer: NodeSigner::new(Some(*endpoint.identity())),
+            signer: NodeSigner::new(Some(identity)),
             gap_pulls: std::sync::Mutex::new(BTreeMap::new()),
         });
         self.shared
@@ -270,140 +341,201 @@ impl Server {
             .set(mesh.clone())
             .map_err(|_| other("mesh already enabled"))?;
         // With n0's relays, the home relay's state is noted as it changes
-        // (plan Step 4.5), until the endpoint closes.
-        if endpoint.relays() == Relays::N0 {
+        // (plan Step 4.5), until the port closes; with none, the watch ends
+        // at once.
+        if let Some(notes) = &mesh.notes {
             let (noting, mut before) = (mesh.clone(), Vec::new());
-            let watch = endpoint.relay_watch(move |now| {
+            let watch = notes.relay_watch(Box::new(move |now| {
                 for line in relay_notes(&before, &now) {
                     noting.status(&line);
                 }
                 before = now;
-            });
+            }));
             self.shared.tasks.spawn(Site::RelayWatch, watch);
         }
         let shared = self.shared.clone();
         self.shared.tasks.spawn(Site::AcceptLoop, async move {
-            // The accept loop holds its own endpoint clone, so the endpoint
-            // outlives every link it produces (the R2 footgun).
+            // Accept only: each link's HELLO runs in its own task (plan Step
+            // 4.5b), so a dialer slow to say it never holds the next.
             loop {
-                match endpoint.accept().await {
+                match mesh.port.accept().await {
                     Ok(Some(link)) => {
                         let (link_shared, mesh) = (shared.clone(), mesh.clone());
                         shared.tasks.spawn(Site::AcceptedLink, async move {
-                            let _ = run_link(link_shared, mesh, link, false).await;
+                            let _ = accepted(link_shared, mesh, Arc::from(link)).await;
                         });
                     }
-                    Ok(None) => break, // endpoint closed
-                    Err(_) => continue, // one bad handshake never stops the loop
+                    // The port closed.
+                    Ok(None) => break,
+                    // One refused attempt never stops the loop.
+                    Err(_) => continue,
                 }
             }
         });
-        Ok(addr)
+        Ok(())
     }
 
-    /// Dial a peer at every address `target` names (plan Step 4.5), run the
-    /// HELLO seam, register the link, and converge the home share (a pull
-    /// each way rides the connection). Returns the peer's directory node id
+    /// Dial a peer at every address `target` names (plan Steps 4.5 and
+    /// 4.5b), run HELLO on the link, register it, and converge the home share
+    /// (a pull each way rides the link). Returns the peer's directory node id
     /// (hex).
     pub async fn connect_peer(&self, target: impl Into<PeerEntry>) -> io::Result<String> {
         let mesh = self.shared.mesh.get().cloned().ok_or_else(|| other("mesh not enabled"))?;
-        let link = mesh.endpoint.get()?.dial(target).await?;
-        let peer = hex_id(&link.peer.peer_id);
-        run_link(self.shared.clone(), mesh, link, true).await?;
-        Ok(peer)
+        let entry = target.into();
+        let at = carrier_addr(&entry).ok_or_else(|| other("the peer names no address to dial"))?;
+        let link: Arc<dyn CarrierLink> = Arc::from(mesh.port.dial(&at).await.map_err(carried)?);
+        let (own, door) = (&mesh.endpoint, mesh.door.as_deref());
+        let hello = hello_dial_link(&*link, own, &mesh.identity, door, HELLO_WITHIN).await?;
+        let node = hello.peer_id;
+        run_link(self.shared.clone(), mesh, link, node, true).await?;
+        Ok(hex_id(&node))
     }
 }
 
-/// Drive one established (post-HELLO) link, dialer or acceptor side:
-/// register it, dispatch inbound streams, and run OUR home-share pull.
+/// An accepted link's task (plan Step 4.5b): its HELLO, within
+/// [`HELLO_WITHIN`], then its driver. A refused HELLO is reported through the
+/// door, and the link, dropped unanswered, ends.
+async fn accepted(
+    shared: Arc<Shared>,
+    mesh: Arc<Mesh>,
+    link: Arc<dyn CarrierLink>,
+) -> io::Result<()> {
+    let (own, door) = (&mesh.endpoint, mesh.door.as_deref());
+    let hello = hello_accept_link(&*link, own, &mesh.identity, door, HELLO_WITHIN).await?;
+    run_link(shared, mesh, link, hello.peer_id, false).await
+}
+
+/// Drive one link after its HELLO, which proved `node`, dialer or acceptor
+/// side: register it, start its conversations, and run OUR home-share pull.
 /// Returns once our own pull has completed (the link itself lives on).
-async fn run_link(shared: Arc<Shared>, mesh: Arc<Mesh>, link: PeerLink, dialed: bool) -> io::Result<()> {
-    let PeerLink { peer, conn, send: s0_send, recv: s0_recv } = link;
-    let peer_hex = hex_id(&peer.peer_id);
-    // The node its HELLO proved, which every stream of the link serves (the
-    // grant check's holder, plan Step 4.3), and which may write this node's
-    // directory from now on (D9's known set, plan Step 4.1b's part 2).
-    let node = peer.peer_id;
+async fn run_link(
+    shared: Arc<Shared>,
+    mesh: Arc<Mesh>,
+    link: Arc<dyn CarrierLink>,
+    node: [u8; 32],
+    dialed: bool,
+) -> io::Result<()> {
+    let peer = hex_id(&node);
+    // The node its HELLO proved, which every conversation of the link serves
+    // (the grant check's holder, plan Step 4.3), and which may write this
+    // node's directory from now on (D9's known set, plan Step 4.1b's part 2).
     mesh.signer.authenticated(node);
-    mesh.links.lock().await.insert(peer_hex.clone(), conn.clone());
-    // The path at HELLO (plan Step 4.5).
-    let path = selected_path(&conn);
-    mesh.note_path(&peer_hex, path.as_ref());
-
-    // Unlink on close, whoever closes first, noting each path iroh selects
-    // until then, and the close.
-    {
-        let (mesh, conn, peer_hex) = (mesh.clone(), conn.clone(), peer_hex.clone());
-        shared.tasks.spawn(Site::Unlink, async move {
-            watch_link(&mesh, &conn, &peer_hex, path).await;
-            mesh.links.lock().await.remove(&peer_hex);
-            mesh.status(&format!("link {peer_hex} closed"));
-        });
-    }
-
-    // Dispatch every inbound stream by its first frame.
-    {
-        let (dispatch, conn) = (shared.clone(), conn.clone());
-        shared.tasks.spawn(Site::StreamDispatch, async move {
-            while let Ok((send, recv)) = conn.accept_bi().await {
-                let stream = dispatch.clone();
-                dispatch.tasks.spawn(Site::PeerStream, async move {
-                    let _ = handle_peer_stream(stream, node, send, recv).await;
-                });
-            }
-        });
-    }
-
-    // Our home-share pull: the dialer rides stream 0 (the acceptor's stream-0
-    // handler above serves it); the acceptor opens its own stream.
-    let (send, recv) = if dialed {
-        (s0_send, s0_recv)
-    } else {
-        // Stream 0 on the acceptor side is the DIALER's pull channel: serve it.
-        {
-            let stream = shared.clone();
-            shared.tasks.spawn(Site::StreamZero, async move {
-                let _ = handle_peer_stream(stream, node, s0_send, s0_recv).await;
-            });
-        }
-        conn.open_bi().await.map_err(other)?
+    // The path at HELLO (plan Step 4.5), as the port notes it.
+    let remote = link.remote_id();
+    let noted = mesh.path(remote.as_ref());
+    mesh.note_path(&peer, noted.as_ref());
+    let (number, holding) = (mesh.numbered.fetch_add(1, Ordering::SeqCst), Arc::default());
+    let watched = Watched {
+        peer: peer.clone(),
+        number,
+        remote,
+        noted,
+        holding: Arc::clone(&holding),
     };
-    // The round is noted with what it took and how long it ran (plan Step
-    // 4.5); the dialer's `peer-connected` follows it.
+    // Started and registered under the table's lock, so that its reader,
+    // should the link end at once, finds it there to unlink.
+    let linked = {
+        let mut links = mesh.links.lock().await;
+        let (spawn, handler) = (spawner(&shared, &mesh, watched), handler(&shared, node));
+        let linked = Linked::start(link.clone(), node, dialed, mesh.max, spawn, handler);
+        let _ = holding.set(linked.clone());
+        let entry = Peer {
+            number,
+            link,
+            linked: linked.clone(),
+        };
+        links.insert(peer.clone(), entry);
+        linked
+    };
+    // Our home-share pull, this end's first conversation, which the peer
+    // serves. The round is noted with what it took and how long it ran (plan
+    // Step 4.5); the dialer's `peer-connected` follows it.
     let began = Instant::now();
-    let pulled = pull_home(&shared, &mesh, node, send, recv).await;
+    let pulled = pull_home(&shared, &mesh, node, linked.open()).await;
     if let Ok(round) = &pulled {
-        let (p, n, ms) = (&peer_hex, round.applied, began.elapsed().as_millis());
-        let line = format!("home round with node {p}: {n} record(s) in {ms} ms");
+        let (n, ms) = (round.applied, began.elapsed().as_millis());
+        let line = format!("home round with node {peer}: {n} record(s) in {ms} ms");
         mesh.status(&line);
     }
     pulled.map(drop)
 }
 
-/// How often a link's watch reads the path iroh sends on (plan Step 4.5).
+/// What a link's reader watches beside its frames (plan Step 4.5b): the link,
+/// by its peer and its number; its far end, whose path the port notes; the
+/// path noted at HELLO; and the link's conversations, which the reader holds
+/// until the link ends, so that a link lives until it ends, whether or not
+/// the table still holds it, as a QUIC connection did.
+#[derive(Clone)]
+struct Watched {
+    peer: String,
+    number: u64,
+    remote: Option<TransportId>,
+    noted: Option<PathSeen>,
+    holding: Arc<OnceLock<Arc<Linked>>>,
+}
+
+/// How a link's tasks start (plan Step 4.5b): each at its site, its reader
+/// watching the link as [`reading`] says.
+fn spawner(shared: &Arc<Shared>, mesh: &Arc<Mesh>, watched: Watched) -> Spawn {
+    let (shared, mesh) = (shared.clone(), mesh.clone());
+    Arc::new(move |task, work| {
+        let _ = match task {
+            LinkTask::Writer => shared.tasks.spawn(Site::LinkWriter, work),
+            LinkTask::Reader => {
+                let reader = reading(mesh.clone(), watched.clone(), work);
+                shared.tasks.spawn(Site::LinkReader, reader)
+            }
+            LinkTask::Inbound => shared.tasks.spawn(Site::InboundConversation, work),
+        };
+    })
+}
+
+/// What a link does with each conversation its peer opens (plan Step 4.5b):
+/// [`serve_conversation`], for `node`, the peer its HELLO proved.
+fn handler(shared: &Arc<Shared>, node: [u8; 32]) -> Handler {
+    let shared = shared.clone();
+    Arc::new(move |conversation| {
+        let shared = shared.clone();
+        Box::pin(async move {
+            let _ = serve_conversation(shared, node, conversation).await;
+        })
+    })
+}
+
+/// How often a link's reader reads the path the carrier sends on (plan Step
+/// 4.5).
 const PATH_POLL: Duration = Duration::from_millis(250);
 
-/// Watch `conn`, a link to `peer`, until it closes, noting each path iroh
-/// selects after `noted`, the one noted at HELLO. It reads the path every
-/// [`PATH_POLL`]: iroh's change stream needs a trait from a crate the node
-/// does not depend on, and a poll needs none.
-async fn watch_link(mesh: &Mesh, conn: &Connection, peer: &str, mut noted: Option<PathSeen>) {
-    let mut closed = pin!(conn.closed());
+/// A link's reader, `work` (plan Step 4.5b). Meanwhile it notes each path the
+/// port selects after the one noted at HELLO, reading it every
+/// [`PATH_POLL`], as a poll needs no change stream from the transport. At the
+/// link's end it unlinks the link, unless a newer one to the node has taken
+/// its place, and notes the close.
+async fn reading(mesh: Arc<Mesh>, watched: Watched, mut work: Work) {
+    let Watched {
+        peer,
+        number,
+        remote,
+        mut noted,
+        holding,
+    } = watched;
+    let watch = mesh.notes.clone().zip(remote);
     loop {
         tokio::select! {
-            _ = &mut closed => {
-                return;
-            }
-            () = tokio::time::sleep(PATH_POLL) => {
-                let now = selected_path(conn);
+            () = &mut work => break,
+            () = tokio::time::sleep(PATH_POLL), if watch.is_some() => {
+                let now = watch.as_ref().and_then(|(notes, remote)| notes.path(remote));
                 let via = |path: &Option<PathSeen>| path.as_ref().map(|path| path.via.clone());
                 if via(&now) != via(&noted) {
-                    mesh.note_path(peer, now.as_ref());
+                    mesh.note_path(&peer, now.as_ref());
                     noted = now;
                 }
             }
         }
     }
+    drop(holding);
+    mesh.unlink(&peer, number).await;
+    mesh.status(&format!("link {peer} closed"));
 }
 
 /// The `relay` lines a change of the home relays' states, from `before` to
@@ -427,31 +559,31 @@ fn relay_notes(before: &[RelayState], now: &[RelayState]) -> Vec<String> {
     lines
 }
 
-/// Serve one inbound peer stream by its first frame: `Heads` = a home-scoped
-/// sync pull (serve the gap, close); `Subscribe` = a forwarded interest (this
-/// node is the claim holder — serve gap + live ops until the interest closes);
-/// `ExchangeReq` = a forwarded exchange (this node is the claim holder — the
-/// attached authority answers, one stream one exchange, `exchange.rs`);
-/// `Ops` = a peer's home-share PUSH (freshly-minted directory records, the B9
-/// step) — scoped ingest, home ops only, one frame per stream, one [`Round`];
-/// a chain it leaves short as a gap starts a pull from the peer
-/// ([`pull_on_gap`]). `node` is the peer, as its HELLO proved it.
-async fn handle_peer_stream(
+/// Serve one conversation the peer opened, by its first frame: `Heads` = a
+/// home-scoped sync pull (serve the gap, END); `Subscribe` = a forwarded
+/// interest (this node is the claim holder — serve gap + live ops until the
+/// interest closes); `ExchangeReq` = a forwarded exchange (this node is the
+/// claim holder — the attached authority answers, one conversation one
+/// exchange, `exchange.rs`); `Ops` = a peer's home-share PUSH (freshly-minted
+/// directory records, the B9 step) — scoped ingest, home ops only, one frame
+/// per conversation, one [`Round`]; a chain it leaves short as a gap starts a
+/// pull from the peer ([`pull_on_gap`]). `node` is the peer, as its HELLO
+/// proved it.
+async fn serve_conversation(
     shared: Arc<Shared>,
     node: [u8; 32],
-    mut send: SendStream,
-    mut recv: RecvStream,
+    mut conversation: Conversation,
 ) -> io::Result<()> {
-    match read_frame(&mut recv).await? {
-        Frame::Heads(h) => serve_home(&shared, &mut send, h).await,
-        Frame::Subscribe(s) => serve_peer_subscribe(shared, node, send, recv, s).await,
+    let Some(mesh) = shared.mesh.get().cloned() else {
+        return Ok(());
+    };
+    match conversation.recv().await? {
+        Frame::Heads(h) => serve_home(&shared, &mesh, node, conversation, h).await,
+        Frame::Subscribe(s) => serve_peer_subscribe(shared, &mesh, node, conversation, s).await,
         Frame::ExchangeReq(x) => {
-            crate::exchange::serve_peer_exchange(shared, node, send, recv, x).await
+            crate::exchange::serve_peer_exchange(shared, node, conversation, x).await
         }
         Frame::Ops(o) => {
-            let Some(mesh) = shared.mesh.get().cloned() else {
-                return Ok(());
-            };
             let mut round = Round::new(&shared, &mesh, node);
             for op in o.ops.into_iter().filter(|op| op.share == HOME) {
                 round.take(op).await;
@@ -460,6 +592,7 @@ async fn handle_peer_stream(
             // gap some pull answers for; a new pull starts after the lines.
             let pull = mesh.note_gaps(node, std::mem::take(&mut round.gaps));
             round.end();
+            conversation.end();
             if let Some(gaps) = pull {
                 let pulling = shared.clone();
                 shared.tasks.spawn(Site::GapPull, async move {
@@ -468,7 +601,7 @@ async fn handle_peer_stream(
             }
             Ok(())
         }
-        _ => Ok(()), // unknown opener: drop the stream, never the connection
+        _ => Ok(()), // unknown opener: reset the conversation, never the link
     }
 }
 
@@ -479,46 +612,50 @@ async fn handle_peer_stream(
 /// ingests and never re-pushes — transitive gossip is deferred. Best-effort:
 /// a push that arrives out of order, or after a lost one, is refused as a gap
 /// and heals by the pull that starts ([`pull_on_gap`]); a lost push with none
-/// after it on its chain waits for the next connect-time pull.
+/// after it on its chain waits for the next connect-time pull. A push is one
+/// conversation per link, its one `Ops` frame then END, only queued (plan
+/// Step 4.5b); one over the frame limit is not sent, with a line.
 pub(crate) async fn push_home(shared: &Arc<Shared>, ops: Vec<Op>) {
     let Some(mesh) = shared.mesh.get() else { return };
-    if ops.is_empty() {
-        return;
-    }
-    let links: Vec<Connection> = mesh.links.lock().await.values().cloned().collect();
-    for conn in links {
-        let ops = ops.clone();
-        shared.tasks.spawn(Site::RecordPush, async move {
-            if let Ok((mut send, _recv)) = conn.open_bi().await {
-                use tokio::io::AsyncWriteExt;
-                let _ = write_frame(&mut send, &Frame::Ops(Ops { ops, pri: None })).await;
-                let _ = send.shutdown().await;
+    let Some(first) = ops.first() else { return };
+    let zone = (first.share.clone(), first.glade_id.clone());
+    let links: Vec<Arc<Linked>> = {
+        let links = mesh.links.lock().await;
+        links.values().map(|peer| peer.linked.clone()).collect()
+    };
+    let frame = Frame::Ops(Ops { ops, pri: None });
+    for linked in links {
+        let conversation = linked.open();
+        match conversation.send(&frame) {
+            Ok(()) => conversation.end(),
+            Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
+                mesh.over_limit(&linked.node(), &zone.0, &zone.1);
             }
-        });
+            Err(_) => {}
+        }
     }
 }
 
 /// The claim holder's side of a forwarded interest (trace C3→C5): register the
 /// peer as an ordinary subscriber session of the zone, ship the resume gap
 /// against the `from` heads it announced, then let the normal fan-out feed the
-/// stream until the peer closes it (interest withdrawn / link gone).
+/// conversation until the peer ends it (interest withdrawn / link gone).
 ///
 /// The grant check (plan Step 4.3), enforced for every peer: a share other
 /// than `home` is served only to a node the fold grants `read.subscribe` on
-/// it. Refused, the stream gets the refused subscribe's two frames (R6), an
-/// ack that names no zone and the reason, and is finished, so the forwarding
-/// node's forward lapses; nothing is registered. Admitted, the stream joins
-/// the admission table, and the re-check pass ends it if a later fold
-/// refuses it (`server::refresh_policy`). Check and registration hold the
-/// cut, so no fold change falls between them unseen.
+/// it. Refused, the conversation gets the refused subscribe's two frames
+/// (R6), an ack that names no zone and the reason, then END, so the
+/// forwarding node's forward lapses; nothing is registered. Admitted, the
+/// conversation joins the admission table, and the re-check pass ends it if
+/// a later fold refuses it (`server::refresh_policy`). Check and registration
+/// hold the cut, so no fold change falls between them unseen.
 async fn serve_peer_subscribe(
     shared: Arc<Shared>,
+    mesh: &Mesh,
     node: [u8; 32],
-    mut qsend: SendStream,
-    mut recv: RecvStream,
+    mut conversation: Conversation,
     s: Subscribe,
 ) -> io::Result<()> {
-    use tokio::io::AsyncWriteExt;
     let key = s.key.clone().unwrap_or_default();
     let holder = Holder::Node(node);
     let cut = shared.cut.lock().await;
@@ -527,9 +664,10 @@ async fn serve_peer_subscribe(
             drop(cut);
             let why = refusal(&holder, READ_SUBSCRIBE, &s.share, denial);
             for frame in refused_subscribe(ErrorCode::Unauthorized, why, &s.share, &s.glade_id) {
-                write_frame(&mut qsend, &frame).await?;
+                conversation.send(&frame)?;
             }
-            return qsend.shutdown().await;
+            conversation.end();
+            return Ok(());
         }
     }
     let sid = shared.next.fetch_add(1, Ordering::SeqCst);
@@ -538,24 +676,9 @@ async fn serve_peer_subscribe(
     shared.router.lock().await.subscribe(sid, &s.share, &s.glade_id, &key);
     shared.admitted.lock().await.insert(sid, node);
 
-    // Writer: drain the session outbound onto the QUIC stream, u32-framed —
-    // the peer framing every glade stream speaks. Its channel closes when the
-    // session leaves the session table (the re-check pass refused it), and
-    // then it finishes the stream.
-    let wtask = shared.tasks.spawn(Site::SubscriptionWriter, async move {
-        while let Some(bytes) = rx.recv().await {
-            let ok = qsend.write_all(&(bytes.len() as u32).to_le_bytes()).await.is_ok()
-                && qsend.write_all(&bytes).await.is_ok()
-                && qsend.flush().await.is_ok();
-            if !ok {
-                return;
-            }
-        }
-        let _ = qsend.shutdown().await;
-    });
-
     // Ack + gap ride the SAME outbound channel as live fan-out, so a live op
-    // can never overtake the resume gap on the stream.
+    // can never overtake the resume gap on the conversation. The gap goes in
+    // chunks under the link's frame limit (plan Step 4.5b).
     let their: crate::session::Heads =
         s.from.clone().unwrap_or_default().into_iter().map(|h| (h.origin, h.seq)).collect();
     let (server_heads, gap) = {
@@ -571,44 +694,70 @@ async fn serve_peer_subscribe(
         }],
     });
     let _ = tx.send(ack.to_bytes());
-    if !gap.is_empty() {
-        let _ = tx.send(Frame::Ops(Ops { ops: gap, pri: Some(Priority::Bulk) }).to_bytes());
+    for ops in chunked(gap, mesh.chunk_bytes()) {
+        let pri = Some(Priority::Bulk);
+        let _ = tx.send(Frame::Ops(Ops { ops, pri }).to_bytes());
     }
     // From here the session table holds the only sender.
     drop(tx);
     drop(cut);
 
-    // Hold the subscription open until the peer closes its end.
-    while read_frame(&mut recv).await.is_ok() {}
+    // One loop is the subscription's writer and its reader (plan Step 4.5b):
+    // it queues the session's frames on the conversation until the peer ends
+    // it or the link ends, or until the session leaves the session table (the
+    // re-check pass refused it), when it sends END. A frame over the link's
+    // limit is an op over it alone: the loop ends there, with a line, and the
+    // forward lapses. It holds no lock across a receive (`conversation.rs`).
+    let finished = loop {
+        tokio::select! {
+            queued = rx.recv() => {
+                let Some(frame) = queued else {
+                    break true;
+                };
+                if let Err(e) = conversation.send_encoded(&frame) {
+                    if e.kind() == io::ErrorKind::InvalidInput {
+                        mesh.over_limit(&node, &s.share, &s.glade_id);
+                    }
+                    break false;
+                }
+            }
+            read = conversation.recv() => {
+                if read.is_err() {
+                    break false;
+                }
+            }
+        }
+    };
     shared.out.lock().await.remove(&sid);
     shared.router.lock().await.unsubscribe_all(sid);
     shared.admitted.lock().await.remove(&sid);
-    wtask.abort();
+    if finished {
+        conversation.end();
+    }
     Ok(())
 }
 
-/// The A-side of the C2 decision's Forward arm: open a stream on the claim
-/// holder's link, send the interest (with our replica's heads as the resume
-/// point), and ingest what comes back into the LOCAL replica — local
+/// The A-side of the C2 decision's Forward arm: open a conversation on the
+/// claim holder's link, send the interest (with our replica's heads as the
+/// resume point), and ingest what comes back into the LOCAL replica — local
 /// subscribers are then fed by the ordinary fan-out (replica serves reads,
-/// trace C5→C6). Deduped per zone: one stream carries any number of local
-/// subscribers. The forward lapses with the stream; a later subscribe retries.
-/// A refusal the claim holder sends on the stream reaches the local
-/// subscribers ([`lapse`]).
+/// trace C5→C6). Deduped per zone: one conversation carries any number of
+/// local subscribers. The forward lapses with the conversation; a later
+/// subscribe retries. A refusal the claim holder sends on it reaches the
+/// local subscribers ([`lapse`]).
 pub(crate) async fn forward_interest(shared: &Arc<Shared>, peer: String, share: String, glade_id: String, key: Vec<u8>) {
     let Some(mesh) = shared.mesh.get().cloned() else { return };
     let zone = (share.clone(), glade_id.clone(), key.clone());
     if !mesh.forwarded.lock().await.insert(zone.clone()) {
         return; // interest already flowing
     }
-    let conn = mesh.links.lock().await.get(&peer).cloned();
-    let Some(conn) = conn else {
+    let Some(linked) = mesh.linked(&peer).await else {
         mesh.forwarded.lock().await.remove(&zone);
         return;
     };
     let forward = shared.clone();
     shared.tasks.spawn(Site::ForwardInterest, async move {
-        let refused = run_forward(&forward, conn, &share, &glade_id, &key).await;
+        let refused = run_forward(&forward, &linked, &share, &glade_id, &key).await;
         lapse(&forward, &mesh, &peer, zone, refused.ok().flatten()).await;
     });
 }
@@ -640,30 +789,39 @@ async fn lapse(shared: &Arc<Shared>, mesh: &Mesh, peer: &str, zone: Zone, refuse
 /// Close every live peer link and forget it, with the interests forwarded
 /// over them: the assembled root's `Sessions` stop (plan Step 3.3), once
 /// every task that could register a link has ended. The link table is taken
-/// by value, so the mesh keeps no `Connection` that could hold the endpoint's
-/// socket open. Returns how many links were closed.
+/// by value, so the mesh keeps no link that could hold the port's socket
+/// open, and the links close all together, each within the port's drain,
+/// with no reason (plan Step 4.5b); the port's own close, at `PeerCarrier`'s
+/// release, then ends anything left. Returns how many links were closed.
 pub(crate) async fn release_links(shared: &Arc<Shared>) -> usize {
     let Some(mesh) = shared.mesh.get() else {
         return 0;
     };
     let links = std::mem::take(&mut *mesh.links.lock().await);
-    for conn in links.values() {
-        conn.close(0u32.into(), b"glade node stopping");
-    }
+    let mut closing: Vec<_> = links.values().map(|peer| peer.link.close()).collect();
+    poll_fn(|cx| {
+        closing.retain_mut(|close| close.as_mut().poll(cx).is_pending());
+        if closing.is_empty() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
     mesh.forwarded.lock().await.clear();
     links.len()
 }
 
-/// Run one forward until its stream ends: `Some` refusal when the claim
+/// Run one forward until its conversation ends: `Some` refusal when the claim
 /// holder refused the read, which ends it (F5).
 async fn run_forward(
     shared: &Arc<Shared>,
-    conn: Connection,
+    linked: &Arc<Linked>,
     share: &str,
     glade_id: &str,
     key: &[u8],
 ) -> io::Result<Option<Error>> {
-    let (mut qsend, mut recv) = conn.open_bi().await.map_err(other)?;
+    let mut conversation = linked.open();
     let from: Vec<Head> = {
         let st = shared.store.lock().await;
         st.heads(share, glade_id, key).into_iter().map(|(origin, seq)| Head { origin, seq, hash: None }).collect()
@@ -674,10 +832,10 @@ async fn run_forward(
         key: if key.is_empty() { None } else { Some(key.to_vec()) },
         from: Some(from),
     };
-    write_frame(&mut qsend, &Frame::Subscribe(sub)).await?;
+    conversation.send(&Frame::Subscribe(sub))?;
     let from_sid = shared.next.fetch_add(1, Ordering::SeqCst);
     loop {
-        let frame = match read_frame(&mut recv).await {
+        let frame = match conversation.recv().await {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break, // interest closed
             Err(e) => return Err(e),
@@ -685,7 +843,7 @@ async fn run_forward(
         match frame {
             Frame::Ops(ops) => {
                 for op in ops.ops {
-                    // Scoped ingest: this stream carries ONE zone's interest —
+                    // Scoped ingest: this conversation carries ONE zone's interest —
                     // the holder can't use it to push any other zone into our
                     // replica.
                     if op.share == share && op.glade_id == glade_id && op.key == key {
@@ -695,19 +853,27 @@ async fn run_forward(
             }
             // The claim holder's refusal (plan Step 4.3), after an ack that
             // names no zone or, from its re-check pass, alone; it then
-            // finishes the stream.
+            // ends the conversation.
             Frame::Error(refused) => return Ok(Some(refused)),
             _ => {}
         }
     }
+    conversation.end();
     Ok(None)
 }
 
 /// Respond to a peer's home-share pull: ship exactly the home-zone ops the
-/// peer lacks (size-capped bulk chunks), then close — close = gap complete.
-/// Scoped to HOME: connect-time anti-entropy replicates the directory only;
-/// app shares move by interest (see the module note).
-async fn serve_home(shared: &Arc<Shared>, send: &mut SendStream, their: Heads) -> io::Result<()> {
+/// peer lacks (bulk, in chunks under the link's frame limit, plan Step
+/// 4.5b), then END — END = gap complete. Scoped to HOME: connect-time
+/// anti-entropy replicates the directory only; app shares move by interest
+/// (see the module note). `node` is the peer, as its HELLO proved it.
+async fn serve_home(
+    shared: &Arc<Shared>,
+    mesh: &Mesh,
+    node: [u8; 32],
+    conversation: Conversation,
+    their: Heads,
+) -> io::Result<()> {
     let mut by_zone: BTreeMap<(String, String, Vec<u8>), BTreeMap<String, i64>> = BTreeMap::new();
     for sh in their.streams {
         let m = by_zone.entry((sh.share.clone(), sh.glade_id.clone(), sh.key.clone())).or_default();
@@ -715,7 +881,7 @@ async fn serve_home(shared: &Arc<Shared>, send: &mut SendStream, their: Heads) -
             m.insert(hd.origin, hd.seq);
         }
     }
-    // Collect the gap under the store lock, then stream without it.
+    // Collect the gap under the store lock, then send it without.
     let gap: Vec<Op> = {
         let st = shared.store.lock().await;
         let mut gap = Vec::new();
@@ -728,37 +894,77 @@ async fn serve_home(shared: &Arc<Shared>, send: &mut SendStream, their: Heads) -
         }
         gap
     };
-    for chunk in gap.chunks(OPS_PER_CHUNK) {
-        write_frame(send, &Frame::Ops(Ops { ops: chunk.to_vec(), pri: Some(Priority::Bulk) })).await?;
+    for ops in chunked(gap, mesh.chunk_bytes()) {
+        let first = ops.first();
+        let zone = first.map(|op| (op.share.clone(), op.glade_id.clone()));
+        let pri = Some(Priority::Bulk);
+        let sent = conversation.send(&Frame::Ops(Ops { ops, pri }));
+        if let (Err(e), Some((share, glade_id))) = (&sent, zone) {
+            if e.kind() == io::ErrorKind::InvalidInput {
+                mesh.over_limit(&node, &share, &glade_id);
+            }
+        }
+        sent?;
     }
-    use tokio::io::AsyncWriteExt;
-    send.shutdown().await // close = gap complete
+    conversation.end(); // END = gap complete
+    Ok(())
 }
 
-/// Pull the peer's home-share gap: announce our home heads, ingest until the
-/// peer closes. Every op lands through the same verify path as any carrier
-/// (`Store::append` chain checks) and fans out to local subscribers — a
-/// directory update reaches a live `dir.workspaces` subscription with no
-/// re-request (the B9 step). Non-home ops on this stream are dropped: the
-/// pull asked for the directory, a peer can't use it to push app content.
-/// The pull is one [`Round`], whose outcome it returns.
+/// The most bytes of ops a chunk holds, but for an op alone (plan Step
+/// 4.5b, question 6): 1 MiB.
+const CHUNK_BYTES: usize = 1 << 20;
+
+/// What a chunk's frame holds beside its ops, with room to spare: the
+/// conversation's header and the `Ops` frame's tag, map, keys, array head and
+/// priority, 12 bytes for up to 255 ops.
+const CHUNK_ROOM: usize = 32;
+
+/// `ops`, in order, in chunks (plan Step 4.5b, question 6): each of at most
+/// [`OPS_PER_CHUNK`] ops and, but for an op alone, of at most `bytes` bytes of
+/// them as each encodes.
+fn chunked(ops: Vec<Op>, bytes: usize) -> Vec<Vec<Op>> {
+    let mut chunks = Vec::new();
+    let (mut chunk, mut held) = (Vec::new(), 0);
+    for op in ops {
+        let size = cbor::encode(&op.to_cbor()).len();
+        let full = chunk.len() == OPS_PER_CHUNK || held + size > bytes;
+        if full && !chunk.is_empty() {
+            chunks.push(std::mem::take(&mut chunk));
+            held = 0;
+        }
+        held += size;
+        chunk.push(op);
+    }
+    if !chunk.is_empty() {
+        chunks.push(chunk);
+    }
+    chunks
+}
+
+/// Pull the peer's home-share gap on `conversation`, one this end opened:
+/// announce our home heads, ingest until the peer's END. Every op lands
+/// through the same verify path as any carrier (`Store::append` chain
+/// checks) and fans out to local subscribers — a directory update reaches a
+/// live `dir.workspaces` subscription with no re-request (the B9 step).
+/// Non-home ops on this conversation are dropped: the pull asked for the
+/// directory, a peer can't use it to push app content. The pull is one
+/// [`Round`], whose outcome it returns.
 async fn pull_home(
     shared: &Arc<Shared>,
     mesh: &Mesh,
     peer: [u8; 32],
-    mut send: SendStream,
-    mut recv: RecvStream,
+    mut conversation: Conversation,
 ) -> io::Result<SyncOutcome> {
     let ours: Vec<StreamHeads> = {
         let st = shared.store.lock().await;
         st.all_heads().into_iter().filter(|sh| sh.share == HOME).collect()
     };
-    write_frame(&mut send, &Frame::Heads(Heads { streams: ours })).await?;
+    conversation.send(&Frame::Heads(Heads { streams: ours }))?;
     let mut round = Round::new(shared, mesh, peer);
     let ended = loop {
-        let frame = match read_frame(&mut recv).await {
+        let frame = match conversation.recv().await {
             Ok(f) => f,
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break Ok(()), // peer closed = done
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break Ok(()), // peer's END = done
             Err(e) => break Err(e),
         };
         if let Frame::Ops(ops) = frame {
@@ -767,6 +973,7 @@ async fn pull_home(
             }
         }
     };
+    conversation.end();
     let outcome = round.end();
     ended.map(|()| outcome)
 }
@@ -874,8 +1081,8 @@ impl<'a> Round<'a> {
 
 /// Pull from `pusher` at once, the store having refused a push of its as a
 /// gap (the hardening's question 2, ruled (b)): its home share, from this
-/// node's heads, on a new stream of its live link, as at connect. So a chain
-/// that a push reached out of order heals now, not at the next link.
+/// node's heads, on a new conversation of its live link, as at connect. So a
+/// chain that a push reached out of order heals now, not at the next link.
 /// Receiver-side only, with no wire change. One pull runs per pusher. A gap
 /// noted while it runs is judged at its end, and pulled for again only if
 /// still short, since its push may have come after the pusher answered. A
@@ -910,17 +1117,16 @@ async fn pull_on_gap(shared: &Arc<Shared>, mesh: &Mesh, pusher: [u8; 32], mut ga
     }
 }
 
-/// One pull of `pusher`'s home share, on a new stream of its live link.
+/// One pull of `pusher`'s home share, on a new conversation of its live link.
 async fn pull_from(
     shared: &Arc<Shared>,
     mesh: &Mesh,
     peer: &str,
     pusher: [u8; 32],
 ) -> io::Result<SyncOutcome> {
-    let conn = mesh.links.lock().await.get(peer).cloned();
-    let conn = conn.ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "no live link"))?;
-    let (send, recv) = conn.open_bi().await.map_err(other)?;
-    pull_home(shared, mesh, pusher, send, recv).await
+    let linked = mesh.linked(peer).await;
+    let gone = || io::Error::new(io::ErrorKind::NotConnected, "no live link");
+    pull_home(shared, mesh, pusher, linked.ok_or_else(gone)?.open()).await
 }
 
 /// The chains a peer's pushes left short as a gap, by (stream, origin): the
@@ -1026,13 +1232,14 @@ pub(crate) async fn ingest_and_fanout(
     res
 }
 
-/// Close the revoking node's live link, if it rides the key it revoked (plan
-/// Step 4.2b): its HELLO was taken before the door knew. The link leaves the
-/// table when its connection ends.
+/// End the revoking node's live link, if it rides the key it revoked (plan
+/// Step 4.2b): its HELLO was taken before the door knew. `Linked::end`
+/// returns at once, as it must under the cut, and the link's writer closes
+/// it (plan Step 4.5b); the link leaves the table when its reader sees it end.
 async fn close_revoked(mesh: &Mesh, (endpoint, node): ([u8; 32], [u8; 32])) {
-    if let Some(conn) = mesh.links.lock().await.get(&hex_id(&node)) {
-        if conn.remote_id().as_bytes() == &endpoint {
-            conn.close(0u32.into(), b"");
+    if let Some(peer) = mesh.links.lock().await.get(&hex_id(&node)) {
+        if peer.link.remote_id() == Some(TransportId(endpoint.to_vec())) {
+            peer.linked.end();
         }
     }
 }
@@ -1079,8 +1286,74 @@ pub fn directory_knows(store: &Store, share: &str) -> bool {
     false
 }
 
+// The one helper every two-node test binds a node's mesh with (plan Step
+// 4.5b), here, in `exchange.rs` and in `claims.rs`. A braced module, so the
+// condition encloses the whole section.
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::num::NonZeroUsize;
+    use std::sync::Arc;
+
+    use glade_carrier_api::{CarrierAddr, CarrierConfig, CarrierPort};
+
+    use super::PeerPort;
+    use crate::frame::MAX_FRAME_BYTES;
+    use crate::iroh_carrier::{entry_of, IrohCarrier, Lent, FIRST_WORD};
+    use crate::netconf::{PeerEntry, Relays};
+    use crate::peer::NodeIdentity;
+    use crate::server::Server;
+    use crate::transport::{Door, EndpointKey};
+
+    /// A fresh endpoint key, which dies with the test.
+    pub(crate) fn endpoint_key() -> EndpointKey {
+        EndpointKey::from_seed(crate::signing::random_seed().unwrap())
+    }
+
+    /// Enable `server`'s mesh as the node `identity`, on an adapter of its
+    /// own: a fresh endpoint key, no door and the node's frame limit. Its
+    /// address, as a peer's entry names it.
+    pub(crate) async fn meshed(server: &Server, identity: NodeIdentity) -> PeerEntry {
+        on_carrier(server, identity, endpoint_key(), None, MAX_FRAME_BYTES).await
+    }
+
+    /// Enable `server`'s mesh as the node `identity`, on an adapter of its
+    /// own lent `key` and `door`, bound on `127.0.0.1` alone with frames of
+    /// at most `max` bytes, the mesh's limit too. Its address, as a peer's
+    /// entry names it.
+    pub(crate) async fn on_carrier(
+        server: &Server,
+        identity: NodeIdentity,
+        key: EndpointKey,
+        door: Option<Arc<Door>>,
+        max: usize,
+    ) -> PeerEntry {
+        let (relays, first_word) = (Relays::Off, FIRST_WORD);
+        let lent = Lent {
+            key,
+            door: door.clone(),
+            relays,
+            first_word,
+        };
+        let carrier = IrohCarrier::new(Some(lent));
+        let local = CarrierAddr("127.0.0.1:0".into());
+        let max_frame_bytes = NonZeroUsize::new(max).unwrap();
+        let config = CarrierConfig {
+            local,
+            max_frame_bytes,
+        };
+        let bound = carrier.bind(config).await.unwrap();
+        let port = PeerPort {
+            max_frame_bytes: max,
+            ..PeerPort::iroh(&carrier, identity, &key, door)
+        };
+        server.enable_mesh(port).await.unwrap();
+        entry_of(&bound).unwrap()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::testing::{endpoint_key, meshed, on_carrier};
     use super::*;
     use crate::claims::testing;
     use crate::registry::{Record, RegistryApi, G_CLAIMS, G_PRINCIPALS};
@@ -1150,13 +1423,11 @@ mod tests {
         a.seed_registry(&boot_a.registry.snapshot()).await;
         b.seed_registry(&boot_b.registry.snapshot()).await;
 
-        let ep_a = PeerEndpoint::bind_with(boot_a.identity().unwrap()).await.unwrap();
-        let ep_b = PeerEndpoint::bind_with(boot_b.identity().unwrap()).await.unwrap();
-        a.enable_mesh(ep_a).await.unwrap();
-        let addr_b = b.enable_mesh(ep_b).await.unwrap();
+        meshed(&a, boot_a.identity().unwrap()).await;
+        let at_b = meshed(&b, boot_b.identity().unwrap()).await;
 
         // The HELLO identity is the directory identity (one id, two renderings).
-        let peer = a.connect_peer(&addr_b).await.unwrap();
+        let peer = a.connect_peer(at_b).await.unwrap();
         assert_eq!(peer, boot_b.node_id);
 
         // A pulled B: B's presence + workspace + claim are in A's replica...
@@ -1196,12 +1467,11 @@ mod tests {
         let b = Server::open(fresh("tb-b-store")).unwrap();
         a.adopt_boot(boot_a).await.unwrap();
         b.adopt_boot(boot_b).await.unwrap();
-        let ep_a = PeerEndpoint::bind_as(id_a, key_a).await.unwrap();
-        let ep_b = PeerEndpoint::bind_as(id_b, key_b).await.unwrap();
-        a.enable_mesh(ep_a).await.unwrap();
-        let addr_b = b.enable_mesh(ep_b).await.unwrap();
-        assert_eq!(*addr_b.endpoint_id.as_bytes(), key_b.endpoint_id);
-        a.connect_peer(&addr_b).await.unwrap();
+        let max = crate::frame::MAX_FRAME_BYTES;
+        on_carrier(&a, id_a, key_a, None, max).await;
+        let at_b = on_carrier(&b, id_b, key_b, None, max).await;
+        assert_eq!(at_b.key, key_b.endpoint_id);
+        a.connect_peer(at_b).await.unwrap();
 
         let live = |node: [u8; 32], key: [u8; 32]| {
             move |st: &Store| {
@@ -1243,15 +1513,9 @@ mod tests {
         let b = Server::open(fresh("forged-b-store")).unwrap();
         a.seed_registry(&boot_a.registry.snapshot()).await;
         b.seed_registry(&boot_b.registry.snapshot()).await;
-        let ep_a = PeerEndpoint::bind_with(boot_a.identity().unwrap())
-            .await
-            .unwrap();
-        let ep_b = PeerEndpoint::bind_with(boot_b.identity().unwrap())
-            .await
-            .unwrap();
-        a.enable_mesh(ep_a).await.unwrap();
-        let addr_b = b.enable_mesh(ep_b).await.unwrap();
-        a.connect_peer(&addr_b).await.unwrap();
+        meshed(&a, boot_a.identity().unwrap()).await;
+        let at_b = meshed(&b, boot_b.identity().unwrap()).await;
+        a.connect_peer(at_b).await.unwrap();
         let held = |node: String| move |st: &Store| st.scan(HOME, G_CLAIMS, &[], &node, -1).len();
         wait_for(
             &b,
@@ -1275,29 +1539,8 @@ mod tests {
             principal: "marker".into(),
         });
         let marker = a_records.append_returning(marker, &a_id).unwrap();
-        let conn = a
-            .shared
-            .mesh
-            .get()
-            .unwrap()
-            .links
-            .lock()
-            .await
-            .get(&b_id)
-            .cloned()
-            .unwrap();
-        let push = |ops: Vec<Op>| {
-            let conn = conn.clone();
-            async move {
-                use tokio::io::AsyncWriteExt;
-                let (mut send, _recv) = conn.open_bi().await.unwrap();
-                write_frame(&mut send, &Frame::Ops(Ops { ops, pri: None }))
-                    .await
-                    .unwrap();
-                send.shutdown().await.unwrap();
-            }
-        };
-        push(vec![bare, forged, marker]).await;
+        let linked = a.shared.mesh.get().unwrap().linked(&b_id).await.unwrap();
+        pushed(&linked, vec![bare, forged, marker]);
         let principals = |st: &Store| {
             st.scan(HOME, crate::registry::G_PRINCIPALS, &[], &a_id, -1)
                 .len()
@@ -1308,7 +1551,7 @@ mod tests {
             assert_eq!(who_serves(&st, "ws-razel", now_ms()), Some(b_id.clone()));
             assert_eq!(held(a_id.clone())(&st), 1, "A's claims chain as it was");
         }
-        push(vec![genuine.clone()]).await;
+        pushed(&linked, vec![genuine.clone()]);
         wait_for(
             &b,
             |st| held(a_id.clone())(st) == 2,
@@ -1346,7 +1589,7 @@ mod tests {
         keys: ([u8; 32], [u8; 32]),
         configured: &[[u8; 32]],
         records: &[Op],
-    ) -> (Server, Lines, PeerAddr) {
+    ) -> (Server, Lines, PeerEntry) {
         let (server, lines, _, addr) = noting_door(name, keys, configured, records).await;
         (server, lines, addr)
     }
@@ -1358,7 +1601,7 @@ mod tests {
         (seed, key): ([u8; 32], [u8; 32]),
         configured: &[[u8; 32]],
         records: &[Op],
-    ) -> (Server, Lines, Lines, PeerAddr) {
+    ) -> (Server, Lines, Lines, PeerEntry) {
         let server = Server::open(fresh(name)).unwrap();
         for op in records {
             server.shared.store.lock().await.append(op.clone()).unwrap();
@@ -1373,12 +1616,9 @@ mod tests {
             crate::peer::NodeIdentity::from_key(seed),
             crate::transport::EndpointKey::from_seed(key),
         );
-        let network = crate::netconf::Network::default();
-        let endpoint = PeerEndpoint::bind_door(identity, key, Arc::new(door), &network)
-            .await
-            .unwrap();
-        let addr = server.enable_mesh(endpoint).await.unwrap();
-        (server, lines, notes, addr)
+        let max = crate::frame::MAX_FRAME_BYTES;
+        let at = on_carrier(&server, identity, key, Some(Arc::new(door)), max).await;
+        (server, lines, notes, at)
     }
 
     /// A note that begins with `head` and ends with a time, ` ms`.
@@ -1410,13 +1650,12 @@ mod tests {
         let admits_b = [endpoint_of(B_KEY)];
         let a = noting_door("notes-link-a", (A_SEED, A_KEY), &admits_b, &[]).await;
         let (a, _, a_notes, at_a) = a;
-        a.connect_peer(&at_b).await.expect("a link");
-        let link = |id: &str, at: &PeerAddr| format!("link {id} via direct {}, rtt ", at.socket);
+        a.connect_peer(at_b.clone()).await.expect("a link");
+        let link = |id: &str, at: &PeerEntry| format!("link {id} via direct {}, rtt ", at.via[0]);
         noted(&a_notes, timed(link(&b_id, &at_b))).await;
         noted(&b_notes, timed(link(&a_id, &at_a))).await;
 
-        let endpoint = a.shared.mesh.get().unwrap().endpoint.give_up();
-        endpoint.expect("A's endpoint").close().await;
+        a.shared.mesh.get().unwrap().port.close().await;
         let closed = format!("link {a_id} closed");
         noted(&b_notes, |line| line == closed).await;
     }
@@ -1444,7 +1683,7 @@ mod tests {
         let admits_b = [endpoint_of(B_KEY)];
         let a = noting_door("notes-round-a", (A_SEED, A_KEY), &admits_b, &a_own).await;
         let (a, _, a_notes, _) = a;
-        a.connect_peer(&at_b).await.expect("a link");
+        a.connect_peer(at_b).await.expect("a link");
         let round = |id: &str, n: usize| format!("home round with node {id}: {n} record(s) in ");
         noted(&a_notes, timed(round(&b_id, 2))).await;
         noted(&b_notes, timed(round(&a_id, 1))).await;
@@ -1498,6 +1737,14 @@ mod tests {
         server.shared.mesh.get().unwrap().links.lock().await.len()
     }
 
+    /// Push `ops` on a conversation of `linked`'s own, as `push_home` does:
+    /// one `Ops` frame, then END.
+    fn pushed(linked: &Arc<Linked>, ops: Vec<Op>) {
+        let (conversation, frame) = (linked.open(), Frame::Ops(Ops { ops, pri: None }));
+        conversation.send(&frame).unwrap();
+        conversation.end();
+    }
+
     /// Done-when (plan Step 4.2b): an endpoint key the door does not know is
     /// refused at accept, before HELLO. The refusing node reports one line
     /// naming the key and the reason; the dialer learns no reason.
@@ -1512,7 +1759,7 @@ mod tests {
         )
         .await;
         let refused = a
-            .connect_peer(&at_b)
+            .connect_peer(at_b.clone())
             .await
             .expect_err("an unknown key linked");
         assert_ne!(refused.kind(), io::ErrorKind::PermissionDenied, "{refused}");
@@ -1541,7 +1788,8 @@ mod tests {
         let (b, b_lines, at_b) = behind_door("door-bound-b", (B_SEED, B_KEY), &[], &[bound]).await;
         let (a, _, _) =
             behind_door("door-bound-a", (A_SEED, A_KEY), &[endpoint_of(B_KEY)], &[]).await;
-        a.connect_peer(&at_b).await.expect("a bound key links");
+        let linked = a.connect_peer(at_b.clone()).await;
+        linked.expect("a bound key links");
         assert_eq!(links(&b).await, 1);
 
         let revoked = signed(
@@ -1558,7 +1806,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(links(&b).await, 0, "the live link was closed");
-        a.connect_peer(&at_b)
+        a.connect_peer(at_b.clone())
             .await
             .expect_err("a revoked key linked");
         let key = crate::transport::tag(&endpoint_of(A_KEY));
@@ -1584,7 +1832,7 @@ mod tests {
             &[],
         )
         .await;
-        a.connect_peer(&at_b)
+        a.connect_peer(at_b.clone())
             .await
             .expect_err("a node linked through another's key");
         let (m, n) = (hex_id(&node_of(other)), hex_id(&node_of(A_SEED)));
@@ -1632,7 +1880,7 @@ mod tests {
         let held = |st: &Store, origin: &str| st.scan(HOME, G_PRINCIPALS, &[], origin, -1);
         let (a_id, b_id) = (hex_id(&node_of(A_SEED)), hex_id(&node_of(B_SEED)));
 
-        a.connect_peer(&at_b).await.unwrap();
+        a.connect_peer(at_b.clone()).await.unwrap();
         {
             let st = a.shared.store.lock().await;
             let b_held = std::slice::from_ref(&b_op);
@@ -1644,7 +1892,7 @@ mod tests {
         );
         assert_eq!(*a_lines.lock().unwrap(), std::slice::from_ref(&deferred));
 
-        a.connect_peer(&at_c).await.unwrap();
+        a.connect_peer(at_c.clone()).await.unwrap();
         let bare = Op {
             seq: 1,
             prev: Some(crate::chain::op_hash(&b_op).to_vec()),
@@ -1655,13 +1903,8 @@ mod tests {
             payload: crate::envelope::seal(&c_identity, &bare),
             ..bare
         };
-        let mesh = b.shared.mesh.get().unwrap();
-        let conn = mesh.links.lock().await.get(&a_id).cloned().unwrap();
-        let (mut send, _recv) = conn.open_bi().await.unwrap();
-        let ops = [vec![forged], c_ops].concat();
-        let pushed = Frame::Ops(Ops { ops, pri: None });
-        write_frame(&mut send, &pushed).await.unwrap();
-        tokio::io::AsyncWriteExt::shutdown(&mut send).await.unwrap();
+        let linked = b.shared.mesh.get().unwrap().linked(&a_id).await.unwrap();
+        pushed(&linked, [vec![forged], c_ops].concat());
         wait_for(&a, |st| held(st, &c_id).len() == 2, "C's records at A").await;
         let refused = format!(
             "refused 1 home record(s) of node {b_id} on dir.principals from peer {b_id}: ({b_id},1) does not verify: its signature does not verify"
@@ -1708,7 +1951,7 @@ mod tests {
         let at = |node: &str| format!("{name}-{node}");
         let (b, _, at_b) = behind_door(&at("b"), (B_SEED, B_KEY), &a_keys, held).await;
         let (a, a_lines, _) = behind_door(&at("a"), (A_SEED, A_KEY), &b_keys, &[]).await;
-        a.connect_peer(&at_b).await.unwrap();
+        a.connect_peer(at_b.clone()).await.unwrap();
         (a, a_lines, b)
     }
 
@@ -1720,16 +1963,12 @@ mod tests {
         }
     }
 
-    /// Push `ops` from B to A on a stream of their own, as `push_home` does.
+    /// Push `ops` from B to A on a conversation of their own, as
+    /// `push_home` does.
     async fn b_pushes(b: &Server, ops: &[Op]) {
         let a_id = hex_id(&node_of(A_SEED));
-        let mesh = b.shared.mesh.get().unwrap();
-        let conn = mesh.links.lock().await.get(&a_id).cloned().unwrap();
-        let (mut send, _recv) = conn.open_bi().await.unwrap();
-        let ops = ops.to_vec();
-        let pushed = Frame::Ops(Ops { ops, pri: None });
-        write_frame(&mut send, &pushed).await.unwrap();
-        tokio::io::AsyncWriteExt::shutdown(&mut send).await.unwrap();
+        let linked = b.shared.mesh.get().unwrap().linked(&a_id).await.unwrap();
+        pushed(&linked, ops.to_vec());
     }
 
     /// The lines once there are `n`, waiting at most about 5 s for them.
@@ -1908,6 +2147,11 @@ mod tests {
     }
 
     async fn two_nodes(name: &str, grant: Option<&[&str]>) -> TwoNodes {
+        two_nodes_limited(name, grant, crate::frame::MAX_FRAME_BYTES).await
+    }
+
+    /// [`two_nodes`], each linked with frames of at most `max` bytes.
+    async fn two_nodes_limited(name: &str, grant: Option<&[&str]>, max: usize) -> TwoNodes {
         let boot_a = boot_at(fresh(&format!("{name}-a-sys")), "gianni").unwrap();
         let mut boot_b = boot_at(fresh(&format!("{name}-b-sys")), "gianni").unwrap();
         let (a_id, b_id) = (boot_a.node_id.clone(), boot_b.node_id.clone());
@@ -1951,11 +2195,9 @@ mod tests {
         a.seed_registry(&boot_a.registry.snapshot()).await;
         b.adopt_boot(boot_b).await.unwrap();
 
-        let ep_a = PeerEndpoint::bind_with(id_a).await.unwrap();
-        let ep_b = PeerEndpoint::bind_with(id_b).await.unwrap();
-        a.enable_mesh(ep_a).await.unwrap();
-        let addr_b = b.enable_mesh(ep_b).await.unwrap();
-        a.connect_peer(&addr_b).await.unwrap();
+        on_carrier(&a, id_a, endpoint_key(), None, max).await;
+        let at_b = on_carrier(&b, id_b, endpoint_key(), None, max).await;
+        a.connect_peer(at_b).await.unwrap();
 
         let (a_shared, b_shared) = (a.shared.clone(), b.shared.clone());
         let lis_a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2050,13 +2292,12 @@ mod tests {
         panic!("A's forward of the tree zone did not lapse");
     }
 
-    /// Subscribe the tree zone on a fresh stream of A's link to B, as A's
-    /// forward does, and return B's answer: a refusal's two frames (R6), and
-    /// the reason, once B has finished the stream.
+    /// Subscribe the tree zone on a fresh conversation of A's link to B, as
+    /// A's forward does, and return B's answer: a refusal's two frames (R6),
+    /// and the reason, once B has ended the conversation.
     async fn refused_on_the_link(t: &TwoNodes) -> glade_wire::generated::Error {
-        let mesh = t.a.mesh.get().unwrap();
-        let conn = mesh.links.lock().await.get(&t.b_id).cloned().unwrap();
-        let (mut qsend, mut recv) = conn.open_bi().await.unwrap();
+        let linked = t.a.mesh.get().unwrap().linked(&t.b_id).await.unwrap();
+        let mut conversation = linked.open();
         let (share, glade_id, _) = tree_zone();
         let subscribe = Subscribe {
             share,
@@ -2064,13 +2305,11 @@ mod tests {
             key: None,
             from: None,
         };
-        write_frame(&mut qsend, &Frame::Subscribe(subscribe))
-            .await
-            .unwrap();
+        conversation.send(&Frame::Subscribe(subscribe)).unwrap();
         let mut frames = Vec::new();
         loop {
-            let read = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut recv));
-            match read.await.expect("B answered and finished the stream") {
+            let read = tokio::time::timeout(Duration::from_secs(5), conversation.recv());
+            match read.await.expect("B answered and ended the conversation") {
                 Ok(frame) => frames.push(frame),
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(e) => panic!("reading B's answer: {e}"),
@@ -2377,5 +2616,160 @@ mod tests {
         assert_eq!(told(&mut rc).await, (ErrorCode::Unauthorized, why));
         forward_lapses(&t.a).await;
         assert!(!tree_routed(&t.a).await, "A routes the zone to no one");
+    }
+
+    // ---- the mesh on the carrier port (plan Step 4.5b, part 3) -------------
+
+    /// Plan Step 4.5b (question 4): HELLO runs in the accepted link's own
+    /// task, not the accept loop. C, a key A's door knows, links to A at the
+    /// carrier, its first word sent, and says no HELLO; B then dials A and
+    /// links within a second, while C's HELLO still waits, unreported.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dialer_that_never_says_hello_does_not_hold_the_accept_loop() {
+        use crate::iroh_carrier::{Lent, FIRST_WORD};
+        use glade_carrier_api::{CarrierAddr, CarrierConfig};
+        let knows = [endpoint_of(B_KEY), endpoint_of(C_KEY)];
+        let (a, a_lines, at_a) = behind_door("held-a", (A_SEED, A_KEY), &knows, &[]).await;
+        let (b, _, _) = behind_door("held-b", (B_SEED, B_KEY), &[endpoint_of(A_KEY)], &[]).await;
+        let key = EndpointKey::from_seed(C_KEY);
+        let (door, relays, first_word) = (None, crate::netconf::Relays::Off, FIRST_WORD);
+        let c = IrohCarrier::new(Some(Lent {
+            key,
+            door,
+            relays,
+            first_word,
+        }));
+        let local = CarrierAddr("127.0.0.1:0".into());
+        let max_frame_bytes = std::num::NonZeroUsize::new(MAX_FRAME_BYTES).unwrap();
+        c.bind(CarrierConfig {
+            local,
+            max_frame_bytes,
+        })
+        .await
+        .unwrap();
+        let to_a = carrier_addr(&at_a).unwrap();
+        let silent = c.dial(&to_a).await.expect("C links at the carrier");
+
+        let began = Instant::now();
+        let linked = tokio::time::timeout(Duration::from_secs(1), b.connect_peer(at_a)).await;
+        let Ok(linked) = linked else {
+            panic!("B still dialing after {:?}", began.elapsed());
+        };
+        assert_eq!(linked.expect("B links"), hex_id(&node_of(A_SEED)));
+        assert_eq!(links(&a).await, 1, "B alone is linked");
+        let reported = a_lines.lock().unwrap().clone();
+        assert_eq!(reported, Vec::<String>::new(), "C's HELLO still waits");
+        drop(silent);
+        c.close().await;
+    }
+
+    /// Plan Step 4.5b (section 5), in place of 4.1b's protocol-2 test: the
+    /// node's endpoint offers `glade/carrier/1` alone, so an endpoint that
+    /// offers only `glade/node/3`, as every node before 4.5b does, fails at
+    /// the handshake either way, before any HELLO: its dial to the node, and
+    /// the node's dial to it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_glade_node_3_endpoint_fails_at_connect_either_way() {
+        use crate::netconf::Via;
+        use iroh::endpoint::{presets, PortmapperConfig};
+        use iroh::{Endpoint, EndpointAddr, EndpointId, TransportAddr};
+        let bound = Duration::from_secs(10);
+        let v3: &[u8] = b"glade/node/3";
+        let old = Endpoint::builder(presets::Minimal)
+            .alpns(vec![v3.to_vec()])
+            .portmapper_config(PortmapperConfig::Disabled)
+            .clear_ip_transports()
+            .bind_addr((std::net::Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let old_accepts = old.clone();
+        tokio::spawn(async move {
+            while let Some(incoming) = old_accepts.accept().await {
+                if let Ok(connecting) = incoming.accept() {
+                    let _ = connecting.await;
+                }
+            }
+        });
+        let a = Server::open(fresh("node-3-a")).unwrap();
+        let at_a = meshed(&a, NodeIdentity::from_key(A_SEED)).await;
+        let Some(Via::Ip(socket)) = at_a.via.first().cloned() else {
+            panic!("A bound no socket: {at_a:?}");
+        };
+        let id = EndpointId::from_bytes(&at_a.key).unwrap();
+        let to_a = EndpointAddr::from_parts(id, [TransportAddr::Ip(socket)]);
+        let dialed = tokio::time::timeout(bound, old.connect(to_a, v3)).await;
+        let refused = dialed.expect("bounded").is_err();
+        assert!(refused, "a glade/node/3 dialer connected");
+
+        let sockets = old.bound_sockets();
+        let socket = sockets.into_iter().find(|socket| socket.is_ipv4()).unwrap();
+        let key = *old.id().as_bytes();
+        let at_old = PeerEntry {
+            key,
+            via: vec![Via::Ip(socket)],
+        };
+        let dialed = tokio::time::timeout(bound, a.connect_peer(at_old)).await;
+        let refused = dialed.expect("bounded").is_err();
+        assert!(refused, "a glade/node/3 endpoint took the node's dial");
+        old.close().await;
+    }
+
+    /// Plan Step 4.5b (section 8, the table's race): A links to B twice, and
+    /// the newer link takes the older's place in each end's table. The older
+    /// then ends: each end notes its close, and each still holds the newer,
+    /// which serves a pull either way.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_newer_link_outlives_the_close_of_an_older_one_to_the_same_node() {
+        let (a_id, b_id) = (hex_id(&node_of(A_SEED)), hex_id(&node_of(B_SEED)));
+        let b = noting_door("twice-b", (B_SEED, B_KEY), &[endpoint_of(A_KEY)], &[]).await;
+        let (b, _, b_notes, at_b) = b;
+        let a = noting_door("twice-a", (A_SEED, A_KEY), &[endpoint_of(B_KEY)], &[]).await;
+        let (a, _, a_notes, _) = a;
+        a.connect_peer(at_b.clone()).await.expect("the older link");
+        let (a_mesh, b_mesh) = (a.shared.mesh.get().unwrap(), b.shared.mesh.get().unwrap());
+        let older = a_mesh.linked(&b_id).await.unwrap();
+        a.connect_peer(at_b).await.expect("the newer link");
+        older.end();
+        let (a_closed, b_closed) = (format!("link {b_id} closed"), format!("link {a_id} closed"));
+        noted(&a_notes, |line| line == a_closed).await;
+        noted(&b_notes, |line| line == b_closed).await;
+        let held = (links(&a).await, links(&b).await);
+        assert_eq!(held, (1, 1), "each end holds the newer link");
+        let pulled = pull_from(&a.shared, a_mesh, &b_id, node_of(B_SEED)).await;
+        pulled.expect("the newer link serves A's pull");
+        let pulled = pull_from(&b.shared, b_mesh, &a_id, node_of(A_SEED)).await;
+        pulled.expect("and B's");
+    }
+
+    /// Plan Step 4.5b (question 6): with links whose frames hold at most
+    /// 4 KiB, B serves A's forward of a zone whose gap is over five times
+    /// that. It crosses in chunks, each under the limit, and reaches A whole
+    /// and in order; in one frame it would be refused, and the forward would
+    /// lapse.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_forwarded_gap_crosses_in_chunks_under_the_frame_limit() {
+        const LIMIT: usize = 4 << 10;
+        let t = two_nodes_limited("chunked", Some(&["read.*"]), LIMIT).await;
+        let (mut prev, mut written) = (crate::chain::op_hash(&t.tree[1]).to_vec(), Vec::new());
+        for seq in 2..22 {
+            let op = tree_op(seq, Some(prev), &[seq as u8; 1 << 10]);
+            prev = crate::chain::op_hash(&op).to_vec();
+            written.push(op);
+        }
+        {
+            let mut store = t.b.store.lock().await;
+            for op in &written {
+                store.append(op.clone()).unwrap();
+            }
+        }
+        let ops = || t.tree.iter().chain(&written);
+        let gap: usize = ops().map(|op| cbor::encode(&op.to_cbor()).len()).sum();
+        assert!(gap > 5 * LIMIT, "a gap of {gap} bytes");
+        let _client = a_client(&t).await;
+        wait_store(&t.a, |st| tree_len(st) == 22, "the whole gap at A").await;
+        let sent: Vec<Vec<u8>> = ops().map(|op| op.payload.clone()).collect();
+        assert_eq!(tree_payloads(&t.a).await, sent);
     }
 }

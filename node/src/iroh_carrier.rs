@@ -17,7 +17,7 @@
 //! door (plan Step 4.2b): an accept hook refuses an endpoint key the door does
 //! not know, and HELLO refuses a node not bound to its connection's key.
 //! [`IrohCarrier`] is the `CarrierPort` over iroh (plan Step 4.2c), which
-//! tracks its links; the mesh still runs on `PeerEndpoint`.
+//! tracks its links, and the port the mesh runs on (plan Step 4.5b).
 //!
 //! Plan Step 4.5: the endpoint's recipe takes the node's network
 //! (`netconf.rs`): the sockets it binds and whether it has n0's relays, and
@@ -36,13 +36,15 @@
 //! address names; waits for an inbound attempt's first word within its bound;
 //! gives each link's TLS exporter bytes as its channel binding; and notes each
 //! link's path and the home relays' states through the node-local
-//! `LinkNotes` port. No root lends it anything yet, so the mesh still runs on
-//! `PeerEndpoint`.
+//! `LinkNotes` port. Part 3: both roots lend it and bind it on the node's
+//! network ([`IrohCarrier::bind_network`]), and the mesh runs on it;
+//! `PeerEndpoint` stays, unused by the node, until part 4 retires it.
 
 use std::fmt;
 use std::future::{ready, Future};
 use std::io;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
@@ -59,8 +61,9 @@ use iroh::Watcher;
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey, TransportAddr};
 
 use crate::assembly::{LinkNotes, PathSeen, RelayState};
+use crate::frame::MAX_FRAME_BYTES;
 use crate::netconf::{Network, PeerEntry, Relays, Via};
-use crate::peer::{hello_accept, hello_dial, spelled, Channel, NodeIdentity, PeerHello};
+use crate::peer::{carried, hello_accept, hello_dial, spelled, Channel, NodeIdentity, PeerHello};
 use crate::transport::{hex, key_of, tag, Door, EndpointKey};
 
 /// ALPN for the glade node<->node protocol 3 (`peer::PROTOCOL`, plan Step
@@ -267,8 +270,6 @@ pub struct PeerEndpoint {
     endpoint: Endpoint,
     identity: NodeIdentity,
     door: Option<Arc<Door>>,
-    /// Whether the endpoint was bound with relays (plan Step 4.5).
-    relays: Relays,
 }
 
 impl PeerEndpoint {
@@ -303,13 +304,12 @@ impl PeerEndpoint {
             endpoint,
             identity,
             door: None,
-            relays: Relays::Off,
         })
     }
 
     /// [`PeerEndpoint::bind_as`], behind `door` (plan Step 4.2b) and on
-    /// `network` (plan Step 4.5): how both roots bind a booted node, whose
-    /// door is closed to keys it does not know.
+    /// `network` (plan Step 4.5): how both roots bound a booted node, whose
+    /// door is closed to keys it does not know, until plan Step 4.5b.
     pub async fn bind_door(
         identity: NodeIdentity,
         key: EndpointKey,
@@ -321,7 +321,6 @@ impl PeerEndpoint {
             endpoint,
             identity,
             door: Some(door),
-            relays: network.relays,
         })
     }
 
@@ -329,24 +328,9 @@ impl PeerEndpoint {
         &self.identity
     }
 
-    /// The door this endpoint was bound behind, if any: the mesh feeds it.
+    /// The door this endpoint was bound behind, if any.
     pub fn door(&self) -> Option<Arc<Door>> {
         self.door.clone()
-    }
-
-    /// Whether the endpoint was bound with n0's relays, whose state the mesh
-    /// then watches (plan Step 4.5).
-    pub(crate) fn relays(&self) -> Relays {
-        self.relays
-    }
-
-    /// Watch this endpoint's home relays until it closes (plan Step 4.5), as
-    /// [`watch_relays`] does.
-    pub(crate) fn relay_watch(
-        &self,
-        seen: impl FnMut(Vec<RelayState>) + Send + 'static,
-    ) -> impl Future<Output = ()> + Send + 'static {
-        watch_relays(&self.endpoint, seen)
     }
 
     /// Report a refused HELLO, naming the endpoint key it came from.
@@ -483,6 +467,13 @@ const LINGER: Duration = Duration::from_secs(3);
 /// ten times the crossing's whole HELLO through n0's relay.
 pub const FIRST_WORD: Duration = Duration::from_secs(10);
 
+/// The frame limit both roots bind with (plan Step 4.5b, question 6): the
+/// node's [`MAX_FRAME_BYTES`], 16 MiB.
+const FRAME_LIMIT: NonZeroUsize = match NonZeroUsize::new(MAX_FRAME_BYTES) {
+    Some(limit) => limit,
+    None => panic!("MAX_FRAME_BYTES is not zero"),
+};
+
 /// What a composition root lends the adapter (plan Step 4.5b): the node's
 /// endpoint key; the door its accept hook asks, if any; whether it has n0's
 /// relays; and how long an inbound attempt has to send its first word,
@@ -554,6 +545,24 @@ impl IrohCarrier {
     pub fn new(lent: Option<Lent>) -> IrohCarrier {
         let (state, loans) = (Mutex::new(PortState::Unbound), AtomicUsize::new(0));
         IrohCarrier(Arc::new(Adapter { lent, state, loans }))
+    }
+
+    /// Bind on `network`'s sockets, with frames of at most
+    /// [`MAX_FRAME_BYTES`], as both composition roots bind (plan Step 4.5b):
+    /// the `peer` line they print, the endpoint's tag and the first socket
+    /// bound, IPv4 first, as the line always read.
+    pub async fn bind_network(&self, network: &Network) -> io::Result<String> {
+        let sockets: Vec<String> = network.bind.iter().map(SocketAddr::to_string).collect();
+        let (local, max_frame_bytes) = (CarrierAddr(sockets.join(",")), FRAME_LIMIT);
+        let config = CarrierConfig {
+            local,
+            max_frame_bytes,
+        };
+        let bound = self.bind(config).await.map_err(carried)?;
+        let entry = entry_of(&bound);
+        let first = entry.and_then(|entry| Some((tag(&entry.key), entry.via.first()?.clone())));
+        let (named, socket) = first.ok_or_else(|| other("the port answered no address"))?;
+        Ok(format!("peer {named} {socket}"))
     }
 
     /// The relays this port was lent: none unless lent n0's.

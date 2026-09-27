@@ -433,7 +433,7 @@ pub(crate) mod testing {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::iroh_carrier::PeerEndpoint;
+    use crate::mesh::testing::meshed;
     use glade_wire::cbor;
     use crate::mesh::who_serves;
     use crate::sysdir::boot_at;
@@ -905,11 +905,9 @@ mod tests {
         // B renews fast so the test OBSERVES renewal (lease 1.5s, renew 300ms).
         b.adopt_boot_tuned(boot_b, 1_500, 300).await.unwrap();
 
-        let ep_a = PeerEndpoint::bind_with(id_a).await.unwrap();
-        let ep_b = PeerEndpoint::bind_with(id_b).await.unwrap();
-        a.enable_mesh(ep_a).await.unwrap();
-        let addr_b = b.enable_mesh(ep_b).await.unwrap();
-        a.connect_peer(&addr_b).await.unwrap();
+        meshed(&a, id_a).await;
+        let at_b = meshed(&b, id_b).await;
+        a.connect_peer(at_b).await.unwrap();
 
         // Serve AFTER connect: propagation can only be the push path (B9).
         b.serve_workspace("ws-live", "live").await.unwrap();
