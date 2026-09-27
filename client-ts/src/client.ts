@@ -256,7 +256,9 @@ export class GladeClient {
   }
 
   /** `append`, resolving with the node's answer as data (R1, R7). It fails at
-   *  once, and appends nothing, when no socket is open. */
+   *  once, and appends nothing, when no socket is open. An op held behind one
+   *  of its chain not placed resolves at once as not placed, with no answer
+   *  from the node: it goes after that op (F6). */
   async appendOutcome(share: string, gladeId: string, shape: string, payload: Uint8Array, key?: Uint8Array): Promise<OpOutcome> {
     this.requireOpen();
     const op = this.session.append(share, gladeId, shape, payload, key);
@@ -264,7 +266,8 @@ export class GladeClient {
   }
 
   /** `sendOps`, resolving with the node's answer to each op, in order (R1,
-   *  R7). It fails at once when no socket is open. */
+   *  R7), or at once as not placed for an op held behind one of its chain
+   *  not placed (F6). It fails at once when no socket is open. */
   async sendOpsOutcome(ops: Op[]): Promise<OpOutcome[]> {
     this.requireOpen();
     requireShippable(ops, "sendOpsOutcome");
@@ -286,8 +289,9 @@ export class GladeClient {
   }
 
   /** Report, once, each op the node could not place (W5): the client keeps
-   *  it and its chain, and sends them again. Returns an unsubscribe. With no
-   *  listener, it goes to `console.warn`. */
+   *  it and its chain, and sends them again. An op held behind one, or
+   *  refused as a gap past one, is reported too, as `unknown_share` (F6).
+   *  Returns an unsubscribe. With no listener, it goes to `console.warn`. */
   onUnplaced(handler: (outcome: OpOutcome) => void): () => void {
     this.unplacedListeners.add(handler);
     return () => this.unplacedListeners.delete(handler);
@@ -362,14 +366,24 @@ export class GladeClient {
   }
 
   /** Send ops in one frame, and keep each until its status names it (R1). An
-   *  op sent with no socket open reaches no node, so it is not kept. */
+   *  op sent with no socket open reaches no node, so it is not kept. One
+   *  behind an op of its chain not placed is held, and told as not placed; it
+   *  goes after that op when that op is sent again (F6). */
   private ship(ops: Op[], waiters: Array<(outcome: OpOutcome) => void> = []): void {
-    const open = this.isOpen();
-    this.send(frame(this.schema, TAG.Ops, "Ops", { ops, pri: null }));
-    if (!open) {
+    if (!this.isOpen()) {
+      this.send(frame(this.schema, TAG.Ops, "Ops", { ops, pri: null }));
       return;
     }
-    ops.forEach((op, i) => this.answers.sent(op, hex(opHash(this.schema, op as never)), waiters[i]));
+    const hashes = ops.map((op) => hex(opHash(this.schema, op as never)));
+    const { now, held } = this.answers.toSend(ops, hashes, waiters);
+    for (const answered of held) {
+      if (answered.unplaced) {
+        this.tell(this.unplacedListeners, answered.outcome, "not placed, and kept to send again");
+      }
+    }
+    if (now.length > 0) {
+      this.send(frame(this.schema, TAG.Ops, "Ops", { ops: now, pri: null }));
+    }
   }
 
   /** One op's status (R1): a refusal is told, and a session the client owns
@@ -417,11 +431,11 @@ export class GladeClient {
     }
   }
 
-  /** While a zone has unplaced ops, a timer sends them again on W5's backoff;
-   *  once none remain, it stops. */
+  /** While a zone has unplaced ops, a timer sends them again on W5's backoff,
+   *  but for those whose resend still waits; once none remain, it stops. */
   private pace(zone: string): void {
     const timer = this.resendTimers.get(zone);
-    if (this.answers.unplacedIn(zone).length === 0) {
+    if (!this.answers.hasUnplaced(zone)) {
       clearTimeout(timer);
       this.resendTimers.delete(zone);
     } else if (timer === undefined) {

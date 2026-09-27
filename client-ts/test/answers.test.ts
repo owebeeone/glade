@@ -169,6 +169,76 @@ test("a later refusal still drops the tail", () => {
   assert.deepEqual(answers.unplacedIn(zone), [other]);
 });
 
+// ---- F6: never past an unplaced op of the same chain -------------------------
+
+test("a gap past an unplaced op of its chain is not placed; answer 4 applies once that op is placed", () => {
+  const ops = chain("a", 3);
+  const [theirs] = chain("b", 1);
+  const answers = new Answers();
+  const caught = ops.map((op) => send(answers, op));
+  send(answers, theirs);
+  answers.status(hashOf(ops[0]), "unknown_share", "no live claim");
+  // Ops 1 and 2 went out before the client knew, and met the gap op 0 left.
+  // By their place they are not placed either, and come as `unknown_share`.
+  const gap = answers.status(hashOf(ops[1]), "protocol", "gap: expected 0, got 1");
+  assert.deepEqual([gap?.refused, gap?.unplaced], [false, true]);
+  assert.deepEqual(caught[1].outcome, { op: ops[1], ok: false, code: "unknown_share", message: "gap: expected 0, got 1" });
+  answers.status(hashOf(ops[2]), "protocol", "gap: expected 0, got 2");
+  // Another chain's `protocol` in the zone is still a refusal.
+  assert.equal(answers.status(hashOf(theirs), "protocol", "shape conflict")?.refused, true);
+  assert.deepEqual(answers.unplacedIn(zone), ops);
+  // Sent again, op 0 is placed. Op 1's `protocol` then follows no op not
+  // placed: a real conflict, which drops it and its tail.
+  for (const op of ops) {
+    send(answers, op);
+  }
+  answers.status(hashOf(ops[0]), "ok", "appended");
+  assert.equal(answers.status(hashOf(ops[1]), "protocol", "shape conflict")?.refused, true);
+  assert.deepEqual(answers.unplacedIn(zone), []);
+});
+
+test("an op whose resend still waits is not sent again", () => {
+  const [op] = chain("a", 1);
+  const answers = new Answers();
+  send(answers, op);
+  answers.status(hashOf(op), "unknown_share", "no live claim");
+  send(answers, op);
+  assert.deepEqual(answers.unplacedIn(zone), [], "its resend still waits for its status");
+  assert.equal(answers.hasUnplaced(zone), true, "so its zone's timer runs on");
+  answers.status(hashOf(op), "unknown_share", "no live claim");
+  assert.deepEqual(answers.unplacedIn(zone), [op]);
+});
+
+test("no op goes past an unplaced op of its chain until that op is sent again", () => {
+  const ops = chain("a", 4);
+  const [theirs] = chain("b", 1);
+  const answers = new Answers();
+  /** Offer ops to send, and catch each one's outcome. */
+  const offer = (sends: Op[]) => {
+    const caught = sends.map(() => ({}) as { outcome?: OpOutcome });
+    const waiters = caught.map((c) => (o: OpOutcome) => {
+      c.outcome = o;
+    });
+    return { ...answers.toSend(sends, sends.map(hashOf), waiters), caught };
+  };
+  assert.deepEqual(offer([ops[0]]).now, [ops[0]]);
+  answers.status(hashOf(ops[0]), "unknown_share", "no live claim");
+  // Op 1 is held: its waiter hears at once that it is not placed, and it is
+  // told once. Another chain goes at once.
+  const held = offer([ops[1], theirs]);
+  assert.deepEqual(held.now, [theirs]);
+  const said = { op: ops[1], ok: false, code: "unknown_share", message: "not sent: seq 0 of its chain is not placed" };
+  assert.deepEqual(held.caught[0].outcome, said);
+  assert.deepEqual(held.held.map((a) => [a.outcome.op.seq, a.unplaced, a.refused]), [[1, true, false]]);
+  // Sent again, op 0 goes first and op 1 after it, and sending resumes.
+  assert.deepEqual(answers.unplacedIn(zone), [ops[0], ops[1]]);
+  assert.deepEqual(offer(answers.unplacedIn(zone)).now, [ops[0], ops[1]]);
+  assert.deepEqual(offer([ops[2]]).now, [ops[2]]);
+  // Not placed once more, op 0 holds its chain back again.
+  answers.status(hashOf(ops[0]), "unknown_share", "no live claim");
+  assert.deepEqual(offer([ops[3]]).now, []);
+});
+
 test("the backoff's schedule: 1 s doubling to 30 s, per zone, afresh once placed", () => {
   assert.deepEqual([0, 1, 2, 3, 4, 5, 6, 7].map(backoffMs), [1000, 2000, 4000, 8000, 16000, 30000, 30000, 30000]);
   const [op] = chain("a", 1);
@@ -407,9 +477,10 @@ test("an op not placed is told once, and sent again on the backoff and once its 
     const told: OpOutcome[] = [];
     client.onUnplaced((o) => told.push(o));
     const first = client.append("sh", "g", "value", utf8("x"));
-    socket.status(first, "unknown_share");
-    // W5: kept, so its chain goes on.
     const second = client.append("sh", "g", "value", utf8("y"));
+    // W5: both went out before the client knew, and are kept, each told once.
+    // One sent after would wait behind the first (F6).
+    socket.status(first, "unknown_share");
     socket.status(second, "unknown_share");
     assert.deepEqual(told.map((o) => o.op.seq), [0, 1]);
     mock.timers.tick(999);
@@ -421,6 +492,8 @@ test("an op not placed is told once, and sent again on the backoff and once its 
     assert.equal(told.length, 2);
     mock.timers.tick(2000);
     assert.equal(socket.ops().length, 6);
+    socket.status(first, "unknown_share");
+    socket.status(second, "unknown_share");
     // Not at the ack: once the replay is in.
     const subscribed = client.subscribe("sh", "g");
     socket.ack([["b", 0]]);
@@ -432,6 +505,39 @@ test("an op not placed is told once, and sent again on the backoff and once its 
     socket.status(second, "ok");
     mock.timers.tick(60_000);
     assert.equal(socket.ops().length, 8);
+    client.close();
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test("over the socket, a gap and a held op reach onUnplaced as unknown_share, and go again in order, once", async () => {
+  mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    const { client, socket } = await fakeClient("a");
+    const told: OpOutcome[] = [];
+    client.onUnplaced((o) => told.push(o));
+    // Ops 0 and 1 go out before the client knows op 0 is not placed, and op
+    // 1 meets the gap op 0 left.
+    const zero = client.append("sh", "g", "value", utf8("x"));
+    const one = client.append("sh", "g", "value", utf8("y"));
+    socket.status(zero, "unknown_share");
+    socket.status(one, "protocol");
+    // F6: op 2 is held, not sent, and not placed at once.
+    const two = await client.appendOutcome("sh", "g", "value", utf8("z"));
+    assert.deepEqual([two.op.seq, two.ok, two.code], [2, false, "unknown_share"]);
+    assert.deepEqual(told.map((o) => [o.op.seq, o.code, o.message]), [
+      [0, "unknown_share", "unknown_share"],
+      [1, "unknown_share", "protocol"],
+      [2, "unknown_share", "not sent: seq 0 of its chain is not placed"],
+    ]);
+    assert.deepEqual(socket.ops().map((o) => o.seq), [0, 1]);
+    // On the backoff all three go again, in order. While their statuses are
+    // awaited, the next tick sends none of them again.
+    mock.timers.tick(1000);
+    assert.deepEqual(socket.ops().map((o) => o.seq), [0, 1, 0, 1, 2]);
+    mock.timers.tick(2000);
+    assert.equal(socket.ops().length, 5);
     client.close();
   } finally {
     mock.timers.reset();

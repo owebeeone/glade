@@ -2,8 +2,10 @@
 // GladeSubstrateV1 §6, "Session answers" R1 and R5-R7, and "Cross-node writes"
 // W5): the ops the client sent, kept by hash until the node's status names
 // them, and the subscribes it sent, kept until each one's answer and replay
-// are in. Pure, with no socket and no clock: the client applies what an answer
-// means to its session, its listeners and its resends.
+// are in. No op goes past an op of its chain not placed, and a gap refusal
+// past one is not placed either (follow-up F6). Pure, with no socket and no
+// clock: the client applies what an answer means to its session, its
+// listeners and its resends.
 
 import { zoneKey, type Head, type Op } from "./store.ts";
 
@@ -16,7 +18,10 @@ export interface OpOutcome {
   ok: boolean;
   /** The node's code, as the wire names it. `unknown_share` means not placed
    *  (W5), and any other code but `ok` and `retention` a refusal. Null when no
-   *  status came: the connection ended first, or the node never answers. */
+   *  status came: the connection ended first, or the node never answers. A
+   *  `protocol` gap past an op of its chain not placed, and an op held back
+   *  behind one, are not placed either, and come as `unknown_share` with the
+   *  node's or the client's reason (F6). */
   code: string | null;
   message: string;
 }
@@ -54,7 +59,8 @@ function settle(waiters: Array<(outcome: OpOutcome) => void>, outcome: OpOutcome
 export class Answers {
   /** Sent ops awaiting a status, by hash, the oldest first. */
   private waiting = new Map<string, Waiting>();
-  /** Ops answered `unknown_share`, by zone, then by hash (W5). */
+  /** Ops not placed, by zone, then by hash: answered `unknown_share` (W5), or
+   *  a gap past one, or held behind one (F6). */
   private unplaced = new Map<string, Map<string, Op>>();
   /** Each zone's resends since it last had no unplaced op. */
   private resends = new Map<string, number>();
@@ -64,6 +70,35 @@ export class Answers {
 
   constructor(bound = 4096) {
     this.bound = bound;
+  }
+
+  /** Of ops to send, in order, those to put on the wire now, each kept until
+   *  its status names it by hash (R1). F6: no op goes past an op of its chain
+   *  not placed and not yet sent again. It is held with that op, not placed:
+   *  its waiter hears so at once, and it goes after that op, in order, when
+   *  that op is sent again (`unplacedIn`). Returns what goes now, and what
+   *  each op held means. */
+  toSend(ops: Op[], hashes: string[], waiters: Array<((outcome: OpOutcome) => void) | undefined> = []): { now: Op[]; held: Answered[] } {
+    const now: Op[] = [];
+    const held: Answered[] = [];
+    ops.forEach((op, i) => {
+      const zone = zoneKey(op.share, op.glade_id, op.key);
+      const before = this.unplacedBefore(zone, op).find(([hash]) => !this.waiting.has(hash));
+      if (before === undefined) {
+        this.sent(op, hashes[i], waiters[i]);
+        now.push(op);
+        return;
+      }
+      const kept = this.unplaced.get(zone) ?? new Map<string, Op>();
+      const unplaced = !kept.has(hashes[i]);
+      kept.set(hashes[i], op);
+      this.unplaced.set(zone, kept);
+      const message = `not sent: seq ${before[1].seq} of its chain is not placed`;
+      const outcome: OpOutcome = { op, ok: false, code: "unknown_share", message };
+      waiters[i]?.(outcome);
+      held.push({ outcome, zone, refused: false, unplaced });
+    });
+    return { now, held };
   }
 
   /** Keep a sent op until its status names it by hash (R1). */
@@ -92,11 +127,14 @@ export class Answers {
     if (w.sends === 0) {
       this.waiting.delete(corr);
     }
-    const outcome: OpOutcome = { op: w.op, ok: code === "ok" || code === "retention", code, message };
-    settle(w.waiters.splice(0), outcome);
     const zone = zoneKey(w.op.share, w.op.glade_id, w.op.key);
+    // F6: a gap past an op of its chain not placed is not placed either. The
+    // client knows it by its place: any other `protocol` comes again when the
+    // ops go again, in order, and is refused then.
+    const notPlaced = code === "unknown_share" || (code === "protocol" && this.unplacedBefore(zone, w.op).length > 0);
+    const outcome: OpOutcome = { op: w.op, ok: code === "ok" || code === "retention", code: notPlaced ? "unknown_share" : code, message };
+    settle(w.waiters.splice(0), outcome);
     const kept = this.unplaced.get(zone) ?? new Map<string, Op>();
-    const notPlaced = code === "unknown_share";
     const unplaced = notPlaced && !kept.has(corr);
     if (notPlaced) {
       kept.set(corr, w.op);
@@ -119,10 +157,24 @@ export class Answers {
     return { outcome, zone, refused: !outcome.ok && !notPlaced, unplaced };
   }
 
-  /** A zone's unplaced ops, in their chains' order, to send again (W5). */
+  /** A zone's unplaced ops, in their chains' order, to send again (W5). One
+   *  already sent again, and waiting for its status, is left out. */
   unplacedIn(zone: string): Op[] {
-    const ops = [...(this.unplaced.get(zone)?.values() ?? [])];
+    const kept = [...(this.unplaced.get(zone) ?? [])];
+    const ops = kept.filter(([hash]) => !this.waiting.has(hash)).map(([, op]) => op);
     return ops.sort((a, b) => (a.origin < b.origin ? -1 : a.origin > b.origin ? 1 : a.seq - b.seq));
+  }
+
+  /** Whether a zone keeps ops not placed, sent again or not (W5): its resend
+   *  timer runs while it does. */
+  hasUnplaced(zone: string): boolean {
+    return (this.unplaced.get(zone)?.size ?? 0) > 0;
+  }
+
+  /** F6: the ops of `op`'s chain before it that are not placed, by hash. */
+  private unplacedBefore(zone: string, op: Op): Array<[string, Op]> {
+    const kept = [...(this.unplaced.get(zone) ?? [])];
+    return kept.filter(([, k]) => k.origin === op.origin && k.seq < op.seq);
   }
 
   /** The wait before a zone's next resend (W5), which it counts. */
