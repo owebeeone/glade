@@ -303,7 +303,8 @@ answers a client (W2, W3).
   (`GladeFirstSlicePlan.md:830`). Otherwise the code names the refusal
   (`session.rs:80-103`, `server.rs:144-147`): `Equivocation` if a different op
   holds the seq; `Protocol` for a gap, a chain break, a SWMR envelope that does
-  not decode, a second SWMR writer or a shape conflict; `Unauthorized` for an
+  not decode, a second SWMR writer, a shape conflict, or a `stream` op, which
+  has no op path and is never stored (F3, 2026-09-27); `Unauthorized` for an
   op on `home` (H-R3, `GladeFirstSlicePlan.md:809`); `Internal` for an I/O
   error.
 - A client matches a status to its op by `corr`, never by its place among other

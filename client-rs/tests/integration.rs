@@ -13,7 +13,7 @@
 //!      and a refused op, whose chain then stops.
 //!   5. the subscribe outcome (Step 3.2): the node's heads come back, a
 //!      subscribe returns with its replay folded and resumes a refused chain,
-//!      and one fails on a frame the session cannot take.
+//!      and a raw `stream` op is refused (F3), its zone left empty.
 //!   6. the follow-ups ruled 2026-09-27: a `ShareController` whose chain a
 //!      refusal stopped subscribes its surface again by itself (F7).
 //!
@@ -497,12 +497,19 @@ async fn a_refused_chain_resumes_after_a_subscribe() {
     node.kill().await.ok();
 }
 
-/// A frame the session cannot take fails the subscribe waiting on its zone. A
-/// raw writer puts a `stream` op, which no client folds, where the replay
-/// carries it.
+/// F3 (the owner's ruling of 2026-09-27): a `stream` op has no op path, so the
+/// node refuses one from any client `Protocol` and keeps none of it. A raw
+/// writer sends one, as no client can (`require_op` refuses it before a send):
+/// its status is `Protocol`, and a fresh reader's subscribe to its zone then
+/// completes with an empty zone. This test once had the node hold such an op,
+/// so that a replay the session cannot take failed the reader's subscribe. No
+/// node now takes one from a client, and a `stream` op was the only op a node
+/// took that `apply_remote` refuses (the node's store refuses a malformed SWMR
+/// envelope too), so that logic is covered by the pure test
+/// `answers.rs::a_frame_the_session_cannot_take_fails_its_zones_subscribes`.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_replay_the_session_cannot_take_fails_its_subscribe() {
-    let tmp = Tmp::new("untakeable");
+async fn a_raw_stream_op_is_refused_and_its_zone_stays_empty() {
+    let tmp = Tmp::new("stream-refused");
     let (mut node, port) = spawn_legacy(&tmp.path().join("store"), 0).await;
     let (mut raw_in, raw) = ws::connect("127.0.0.1", port).await.unwrap();
     let op = Op { share: "ws-app".into(), glade_id: "ws.feed".into(), key: vec![], origin: "raw".into(), seq: 0, prev: None, lamport: 1, refs: vec![], shape: Shape::Stream, payload: b"x".to_vec() };
@@ -513,13 +520,12 @@ async fn a_replay_the_session_cannot_take_fails_its_subscribe() {
         panic!("no status for the raw op");
     };
     let status = generated::Error::from_cbor(&cbor::decode(&answer[1..]));
-    assert_eq!(status.code, ErrorCode::Ok, "the node holds the raw op: {status:?}");
+    assert_eq!(status.code, ErrorCode::Protocol, "the node refuses the raw stream op: {status:?}");
 
     let reader = GladeClient::new("reader");
     reader.connect(&format!("ws://127.0.0.1:{port}")).await.unwrap();
-    let subscribed = within(reader.subscribe("ws-app", "ws.feed", None)).await;
-    assert!(subscribed.is_err(), "a replay the session cannot take fails its subscribe, got {subscribed:?}");
-    assert_eq!(subscribed.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+    let outcome = within(reader.subscribe_outcome("ws-app", "ws.feed", None)).await.unwrap();
+    assert_eq!(outcome, SubscribeOutcome::Accepted { heads: vec![] }, "the node kept none of the op: its zone is empty");
 
     reader.close().await;
     node.kill().await.ok();

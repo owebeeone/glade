@@ -1,7 +1,8 @@
 //! The glade node server (P1) — ties the store, router, and echo provider over
 //! the websocket carrier. One connection per session; frames dispatched:
 //! `Subscribe` registers interest and ships the resume gap, `Ops` appends +
-//! fans out (minus origin) and answers each op with its status, and the directed
+//! fans out (minus origin) and answers each op with its status (refusing a
+//! client's op on `home`, and a `stream` op, which has no op path), and the directed
 //! exchange/channel frames hit the echo provider. The resume/convergence and
 //! verification logic all live in the carrier-free modules; this is the glue.
 
@@ -14,7 +15,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
 
 use glade_wire::cbor;
-use glade_wire::generated::{ErrorCode, Op, Ops, Welcome};
+use glade_wire::generated::{ErrorCode, Op, Ops, Shape, Welcome};
 
 use glade_grant_api::{GrantPort, Holder};
 
@@ -248,6 +249,15 @@ fn home_refused(op: &Op) -> Frame {
     op_status(op, ErrorCode::Unauthorized, message)
 }
 
+/// The answer to a client's `stream` op (F3, question 13; the owner's ruling
+/// of 2026-09-27): its status (R1), under the wire's `Protocol` code. A
+/// stream is a live channel, never stored, so it has no op path
+/// (`GladeShapeDispatch.md`), and neither client sends or folds one.
+fn stream_refused(op: &Op) -> Frame {
+    let message = "refused: stream has no op path; a stream is a live channel, never stored";
+    op_status(op, ErrorCode::Protocol, message.into())
+}
+
 async fn handle(shared: Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
     let (mut reader, writer) = ws::accept(stream).await?;
     let sid = shared.next.fetch_add(1, Ordering::SeqCst);
@@ -414,6 +424,13 @@ async fn handle(shared: Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
                     // (plan Step 4.3, part 1). The frame's other ops go on.
                     if op.share == HOME {
                         send(&shared, sid, &home_refused(&op)).await;
+                        continue;
+                    }
+                    // F3 (question 13): a `stream` op has no op path, so a
+                    // client's is refused before any of it is kept, whatever
+                    // the store holds. The frame's other ops go on.
+                    if op.shape == Shape::Stream {
+                        send(&shared, sid, &stream_refused(&op)).await;
                         continue;
                     }
                     // R4: the cut is held from the append until the fan-out
@@ -840,6 +857,62 @@ mod tests {
             answers, want,
             "one status per op, in order, each naming its op"
         );
+    }
+
+    /// F3 (question 13; the owner's ruling of 2026-09-27): a `stream` op has
+    /// no op path, a stream being a live channel that is never stored
+    /// (`GladeShapeDispatch.md`). A client's is refused `Protocol`, as its
+    /// status (R1), before any of it is kept: it is not stored, fanned out or
+    /// held by its sender, so the same origin's value op at the same seq
+    /// lands after it, and a subscriber of the zone gets that op alone. On
+    /// `home`, a stream op is refused `Unauthorized`, as every client op on
+    /// `home` is. One the store already holds, as a node before F3 kept it,
+    /// is refused too. Proves the websocket client path only.
+    #[tokio::test]
+    async fn a_client_stream_op_is_refused_and_never_stored() {
+        let (shared, port) = serving("glade-server-stream-refused").await;
+        let (mut r_sub, w_sub) = ws::connect("127.0.0.1", port).await.unwrap();
+        let (mut r, w) = ws::connect("127.0.0.1", port).await.unwrap();
+        errors_before_ack(&mut r_sub, &w_sub).await; // subscribed to sh/g
+
+        let live = Op {
+            shape: Shape::Stream,
+            ..op("w", 0, b"live")
+        };
+        let value = op("w", 0, b"value");
+        let on_home = Op {
+            share: HOME.into(),
+            glade_id: G_GRANTS.into(),
+            ..live.clone()
+        };
+        let kept = Op {
+            glade_id: "kept".into(),
+            ..live.clone()
+        };
+        shared.store.lock().await.append(kept.clone()).unwrap();
+        let ops = vec![live.clone(), value.clone(), on_home.clone(), kept.clone()];
+        w.send_binary(&Frame::Ops(Ops { ops, pri: None }).to_bytes())
+            .await
+            .unwrap();
+        let statuses = errors_before_ack(&mut r, &w).await;
+
+        let answers: Vec<Said> = statuses.iter().map(said).collect();
+        let want = [
+            status_for(&live, ErrorCode::Protocol),
+            status_for(&value, ErrorCode::Ok),
+            status_for(&on_home, ErrorCode::Unauthorized),
+            status_for(&kept, ErrorCode::Protocol),
+        ];
+        assert_eq!(answers, want, "each stream op refused, in order");
+        let why = "refused: stream has no op path; a stream is a live channel, never stored";
+        assert_eq!(statuses[0].message, why);
+        let st = shared.store.lock().await;
+        let stored = st.scan("sh", "g", &[], "w", i64::MIN);
+        drop(st);
+        let only = std::slice::from_ref(&value);
+        assert_eq!(stored, only, "only the value op is stored");
+        let fanned = ops_until_bound(&mut r_sub, &w_sub).await;
+        assert_eq!(fanned, [value], "the subscriber gets the value op alone");
     }
 
     /// Subscribe to `sh/g`: the statuses that arrived before its ack, and the
