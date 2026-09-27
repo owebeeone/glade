@@ -16,6 +16,7 @@ use std::path::Path;
 use glade_signer_api::{Purpose, SignatureStatus};
 use glade_wire::cbor::{self, Cbor};
 use glade_wire::generated::{Op, Shape};
+use glade_wire::wellformed::{self, Malformed};
 
 use crate::peer::NodeIdentity;
 use crate::registry::{
@@ -136,11 +137,62 @@ pub fn record_bytes(payload: &[u8]) -> Vec<u8> {
     open(payload).map_or_else(|| payload.to_vec(), |(record, _)| record)
 }
 
-/// The record `op` carries, decoded by `from`, a record kind's `from_cbor`.
-/// A verified store's records are each their stream's kind, so none panics
-/// the wire codec's decoders.
-pub fn record<T>(op: &Op, from: impl FnOnce(&Cbor) -> T) -> T {
-    from(&cbor::decode(&record_bytes(&op.payload)))
+/// The record `op` carries, decoded by `from`, a record kind's `from_cbor`,
+/// or why its bytes were refused: `wellformed::decode` reads them first, so
+/// none the wire codec's decode would panic on, or recurse too deep for,
+/// reaches it (F15b). A verified store's records are each their stream's
+/// kind, so none is refused, and none panics `from`.
+pub fn record<T>(op: &Op, from: impl FnOnce(&Cbor) -> T) -> Result<T, Malformed> {
+    wellformed::decode(&record_bytes(&op.payload)).map(|record| from(&record))
+}
+
+/// [`record`], for a fold: a record it refuses is skipped, and said on
+/// stderr in one line, [`skipped`].
+pub(crate) fn folded<T>(op: &Op, from: impl FnOnce(&Cbor) -> T) -> Option<T> {
+    match record(op, from) {
+        Ok(record) => Some(record),
+        Err(why) => {
+            eprintln!("{}", skipped(op, why));
+            None
+        }
+    }
+}
+
+/// The line a fold skips `op`'s record with: its zone and its seq, and why.
+fn skipped(op: &Op, why: Malformed) -> String {
+    let (share, stream, seq) = (&op.share, &op.glade_id, op.seq);
+    let hex: String = op.key.iter().map(|byte| format!("{byte:02x}")).collect();
+    let key = match hex.is_empty() {
+        true => hex,
+        false => format!(" key {hex}"),
+    };
+    format!("skipped a record that cannot be read: zone {share}/{stream}{key}, seq {seq} ({why})")
+}
+
+/// The op `bytes` hold, one a journal or a snapshot stored, or why they were
+/// refused: `wellformed::decode` reads them first (F15b).
+pub(crate) fn decode_op(bytes: &[u8]) -> Result<Op, Malformed> {
+    wellformed::decode(bytes).map(|op| Op::from_cbor(&op))
+}
+
+/// The ops a snapshot's `records` hold, each read by [`decode_op`]: one it
+/// refuses is skipped, and said on stderr in one line, [`unreadable_op`].
+pub(crate) fn snapshot_ops(records: &[Vec<u8>]) -> Vec<Op> {
+    let read = |(at, bytes): (usize, &Vec<u8>)| match decode_op(bytes) {
+        Ok(op) => Some(op),
+        Err(why) => {
+            eprintln!("{}", unreadable_op("skipped", at, why));
+            None
+        }
+    };
+    records.iter().enumerate().filter_map(read).collect()
+}
+
+/// The line an op a snapshot holds at `at` is `done` with, `skipped` or
+/// `quarantined`, when [`decode_op`] refuses it: its place, and why.
+pub(crate) fn unreadable_op(done: &str, at: usize, why: Malformed) -> String {
+    let n = at + 1;
+    format!("{done} an op that cannot be read: record {n} of the snapshot ({why})")
 }
 
 /// The check every `home` ingest makes, its rules in this order: an envelope;
@@ -688,5 +740,73 @@ mod tests {
         for bytes in unreadable {
             assert_eq!(parse(bytes), None, "{bytes:02x?}");
         }
+    }
+
+    /// F15b: a record `wellformed::decode` refuses is refused by [`record`]
+    /// and skipped by [`folded`], whose line names its zone and seq; an op
+    /// it refuses is skipped by [`snapshot_ops`], which keeps the ops around
+    /// it.
+    #[test]
+    fn a_record_or_an_op_that_cannot_be_read_is_refused_or_skipped() {
+        let mut nested = vec![0x81; 100_000];
+        nested.push(0);
+        let op = Op {
+            share: HOME.into(),
+            glade_id: G_CLAIMS.into(),
+            seq: 3,
+            payload: nested.clone(),
+            ..Op::default()
+        };
+        let why = Malformed::TooDeep;
+        assert_eq!(record(&op, ServeClaim::from_cbor), Err(why));
+        assert_eq!(folded(&op, ServeClaim::from_cbor), None);
+        let line = "skipped a record that cannot be read: zone home/dir.claims, seq 3";
+        assert_eq!(skipped(&op, why), format!("{line} ({why})"));
+        let held = cbor::encode(&op.to_cbor());
+        let ops = snapshot_ops(&[held.clone(), nested, held]);
+        assert_eq!(ops, [op.clone(), op]);
+    }
+
+    /// F15b: no production code of this crate calls the wire codec's
+    /// `cbor::decode`, which recurses once for each level of nesting, with no
+    /// limit: bytes from a client, a peer or the store reach it only through
+    /// `wellformed::decode`, as [`record`] and [`decode_op`] read them. A
+    /// source check over `src/`: each file's code before its first
+    /// `#[cfg(test)]`, where this crate's test modules begin, with every
+    /// comment set aside. The node gate runs it with the other tests.
+    #[test]
+    fn no_production_code_calls_the_recursive_decode() {
+        assert!(names_the_decode("x(cbor::decode(&b))") && names_the_decode("cbor::decode;"));
+        assert!(!names_the_decode("cbor::decoded(&b)"));
+        let mut paths = vec![Path::new(env!("CARGO_MANIFEST_DIR")).join("src")];
+        let (mut files, mut named) = (0, Vec::new());
+        while let Some(path) = paths.pop() {
+            if path.is_dir() {
+                let entries = std::fs::read_dir(&path).unwrap();
+                paths.extend(entries.map(|entry| entry.unwrap().path()));
+                continue;
+            }
+            if path.extension().is_none_or(|ext| ext != "rs") {
+                continue;
+            }
+            files += 1;
+            let text = std::fs::read_to_string(&path).unwrap();
+            let production = |line: &&str| line.trim() != "#[cfg(test)]";
+            for (n, line) in text.lines().take_while(production).enumerate() {
+                if names_the_decode(line.split("//").next().unwrap_or_default()) {
+                    named.push(format!("{}:{}", path.display(), n + 1));
+                }
+            }
+        }
+        assert!(files > 20, "the check read {files} files");
+        assert!(named.is_empty(), "raw cbor::decode: {named:?}");
+    }
+
+    /// Whether `code` names `cbor::decode` itself, not a longer name.
+    fn names_the_decode(code: &str) -> bool {
+        code.match_indices("cbor::decode").any(|(at, name)| {
+            let next = code[at + name.len()..].chars().next();
+            !next.is_some_and(|c| c.is_alphanumeric() || c == '_')
+        })
     }
 }

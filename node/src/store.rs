@@ -500,8 +500,14 @@ fn read_proofs(path: &Path) -> Result<Vec<EquivProof>, StoreError> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let ops = read_log(path)?; // same framing — a flat run of ops, paired up
-    Ok(ops.chunks_exact(2).map(|p| EquivProof { a: p[0].clone(), b: p[1].clone() }).collect())
+    // Same framing: a flat run of ops, paired up. A pair holding an op that
+    // cannot be read is dropped whole, so the pairs after it stay pairs (F15b).
+    let ops = read_records(path)?;
+    let pair = |p: &[Option<Op>]| {
+        let (a, b) = (p[0].clone()?, p[1].clone()?);
+        Some(EquivProof { a, b })
+    };
+    Ok(ops.chunks_exact(2).filter_map(pair).collect())
 }
 
 fn log_path(root: &Path, share: &str, origin: &str) -> PathBuf {
@@ -516,12 +522,20 @@ fn append_to_log(root: &Path, op: &Op) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// Every op one journal holds, in order: [`read_records`]'s, less the ones
+/// it could not read.
+fn read_log(path: &Path) -> Result<Vec<Op>, StoreError> {
+    Ok(read_records(path)?.into_iter().flatten().collect())
+}
+
 /// Every complete record in one journal, in order. A tail too short for its
 /// record is what an interrupted append leaves: it is skipped, as it always
 /// was, and now also cut from the file, so the next append starts on a record
 /// boundary instead of after the torn bytes (plan Step 4.4). A journal whose
-/// records are all complete is not written to.
-fn read_log(path: &Path) -> Result<Vec<Op>, StoreError> {
+/// records are all complete is not written to. A record `wellformed::decode`
+/// refuses is `None`, and said on stderr in one line naming its place (F15b):
+/// the file keeps it.
+fn read_records(path: &Path) -> Result<Vec<Option<Op>>, StoreError> {
     let data = fs::read(path)?;
     let mut ops = Vec::new();
     let mut i = 0usize;
@@ -531,7 +545,12 @@ fn read_log(path: &Path) -> Result<Vec<Op>, StoreError> {
         if end > data.len() {
             break; // truncated tail — the partial record is cut below
         }
-        ops.push(Op::from_cbor(&cbor::decode(&data[i + 4..end])));
+        let op = envelope::decode_op(&data[i + 4..end]);
+        if let Err(why) = &op {
+            let (n, file) = (ops.len() + 1, path.display());
+            eprintln!("skipped an op that cannot be read: record {n} of {file} ({why})");
+        }
+        ops.push(op.ok());
         i = end;
     }
     if i < data.len() {
@@ -974,5 +993,40 @@ mod tests {
         let mut h = s.heads("sh", "g", &[]);
         h.sort();
         assert_eq!(h, vec![("a".to_string(), 2), ("b".to_string(), 1)]);
+    }
+
+    /// F15b: an op nested 100,000 deep in a journal, which the wire codec's
+    /// decode recursed on until the stack overflowed, is skipped, and the ops
+    /// around it load. In the proofs journal the pair it belongs to is
+    /// dropped, so the pairs after it stay pairs.
+    #[test]
+    fn open_skips_an_op_it_cannot_read_and_its_proof_pair() {
+        let root = fresh("nested-op");
+        let mut nested = vec![0x81; 100_000];
+        nested.push(0);
+        let framed = |bytes: &[u8]| [&(bytes.len() as u32).to_le_bytes()[..], bytes].concat();
+        let odd = cbor::encode(&op("sh", "b", 0, b"odd").to_cbor());
+        let equivocate = |seq: i64| {
+            let mut s = Store::open(&root).unwrap();
+            s.append(op("sh", "a", seq, b"held")).unwrap();
+            s.append(op("sh", "a", seq, b"fork")).unwrap_err();
+        };
+        equivocate(0);
+        let written = [
+            (log_path(&root, "sh", "a"), framed(&nested)),
+            (proofs_path(&root), [framed(&nested), framed(&odd)].concat()),
+        ];
+        for (path, bytes) in written {
+            let mut file = OpenOptions::new().append(true).open(path).unwrap();
+            file.write_all(&bytes).unwrap();
+        }
+        equivocate(1);
+
+        let s = Store::open(&root).unwrap();
+        let held = s.scan("sh", "g", &[], "a", -1);
+        assert_eq!(held.iter().map(|o| o.seq).collect::<Vec<_>>(), [0, 1]);
+        let proofs = s.equivocation_proofs().iter();
+        let slots: Vec<(i64, i64)> = proofs.map(|p| (p.a.seq, p.b.seq)).collect();
+        assert_eq!(slots, [(0, 0), (1, 1)]);
     }
 }

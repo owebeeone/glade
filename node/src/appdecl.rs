@@ -73,7 +73,6 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-use glade_wire::cbor;
 use glade_wire::generated::Op;
 
 use crate::envelope;
@@ -769,7 +768,7 @@ pub fn register(
     reg: &mut dyn RegistryApi,
     origin: &str,
 ) -> Result<Registered, RegistryError> {
-    let ops: Vec<Op> = reg.snapshot().records.iter().map(|bytes| Op::from_cbor(&cbor::decode(bytes))).collect();
+    let ops: Vec<Op> = envelope::snapshot_ops(&reg.snapshot().records);
     let mut out = Registered::default();
 
     // Bindings: this app's live declarations, by glade id — the diff basis.
@@ -833,6 +832,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use glade_grant_api::admits;
+    use glade_wire::cbor;
     use glade_wire::generated::Shape;
 
     use crate::registry::{

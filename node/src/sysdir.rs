@@ -51,7 +51,6 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use glade_wire::cbor;
-use glade_wire::generated::Op;
 
 use crate::claims::LEASE_TTL_MS;
 use crate::envelope::{self, Format};
@@ -404,7 +403,12 @@ pub(crate) fn load_or_create_secret(dir: &Path, name: &str) -> io::Result<[u8; 3
 fn set_aside(dir: &Path, snap: &mut SystemSnapshot) -> io::Result<Option<SetAside>> {
     let (mut old, mut kept) = (Vec::new(), Vec::new());
     for bytes in snap.records.drain(..) {
-        let op = Op::from_cbor(&cbor::decode(&bytes));
+        // An op that cannot be read is left to the registry's load, which
+        // quarantines it and says so (F15b).
+        let Ok(op) = envelope::decode_op(&bytes) else {
+            kept.push(bytes);
+            continue;
+        };
         match envelope::format(&op) {
             Format::Sealed => kept.push(bytes),
             Format::Unsigned => old.push(bytes),
@@ -545,6 +549,7 @@ fn reg_io(e: crate::registry::RegistryError) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use glade_wire::generated::Op;
 
     fn fresh(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("glade-sysdir-{name}"));

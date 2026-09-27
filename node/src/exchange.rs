@@ -23,6 +23,7 @@ use iroh::endpoint::{RecvStream, SendStream};
 
 use glade_grant_api::{GrantPort, Holder};
 use glade_wire::generated::{ExchangeReq, ExchangeRes, Heads, StreamHeads};
+use glade_wire::wellformed;
 
 use crate::echo::Echo;
 use crate::envelope;
@@ -69,7 +70,8 @@ fn res_err(corr: &str, error: &str) -> Frame {
 pub fn declared_exchange(store: &Store, glade_id: &str) -> bool {
     for (origin, _) in store.heads(HOME, G_SERVICES, &[]) {
         for op in store.scan(HOME, G_SERVICES, &[], &origin, i64::MIN) {
-            if envelope::record(&op, ServiceDefinition::from_cbor).glade_id == glade_id {
+            let service = envelope::folded(&op, ServiceDefinition::from_cbor);
+            if service.is_some_and(|service| service.glade_id == glade_id) {
                 return true;
             }
         }
@@ -162,7 +164,9 @@ async fn handle_create(shared: &Arc<Shared>, sid: SessionId, req: ExchangeReq) {
         send(shared, sid, &res_err(&req.corr, "workspace.create needs a WorkspaceCreateReq payload")).await;
         return;
     }
-    let create = WorkspaceCreateReq::from_cbor(&glade_wire::cbor::decode(&req.payload));
+    let Some(create) = create_request(shared, sid, &req).await else {
+        return;
+    };
     if create.workspace.is_empty() || create.target.is_empty() {
         send(shared, sid, &res_err(&req.corr, "workspace.create needs {workspace, target}")).await;
         return;
@@ -195,6 +199,24 @@ async fn handle_create(shared: &Arc<Shared>, sid: SessionId, req: ExchangeReq) {
     }
 }
 
+/// `req`'s `WorkspaceCreateReq`, or `None` once its requester is answered
+/// why not: bytes the wire codec's decode would panic on, or recurse too
+/// deep for, are refused as data, and the session goes on (F15b).
+async fn create_request(
+    shared: &Arc<Shared>,
+    sid: SessionId,
+    req: &ExchangeReq,
+) -> Option<WorkspaceCreateReq> {
+    match wellformed::decode(&req.payload) {
+        Ok(create) => Some(WorkspaceCreateReq::from_cbor(&create)),
+        Err(why) => {
+            let reason = format!("workspace.create refused its payload: {why}");
+            send(shared, sid, &res_err(&req.corr, &reason)).await;
+            None
+        }
+    }
+}
+
 /// An inbound `ExchangeRes` (the attached provider answering): resolve the
 /// pending correlation and deliver to the recorded requester (trace D4/D5).
 pub(crate) async fn handle_response(shared: &Arc<Shared>, res: ExchangeRes) {
@@ -219,15 +241,30 @@ async fn forward_exchange(shared: &Arc<Shared>, peer: String, req: ExchangeReq, 
 async fn try_forward(shared: &Arc<Shared>, peer: &str, req: ExchangeReq) -> io::Result<ExchangeRes> {
     let mesh = shared.mesh.get().cloned().ok_or_else(|| other("mesh not enabled"))?;
     let conn = mesh.links.lock().await.get(peer).cloned().ok_or_else(|| other("no live peer link"))?;
+    let glade_id = req.glade_id.clone();
     let (mut qsend, mut recv) = conn.open_bi().await.map_err(other)?;
     write_frame(&mut qsend, &Frame::ExchangeReq(req)).await?;
     let frame = tokio::time::timeout(FORWARD_TIMEOUT, read_frame(&mut recv))
         .await
         .map_err(|_| other("timeout awaiting ExchangeRes from claim holder"))??;
     match frame {
-        Frame::ExchangeRes(res) => Ok(res),
+        Frame::ExchangeRes(res) => forwarded(&glade_id, res),
         got => Err(other(format!("expected ExchangeRes, got {got:?}"))),
     }
+}
+
+/// The claim holder's answer to an exchange on `glade_id` forwarded to it
+/// (F15b). A `workspace.create` answer carries the node's own
+/// `WorkspaceCreateRes`, which the requester decodes, so one whose payload
+/// `wellformed::decode` refuses fails the exchange. Any other exchange's
+/// payload is its app's, opaque to the node, and passes as it came.
+fn forwarded(glade_id: &str, res: ExchangeRes) -> io::Result<ExchangeRes> {
+    let payload = res.payload.as_deref();
+    let created = payload.filter(|_| glade_id == WORKSPACE_CREATE);
+    if let Some(Err(why)) = created.map(wellformed::decode) {
+        return Err(other(format!("its {WORKSPACE_CREATE} answer: {why}")));
+    }
+    Ok(res)
 }
 
 /// The claim holder's side of a forwarded exchange (trace D2→D4): a synthetic
@@ -514,7 +551,7 @@ mod tests {
         let mut max = 0;
         for (origin, _) in st.heads(HOME, crate::registry::G_CLAIMS, &[]) {
             for op in st.scan(HOME, crate::registry::G_CLAIMS, &[], &origin, i64::MIN) {
-                let c = envelope::record(&op, ServeClaim::from_cbor);
+                let c = envelope::record(&op, ServeClaim::from_cbor).unwrap();
                 if c.share == share && c.epoch > max {
                     max = c.epoch;
                 }
@@ -802,7 +839,8 @@ mod tests {
             if let Frame::Ops(ops) = next_frame(&mut rc, "BindingDecl records").await {
                 for op in ops.ops {
                     assert_eq!(op.origin, b_id, "declarations ride the registrant's chain");
-                    bindings.push(envelope::record(&op, BindingDecl::from_cbor).glade_id);
+                    let binding = envelope::record(&op, BindingDecl::from_cbor).unwrap();
+                    bindings.push(binding.glade_id);
                 }
             }
         }
@@ -820,7 +858,7 @@ mod tests {
         while grants.len() < 3 {
             if let Frame::Ops(ops) = next_frame(&mut rc, "seeded grant records").await {
                 for op in ops.ops {
-                    let g = envelope::record(&op, CapabilityGrant::from_cbor);
+                    let g = envelope::record(&op, CapabilityGrant::from_cbor).unwrap();
                     grants.push((g.principal, g.share, g.verbs.join(",")));
                 }
             }
@@ -941,5 +979,66 @@ mod tests {
         let store = t.a.store.lock().await;
         let held = store.scan("ws-razel", "ws.tree", &[], "grazel-b", i64::MIN);
         assert!(held.is_empty(), "nothing of the zone reached A: {held:?}");
+    }
+
+    /// F15b: a `workspace.create` whose payload nests 100,000 deep, which the
+    /// wire codec's decode recursed on until the node's stack overflowed and
+    /// the process aborted, is answered `ok: false` with the reason, and the
+    /// node serves on: that session and another client are answered.
+    #[tokio::test]
+    async fn a_nested_create_payload_is_refused_and_the_node_serves_on() {
+        let server = Server::open(fresh("nested-create")).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(server.run(listener));
+        let (mut rc, wc) = ws::connect("127.0.0.1", port).await.unwrap();
+
+        let mut nested = vec![0x81; 100_000];
+        nested.push(0);
+        let create = xreq(HOME, WORKSPACE_CREATE, "n-1", &nested);
+        wc.send_binary(&create).await.unwrap();
+        let res = next_exchange_res(&mut rc, "the nested create's answer").await;
+        assert_eq!((res.corr.as_str(), res.ok), ("n-1", false));
+        let why = res.error.unwrap_or_default();
+        assert!(why.contains("nested deeper than 32"), "{why}");
+
+        let (mut other, wo) = ws::connect("127.0.0.1", port).await.unwrap();
+        for (r, w, corr) in [(&mut rc, &wc, "e-1"), (&mut other, &wo, "e-2")] {
+            let echo = xreq("s", "e.x", corr, b"ping");
+            w.send_binary(&echo).await.unwrap();
+            let res = next_exchange_res(r, "an echo").await;
+            let echoed = (res.corr.as_str(), res.payload.as_deref());
+            assert_eq!(echoed, (corr, Some(b"ping".as_slice())));
+        }
+    }
+
+    /// F15b: a claim holder's answer to a forwarded `workspace.create`
+    /// carries the node's own `WorkspaceCreateRes`, which the requester
+    /// decodes, so one whose payload `wellformed` refuses fails the exchange.
+    /// A well-formed one passes as it came, and so does any other exchange's
+    /// payload, which is its app's.
+    #[test]
+    fn a_nested_answer_to_a_forwarded_create_is_a_failure() {
+        let mut nested = vec![0x81; 100_000];
+        nested.push(0);
+        let created = crate::sysdata::WorkspaceCreateRes {
+            workspace: "ws".into(),
+            node: "n".into(),
+            created: true,
+        };
+        let well_formed = glade_wire::cbor::encode(&created.to_cbor());
+        let answer = |payload: &[u8]| ExchangeRes {
+            corr: "c".into(),
+            ok: true,
+            payload: Some(payload.to_vec()),
+            error: None,
+        };
+        let failed = forwarded(WORKSPACE_CREATE, answer(&nested));
+        let why = failed.unwrap_err().to_string();
+        assert!(why.contains("nested deeper than 32"), "{why}");
+        let passed = forwarded(WORKSPACE_CREATE, answer(&well_formed));
+        assert_eq!(passed.unwrap(), answer(&well_formed));
+        let app = forwarded("d.ops", answer(&nested));
+        assert_eq!(app.unwrap(), answer(&nested));
     }
 }

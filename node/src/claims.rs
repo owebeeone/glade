@@ -303,7 +303,8 @@ pub(crate) async fn note_principal(shared: &Arc<Shared>, principal: &str) {
 fn knows_principal(store: &Store, principal: &str) -> bool {
     for (origin, _) in store.heads(HOME, G_PRINCIPALS, &[]) {
         for op in store.scan(HOME, G_PRINCIPALS, &[], &origin, i64::MIN) {
-            if envelope::record(&op, PrincipalRecord::from_cbor).principal == principal {
+            let record = envelope::folded(&op, PrincipalRecord::from_cbor);
+            if record.is_some_and(|record| record.principal == principal) {
                 return true;
             }
         }
@@ -373,7 +374,7 @@ fn home_epoch(store: &Store, node: &str) -> i64 {
     let claims = store.scan(HOME, G_CLAIMS, &[], node, i64::MIN);
     let claims = claims
         .iter()
-        .map(|op| envelope::record(op, ServeClaim::from_cbor));
+        .filter_map(|op| envelope::folded(op, ServeClaim::from_cbor));
     let home = claims.filter(|claim| claim.share == HOME);
     home.map(|claim| claim.epoch).max().unwrap_or(1)
 }
@@ -384,7 +385,9 @@ fn max_claim_epoch(store: &Store, share: &str) -> i64 {
     let mut max = 0;
     for (origin, _) in store.heads(HOME, G_CLAIMS, &[]) {
         for op in store.scan(HOME, G_CLAIMS, &[], &origin, i64::MIN) {
-            let c = envelope::record(&op, ServeClaim::from_cbor);
+            let Some(c) = envelope::folded(&op, ServeClaim::from_cbor) else {
+                continue;
+            };
             if c.share == share && c.epoch > max {
                 max = c.epoch;
             }
@@ -460,7 +463,7 @@ mod tests {
         let mut max = i64::MIN;
         for (origin, _) in store.heads(HOME, G_CLAIMS, &[]) {
             for op in store.scan(HOME, G_CLAIMS, &[], &origin, i64::MIN) {
-                let c = envelope::record(&op, ServeClaim::from_cbor);
+                let c = envelope::record(&op, ServeClaim::from_cbor).unwrap();
                 if c.share == share && c.node == node && c.lease_expiry_ms > max {
                     max = c.lease_expiry_ms;
                 }
@@ -698,7 +701,7 @@ mod tests {
         let claims = store.scan(HOME, G_CLAIMS, &[], node, i64::MIN);
         let claims = claims
             .iter()
-            .map(|op| envelope::record(op, ServeClaim::from_cbor));
+            .map(|op| envelope::record(op, ServeClaim::from_cbor).unwrap());
         let home = claims.filter(|claim| claim.share == HOME);
         home.map(|claim| claim.epoch).collect()
     }
@@ -853,7 +856,7 @@ mod tests {
         let claims = st.scan(HOME, G_CLAIMS, &[], &node, i64::MIN);
         let epochs: Vec<i64> = claims
             .iter()
-            .map(|op| envelope::record(op, ServeClaim::from_cbor).epoch)
+            .map(|op| envelope::record(op, ServeClaim::from_cbor).unwrap().epoch)
             .collect();
         assert_eq!(
             epochs,
@@ -924,7 +927,7 @@ mod tests {
                 let mut hosts = Vec::new();
                 for (origin, _) in st.heads(HOME, crate::registry::G_WORKSPACES, &[]) {
                     for op in st.scan(HOME, crate::registry::G_WORKSPACES, &[], &origin, i64::MIN) {
-                        let e = envelope::record(&op, WorkspaceEntry::from_cbor);
+                        let e = envelope::record(&op, WorkspaceEntry::from_cbor).unwrap();
                         if e.workspace == "ws-live" {
                             hosts = e.eligible_hosts.clone();
                         }
@@ -1008,7 +1011,8 @@ mod tests {
             let mut n = 0;
             for (origin, _) in st.heads(HOME, G_PRINCIPALS, &[]) {
                 for op in st.scan(HOME, G_PRINCIPALS, &[], &origin, i64::MIN) {
-                    if envelope::record(&op, PrincipalRecord::from_cbor).principal == principal {
+                    let record = envelope::record(&op, PrincipalRecord::from_cbor).unwrap();
+                    if record.principal == principal {
                         n += 1;
                     }
                 }
@@ -1030,7 +1034,8 @@ mod tests {
             Frame::Ops(ops) => {
                 assert_eq!(ops.ops.len(), 1);
                 assert_eq!(ops.ops[0].origin, node_id, "attributed to the witnessing node's chain");
-                assert_eq!(envelope::record(&ops.ops[0], PrincipalRecord::from_cbor).principal, "alice");
+                let record = envelope::record(&ops.ops[0], PrincipalRecord::from_cbor).unwrap();
+                assert_eq!(record.principal, "alice");
             }
             other => panic!("expected the principal record, got {other:?}"),
         }
@@ -1045,7 +1050,8 @@ mod tests {
         assert!(matches!(next(&mut r4, "bob welcome").await, Frame::Welcome(_)));
         match next(&mut r2, "the bob record, live").await {
             Frame::Ops(ops) => {
-                assert_eq!(envelope::record(&ops.ops[0], PrincipalRecord::from_cbor).principal, "bob");
+                let record = envelope::record(&ops.ops[0], PrincipalRecord::from_cbor).unwrap();
+                assert_eq!(record.principal, "bob");
             }
             other => panic!("expected the live principal record, got {other:?}"),
         }

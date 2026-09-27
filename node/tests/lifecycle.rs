@@ -334,7 +334,7 @@ fn claims_held(instance: &Path) -> Vec<(String, i64)> {
     let ops = saved.records.iter();
     let ops = ops.map(|bytes| Op::from_cbor(&cbor::decode(bytes)));
     let claims = ops.filter(|op| op.glade_id == "dir.claims");
-    let claims = claims.map(|op| envelope::record(&op, ServeClaim::from_cbor));
+    let claims = claims.map(|op| envelope::record(&op, ServeClaim::from_cbor).unwrap());
     let held = claims.map(|claim| (claim.share, claim.lease_expiry_ms));
     held.collect()
 }

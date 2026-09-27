@@ -7689,3 +7689,9 @@ The owner's ruling of 2026-09-27; each is refused as a bad frame, not a panic or
 - **Size: `MAX_FRAME_BYTES`, 16 MiB** (`frame.rs`; question 6's limit), checked by `frame_len`
   before allocating, in `WsReader::read` and `peer::read_frame`: a longer header ends that
   connection or stream alone. On the websocket a refused message is skipped; its session goes on.
+- **Payloads read apart from their frame (F15b):** every other production decode goes through
+  `wellformed::decode` (`envelope::record`, `decode_op`, `snapshot_ops`); a source test in
+  `envelope.rs` fails the gate on a raw `cbor::decode`. A refused `workspace.create` payload, or
+  a peer's refused answer to a forwarded one, answers `ok: false`; an unsealed registry refuses the
+  record; a stored op is skipped (in records.json quarantined, closing the grant fold), a folded
+  record skipped, each with one stderr line; a nested `home` payload still refuses the start (4.1b).

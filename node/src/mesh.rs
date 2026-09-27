@@ -1044,7 +1044,9 @@ pub fn who_serves(store: &Store, share: &str, now_ms: i64) -> Option<String> {
     let mut best: Option<crate::sysdata::ServeClaim> = None;
     for (origin, _) in store.heads(HOME, crate::registry::G_CLAIMS, &[]) {
         for op in store.scan(HOME, crate::registry::G_CLAIMS, &[], &origin, i64::MIN) {
-            let c = envelope::record(&op, crate::sysdata::ServeClaim::from_cbor);
+            let Some(c) = envelope::folded(&op, crate::sysdata::ServeClaim::from_cbor) else {
+                continue;
+            };
             if c.share == share && c.lease_expiry_ms > now_ms && best.as_ref().map_or(true, |b| c.epoch > b.epoch) {
                 best = Some(c);
             }
@@ -1060,14 +1062,16 @@ pub fn who_serves(store: &Store, share: &str, now_ms: i64) -> Option<String> {
 pub fn directory_knows(store: &Store, share: &str) -> bool {
     for (origin, _) in store.heads(HOME, crate::registry::G_WORKSPACES, &[]) {
         for op in store.scan(HOME, crate::registry::G_WORKSPACES, &[], &origin, i64::MIN) {
-            if envelope::record(&op, crate::sysdata::WorkspaceEntry::from_cbor).workspace == share {
+            let entry = envelope::folded(&op, crate::sysdata::WorkspaceEntry::from_cbor);
+            if entry.is_some_and(|entry| entry.workspace == share) {
                 return true;
             }
         }
     }
     for (origin, _) in store.heads(HOME, crate::registry::G_CLAIMS, &[]) {
         for op in store.scan(HOME, crate::registry::G_CLAIMS, &[], &origin, i64::MIN) {
-            if envelope::record(&op, crate::sysdata::ServeClaim::from_cbor).share == share {
+            let claim = envelope::folded(&op, crate::sysdata::ServeClaim::from_cbor);
+            if claim.is_some_and(|claim| claim.share == share) {
                 return true;
             }
         }
@@ -2111,7 +2115,8 @@ mod tests {
             if let Frame::Ops(ops) = next_frame(&mut rc, "workspace entries").await {
                 for op in ops.ops {
                     assert_eq!(op.origin, b_id, "entries carry their writing origin");
-                    names.push(envelope::record(&op, crate::sysdata::WorkspaceEntry::from_cbor).workspace);
+                    let entry = envelope::record(&op, crate::sysdata::WorkspaceEntry::from_cbor);
+                    names.push(entry.unwrap().workspace);
                 }
             }
         }

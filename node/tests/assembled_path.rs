@@ -449,7 +449,7 @@ fn claims_held(instance: &Path) -> Vec<(String, i64)> {
     let ops = saved.records.iter();
     let ops = ops.map(|bytes| Op::from_cbor(&cbor::decode(bytes)));
     let claims = ops.filter(|op| op.glade_id == "dir.claims");
-    let claims = claims.map(|op| envelope::record(&op, ServeClaim::from_cbor));
+    let claims = claims.map(|op| envelope::record(&op, ServeClaim::from_cbor).unwrap());
     let held = claims.map(|claim| (claim.share, claim.lease_expiry_ms));
     held.collect()
 }
@@ -709,6 +709,52 @@ fn both_roots_check_client_grants_only_when_switched_on() {
             };
             assert_eq!(answers, expected, "{root:?}, checked {checked}: {stderr}");
         }
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// F15b: an op nested 100,000 deep, which the wire codec's decode recursed on
+/// until the start aborted with a stack overflow, already stored in
+/// records.json and in the served store's `home` journals of an instance.
+/// Each root starts past both: it quarantines the one and skips the other,
+/// says so on stderr, one line each, and serves.
+#[test]
+fn both_roots_start_past_a_nested_op_in_the_store() {
+    let mut nested = vec![0x81; 100_000];
+    nested.push(0);
+    let records = Cbor::Map(vec![
+        (1, Cbor::Array(vec![Cbor::Bytes(nested.clone())])),
+        (2, Cbor::Array(vec![])),
+    ]);
+    let framed = [&(nested.len() as u32).to_le_bytes()[..], &nested].concat();
+    let hex = |text: &str| text.bytes().map(|b| format!("{b:02x}")).collect::<String>();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let dir = scratch("nested-op");
+    let home = dir.join("glade-home");
+    for (root, name) in [(Root::HandWritten, "h"), (Root::Assembled, "a")] {
+        let instance = home.join("sys").join(name);
+        let journals = instance.join("cache").join("store").join(hex(HOME));
+        std::fs::create_dir_all(&journals).unwrap();
+        std::fs::write(instance.join("records.json"), cbor::encode(&records)).unwrap();
+        std::fs::write(journals.join(format!("{}.log", hex("n1"))), &framed).unwrap();
+        let node = Running::start(&home, root, &["--profile", "local", "--name", name, "0"]);
+        let lines = node.lines.clone();
+        let port = lines
+            .iter()
+            .find_map(|line| line.strip_prefix("listening "));
+        let port: u16 = port.unwrap().parse().unwrap();
+        let served = runtime.block_on(ws_subscribe(port, None));
+        let stderr = node.stop();
+        assert_eq!(served, Ok(1), "{root:?}: {stderr}");
+        let quarantined = "quarantined 1 record(s) at load".to_string();
+        assert!(lines.contains(&quarantined), "{root:?}: {lines:?}");
+        let said = stderr
+            .lines()
+            .filter(|line| line.ends_with("(bad frame: nested deeper than 32)"));
+        assert_eq!(said.count(), 2, "{root:?}: {stderr}");
     }
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -1249,7 +1295,7 @@ fn both_roots_set_an_unsigned_instance_aside_and_serve_signed() {
         let epochs: Vec<i64> = store
             .scan(HOME, "dir.claims", &[], &node, i64::MIN)
             .iter()
-            .map(|op| envelope::record(op, ServeClaim::from_cbor))
+            .map(|op| envelope::record(op, ServeClaim::from_cbor).unwrap())
             .filter(|claim| claim.share == "ws-x")
             .map(|claim| claim.epoch)
             .collect();

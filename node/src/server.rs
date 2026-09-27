@@ -14,12 +14,12 @@ use std::sync::{Arc, OnceLock};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
 
-use glade_wire::cbor;
 use glade_wire::generated::{ErrorCode, Op, Ops, Shape, Welcome};
 
 use glade_grant_api::{GrantPort, Holder};
 
 use crate::echo::Echo;
+use crate::envelope;
 use crate::frame::Frame;
 use crate::grants::{names_a_node, no_principal, refusal, Policy, PolicyView, READ_SUBSCRIBE};
 use crate::mesh::Mesh;
@@ -130,8 +130,7 @@ impl Server {
     pub async fn seed_registry(&self, snap: &SystemSnapshot) -> usize {
         let mut store = self.shared.store.lock().await;
         let mut appended = 0usize;
-        for bytes in &snap.records {
-            let op = Op::from_cbor(&cbor::decode(bytes));
+        for op in envelope::snapshot_ops(&snap.records) {
             if matches!(store.append(op), Ok(Append::Appended)) {
                 appended += 1;
             }
@@ -530,6 +529,7 @@ mod tests {
     use super::*;
     use crate::registry::{G_GRANTS, HOME};
     use crate::sysdata::CapabilityGrant;
+    use glade_wire::cbor;
     use glade_wire::generated::{
         Error, ExchangeReq, Head, Heads, Hello, Op, Ops, Shape, StreamHeads, Subscribe,
     };

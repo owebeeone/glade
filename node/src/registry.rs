@@ -26,6 +26,7 @@ use std::sync::{Mutex, PoisonError};
 
 use glade_wire::cbor;
 use glade_wire::generated::{Head, Op, Shape, StreamHeads};
+use glade_wire::wellformed::{self, Malformed};
 
 use crate::chain::op_hash;
 use crate::envelope::{self, Refused};
@@ -145,7 +146,8 @@ impl Record {
 /// fork; the same op again is no error but [`Ingested::Duplicate`].
 /// `Unverified` is an op a sealed registry was handed that does not verify
 /// (plan Step 4.1b), and `NotOurs` an append a sealed registry was asked to
-/// make under another node's origin.
+/// make under another node's origin. `Malformed` is an op an unsealed
+/// registry was handed whose record `wellformed::decode` refuses (F15b).
 #[derive(Debug, PartialEq)]
 pub enum RegistryError {
     Gap { expected: i64, got: i64 },
@@ -153,6 +155,7 @@ pub enum RegistryError {
     Equivocation { origin: String, seq: i64 },
     Unverified { origin: String, why: Refused },
     NotOurs { origin: String },
+    Malformed { origin: String, why: Malformed },
 }
 
 /// Where an ingested op landed: appended to its chain, or already held there
@@ -410,8 +413,18 @@ impl Registry {
         let mut rejected = 0usize;
         // Track chains whose tail is poisoned so the suffix is dropped too.
         let mut poisoned: BTreeMap<(String, String), bool> = BTreeMap::new();
-        for bytes in &snap.records {
-            let op = Op::from_cbor(&cbor::decode(bytes));
+        for (at, bytes) in snap.records.iter().enumerate() {
+            // An op that cannot be read may be on any stream, a grant's or a
+            // revocation's, so the grant fold fails closed (F15b).
+            let op = match envelope::decode_op(bytes) {
+                Ok(op) => op,
+                Err(why) => {
+                    eprintln!("{}", envelope::unreadable_op("quarantined", at, why));
+                    rejected += 1;
+                    reg.policy_quarantined = true;
+                    continue;
+                }
+            };
             let chain = (op.glade_id.clone(), op.origin.clone());
             let policy = Record::is_policy(&op.glade_id);
             if *poisoned.get(&chain).unwrap_or(&false) {
@@ -440,13 +453,14 @@ impl Registry {
         if self.policy_quarantined {
             return None;
         }
+        // A grant or a revocation that cannot be read fails it closed too.
         let mut policy = Policy::default();
         for o in self.fold_iter(G_GRANTS) {
-            let grant = envelope::record(o, CapabilityGrant::from_cbor);
+            let grant = envelope::record(o, CapabilityGrant::from_cbor).ok()?;
             policy.grant(&grant.principal, &grant.share, grant.verbs);
         }
         for o in self.fold_iter(G_REVOCATIONS) {
-            let revocation = envelope::record(o, CapabilityRevocation::from_cbor);
+            let revocation = envelope::record(o, CapabilityRevocation::from_cbor).ok()?;
             policy.revoke(&revocation.principal, &revocation.share);
         }
         Some(policy)
@@ -470,6 +484,11 @@ impl Registry {
                 let origin = op.origin;
                 return Err(RegistryError::Unverified { origin, why });
             }
+        } else if let Err(why) = wellformed::decode(&envelope::record_bytes(&op.payload)) {
+            // An unsealed registry does not verify, so no kind check reads
+            // the record: it refuses one its folds could not read (F15b).
+            let origin = op.origin;
+            return Err(RegistryError::Malformed { origin, why });
         }
         self.link(op)
     }
@@ -523,7 +542,8 @@ impl Registry {
     pub fn has_node(&self, node_id: &str) -> bool {
         self.fold_iter(G_NODES)
             .into_iter()
-            .any(|o| envelope::record(o, NodeRecord::from_cbor).node_id == node_id)
+            .filter_map(|o| envelope::folded(o, NodeRecord::from_cbor))
+            .any(|record| record.node_id == node_id)
     }
 
     /// Decoded records of one kind, in deterministic (origin, seq) order —
@@ -595,7 +615,7 @@ impl Registry {
     pub fn recovery_key(&self, node: &str) -> Option<String> {
         let own = self.fold_iter(G_RECOVERY_KEYS);
         let own = own.into_iter().filter(|o| o.origin == node);
-        let keys = own.map(|o| envelope::record(o, NodeRecoveryKey::from_cbor));
+        let keys = own.filter_map(|o| envelope::folded(o, NodeRecoveryKey::from_cbor));
         let ours = keys.filter(|key| key.node == node);
         ours.map(|key| key.recovery_key).next()
     }
@@ -648,7 +668,7 @@ impl RegistryApi for Registry {
     fn who_serves(&self, workspace: &str, now_ms: i64) -> Option<String> {
         self.fold_iter(G_CLAIMS)
             .into_iter()
-            .map(|o| envelope::record(o, ServeClaim::from_cbor))
+            .filter_map(|o| envelope::folded(o, ServeClaim::from_cbor))
             .filter(|c| c.share == workspace && c.lease_expiry_ms > now_ms) // read-time expiry
             .max_by_key(|c| c.epoch) // highest live epoch wins
             .map(|c| c.node)
@@ -658,7 +678,9 @@ impl RegistryApi for Registry {
         // LWW-per-workspace: the latest (origin, seq) WorkspaceEntry wins.
         let mut latest: Option<WorkspaceEntry> = None;
         for o in self.fold_iter(G_WORKSPACES) {
-            let e = envelope::record(o, WorkspaceEntry::from_cbor);
+            let Some(e) = envelope::folded(o, WorkspaceEntry::from_cbor) else {
+                continue;
+            };
             if e.workspace == share {
                 latest = Some(e);
             }
@@ -676,14 +698,18 @@ impl RegistryApi for Registry {
             .fold_iter(G_REVOCATIONS)
             .into_iter()
             .map(|o| envelope::record(o, CapabilityRevocation::from_cbor))
-            .any(|r| r.principal == principal && r.share == share);
+            .any(|r| match r {
+                Ok(r) => r.principal == principal && r.share == share,
+                // one that cannot be read may be this pair's: fail closed
+                Err(_) => true,
+            });
         if revoked {
             return vec![];
         }
         let mut verbs: Vec<String> = self
             .fold_iter(G_GRANTS)
             .into_iter()
-            .map(|o| envelope::record(o, CapabilityGrant::from_cbor))
+            .filter_map(|o| envelope::folded(o, CapabilityGrant::from_cbor))
             .filter(|g| g.principal == principal && g.share == share)
             .flat_map(|g| g.verbs)
             .collect();
@@ -700,7 +726,7 @@ impl RegistryApi for Registry {
         let mut nodes: Vec<String> = self
             .fold_iter(G_NODES)
             .into_iter()
-            .map(|o| envelope::record(o, NodeRecord::from_cbor))
+            .filter_map(|o| envelope::folded(o, NodeRecord::from_cbor))
             .filter(|n| n.operator == operator)
             .map(|n| n.node_id)
             .collect();
@@ -791,12 +817,16 @@ impl BindingFold {
         for op in ops {
             let (app, glade_id, decl) = match op.glade_id.as_str() {
                 G_BINDINGS => {
-                    let b = envelope::record(op, BindingDecl::from_cbor);
+                    let Some(b) = envelope::folded(op, BindingDecl::from_cbor) else {
+                        continue;
+                    };
                     let record = envelope::record_bytes(&op.payload);
                     (b.app.clone(), b.glade_id.clone(), Some((b, record)))
                 }
                 G_BINDING_RETRACTIONS => {
-                    let r = envelope::record(op, BindingRetraction::from_cbor);
+                    let Some(r) = envelope::folded(op, BindingRetraction::from_cbor) else {
+                        continue;
+                    };
                     (r.app, r.glade_id, None)
                 }
                 _ => continue,
@@ -1311,5 +1341,72 @@ mod tests {
         assert_eq!(reloaded, snap);
         // no tmp file left behind after the rename.
         assert!(!dir.join("records.json.tmp").exists());
+    }
+
+    /// F15b: a record nested 100,000 deep, which the wire codec's decode
+    /// recursed on until the stack overflowed, is never taken into a
+    /// directory stream. An unsealed registry, the record host of the test
+    /// compositions and the journeys, refuses it at ingest, as a sealed one
+    /// refuses it unverified. A snapshot holding it, or holding an op itself
+    /// nested so, loads with both quarantined and the grant fold closed, and
+    /// every fold answers.
+    #[test]
+    fn a_nested_record_is_refused_and_a_nested_op_quarantined() {
+        let mut nested = vec![0x81; 100_000];
+        nested.push(0);
+        let op = Op {
+            share: HOME.into(),
+            glade_id: G_GRANTS.into(),
+            origin: "n1".into(),
+            shape: Shape::Log,
+            payload: nested.clone(),
+            ..Op::default()
+        };
+        let mut unsealed = Registry::new();
+        let refused = unsealed.ingest(op.clone());
+        assert!(refused.is_err(), "{refused:?}");
+        let mut sealed = Registry::sealed(NodeIdentity::from_key([7; 32]));
+        assert!(sealed.ingest(op.clone()).is_err());
+
+        let records = vec![cbor::encode(&op.to_cbor()), nested];
+        let snap = SystemSnapshot {
+            records,
+            heads: vec![],
+            revision: None,
+        };
+        let (loaded, rejected) = Registry::from_snapshot(&snap);
+        assert_eq!(rejected, 2);
+        assert!(loaded.policy().is_none(), "the grant fold fails closed");
+        assert_eq!(loaded.grants_for("p", "ws"), Vec::<String>::new());
+        assert_eq!(unsealed.who_serves("ws", 0), None);
+    }
+
+    /// F15b: a grant or a revocation a fold cannot read closes the grant
+    /// fold: the policy is unreadable, and `grants_for` grants nothing, since
+    /// a revocation it cannot read may be the pair's. Ingest and load never
+    /// let one in; this one is put in by hand.
+    #[test]
+    fn a_policy_record_that_cannot_be_read_closes_the_grant_fold() {
+        let mut r = Registry::new();
+        let grant = CapabilityGrant {
+            principal: "p".into(),
+            share: "ws".into(),
+            verbs: vec!["read.*".into()],
+        };
+        r.append(Record::Grant(grant), "n1").unwrap();
+        assert!(r.policy().is_some());
+        assert_eq!(r.grants_for("p", "ws"), ["read.*"]);
+        let mut nested = vec![0x81; 100_000];
+        nested.push(0);
+        r.ops.push(Op {
+            share: HOME.into(),
+            glade_id: G_REVOCATIONS.into(),
+            origin: "n1".into(),
+            shape: Shape::Log,
+            payload: nested,
+            ..Op::default()
+        });
+        assert!(r.policy().is_none());
+        assert_eq!(r.grants_for("p", "ws"), Vec::<String>::new());
     }
 }
