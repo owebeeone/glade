@@ -63,8 +63,10 @@
 //! declares (plan Step 4.3's precondition 4). A `revoke` line is never warned
 //! for its share: withdrawing a grant on a share nothing serves is its use.
 //! [`load_all`] also warns on a seed a `revoke` line of that start cancels,
-//! and `parse` on the odd spellings, a verb of just `*` and a node's id
-//! written with capitals (F4, the owner's ruling of 2026-09-27). Each is a
+//! and `parse` on the odd spellings: a node's id written with capitals (F4,
+//! the owner's ruling of 2026-09-27), and a verb holding a `*` that does not
+//! end a pattern `p.*`, such as `*`, `.*`, `read*` or `*.x` (F14, the same
+//! day's, in place of F4's warning on a verb of just `*`). Each is a
 //! warning: the line still registers.
 
 use std::fs;
@@ -192,10 +194,27 @@ fn cancelled_seed(principal: &str, share: &str, at: &str) -> String {
          grant registers, and allows nothing"
     )
 }
-/// What a seed's verb of just `*` is told, on its line (F4): a verb that ends
-/// in `.*` is a pattern, and a lone `*` is none (`glade_grant_api::admits`).
-const LONE_STAR_VERB: &str = "the verb `*` allows only a verb named `*`, for a pattern is \
-     written `p.*`, as `read.*` allows every verb that begins `read.`; the grant registers";
+/// Whether `verb` holds a `*` that does not end a pattern (F14): a verb
+/// `p.*`, with `p` not empty, is a pattern whose last `*` stands for every
+/// ending, and any other `*` matches only a `*` (`glade_grant_api::admits`,
+/// whose shape this follows). So `*`, `.*`, `read*`, `*.x` and the first `*`
+/// of `*.*` do; `read.*` does not.
+fn stray_star(verb: &str) -> bool {
+    let literal = match verb.strip_suffix('*') {
+        Some(prefix) if prefix.len() > 1 && prefix.ends_with('.') => prefix,
+        _ => verb,
+    };
+    literal.contains('*')
+}
+/// What a seed's verb holding a `*` that does not end a pattern is told, on
+/// its line, once for each such verb (F14, in place of F4's warning on a
+/// verb of just `*`).
+fn stray_star_verb(verb: &str) -> String {
+    format!(
+        "a `*` in the verb `{verb}` matches only a `*`, for only a `*` that ends a pattern `p.*` \
+         stands for more, as `read.*` allows every verb that begins `read.`; the grant registers"
+    )
+}
 /// What a principal written as a node's id with capitals is told, on its
 /// `seed` or `revoke` line (F4): a node's id is 64 lower-case hex digits
 /// (`grants::names_a_node`), so this token names no node, and a client may
@@ -447,13 +466,17 @@ pub fn parse(text: &str) -> Result<AppDecl, String> {
                     share: toks[2].into(),
                     verbs: toks[3].split(',').map(str::to_string).collect(),
                 };
-                // F4: the odd spellings, told on the line; the grant registers.
+                // F4 and F14: the odd spellings, told on the line; the grant
+                // registers. A verb written twice on the line is told once.
                 if capitalised_hex(&seed.principal) {
                     let told = capitalised_node_id(&seed.principal);
                     decl.warnings.push(format!("line {n}: {told}"));
                 }
-                if seed.verbs.iter().any(|verb| verb == "*") {
-                    decl.warnings.push(format!("line {n}: {LONE_STAR_VERB}"));
+                for (i, verb) in seed.verbs.iter().enumerate() {
+                    if stray_star(verb) && !seed.verbs[..i].contains(verb) {
+                        let told = stray_star_verb(verb);
+                        decl.warnings.push(format!("line {n}: {told}"));
+                    }
                 }
                 decl.seeds.push(seed);
                 decl.seed_lines.push(n);
@@ -809,6 +832,7 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
+    use glade_grant_api::admits;
     use glade_wire::generated::Shape;
 
     use crate::registry::{
@@ -1908,7 +1932,7 @@ mod tests {
 
     /// F4: the odd spellings of a grant, each told on its line in file order,
     /// and each line still registers. A verb of just `*` is no pattern
-    /// (`glade_grant_api::admits`): it allows only a verb named `*`. A
+    /// (`glade_grant_api::admits`), and is told F14's rule (below). A
     /// principal of 64 hex digits with one capital or more names no node,
     /// whose id is lower-case hex, but a name a client may claim, on a
     /// `seed` or a `revoke` line. The spellings the format page defines warn
@@ -1929,7 +1953,7 @@ mod tests {
         ];
         let decl = parse(&v1_file(&lines.join("\n"))).unwrap();
         let told = [
-            format!("line 3: {LONE_STAR_VERB}"),
+            format!("line 3: {}", stray_star_verb("*")),
             format!("line 4: {}", capitalised_node_id(&capitals)),
             format!("line 5: {}", capitalised_node_id(&one_capital)),
         ];
@@ -1937,14 +1961,65 @@ mod tests {
         let registered = (decl.seeds.len(), decl.revocations.len());
         assert_eq!(registered, (4, 2), "each registers");
         assert_eq!(
-            LONE_STAR_VERB,
-            "the verb `*` allows only a verb named `*`, for a pattern is written `p.*`, as `read.*` \
-             allows every verb that begins `read.`; the grant registers"
-        );
-        assert_eq!(
             capitalised_node_id("P"),
             "the principal `P` is a node's id written with capitals, which names no node: a node's \
              id is lower-case hex, and a client may claim this name; the line registers"
+        );
+    }
+
+    /// F14 (the owner's ruling of 2026-09-27), in place of F4's verb of just
+    /// `*`: a `*` in a seed's verb that does not end a pattern `p.*`, `p` not
+    /// empty, matches only a `*`. Each verb holding one is told on its line,
+    /// in the order written, and once however often the line writes it:
+    /// `*`, `.*`, `read*`, `*.x`, `read.**`, and `*.*`, `a.*.*` and
+    /// `re*ad.*`, whose last `*` ends a pattern and whose first does not.
+    /// Each line still registers, its verbs as written. Patterns and plain
+    /// verbs are told nothing: `read.*`, `gwz.*`, `a.b.*`, `..*` (whose `p`
+    /// is `.`), `read.subscribe` and `read`. The rule is the grant port's: a
+    /// verb is told exactly when one of its `*`s is one that
+    /// `glade_grant_api::admits` would not let another letter stand for.
+    #[test]
+    fn a_verb_with_a_star_that_ends_no_pattern_is_warned() {
+        let told = [
+            "*", ".*", "read*", "*.x", "read.**", "*.*", "a.*.*", "re*ad.*",
+        ];
+        let silent = ["read.*", "gwz.*", "a.b.*", "..*", "read.subscribe", "read"];
+        let lines = [
+            "seed owner ws-a read.*,*",
+            "seed owner ws-a .*,read*,read.*,read*",
+            "seed owner ws-a *.x,read.**,*.*",
+            "seed owner ws-a a.*.*,re*ad.*",
+            "seed owner ws-a read.*,gwz.*,a.b.*,..*,read.subscribe,read",
+        ];
+        let decl = parse(&v1_file(&lines.join("\n"))).unwrap();
+        let at = [3, 4, 4, 5, 5, 5, 6, 6];
+        let expected: Vec<String> = at
+            .iter()
+            .zip(told)
+            .map(|(n, verb)| format!("line {n}: {}", stray_star_verb(verb)))
+            .collect();
+        assert_eq!(decl.warnings, expected);
+        assert_eq!(decl.seeds.len(), 5, "each registers");
+        assert_eq!(decl.seeds[1].verbs, [".*", "read*", "read.*", "read*"]);
+
+        // The grant port's reading: a `*` stands for more exactly when
+        // `admits` takes another letter in its place.
+        let literal = |verb: &str| {
+            verb.match_indices('*').any(|(i, _)| {
+                let other = format!("{}x{}", &verb[..i], &verb[i + 1..]);
+                !admits(verb, &other)
+            })
+        };
+        for verb in told {
+            assert!(stray_star(verb) && literal(verb), "{verb}");
+        }
+        for verb in silent {
+            assert!(!stray_star(verb) && !literal(verb), "{verb}");
+        }
+        assert_eq!(
+            stray_star_verb("read*"),
+            "a `*` in the verb `read*` matches only a `*`, for only a `*` that ends a pattern `p.*` \
+             stands for more, as `read.*` allows every verb that begins `read.`; the grant registers"
         );
     }
 }

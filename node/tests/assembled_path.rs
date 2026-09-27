@@ -530,10 +530,11 @@ fn both_roots_warn_of_a_seeds_undeclared_share_and_register_a_revoke_line() {
 }
 
 /// F4 (the owner's ruling of 2026-09-27), on each root: the odd spellings of
-/// a grant, a verb of just `*` and a node's id written with capitals, and a
-/// seed that another loaded file's `revoke` line cancels, are each warned on
-/// stderr, on the seed's file and line, in that order; the start goes on, and
-/// the revoking file is warned of nothing.
+/// a grant, a verb with a `*` that does not end a pattern `p.*` (F14, here
+/// `*` and `read*`) and a node's id written with capitals, and a seed that
+/// another loaded file's `revoke` line cancels, are each warned on stderr, on
+/// the seed's file and line, in that order; the start goes on, and the
+/// revoking file is warned of nothing.
 #[test]
 fn both_roots_warn_of_odd_grant_spellings_and_a_seed_another_file_revokes() {
     let dir = scratch("odd-grants");
@@ -541,15 +542,21 @@ fn both_roots_warn_of_odd_grant_spellings_and_a_seed_another_file_revokes() {
     let capitals = "0123456789ABCDEF".repeat(4);
     let (seeds, revokes) = (dir.join("a.glade"), dir.join("b.glade"));
     let text = format!(
-        "glade-app v1\napp a\nseed owner ws-x read.*,*\nseed {capitals} ws-x read.*\nworkspace ws-x notes\n"
+        "glade-app v1\napp a\nseed owner ws-x read.*,*,read*\nseed {capitals} ws-x read.*\nworkspace ws-x notes\n"
     );
     std::fs::write(&seeds, text).unwrap();
     std::fs::write(&revokes, "glade-app v1\napp b\nrevoke owner ws-x\n").unwrap();
     let (a, b) = (seeds.display().to_string(), revokes.display().to_string());
     let told = [
         format!(
-            "{a}: warning: line 3: the verb `*` allows only a verb named `*`, for a pattern is \
-             written `p.*`, as `read.*` allows every verb that begins `read.`; the grant registers"
+            "{a}: warning: line 3: a `*` in the verb `*` matches only a `*`, for only a `*` that \
+             ends a pattern `p.*` stands for more, as `read.*` allows every verb that begins \
+             `read.`; the grant registers"
+        ),
+        format!(
+            "{a}: warning: line 3: a `*` in the verb `read*` matches only a `*`, for only a `*` \
+             that ends a pattern `p.*` stands for more, as `read.*` allows every verb that begins \
+             `read.`; the grant registers"
         ),
         format!(
             "{a}: warning: line 4: the principal `{capitals}` is a node's id written with capitals, \

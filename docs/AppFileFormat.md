@@ -395,14 +395,15 @@ id, holds no grant.
 | reading a surface | `read.subscribe` |
 | a request on an exchange | the exchange's glade id, such as `gwz.ops` |
 
-A verb that ends in `.*` is a pattern: `p.*` allows every verb that begins
-with `p.`. So `read.*` allows `read.subscribe`, `gwz.*` allows `gwz.ops`, and
-`gyld.*` allows `gyld.ops`. Any other verb allows only itself.
+A verb `p.*`, where `p` is not empty, is a pattern: it allows every verb that
+begins with `p.`. So `read.*` allows `read.subscribe`, `gwz.*` allows
+`gwz.ops`, and `gyld.*` allows `gyld.ops`. Any other verb allows only itself.
 
 Two spellings are warned on their line, and the line still registers: a verb
-of just `*`, which allows only a verb named `*`, where a pattern is written
-`p.*`; and a principal of 64 hexadecimal digits with a capital letter, which
-names no node, since a node's id is lower-case (on a `revoke` line too).
+with a `*` anywhere but at the end of a pattern `p.*`, such as `*`, `.*`,
+`read*` or `*.x`, since such a `*` matches only a `*` (the warning names each
+such verb); and a principal of 64 hexadecimal digits with a capital letter,
+which names no node, since a node's id is lower-case (on a `revoke` line too).
 
 ## Changing or deleting a line
 
