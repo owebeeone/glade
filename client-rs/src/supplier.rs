@@ -16,7 +16,9 @@
 //! re-Subscribes every serving; the per-surface answer/op loops persist across
 //! reconnects (their receivers outlive the connection), so only the wire
 //! attachment is re-established. A refused subscribe is an error (R6), so a
-//! `serve_*` fails and a reattach tries again.
+//! `serve_*` fails and a reattach tries again. A refused op stops its chain
+//! until a subscribe (answer 4), so a `ShareController` whose chain a refusal
+//! stopped subscribes its surface again before its next write.
 
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -87,7 +89,8 @@ pub struct SupplierConfig {
 /// The publish controller for a value/log surface (`serve_share`). `set` is the
 /// value op (lww whole-value refresh); `append` is the log op (one entry). Each
 /// APPENDS into the surface's stream — which is what "serving" a value/log
-/// surface IS. Wrong-shape use errors.
+/// surface IS. Wrong-shape use errors. When a refusal has stopped the
+/// surface's chain, a write subscribes the surface again first (answer 4).
 #[derive(Clone)]
 pub struct ShareController {
     client: GladeClient,
@@ -108,6 +111,7 @@ impl ShareController {
         self.publish(payload).await
     }
     async fn publish(&self, payload: Vec<u8>) -> io::Result<Op> {
+        resume_surface(&self.client, &self.surface).await?;
         self.client.append(&self.surface.share, &self.surface.glade_id, &self.surface.shape, payload, self.surface.key_slice()).await
     }
 }
@@ -281,6 +285,17 @@ async fn subscribe_surface(client: &GladeClient, surface: &SupplierSurface) -> i
             Err(io::Error::other(format!("subscribe to {}/{} refused ({code}): {message}", surface.share, surface.glade_id)))
         }
     }
+}
+
+/// Subscribe a served surface again when a refusal stopped its chain (answer
+/// 4), which resumes the chain on the node's ops, so a write to the surface is
+/// not lost to the stopped chain.
+async fn resume_surface(client: &GladeClient, surface: &SupplierSurface) -> io::Result<()> {
+    let (share, glade_id) = (&surface.share, &surface.glade_id);
+    if client.stopped(share, glade_id, surface.key_slice()).await {
+        subscribe_surface(client, surface).await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -11,9 +11,10 @@
 //! (GladeSubstrateV1 §6, R1): `append_outcome` / `send_ops_outcome` return it
 //! as data, `on_refused` reports every refusal, and a refused op's chain stops
 //! until a subscribe (answer 4). An op not placed is kept and sent again, zone
-//! by zone, and `on_unplaced` reports it (W5). `subscribe_outcome` returns a
-//! subscribe's heads, or its refusal and reason (R5, R6). No node internals —
-//! the wire + tokio only.
+//! by zone, and `on_unplaced` reports it (W5); no later op of its chain goes
+//! before it, and a gap refusal past it is not placed either (F6).
+//! `subscribe_outcome` returns a subscribe's heads, or its refusal and reason
+//! (R5, R6). No node internals — the wire + tokio only.
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -187,10 +188,19 @@ impl Inner {
         }
     }
 
-    /// Report a refusal to `on_refused`, and an op not placed, once, to
-    /// `on_unplaced`; start the zone's resend timer while it has ops not
-    /// placed (W5); and tell the op's waiter.
+    /// `report`, then start the zone's resend timer while it has ops not
+    /// placed (W5).
     async fn answer(self: &Arc<Self>, answered: Answered<Waiter>) {
+        let zone = zone_of(&answered.op);
+        self.report(answered).await;
+        if let Some(timer) = self.answers.lock().await.start_resending(&zone) {
+            tokio::spawn(resend_loop(Arc::downgrade(self), zone, timer));
+        }
+    }
+
+    /// Report a refusal to `on_refused`, and an op not placed, once, to
+    /// `on_unplaced`; and tell the op's waiter.
+    async fn report(&self, answered: Answered<Waiter>) {
         let op = answered.op.clone();
         match &answered.outcome {
             OpOutcome::Refused { code, message } => {
@@ -204,10 +214,6 @@ impl Inner {
             _ => {}
         }
         tell(answered);
-        let zone = zone_of(&op);
-        if let Some(timer) = self.answers.lock().await.start_resending(&zone) {
-            tokio::spawn(resend_loop(Arc::downgrade(self), zone, timer));
-        }
     }
 
     /// Subscribes whose replay is in (R7). Before each returns, its zone's
@@ -254,7 +260,8 @@ impl Inner {
     }
 
     /// Send ops in one frame, each kept by its hash, with its waiter, until its
-    /// status comes (R1).
+    /// status comes (R1). One behind an op of its chain not placed is held,
+    /// to go after that op when it is sent again (F6).
     async fn ship(&self, ops: Vec<generated::Op>, waiters: Vec<Option<Waiter>>) -> io::Result<()> {
         for op in &ops {
             require_op(op.shape, &op.payload, "send_ops")?;
@@ -262,15 +269,21 @@ impl Inner {
         if self.writer.lock().await.is_none() {
             return Err(not_connected());
         }
-        {
-            let mut answers = self.answers.lock().await;
-            for (op, waiter) in ops.iter().zip(waiters) {
-                if let Some(gone) = answers.sent(op.clone(), waiter) {
-                    tell(gone);
-                }
-            }
+        let (ops, due) = self.answers.lock().await.to_send(ops, waiters);
+        self.put(ops, due).await
+    }
+
+    /// Give the answers `to_send` found due at once, and send the ops it let
+    /// go now, if any, in one frame.
+    async fn put(&self, ops: Vec<generated::Op>, due: Vec<Answered<Waiter>>) -> io::Result<()> {
+        for answered in due {
+            self.report(answered).await;
         }
-        self.send(frame(FrameType::Ops, Ops { ops, pri: None }.to_cbor())).await
+        if ops.is_empty() {
+            return Ok(());
+        }
+        let bytes = frame(FrameType::Ops, Ops { ops, pri: None }.to_cbor());
+        self.send(bytes).await
     }
 
     async fn send(&self, bytes: Vec<u8>) -> io::Result<()> {
@@ -448,6 +461,8 @@ impl GladeClient {
     /// if the connection ends first. A node from before the client-writes
     /// plan's Phase 2 sends no status, so against one this waits until the
     /// connection ends, or until later sends pass the bound on those kept.
+    /// An op held behind one of its chain not placed is `NotPlaced` at once,
+    /// with no answer from the node: it goes after that op (F6).
     pub async fn append_outcome(&self, share: &str, glade_id: &str, shape: &str, payload: Vec<u8>, key: Option<&[u8]>) -> io::Result<(generated::Op, OpOutcome)> {
         let (tx, rx) = oneshot::channel();
         let op = self.append_op(share, glade_id, shape, payload, key, Some(tx)).await?;
@@ -463,17 +478,16 @@ impl GladeClient {
             return Err(not_connected());
         }
         let k = key.map(|k| k.to_vec()).unwrap_or_default();
-        let op = {
+        let (op, ops, due) = {
             // Kept under the session's lock, so a status is never applied
             // between the op's making and its keeping.
             let mut session = self.inner.session.lock().await;
             let op = session.append(share, glade_id, shape, payload, k)?;
-            if let Some(gone) = self.inner.answers.lock().await.sent(op.clone(), waiter) {
-                tell(gone);
-            }
-            op
+            let mut answers = self.inner.answers.lock().await;
+            let (ops, due) = answers.to_send(vec![op.clone()], vec![waiter]);
+            (op, ops, due)
         };
-        self.inner.send(frame(FrameType::Ops, Ops { ops: vec![op.clone()], pri: None }.to_cbor())).await?;
+        self.inner.put(ops, due).await?;
         Ok(op)
     }
 
@@ -483,7 +497,8 @@ impl GladeClient {
         self.inner.ship(ops, waiters).await
     }
 
-    /// `send_ops`, then the node's answer to each op, in the order given.
+    /// `send_ops`, then the node's answer to each op, in the order given; for
+    /// an op held behind one of its chain not placed, `NotPlaced` (F6).
     pub async fn send_ops_outcome(&self, ops: Vec<generated::Op>) -> io::Result<Vec<OpOutcome>> {
         let (waiters, answers): (Vec<_>, Vec<_>) = ops
             .iter()
@@ -511,6 +526,9 @@ impl GladeClient {
 
     /// A fresh receiver for this client's ops the node could not place (W5),
     /// each told once: the client keeps it and its chain, and sends them again.
+    /// An op held behind one of them, or refused as a gap past one, is told
+    /// too (F6); all come as `UnknownShare`, with the node's or the client's
+    /// reason.
     pub async fn on_unplaced(&self) -> mpsc::UnboundedReceiver<OpStatus> {
         let (tx, rx) = mpsc::unbounded_channel();
         self.inner.unplaced_senders.lock().await.push(tx);
@@ -554,6 +572,13 @@ impl GladeClient {
         let (tx, rx) = mpsc::unbounded_channel();
         self.inner.drop_senders.lock().await.push(tx);
         rx
+    }
+
+    /// Whether a refusal stopped this client's chain in the zone (answer 4):
+    /// its appends fail until a subscribe of the zone resumes it.
+    pub(crate) async fn stopped(&self, share: &str, glade_id: &str, key: Option<&[u8]>) -> bool {
+        let session = self.inner.session.lock().await;
+        session.stopped(share, glade_id, key.unwrap_or(&[]))
     }
 
     /// Fold a bound value surface (lww) over what this session has seen.

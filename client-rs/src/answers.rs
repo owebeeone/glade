@@ -3,12 +3,14 @@
 //! status names it by `corr`, never by its place among other frames. `Ok` and
 //! `Retention` settle it; `UnknownShare` leaves it not placed, kept to be sent
 //! again, zone by zone (W5); any other code refuses it, and the session drops it
-//! with the rest of its chain (answer 4). A subscribe waits for its ack, which
-//! names its zone and each origin's head there, or names none for a refusal
-//! whose reason follows (R6); then for its replay, which is in once the
-//! connection has received, or sent and had answered `Ok`, an op at or above
-//! each head (R7). Pure: no socket and no clock (LBT-008). `client.rs` feeds it
-//! the frames and tells the waiters it hands back.
+//! with the rest of its chain (answer 4). No op goes past an op of its chain not
+//! placed, and a gap refusal past one is not placed either (F6). A subscribe
+//! waits for its ack, which names its zone and each origin's head there, or
+//! names none for a refusal whose reason follows (R6); then for its replay,
+//! which is in once the connection has received, or sent and had answered
+//! `Ok`, an op at or above each head (R7). Pure: no socket and no clock
+//! (LBT-008). `client.rs` feeds it the frames and tells the waiters it hands
+//! back.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
@@ -39,7 +41,9 @@ pub enum OpOutcome {
     /// not refused: nothing is dropped, and the chain goes on.
     Retained,
     /// `UnknownShare`: not placed (W5). The client keeps the op and its chain,
-    /// and sends them again.
+    /// and sends them again. So too a `Protocol` gap past an op of its chain
+    /// not placed, and an op held back behind one, which the node never saw
+    /// (F6).
     NotPlaced { message: String },
     /// Any other code. An op the session made is dropped with the later ops
     /// of its chain, which waits for a subscribe of its zone (answer 4).
@@ -74,7 +78,8 @@ struct Sent<W> {
 }
 
 /// The sends not yet answered, oldest first; and (W5) the ops not placed, in
-/// the order their statuses came, with each zone's resend count and timer.
+/// the order they were found so, held ones (F6) with them, with each zone's
+/// resend count and timer.
 pub struct Answers<W> {
     waiting: VecDeque<Sent<W>>,
     bound: usize,
@@ -94,6 +99,42 @@ impl<W> Answers<W> {
     /// How many sends wait for a status.
     pub fn waiting(&self) -> usize {
         self.waiting.len()
+    }
+
+    /// Of ops to send, in order, those to put on the wire now, each kept by
+    /// its hash until its status comes (R1); and the answers due at once:
+    /// `Unknown` to a send let go past the bound, `NotPlaced` to an op held.
+    /// F6: no op goes past an op of its chain not placed and not yet sent
+    /// again. It is held with that op, not placed, and goes after it, in
+    /// order, when that op is sent again (`unplaced_in`).
+    pub fn to_send(
+        &mut self,
+        ops: Vec<Op>,
+        waiters: Vec<Option<W>>,
+    ) -> (Vec<Op>, Vec<Answered<W>>) {
+        let mut now = Vec::new();
+        let mut answered = Vec::new();
+        for (op, waiter) in ops.into_iter().zip(waiters) {
+            let before = self.unplaced_before(&op).find(|kept| !self.in_flight(kept));
+            if let Some(seq) = before.map(|kept| kept.seq) {
+                let newly_unplaced = !self.unplaced.contains(&op);
+                if newly_unplaced {
+                    self.unplaced.push(op.clone());
+                }
+                let message = format!("not sent: seq {seq} of its chain is not placed");
+                let outcome = OpOutcome::NotPlaced { message };
+                answered.push(Answered {
+                    op,
+                    outcome,
+                    waiter,
+                    newly_unplaced,
+                });
+                continue;
+            }
+            answered.extend(self.sent(op.clone(), waiter));
+            now.push(op);
+        }
+        (now, answered)
     }
 
     /// Keep a sent op until its status comes. Past the bound the oldest send
@@ -120,6 +161,12 @@ impl<W> Answers<W> {
             ErrorCode::Ok => OpOutcome::Accepted,
             ErrorCode::Retention => OpOutcome::Retained,
             ErrorCode::UnknownShare => OpOutcome::NotPlaced { message },
+            // F6: a gap past an op of its chain not placed is not placed
+            // either. The client knows it by its place: any other `Protocol`
+            // comes again when the ops go again, in order, and is refused then.
+            ErrorCode::Protocol if self.unplaced_before(&op).next().is_some() => {
+                OpOutcome::NotPlaced { message }
+            }
             code => OpOutcome::Refused { code, message },
         };
         let mut newly_unplaced = false;
@@ -162,7 +209,7 @@ impl<W> Answers<W> {
         let mut ops: Vec<Op> = self
             .unplaced
             .iter()
-            .filter(|op| in_zone(op, zone) && !self.waiting.iter().any(|sent| sent.op == **op))
+            .filter(|op| in_zone(op, zone) && !self.in_flight(op))
             .cloned()
             .collect();
         ops.sort_by(|a, b| a.origin.cmp(&b.origin).then(a.seq.cmp(&b.seq)));
@@ -195,6 +242,17 @@ impl<W> Answers<W> {
             return None;
         }
         Some(self.unplaced_in(zone))
+    }
+
+    /// F6: the ops of `op`'s chain before it that are not placed.
+    fn unplaced_before<'a>(&'a self, op: &'a Op) -> impl Iterator<Item = &'a Op> {
+        let before = move |kept: &&Op| same_chain(kept, op) && kept.seq < op.seq;
+        self.unplaced.iter().filter(before)
+    }
+
+    /// Sent, and waiting for its status.
+    fn in_flight(&self, op: &Op) -> bool {
+        self.waiting.iter().any(|sent| sent.op == *op)
     }
 }
 
@@ -573,6 +631,146 @@ mod tests {
         assert!(session.append("s", "g", Shape::Value, vec![9], vec![]).is_err(), "the chain waits for a subscribe");
         answers.ended();
         assert!(answers.unplaced_in(&zone()).is_empty(), "a dropped op is never sent again");
+    }
+
+    // ---- F6: never past an unplaced op of the same chain ------------------
+
+    #[test]
+    fn a_gap_past_an_unplaced_op_is_not_placed() {
+        let mut session = Session::new("w");
+        let mut answers = Answers::new(WAITING_BOUND);
+        let ops = three(&mut session, &mut answers);
+        answers
+            .status(&mut session, &status(&ops[0], ErrorCode::UnknownShare))
+            .unwrap();
+
+        // Ops 1 and 2 went out before the client knew, and met the gap op 0
+        // left. By their place, they are not placed either.
+        let gap = answers
+            .status(&mut session, &status(&ops[1], ErrorCode::Protocol))
+            .unwrap();
+        let said = OpOutcome::NotPlaced {
+            message: "Protocol".into(),
+        };
+        let got = (gap.outcome, gap.waiter, gap.newly_unplaced);
+        assert_eq!(
+            got,
+            (said, Some(1), true),
+            "a gap past an unplaced op is no refusal"
+        );
+        answers
+            .status(&mut session, &status(&ops[2], ErrorCode::Protocol))
+            .unwrap();
+        // Another chain's `Protocol` in the zone is still a refusal.
+        let theirs = Session::new("v")
+            .append("s", "g", Shape::Value, vec![9], vec![])
+            .unwrap();
+        answers.sent(theirs.clone(), None);
+        let other = answers
+            .status(&mut session, &status(&theirs, ErrorCode::Protocol))
+            .unwrap();
+        assert!(
+            matches!(other.outcome, OpOutcome::Refused { .. }),
+            "{other:?}"
+        );
+        // Answer 4 does not apply: the session keeps the chain, and all three
+        // go again, in order.
+        assert_eq!(session.fold_value("s", "g", &[]), Some(vec![2]));
+        assert_eq!(answers.unplaced_in(&zone()), ops);
+
+        // Sent again, op 0 is placed. Op 1's `Protocol` then follows no op not
+        // placed: a real conflict, which answer 4 drops with its tail.
+        for op in answers.unplaced_in(&zone()) {
+            answers.sent(op, None);
+        }
+        answers
+            .status(&mut session, &status(&ops[0], ErrorCode::Ok))
+            .unwrap();
+        let refused = answers
+            .status(&mut session, &status(&ops[1], ErrorCode::Protocol))
+            .unwrap();
+        let protocol = matches!(
+            refused.outcome,
+            OpOutcome::Refused {
+                code: ErrorCode::Protocol,
+                ..
+            }
+        );
+        assert!(protocol, "{refused:?}");
+        assert_eq!(
+            session.fold_value("s", "g", &[]),
+            Some(vec![0]),
+            "the refused op and its tail are dropped"
+        );
+        answers.ended();
+        assert!(
+            answers.unplaced_in(&zone()).is_empty(),
+            "a dropped op is never sent again"
+        );
+    }
+
+    #[test]
+    fn no_op_goes_past_an_unplaced_op_of_its_chain() {
+        let mut session = Session::new("w");
+        let mut answers = Answers::new(WAITING_BOUND);
+        let append = |session: &mut Session, glade_id: &str, i: u8| {
+            session
+                .append("s", glade_id, Shape::Value, vec![i], vec![])
+                .unwrap()
+        };
+        let first = append(&mut session, "g", 0);
+        assert_eq!(
+            answers.to_send(vec![first.clone()], vec![Some(0)]).0,
+            vec![first.clone()]
+        );
+        answers
+            .status(&mut session, &status(&first, ErrorCode::UnknownShare))
+            .unwrap();
+
+        // While op 0 is not placed, a later op of its chain is held, not sent.
+        // Its waiter hears it is not placed, and it is told once.
+        let later = append(&mut session, "g", 1);
+        let (now, told) = answers.to_send(vec![later.clone()], vec![Some(1)]);
+        assert!(
+            now.is_empty(),
+            "no op goes past an unplaced op of its chain: {now:?}"
+        );
+        let held = OpOutcome::NotPlaced {
+            message: "not sent: seq 0 of its chain is not placed".into(),
+        };
+        let told: Vec<_> = told
+            .into_iter()
+            .map(|a| (a.op, a.outcome, a.waiter, a.newly_unplaced))
+            .collect();
+        assert_eq!(told, vec![(later.clone(), held, Some(1), true)]);
+        // Another chain goes at once: another zone, or another origin here.
+        let elsewhere = append(&mut session, "h", 2);
+        let theirs = append(&mut Session::new("v"), "g", 3);
+        let (now, _) = answers.to_send(vec![elsewhere.clone(), theirs.clone()], vec![None, None]);
+        assert_eq!(now, vec![elsewhere, theirs]);
+
+        // Sent again, op 0 goes first, and the held op after it.
+        let again = answers.unplaced_in(&zone());
+        assert_eq!(again, vec![first.clone(), later.clone()]);
+        assert_eq!(
+            answers.to_send(again, vec![None, None]).0,
+            vec![first.clone(), later]
+        );
+        // With op 0 sent again, sending has resumed: the next op goes at once.
+        let next = append(&mut session, "g", 4);
+        assert_eq!(
+            answers.to_send(vec![next.clone()], vec![None]).0,
+            vec![next]
+        );
+        // Not placed once more, op 0 holds its chain back again.
+        answers
+            .status(&mut session, &status(&first, ErrorCode::UnknownShare))
+            .unwrap();
+        let last = append(&mut session, "g", 5);
+        assert!(
+            answers.to_send(vec![last], vec![None]).0.is_empty(),
+            "held again"
+        );
     }
 
     #[test]

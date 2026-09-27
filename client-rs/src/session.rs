@@ -212,6 +212,13 @@ impl Session {
         self.unresumed.remove(&Store::chain_key(share, glade_id, key, &self.origin));
     }
 
+    /// Whether a refusal stopped this origin's chain in the zone, until it is
+    /// resumed (answer 4).
+    pub fn stopped(&self, share: &str, glade_id: &str, key: &[u8]) -> bool {
+        let chain = Store::chain_key(share, glade_id, key, &self.origin);
+        self.unresumed.contains_key(&chain)
+    }
+
     /// Apply ops received from the node; advance the lamport clock.
     pub fn apply_remote(&mut self, ops: &[Op]) -> io::Result<()> {
         // Preflight the whole batch: rejection is atomic with respect to store

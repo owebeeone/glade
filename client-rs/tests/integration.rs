@@ -14,6 +14,8 @@
 //!   5. the subscribe outcome (Step 3.2): the node's heads come back, a
 //!      subscribe returns with its replay folded and resumes a refused chain,
 //!      and one fails on a frame the session cannot take.
+//!   6. the follow-ups ruled 2026-09-27: a `ShareController` whose chain a
+//!      refusal stopped subscribes its surface again by itself (F7).
 //!
 //! Requires the node binary; the harness builds it once if absent.
 
@@ -520,5 +522,58 @@ async fn a_replay_the_session_cannot_take_fails_its_subscribe() {
     assert_eq!(subscribed.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
 
     reader.close().await;
+    node.kill().await.ok();
+}
+
+// ---- 6. follow-ups ruled 2026-09-27 ----------------------------------------
+
+/// F7: a `ShareController` surface whose chain a refusal stopped subscribes
+/// again by itself, so its next write goes to the node instead of failing on
+/// the stopped chain. Another client makes the zone a `crdt` one, so the node
+/// refuses each of the supplier's value ops as a shape conflict.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_share_controller_resubscribes_a_chain_a_refusal_stopped() {
+    let tmp = Tmp::new("resubscribes");
+    let (mut node, port) = spawn_legacy(&tmp.path().join("store"), 0).await;
+    let url = format!("ws://127.0.0.1:{port}");
+    let other = GladeClient::new("other");
+    other.connect(&url).await.unwrap();
+    let crdt = other.append_outcome("ws-app", "ws.state", "crdt", b"c".to_vec(), None);
+    assert_eq!(
+        within(crdt).await.unwrap().1,
+        OpOutcome::Accepted,
+        "the zone is a crdt one"
+    );
+
+    let client = GladeClient::new("sup");
+    client.connect(&url).await.unwrap();
+    let mut refusals = client.on_refused().await;
+    let sup = Supplier::attach(client.clone(), SupplierConfig::default());
+    let surface = SupplierSurface::new("ws-app", "ws.state", "value");
+    let state = sup.serve_share(surface, |_| {}).await.unwrap();
+    state.set(b"v0".to_vec()).await.unwrap();
+    let first = within(refusals.recv()).await.expect("a refusal");
+    assert_eq!(
+        (first.code, first.op.payload),
+        (ErrorCode::Protocol, b"v0".to_vec())
+    );
+
+    // The refusal stopped the chain. The controller subscribes again, and the
+    // next write goes to the node, which answers it on its merits.
+    let next = within(state.set(b"v1".to_vec())).await;
+    assert!(
+        next.is_ok(),
+        "the next write must not be lost to the stopped chain, got {next:?}"
+    );
+    let second = within(refusals.recv())
+        .await
+        .expect("the node's answer to the next write");
+    assert_eq!(
+        (second.code, second.op.payload),
+        (ErrorCode::Protocol, b"v1".to_vec())
+    );
+
+    sup.detach_all().await;
+    other.close().await;
     node.kill().await.ok();
 }
