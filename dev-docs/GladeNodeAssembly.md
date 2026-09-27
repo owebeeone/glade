@@ -6694,3 +6694,753 @@ section 10 expected.
   instances, both keys, the configuration and id files, the logs and the
   builds. The rest of `scratch/`, and both glade checkouts, clean at
   `4a34168`, are as they were.
+
+## The mesh on the carrier port (plan Step 4.5b)
+
+Design addition, 2026-09-27, written before any code against glade `71b9f0b` (F5; glade-wz
+root `efafed9`). A document only: nothing was changed, built or run. The red runs and the
+measured figures are filled in as each part is built.
+
+The spec is plan Step 4.5b (`dev-docs/GladeFirstSlicePlan.md:895-909` at the glade-wz root) and
+these rulings:
+
+- The owner, 2026-09-25, on 4.2c (plan `:782`; this note's 4.2c questions, `:3647-3665`): the mesh
+  moves onto the carrier port in a step of its own, after 4.5 and before 4.6, so that 4.6's journeys
+  run over the carrier the node keeps; the adapter keeps its ALPN, `glade/carrier/1`, and its first
+  word, `gcl1`; the wait for the first word gets a bound here, where the adapter first faces other
+  machines.
+- 4.2c's question 1 (`:3649-3656`) names what the move needs: HELLO's exporter bytes (D6) through
+  the port, or a session-level replacement for them; the door's hook on the adapter's endpoint; the
+  sync driver on a link's frames; 4.5's bind address and relay mode; both roots lending the adapter
+  the node's endpoint key.
+- 4.5c's ruled design (`GladeDirectoryCheckpoints.md:700-705`): once the mesh rides
+  `glade/carrier/1`, HELLO's `protocol` check (`peer.rs:174-176`) is the only version gate, and 4.5c's
+  move to `PROTOCOL` 4 rides it. This step must keep that gate working.
+- `GladeNodeSigning.md` D6 and D7 (`:212-264`), ruled as recommended: HELLO signs a transcript bound
+  to the TLS session, under `glade/v1/peer-hello\0`.
+- The standing rules: no process globals (glade's `AGENTS.md`); nothing listens beyond loopback by
+  default, or reaches a network the owner has not configured (4.5, section 1).
+
+Paths: `node/src/…` is `glade/node/src/…`, with line numbers at `71b9f0b`, and `dev-docs/…` alone
+is the glade-wz root's. Every node file cited but `mesh.rs` is as it was at `e27cb71`; F5 moved
+`mesh.rs`, and the node lane's next steps may move it again before this one is built.
+
+Nothing changes in the wire IR, in the node's own IR or in the dependencies: no crate is added and
+no `Cargo.lock` line moves. The carrier contract gains one method.
+
+### Summary
+
+**The recommendation.**
+
+- **One carrier link per peer**, the link 4.2c's adapter makes: one QUIC connection with one stream,
+  opened by `gcl1`. HELLO is its first frame each way. After HELLO the mesh carries on it every
+  exchange it now gives a QUIC stream of its own (the two pulls, each push, each forwarded interest
+  and exchange, each pull on a gap), each as a conversation: frames under a 5-byte header, ended as
+  a QUIC stream is. One writer task is the link's only sender and one reader task its only receiver,
+  so a cancelled conversation never tears a frame (sections 2 and 3).
+- **HELLO through the port.** `CarrierLink` gains `channel_binding(label)`: 32 bytes both ends of the
+  link's transport session export under `label`, and no other session does, or `None`. HELLO asks for
+  `glade/v1/peer-hello`, the label it exports under today, so D6's transcript is unchanged, byte for
+  byte. CA-006 pins the method (section 4).
+- **The version gate.** `glade/node/3` retires: the endpoint offers `glade/carrier/1` alone. `PROTOCOL`
+  stays 3, and from here HELLO's number is the node protocol's only gate, which 4.5c moves to 4 as
+  ruled. A node of 4.5 or older fails at the TLS handshake, whichever end dials, before the door or
+  HELLO (section 5).
+- **The door** is the adapter's endpoint hook, lent by the root with the key; HELLO's half runs on
+  the link, in the mesh. A refused dialer learns no reason (section 6).
+- **The first word** is awaited 10 s at most, from the connection's arrival to its fourth byte. At
+  expiry the attempt is closed with code 0 and no reason, the door reports it, and the port accepts
+  the next. HELLO gets a 10 s bound of its own and leaves the accept loop (section 7).
+- **The sync driver** runs the same exchanges with the same meaning: pulls, pushes, pull on a gap,
+  forwards, exchanges, D9, the grant check, the rounds and 4.5's `link` and `home round` notes.
+  Frames are at most 16 MiB, and every serve path chunks (section 8).
+- **4.5's configuration** reaches the adapter as values the root lends it (the key, the door, the
+  relays) and the sockets `bind` is given; a dial names every address its entry names. The release
+  wait keeps probing the port's own sockets, beyond loopback too (section 9).
+- **Both roots** build one adapter from the booted instance. The assembled root lends that adapter
+  to the module's peer role, binds it in `PeerCarrier` and releases it with the port's `close`;
+  `EndpointSlot` retires. No value comes from a process global (section 10).
+- **What retires:** `PeerEndpoint`, `PeerLink`, `EndpointSlot`, the ALPN `glade/node/3`, the stream
+  HELLO and the hand-written `u32` writers. **Nothing stays for compatibility** on the wire. The async
+  witness, which builds on `PeerEndpoint`, is frozen at the last revision that has it (section 11).
+- **The desk** sees nothing but ports (section 12).
+
+**The split** (section 14), each part gated, replayed on a stand-in of the desk and landed through
+gwz, then 4.5's crossing again:
+
+| Part | What | Production | Tests |
+| --- | --- | --- | --- |
+| 1 | The port's half: `channel_binding` and CA-006; the adapter lent a door and relays, bound on the sockets it is given, dialing every address; the first word's bound; the notes port | ~270 | ~300 |
+| 2 | The link's conversations and HELLO on a link, as a library | ~280 | ~300 |
+| 3 | The move: the mesh and the exchanges on conversations; both roots lend and bind the adapter | ~+350/−330 | ~+350/−150 |
+| 4 | The retirement: `PeerEndpoint`, the stream HELLO, their tests | ~+20/−330 | ~−250 |
+
+Parts 1, 2 and 4 change nothing a running node does; part 3 does.
+
+**Questions for the owner**, at the end, each with a recommendation:
+
+1. One link per peer, the node's conversations on it.
+2. `channel_binding(label)` in the carrier contract, with CA-006.
+3. `glade/node/3` retires, `PROTOCOL` stays 3, and no compatibility window.
+4. The first word's bound: 10 s over the whole attempt, reported; HELLO's own, off the accept loop.
+5. The path and relay notes through a node-local port, not the contract.
+6. Frames of at most 16 MiB; chunks of 64 ops or 1 MiB.
+7. The release wait keeps probing the port's own sockets beyond loopback.
+8. One adapter per node, lent to the module and bound by `PeerCarrier`.
+9. What retires; the library's sync driver stays; the async witness is frozen.
+10. Four parts, then the crossing.
+
+### 1. What the mesh does on QUIC today
+
+The mesh keeps each peer's iroh `Connection` (`mesh.rs:80`) and gives each exchange a QUIC stream
+of its own:
+
+| Exchange | Opened by | Today | Ended by |
+| --- | --- | --- | --- |
+| HELLO | the dialer | stream 0's first two frames (`iroh_carrier.rs:376-397`, `peer.rs:200-268`) | the WELCOME, or the stream dropped |
+| the dialer's pull | the dialer | stream 0 after HELLO; the acceptor serves it (`mesh.rs:358-367`) | the acceptor finishing the stream, "close = gap complete" (`mesh.rs:734`) |
+| the acceptor's pull | the acceptor | a stream it opens (`mesh.rs:368`) | the same |
+| a push | the minting node | a stream per push per link, one `Ops` frame (`mesh.rs:482-498`) | a finish |
+| a forwarded interest | the forwarding node | `Subscribe`, then the ack, the gap and live ops (`mesh.rs:658-703`, `:513-587`); since F5 a refusal too | the forwarder's close, or the holder's finish |
+| a forwarded exchange or `workspace.create` | the requesting node | `ExchangeReq`, then `ExchangeRes` (`exchange.rs:219-235`, `:243-268`) | a finish |
+| a pull on a gap | the receiver of a refused push | `Heads`, then the gap (`mesh.rs:913-923`) | a finish |
+
+Every inbound stream is dispatched by its first frame (`mesh.rs:344-354`, `:438-472`). The framing
+is the node's own `u32` length prefix (`peer.rs:45-63`), written by hand twice more
+(`mesh.rs:546-547`, `exchange.rs:264-266`), with no limit on a frame's length. QUIC gives each stream
+its own flow control, at most 100 open bidirectional streams a connection (noq-proto 1.3.0, the
+version in the node's lock, `src/config/transport.rs:557`), and a reset when a stream's handle drops
+unfinished.
+
+The port offers less: one ordered duplex of frames per link, each at most `max_frame_bytes`, ended as
+a whole (`contracts/carrier-api/src/lib.rs:130-171`; below, `carrier-api/src/lib.rs`). "An adapter
+MAY carry many links over one transport connection; this port promises nothing about reuse"
+(`:115-116`). 4.2c's adapter makes each link one QUIC connection with one stream (this note,
+`:3524-3530`; `iroh_carrier.rs:550-590`).
+
+### 2. The unit of a link (question 1)
+
+- **(a) One link per peer, conversations on it. Recommended.** The link the dialer dials and HELLO
+  proves carries every exchange between the two nodes, each a conversation (section 3). The adapter
+  stays as 4.2c built it and the owner ruled it: one connection, one stream, `gcl1`, and no task of
+  its own. HELLO runs once per link, as it runs once per connection today, and every frame on the
+  link is from the node it proved. The cost: the conversations share one stream's flow control, so
+  a conversation that reads slowly slows its link; and the node carries a small multiplexer, about
+  240 lines.
+- **(b) A link per conversation, the adapter carrying a peer's links on one connection.** Each QUIC
+  stream is a link, as `dev-docs/IrohGladeMapping.md` leans ("one stream per `(share, glade_id, key)`
+  interest or sync round", `:382-384`; per-stream flow control, `:125`), and as the contract allows.
+  The exchanges keep QUIC's per-stream flow control and need no multiplexer. But:
+  - the adapter becomes a connection manager: live connections by endpoint id, a `dial` of a bare id
+    onto a live connection, an `accept` of new streams on every connection as well as of new
+    connections (which needs tasks, or a hand-polled set of futures), and a link's close that leaves
+    its connection up;
+  - an acceptor reaches an admit-only peer only through such a live connection, so the mesh would
+    rest on reuse the contract does not promise, and the contract would have to promise it, with a
+    probe;
+  - HELLO would run once per connection, and every later link be taken as that node's by an equal
+    channel binding: a new trust rule, sound over TLS, but new;
+  - it changes the link 4.2c built and the owner ruled.
+- **(c) A link per conversation, each its own connection.** Every push and pull would pay a TLS
+  handshake and a HELLO, about 1.5 s through a relay (the crossing, `:6530-6532`), and an acceptor
+  could not reach an admit-only peer at all. Rejected.
+- **(d) Sub-streams in the contract** (a `CarrierLink` that opens and accepts streams). (b)'s session,
+  moved into every carrier's contract, the WebSocket one's included. Larger than the slice needs.
+
+What decides it for the slice: the substrate already runs the client path as one lane of size-capped
+frames, and calls a second lane "a transport change with no protocol change"
+(`GladeSubstrateV1.md:236-251`); two nodes of the slice exchange a few hundred records and a few
+forwarded zones; and (a) leaves the ruled adapter as it is and touches the contract only for HELLO's
+binding. The mesh speaks only through conversations (section 3), so (b) stays open as a later change
+of the layer beneath them, under a new HELLO number, with no change to the sync driver.
+
+### 3. Conversations on a link
+
+**The header.** After HELLO, every frame on the link begins:
+
+| Bytes | Field |
+| --- | --- |
+| 0-3 | the conversation, a `u32` little-endian: odd from the link's dialer, even from its acceptor, never 0 |
+| 4 | what follows: `0` a frame, `1` END, `2` RESET |
+| 5 on | with `0`, one `Frame` as `frame.rs` encodes it: its type byte, then its CBOR |
+
+- HELLO is the link's first frame each way, a bare `Frame` with no header (section 4).
+- A conversation is opened by its first frame. The peer's handler is chosen by that frame, as a
+  stream's is today: `Heads` a pull to serve, `Subscribe` a forwarded interest, `ExchangeReq` a
+  forwarded exchange, `Ops` a push (`mesh.rs:438-472`).
+- END says its sender sends nothing more on the conversation: QUIC's finish, on which every "close =
+  gap complete" rests (`mesh.rs:734`). Its receiver reads the end as `UnexpectedEof`, as now.
+- RESET is sent for a conversation dropped before its END, as QUIC resets a stream dropped
+  unfinished. Its receiver reads an error, so a pull cut short is not a completed round.
+- The link's end ends every open conversation with an error, never with a clean end.
+- A conversation's number is never used twice on one link. A frame for a conversation this end has
+  ended, or for a number of this end's parity it never opened, is dropped.
+
+**Two tasks per link.**
+
+- **The writer** is the link's only caller of `CarrierLink::send`. Conversations queue their frames
+  to it, first in first out, and never wait for the network. So a conversation cancelled at any
+  await point never leaves a frame torn, which would end the link for every conversation on it
+  (`iroh_carrier.rs:825-829`). Today the served subscription's writer is aborted mid-write when its
+  peer leaves (`mesh.rs:585`); writing to the link itself, that abort would end the peer's whole link.
+- **The reader** is the link's only caller of `recv`. It reads the header, puts the rest in its
+  conversation's queue, and starts a handler task for each conversation the peer opens. It decodes no
+  `Frame`: a frame that panics the decoder (F12's shape value) ends that conversation's task, as it
+  ends one stream's task today, not the link. A frame too short for its header ends the link.
+- The reader also keeps the link's watch (section 8): the path every 250 ms, and at the link's end
+  the unlink and the `link … closed` note.
+
+**Bounds.**
+
+- Each conversation's queue holds 16 frames. When one is full the reader waits, and the carrier's
+  flow control holds the peer back: a slow conversation slows its own link and no other. The frames
+  of a conversation whose handler has let go of it (dropped its receiving half) are dropped.
+- At most 100 conversations the peer opened are open at once, QUIC's default above; a further one is
+  reset at once.
+- The writer's queue is unbounded, as each session's outbound queue already is (`mesh.rs:535`).
+
+**Why the reader cannot wait for ever.** It waits only on a full queue whose handler is running. No
+handler waits for the writer, since it only queues, and none holds a node lock (`cut`, `store`,
+`links`) across a receive: `pull_home` and `run_forward` take them per op, in `ingest_and_fanout`
+(`mesh.rs:1003-1026`), and `serve_home` collects its gap under the store lock and sends after
+(`mesh.rs:717-730`). So every full queue drains. Every later handler must keep that rule, and the
+module's documentation states it.
+
+**The shape**, in a new, carrier-free module, `node/src/conversation.rs` (it names `CarrierLink` and
+`Frame`, and no iroh type):
+
+```rust
+/// One HELLO'd carrier link and its conversations (plan Step 4.5b).
+pub(crate) struct Linked { /* the link, its node, its writer's queue, its open conversations */ }
+
+impl Linked {
+    /// Start the link's writer and reader; each conversation the peer opens
+    /// goes to a handler the caller supplies.
+    pub(crate) fn start(
+        link: Arc<dyn CarrierLink>,
+        node: [u8; 32],
+        dialed: bool, /* the handler, the tasks, the limits */
+    ) -> Arc<Linked>;
+    /// A new conversation of this end's.
+    pub(crate) fn open(self: &Arc<Self>) -> Conversation;
+    /// End the link from anywhere, never waiting: its writer closes it.
+    pub(crate) fn end(&self);
+}
+
+impl Conversation {
+    /// Queue `frame` for the writer; a frame over the link's limit is refused here.
+    pub(crate) fn send(&self, frame: &Frame) -> io::Result<()>;
+    /// The next frame; `UnexpectedEof` at its END.
+    pub(crate) async fn recv(&mut self) -> io::Result<Frame>;
+    /// END. Dropped before it, the conversation is reset.
+    pub(crate) fn end(self);
+}
+```
+
+### 4. HELLO through the port (question 2)
+
+D6 signs `{1: protocol, 2: role, 3: node id, 4: dialer endpoint id, 5: acceptor endpoint id, 6:
+exported bytes}` (`peer.rs:111-138`), the bytes being 32 exported from the connection's TLS session
+under `glade/v1/peer-hello` (`iroh_carrier.rs:63-78`). Through the port the mesh has the far end's
+endpoint id, `remote_id()`, and its own, from the key the root lends the adapter. It lacks the
+exported bytes: no port method gives them (4.2b's gap for later, `:3178-3180`).
+
+- **(a) An accessor. Recommended.** `CarrierLink::channel_binding(&self, label: &[u8]) ->
+  Option<ChannelBinding>`, with `ChannelBinding(pub [u8; 32])`: the bytes both ends of the link's
+  transport session derive under `label` (TLS's exporter, RFC 8446 §7.5, as RFC 9266 uses it for a
+  channel binding), which no other session derives; `None` from a transport with no session secret,
+  as the WebSocket client carrier will be. Links an adapter carries over one session share them, and
+  that is what binds a HELLO to its session. HELLO asks for `glade/v1/peer-hello`, so field 6, and
+  D6, stay as they are. The iroh adapter answers with the connection's `export_keying_material`
+  (iroh 1.2.0 `src/endpoint/connection.rs:1085`), while the link lives.
+- (b) The same accessor with no label, RFC 9266's fixed one. Simpler to state; field 6 then changes
+  its label, a D6 detail, and every later use of an exporter shares one value.
+- (c) A nonce each way before HELLO, as bare frames below the IR. No contract change, but one more
+  round trip before HELLO, about 430 ms through a relay (`:6533-6536`); D6 weighed a challenge as its
+  option (c) and set it aside.
+- (d) No binding. The transcript keeps both endpoint ids, so a relay through a third party still
+  fails; but a HELLO recorded on one connection would verify on the next between the same two
+  endpoints, and whoever holds a node's `endpoint.key` could speak for the node without its
+  `node.key`, which 4.2's two keys exist to prevent. Rejected.
+- (e) HELLO in the adapter. The contract says a carrier authenticates no node
+  (`carrier-api/src/lib.rs:132-135`). Rejected.
+
+**The contract's change**, for (a): one required method, as `remote_id` was (4.2b), and its name in
+`CarrierLink`'s row of `glade/contracts/architecture-policy.json:43`, for the owner's review as that
+file's earlier changes were. CA-006 (section 13) runs on the contract's fixture, the node's fake
+network, the journeys' faulty link (a keyed checksum over a per-link token and the label, never
+cryptography) and iroh. No type crosses the port but bytes (LBT-004).
+
+**HELLO on a link**, both roles, as `peer.rs` does it on a stream today (`peer.rs:200-268`):
+
+- the dialer's first frame is `NodeHello` and the acceptor's `NodeWelcome`, bare;
+- the channel is the dialer's endpoint id, the acceptor's, and the link's
+  `channel_binding(b"glade/v1/peer-hello")`; a link whose `remote_id` is not 32 bytes, or which has
+  no binding, cannot complete HELLO;
+- the checks are today's: the protocol (`peer.rs:174-176`), the signature for this transcript, the
+  door's `binds` (`peer.rs:187-198`); then D9's `authenticated` (`mesh.rs:326`), the refusal lines
+  and the refused HELLO left unanswered.
+
+### 5. The version gate (question 3)
+
+Today the ALPN names the node protocol, `glade/node/3` (`iroh_carrier.rs:54-57`), and HELLO checks
+the number as well (`peer.rs:174-176`), so a node of an older protocol fails at connect (4.1a, 4.1b).
+
+After this step the endpoint offers `glade/carrier/1` alone. That names the carrier's framing and its
+first word, as ruled, and nothing of the node protocol, which is now: HELLO (D6) as the link's first
+frame each way, then section 3's conversations, each carrying the frames its stream carries today.
+HELLO's `protocol` is that protocol's only gate.
+
+- **`PROTOCOL` stays 3. Recommended.** No node has spoken `glade/carrier/1` before this step, since
+  no root lends the adapter a key before part 3 (`assembly.rs:761-777`), so no carrier peer can
+  mistake the number, and 4.5c's ruled move to 4 needs no amendment. A HELLO of the stream era cannot
+  be replayed on a carrier link either: its exported bytes belong to another TLS session. The
+  alternative, 4 now for the new framing and 4.5c at 5, changes a ruled answer for no peer.
+- **How an older peer fails.**
+  - A node of 4.5 or older, dialing or dialed: the TLS handshake finds no common ALPN and fails,
+    before the door's hook and before HELLO. The dialer prints `peer <tag>@<address>: <error>`. The
+    acceptor prints nothing, as for any failed handshake today (`mesh.rs:296`).
+  - A 4.5b node and a 4.5c node: HELLO is refused, `protocol 3, not 4`. The acceptor prints `peer
+    refused: endpoint <tag>: HELLO refused: protocol 3, not 4`; the dialer's link ends with no reason.
+    This step pins that gate over the port (section 13), for 4.5c to turn.
+- **No window of both ALPNs.** Nothing deployed links: the desk has no peer, and the crossing's
+  instances are deleted (`:6683-6696`). A window would keep `PeerEndpoint`'s stream protocol, about
+  400 lines, beside the new one.
+- n0 now reads `glade/carrier/1` in a relayed connection's first packets, where it read
+  `glade/node/3` (`:5928`, `:6621`): the carrier's name, no longer the node protocol's version.
+
+### 6. The door on the adapter's endpoint
+
+- **Where.** The accept-time half stays iroh's `after_handshake` hook on the accepting side
+  (`iroh_carrier.rs:156-186`), now on the adapter's endpoint: the root lends the adapter the door with
+  the key (section 9), and `bind` hands it to the recipe, where 4.2c hands it none
+  (`iroh_carrier.rs:618`). The HELLO half runs on the link, in the mesh (section 4). The mesh still
+  loads the one door before its first accept and feeds it each record that lands
+  (`mesh.rs:256`, `:1003-1026`).
+- **Alternatives weighed.** The mesh could check `remote_id()` after `accept`, with no hook; every
+  key would then complete TLS, open a stream and hold the first word's wait before its refusal,
+  where the relay ruling asked for a lock on the door. Or the adapter could hold an admission policy
+  of its own; the door is one shared object now, and stays one.
+- **What a refused dialer sees.**
+  - Refused at accept: the connection is closed with code 0 and no reason (`:3139-3143`). The
+    adapter's `dial` may already have answered, since the dialer's handshake ends before the
+    acceptor's hook runs; HELLO then reads the link's end. Either way the error names no reason
+    (`connection lost`, or `the link ended before a WELCOME`), and the root prints `peer
+    <tag>@<address>: <error>`, as 4.2b and 4.5 laid it out.
+  - Refused at HELLO, or by either bound: the acceptor sends no WELCOME and ends the link; the same.
+  - The refusing node prints `peer refused: endpoint <tag>: <reason>` on stderr, as now.
+- **A revocation that lands** still ends the revoking node's live link on that key
+  (`mesh.rs:1031-1037`). The mesh finds the link by node, compares `remote_id()` and calls
+  `Linked::end`, which returns at once; the writer closes the link. The port's `close` drains for up to
+  3 s, so it must not be awaited under the cut lock `ingest_and_fanout` holds, where today's
+  `conn.close` returns at once.
+
+### 7. The first word's bound, and HELLO's (question 4)
+
+**The wait today.** The adapter's `accept_on` waits for the handshake, the stream and the four bytes
+with no bound (`iroh_carrier.rs:577-590`; 4.2c's gap, `:3624-3625`). A dialer the door admits that
+connects and sends nothing holds that `accept`, and the port takes one attempt at a time. HELLO has
+no bound either, and runs inside the accept loop (`iroh_carrier.rs:388-397`, `mesh.rs:284-299`;
+4.2b's gap, `:3400-3401`).
+
+- **The bound: 10 s**, from the moment the endpoint hands the port an incoming connection to the
+  word's fourth byte: the handshake, the door's hook, the stream and the word under one deadline.
+  The crossing's whole HELLO, from the dial to the `link` line, took 1.4 to 1.6 s through n0's
+  relay at about 430 ms a round trip (`:6530-6536`, `:6567-6569`), and the first word arrives in
+  less than half of that. So 10 s is more than ten times what the relay took: room for a far slower
+  path and a lost first flight. It is also the length of the node's other waits, `STOP_WITHIN`
+  (`lifecycle.rs:88`) and the provider's timeout (`exchange.rs:46`).
+- **At expiry** the adapter closes the connection with code 0 and no reason, and answers that
+  `accept` with `Err(Transport("no first word within 10 s"))`: the contract makes that one refused
+  attempt, the endpoint staying usable (`carrier-api/src/lib.rs:122-123`), and the mesh's accept loop
+  goes on (`mesh.rs:296`). Once the handshake has proved a key, the door reports `peer refused:
+  endpoint <tag>: no first word within 10 s`; before that nothing is reported, as for any failed
+  handshake.
+- **HELLO's bound: 10 s**, from the moment the port hands over the link, at either end, to a
+  verified `NodeHello` (the acceptor) or `NodeWelcome` (the dialer). HELLO leaves the accept loop
+  for the accepted link's own task (`Site::AcceptedLink`), so a slow HELLO no longer holds the next
+  dialer. Refused: `peer refused: endpoint <tag>: HELLO refused: no HELLO within 10 s`; the
+  dialer's error reads `no WELCOME within 10 s`.
+- Both bounds are constants, passed as arguments to the adapter's constructor and to HELLO, so tests
+  pass 200 ms: no flag, no global.
+- The adapter still takes one attempt at a time, so a dialer the door admits can hold the others up
+  to 10 s an attempt (named gap). Handshakes in parallel would need tasks the adapter does not have.
+- **Alternatives weighed.** 5 s, which a slow relay's first contact could miss; 30 s, QUIC's idle
+  timeout (noq-proto 1.3.0 `src/config/transport.rs:560`), which adds little over none; a bound on the
+  four bytes alone, which leaves the handshake and the stream unbounded.
+
+### 8. The sync driver over the port
+
+| Exchange | Today | On the port |
+| --- | --- | --- |
+| HELLO | stream 0's first two frames | the link's first frame each way, bare (section 4) |
+| the dialer's pull | stream 0 after HELLO | the dialer's first conversation, `Heads`, served and ended by the acceptor |
+| the acceptor's pull | a stream it opens | the acceptor's first conversation |
+| a push | a stream per push per link | a conversation per push per link: one `Ops`, END |
+| a forwarded interest | a stream | a conversation: `Subscribe`, then the ack, the gap in chunks, live ops, or F5's refusal |
+| a forwarded exchange, `workspace.create` | a stream | a conversation: `ExchangeReq`, `ExchangeRes`, END |
+| a pull on a gap | a stream on the pusher's link | a conversation on the pusher's link |
+
+- **The rounds and the notes.** `home round with node <id>: <n> record(s) in <ms> ms` is timed around
+  the pull's conversation, as `mesh.rs:372-379` times the stream. `link <node> via relay <url>|direct
+  <ip:port>, rtt <n> ms` is noted at HELLO and at each change the reader's 250 ms poll sees
+  (`mesh.rs:383-406` today), the path coming from the adapter through the node-local notes port
+  (section 9). `link <node> closed` is noted when the reader sees the link end, and `peer-connected`
+  follows the dialer's pull, as now.
+- **Pull on a gap** is unchanged: its table, one pull per pusher, its lines (`mesh.rs:885-923`);
+  `pull_from` opens a conversation where it opened a stream.
+- **D9 and the grant check** are unchanged: every conversation on a link belongs to the node its HELLO
+  proved (`Holder::Node`), as every stream of a connection does today.
+- **The forwards**, F5's refusal included (`mesh.rs:597-637`, `:658-703`), read the conversation as
+  they read the stream. The claim holder's subscription writer ends its conversation where it
+  finished its stream.
+- **The frame limit: 16 MiB** (question 6), the roots' `CarrierConfig::max_frame_bytes`, less the
+  header for a frame. Today no frame has a limit (`peer.rs:54-63`), and the forwarded gap is one
+  frame, however long (`mesh.rs:573-575`). So every serve path chunks, at `OPS_PER_CHUNK` (64) ops or
+  once a chunk holds 1 MiB: the pull's serve (`mesh.rs:730`) and the forwarded gap. A single op over
+  the limit cannot cross: its conversation's send refuses it, with a line naming the zone (named gap;
+  the wire's `Chunk` frame is the later remedy).
+- **The release.** `release_links` still takes the table by value (`mesh.rs:644-654`) and closes each
+  link, all together, each within the adapter's 3 s drain; a link's close carries no reason, where it
+  said `glade node stopping` (`mesh.rs:650`). The port's `close`, in `PeerCarrier`'s release, then ends
+  anything left (CA-004).
+- **The table's race.** The reader removes its node's entry only while it still holds that link;
+  today's unlink removes by node id (`mesh.rs:334-341`), and so could remove a newer link's entry.
+
+**The tasks** (`tasks.rs:37-73`), all `Sessions`' unless said:
+
+| Site | Before | After |
+| --- | --- | --- |
+| `AcceptLoop` | accept, HELLO inline | accept only |
+| `AcceptedLink` | the accepted link's driver | its HELLO, bounded, then its driver |
+| `Unlink`, `StreamDispatch` | watch the connection; accept its streams | one `LinkReader`: route frames, watch the path, unlink at the end |
+| (new) `LinkWriter` | | the link's only sender |
+| `PeerStream`, `StreamZero` | one inbound stream; the dialer's stream 0 | one `InboundConversation`, chosen by its first frame |
+| `RecordPush` (`Records`) | a push on a stream of its own | retires: a push only queues its frame, so `Records` keeps the renewal loop alone |
+| the rest | | unchanged |
+
+### 9. 4.5's configuration through the adapter
+
+- **What the root lends the adapter**, as `IrohCarrier::new`'s argument and the module's component
+  parameters: `Lent { key: EndpointKey, door: Option<Arc<Door>>, relays: Relays, first_word:
+  Duration }`, where 4.2c lends `Option<EndpointKey>` (`assembly.rs:761-777`). Lent none, it refuses
+  to bind, as now. The CA probes lend no door.
+- **`bind`.** `CarrierConfig::local` names the sockets, `<ip:port>[,<ip:port>]`, at most one per
+  family as the file allows, an `<endpoint-id>@` prefix ignored as 4.5 made it
+  (`iroh_carrier.rs:593-602`). The recipe is `bind_endpoint` with the lent key, door and relays
+  (`:92-114`), where the adapter now passes one socket, relays off and no door (`:614-618`). It
+  answers `<endpoint-id>@<socket>[,<socket>]` as bound, IPv4 first, and the root prints `peer <tag>
+  <first socket>` from that, as now.
+- **`dial`.** A `CarrierAddr` takes a peer entry's form with the full id, `<endpoint-id>@<via>[,<via>]`,
+  each via an `ip:port` or one of n0's relay URLs, and becomes one `EndpointAddr` with every address
+  (`endpoint_addr`, `:141-154`), where the adapter now dials one socket (`:629-641`). A relay URL needs
+  a port lent `relay n0`, as the file's load already demands. Two helpers in `iroh_carrier.rs` turn a
+  `PeerEntry` into such an address and a bound address into the `peer` line's tag and socket, so the
+  syntax stays the adapter's.
+- **Peers** are not the adapter's: the door holds the keys to admit, and the mesh dials each entry
+  that has an address, as now.
+- **The notes port** (question 5). The `link` lines need the selected path and the `relay` lines the
+  home relays' states (4.5 part 2; `iroh_carrier.rs:416-462`, `:331-359`), which no port method
+  carries. A node-local port, `LinkNotes`, beside `TransportPort` in `assembly.rs`: `path(&TransportId)
+  -> Option<PathSeen>`, for the newest live link to that endpoint, and `relay_watch(seen)`, a future
+  that reports the states until the port closes, with relays only, holding no endpoint handle, as now.
+  `IrohCarrier` implements it; the mesh takes it beside the port, optionally, and a node without it
+  notes no path. iroh's types still stop in the adapter. The alternative, `CarrierLink::path()` and a
+  relay state on `CarrierPort`, puts iroh's notions into every carrier's contract for the sake of
+  status lines.
+- **The release wait beyond loopback** (question 7; 4.5's named gap, `:6243-6247`). The adapter's
+  `close` binds each socket it held, for an instant, to see that iroh has let it go
+  (`iroh_carrier.rs:681-697`). Bound beyond loopback, it binds that address too. Recommend keeping
+  it: it binds only sockets this port held a moment before, which the owner's file named, from the
+  same process; it sends and reads nothing; and without it CA-004's promise, that `close` frees the
+  address, holds on loopback alone. The alternatives: probe loopback sockets only, and beyond loopback
+  resolve at iroh's close, so that an in-process re-bind there races iroh's few milliseconds; or no
+  probe, with which CA-004 failed 21 runs in 25 (4.5 part 1).
+- **Nothing listens beyond loopback by default.** With no file the network is `127.0.0.1:0` with
+  relays off (4.5, section 1), and the adapter binds exactly the sockets the root passes, calls for
+  relays only when lent `relay n0`, and dials only the addresses an entry names.
+
+### 10. Both roots lend the adapter (question 8)
+
+- **The hand-written root** (`bin/glade-node.rs:371-393`), after adoption, where it binds
+  `PeerEndpoint` today: it builds the door as now, then `IrohCarrier::new(Some(Lent { key:
+  node.endpoint_key(), door, relays: network.relays, first_word }))`, binds it on the network's sockets
+  with the frame limit, prints `peer <tag> <socket>`, and hands the mesh the adapter, as the port and
+  as the notes, with the node's identity and endpoint id. The dials follow, as now.
+- **The assembled root** (`lifecycle.rs`):
+  - `Instance` builds the same adapter, unbound, from the booted values: `Booted` (`:181-192`) holds
+    it beside the door;
+  - `Assembly` lends it to the module as `peer_carrier_binding`'s parameter, so the module's peer role
+    and the node's mesh are one adapter, 3.2's one iroh-facing occurrence (`:69-75` of this note).
+    `IrohCarrier` becomes a cheap clone over one shared state, and the component hands the module a
+    clone;
+  - `PeerCarrier` binds it, where it binds `PeerEndpoint` into an `EndpointSlot` (`:552-578`), and its
+    release calls the port's `close`, the by-value discipline the contract states for a port released
+    through an `Arc` (`carrier-api/src/lib.rs:53-64`). `EndpointSlot` and `PeerEndpoint::close(self)`
+    retire;
+  - `Sessions` enables the mesh over the bound port and prints the `peer` line, as now (`:620-626`);
+  - the plan's edges do not change: `PeerCarrier` still needs `Instance` and `Storage`.
+- **The alternative:** `PeerCarrier` builds an adapter of its own, as it builds `PeerEndpoint` today,
+  and the module's peer role stays unlent. Fewer moving parts, but two iroh-facing objects per node,
+  one of them inert, where 3.2 said the mesh would move onto the carrier binding (`:107-109`).
+- **No process globals.** The key comes from the booted instance (`endpoint.key`, 4.2a), the network
+  from the file and flags the entry point read (4.5), and the door from the root; the bounds and the
+  frame limit are constants passed down. Nothing reads the environment, and neither the adapter nor
+  the conversations keep a static. The adapter spawns no task: its accept, dial and close run in
+  their callers' futures, and the relay watch is a future the mesh spawns through `Tasks`. The
+  process-globals check stays at 3 permanent entries and no debt.
+
+### 11. What retires, and what stays (question 9)
+
+| Retires | Where | Replaced by |
+| --- | --- | --- |
+| `PeerEndpoint`: its four binds, `dial`, `accept`, `close`, `relay_watch`, `door`, `identity`, `addr` | `iroh_carrier.rs:246-414` | the adapter and the conversations |
+| `PeerLink` | `:237-244` | `Linked` |
+| the ALPN `glade/node/3` | `:54-57` | section 5 |
+| the exporter read on a `Connection` | `:63-78` | `channel_binding` |
+| `EndpointSlot` | `mesh.rs:164-196` | the port's `close` |
+| `hello_dial` and `hello_accept` over `AsyncRead`/`AsyncWrite` | `peer.rs:200-268` | HELLO on a link (part 2) |
+| the hand-written `u32` writers | `mesh.rs:546-547`, `exchange.rs:264-266` | conversations |
+| five sites | `tasks.rs:37-73` | section 8's |
+| `PeerEndpoint`'s tests: `dial_and_hello_over_iroh`, `a_protocol_2_node_fails_at_connect`, `sync_over_iroh`, `close_frees_the_bound_port`, `close_ends_an_accept_loop_and_a_kept_clone_keeps_the_port` | `iroh_carrier.rs:1030`, `:1092`, `:1138`, `:1213`, `:1230` | the tests named in section 13 |
+
+**What stays.**
+
+- The library's sync driver, `serve_sync` and `pull_sync`, with `read_frame` and `write_frame` as
+  their framing and their five tests (`peer.rs:303-402`, `:629-`). The mesh never called them; they
+  are carrier-free by construction, and 4.5c part 2 is ruled to edit `serve_sync`
+  (`GladeDirectoryCheckpoints.md:410-414`). Whether a driver with no production caller should go is a
+  question of dead code, not of this move. The alternative retires them in part 4, about 120
+  production lines and 260 of tests, and 4.5c part 2 then edits `serve_home` alone.
+- `bind_endpoint`, `DoorHook`, `bound_addr` and `endpoint_addr`, now the adapter's alone; the notes'
+  two types, which move to the notes port; the transcript and its checks (`peer.rs:104-198`); the
+  door; the network's types; every line's form.
+- **On the wire, nothing** (section 5).
+
+**The async witness.** `glade/dev-docs/async-witness/real` builds on `PeerEndpoint`, `PeerLink` and
+`PeerAddr` (`real/src/peer_carrier.rs:49`, `real/src/peer_plan.rs:34`) through a path dependency on
+the node (`real/Cargo.toml`), and each node step has type-checked it on a scratch copy. After part 4
+it no longer builds against HEAD. Recommend freezing it at the last glade revision that has
+`PeerEndpoint`, part 3's, with one line in its README naming that revision and how to check it out in
+a worktree; its evidence is Phase 3's record, and is not rewritten. The alternatives: keep
+`PeerEndpoint` alive for it, as code no node runs and the gate still builds; or port the witness onto
+`IrohCarrier`, which rewrites its evidence (its `WitnessCarrier` is itself a `CarrierPort` over
+`PeerEndpoint`, which `IrohCarrier` now is in the node).
+
+### 12. Compatibility
+
+- **A 4.5b node and an older one** fail at connect, whichever dials, and print as section 5 says.
+  Nothing is written.
+- **A downgrade** from 4.5b: no file, record or format changes, so an older binary starts on an
+  instance 4.5b ran, as before, and speaks `glade/node/3` again.
+- **The owner's desk.** grazel passes no `--peer` and no `--config` (`:5511-5514`). At its restart on
+  part 3:
+  - the endpoint is the adapter's, bound by the same recipe on `127.0.0.1:0`, relays off, portmapper
+    off, behind the door's hook (`iroh_carrier.rs:92-114`): UDP and TCP on `127.0.0.1` alone;
+  - the lines are today's: `peer <tag> 127.0.0.1:<port>` with the same tag, nothing after
+    `listening`, and on stderr the recovery warning alone;
+  - what differs cannot be seen from the desk: the ALPN.
+- **The replay before the desk's restart**, at each part: today's binary, this build, then today's
+  again, on a stand-in laid out as grazel lays out the desk, with `lsof`. Parts 1, 2 and 4 must print
+  the same lines; part 3 the same lines apart from ports.
+- **Clients and suppliers** speak the websocket and see nothing.
+
+### 13. Tests, each begun red
+
+Each is run first against the code with the part it guards switched off, in a scratch copy of the
+sources, and the message it prints is recorded, as in the steps before.
+
+**Part 1** (the port's half):
+
+| Test | Proves | Red against |
+| --- | --- | --- |
+| contracts: `ca_006_each_link_binds_its_transport_session` | on the fixture: both ends of a link derive the same bytes under a label; another label gives other bytes; links to two far ends differ; a fixture with no secret answers `None` on every link | the probe run on a fixture whose links all answer one value, which must fail it |
+| contracts: `rejects_a_binding_every_link_shares`, `rejects_a_binding_that_ignores_its_label` | CA-006 refuses those two fixtures | none: they guard the probe |
+| node: CA-006 on the fake network (`tests/assembly`) and through the faulty link (`tests/journeys`) | the fakes' checksum passes | a fake deriving its bytes from its own end, not the link's: the two ends disagree |
+| `iroh_carrier`: `ca_006_iroh_binds_each_link_to_its_tls_session` | CA-006 on real iroh over loopback | an export that ignores `label` |
+| `iroh_carrier`: `the_first_word_is_awaited_within_its_bound` | with a 200 ms bound, a raw dialer on the carrier's ALPN that sends nothing, and one that sends `gc`, are each refused within about the bound and reported by tag, and the port then accepts a genuine link | no bound: the accept still waiting after 2 s |
+| `iroh_carrier`: `a_carrier_behind_a_door_refuses_an_unknown_key_at_accept` | the hook on the adapter's endpoint: an unknown key's connection is closed, code 0, no reason, and reported; a configured key links | the adapter bound with no door: the unknown key links |
+| `iroh_carrier`: `a_carrier_binds_the_sockets_it_is_given_and_dials_every_address` | `local` naming a `127.0.0.1` and a `[::1]` socket, each found free, binds both and the answer names both; a dial address with an `ip:port` and a relay URL becomes one `EndpointAddr` with both (pure) | the adapter binding the first socket alone, and dialing one address as `PeerAddr::parse` reads it |
+| `iroh_carrier`: `a_carrier_notes_each_links_path` | `LinkNotes::path` reads `direct 127.0.0.1:<port>` for a linked endpoint, `None` for another | a notes port answering `None` |
+
+CA-001..005 run on iroh as before, each port lent a key and no door, and pass.
+
+**Part 2** (the link's conversations and HELLO on a link):
+
+| Test | Proves | Red against |
+| --- | --- | --- |
+| `conversation`: `conversations_interleave_on_one_link_and_end_apart` | over an in-memory link pair: three conversations each way interleave; each ends by END while the others go on; each end hands the peer's conversations to handlers chosen by their first frames | one conversation per link: the second read as the first's |
+| `conversation`: `a_conversation_dropped_before_its_end_is_reset` | the far end reads an error, not a clean end | a drop that sends END |
+| `conversation`: `a_conversation_cancelled_mid_send_never_ends_its_link` | over two `IrohCarrier`s: a conversation's task aborted while its 4 MiB frame is being sent, past the peer's window; another conversation's frame then arrives whole | conversations calling `send` themselves: the link ends |
+| `conversation`: `a_slow_conversation_holds_its_queue_and_one_let_go_holds_nothing` | a full queue of 16 holds the reader until it drains; a dropped conversation's later frames are dropped and the others flow | an unbounded queue; a reader waiting on a dropped conversation |
+| `conversation`: `the_hundred_and_first_conversation_is_reset` | the cap | no cap |
+| `conversation`: `the_links_end_ends_every_conversation_with_an_error` | open conversations read an error, never a clean end | a clean end |
+| `peer`: `a_hello_on_a_link_binds_its_transport_session` | over two `IrohCarrier`s: HELLO completes both ways; a HELLO recorded on one link is refused on a second link between the same two ports; a reflected one is refused | a binding of fixed bytes: the replay accepted |
+| `peer`: `a_hello_of_another_protocol_is_refused_on_a_link` | a `NodeHello` of protocol 4 is refused and unanswered, reported `protocol 4, not 3`: the gate 4.5c turns | the protocol check switched off |
+| `peer`: `a_link_without_an_endpoint_key_or_a_binding_cannot_hello` | refused on a fake link (its `remote_id` is 8 bytes) and on a link with no binding | zeros taken as the channel |
+| `peer`: `hello_on_a_link_is_bounded` | a dialer that never sends `NodeHello`, and an acceptor that never answers, are each refused within a 200 ms bound, the acceptor's refusal reported | no bound |
+
+The in-memory HELLO tests (`peer.rs:436-626`) move onto the in-memory link pair and prove what they
+proved.
+
+**Part 3** (the move):
+
+| Test | Proves | Red against |
+| --- | --- | --- |
+| `mesh`: `a_dialer_that_never_says_hello_does_not_hold_the_accept_loop` | over real iroh: C links at the carrier and sends nothing; B dials A and links within a second while C's HELLO still waits | HELLO in the accept loop: B waits out C's bound |
+| `mesh`: `a_glade_node_3_endpoint_fails_at_connect_either_way` (replaces `a_protocol_2_node_fails_at_connect`) | an endpoint offering only `glade/node/3` fails at the handshake, dialing and dialed | the adapter offering `glade/node/3` too |
+| `mesh`: `a_forwarded_gap_crosses_in_chunks_under_the_frame_limit` | with a small test limit, a zone whose gap exceeds it reaches the forwarding node whole, in order, in chunks | the gap in one frame: refused, and the forward lapses |
+| `mesh`: `a_newer_link_outlives_the_close_of_an_older_one_to_the_same_node` | two links to one node; the older closes; the newer still serves the node | removal by node id |
+| `lifecycle`: `the_module_and_the_mesh_share_one_adapter` | the peer carrier resolved from the module `Assembly` builds answers `AlreadyBound` once the booted adapter is bound: one adapter | the component building an adapter of its own |
+
+Changed and passing: every `mesh` test over real iroh (the convergence, binding, forged-claim, notes,
+door, D9, gap, golden-path and grant tests, F5's two among them), `exchange`'s and `claims`' two-node
+tests, all through one shared helper that binds a node's adapter; `tests/release_order`, unchanged.
+Unchanged and passing, since their lines do not change: `tests/assembled_path` (the door, the notes,
+the configuration, no endpoint id in any line), `tests/lifecycle` (a link, then a clean stop with the
+ports free; the refused dialer) and `tests/stop_signal`. These, with the three door tests of `mesh`,
+are the done-when's "the door's".
+
+**Part 4** removes tests only. Each removed test's rule is held by another: `dial_and_hello_over_iroh`
+by `a_hello_on_a_link_binds_its_transport_session`; `a_protocol_2_node_fails_at_connect` by
+`a_glade_node_3_endpoint_fails_at_connect_either_way`; `sync_over_iroh` by the mesh's convergence
+tests over the port; the two close tests by CA-004 on iroh and
+`a_closed_carrier_frees_its_port_though_its_links_survive`; the stream HELLO's by part 2's.
+
+**4.5's crossing again**, the done-when's third part, after part 4: section 10 of 4.5 as run on
+2026-09-27, with the same machines, roles, runs and teardown. Before it, the Pi's sibling checkouts
+are pulled `--ff-only` so their two suites count, and each machine's temporary directory is set inside
+its scratch directory (the lane owner's proposals of 2026-09-27). Recorded as 4.5's table was, beside
+it: the tree, and the ALPN n0 could read.
+
+**The gate** (`node/check.sh`, 9 components) at each part: the node's tests on both paths; rustfmt at
+or below its baseline (293 since F5), with no deviation in a line the part writes; clippy at its
+baseline; process-globals with nothing new; confinement with no new crate; the contracts gate with
+CA-006. Beside it: the six downstream suites against the rebuilt binary, and the desk's replay
+(section 12).
+
+**What they do not prove:** Windows and Linux, which the crossing covers; a relay path, save by the
+crossing; a change of selected path (a loopback link has one path); two networks; more than two nodes;
+what one slow conversation costs its link over a slow relay.
+
+### 14. Size and the split (question 10)
+
+Estimated, in `.rs` lines with doc comments. Recent steps have run over their estimates (4.5 part 1
+ran about 530 against 440, `:6395-6396`), so each part is kept well under 500.
+
+| Part | Production | Tests |
+| --- | --- | --- |
+| 1: `carrier-api` about 70 (the method, its type and its words, CA-006); `iroh_carrier.rs` about 170 (`Lent`, the shared state, `bind` on the lent network, the dial of every address, `channel_binding`, the first word's bound and its report, `LinkNotes` with the relay watch moved in); `assembly.rs` about 30 (the parameters, the port) | ~270 | ~300 |
+| 2: `conversation.rs` about 240 (new: the header, `Linked`, the writer, the reader, `Conversation`); `peer.rs` about 45 (HELLO on a link, its bound) | ~280 | ~300 |
+| 3: `mesh.rs` about +250/−240; `exchange.rs` about +20/−25; the roots and `lifecycle.rs` about +70/−60; `tasks.rs` about +10/−10 | ~+350/−330 | ~+350/−150 |
+| 4: `iroh_carrier.rs` about −250; `peer.rs` about −70; the witness's README +3 | ~+20/−330 | ~−250 |
+
+In that order, foundational first: part 1's method is what part 2's HELLO asks, part 2's conversations
+are what part 3's mesh speaks, and part 4 deletes what part 3 leaves unused. Part 1 and part 2's
+conversations touch disjoint files (the contracts and `iroh_carrier.rs`; `conversation.rs`), so
+they could run side by side once the contract's method lands; in the one node lane they run in order.
+Folding part 4 into part 3 would make one commit of about +370/−660; part 3 is the one that changes
+behaviour, and it is easier to review with nothing else in it.
+
+### Named gaps (4.5b)
+
+- **One stream's flow control per peer.** A conversation that reads slowly slows its link, where QUIC
+  kept streams apart; frames interleave in arrival order, and chunks keep bulk from holding a link for
+  long.
+- **An op over 16 MiB never crosses a link**; its send is refused with a line. The websocket takes
+  such an op from a client, with no limit (`ws.rs:224-238`).
+- **The adapter's accept is serial**: a dialer the door admits can hold other inbound links up to
+  10 s an attempt.
+- **Two links to one node**, both dialing at once: the newer serves the node's conversations, and the
+  notes port answers for an endpoint's newest link.
+- **A lost link is not dialed again** (4.5's gap, unchanged).
+- **The record transport is not the mesh's push.** `CarrierTransport::push` dials a link of its own
+  and sends a frame per op with no HELLO (`assembly.rs:698-722`); nothing calls it in production, and
+  the mesh's push is a conversation on the HELLO'd link.
+- **The release probe** binds, for an instant, each address the port held, beyond loopback when the
+  owner's file binds there (section 9).
+- **The async witness** no longer builds against HEAD after part 4 (section 11).
+- **The conversation header** is defined in this note and the code alone; no other language speaks
+  the node protocol, and no vector pins it.
+
+### Default-path changes (4.5b)
+
+At part 3; parts 1, 2 and 4 change nothing a running node does.
+
+1. The node's endpoint offers the ALPN `glade/carrier/1` alone, with the first word `gcl1`. A node on
+   `glade/node/3` and this one fail at connect, either way.
+2. A peer link is one carrier link carrying the node's conversations (section 3), with HELLO its
+   first frame each way.
+3. An inbound attempt that sends no first word within 10 s, and a HELLO not completed within 10 s,
+   are refused and reported; HELLO no longer holds the accept loop.
+4. A frame is at most 16 MiB, and the forwarded gap crosses in chunks.
+5. A refused dialer's line names no reason, in new words (section 6); a link's close carries no
+   reason.
+6. **What the owner's desk sees at its next restart:** the same lines apart from ports, UDP and TCP
+   on `127.0.0.1` alone, nothing new on stderr.
+
+### What this changes for 4.5c and 4.6
+
+- **4.5c.**
+  - No ALPN is left to move: part 3's `PROTOCOL` 4 is `peer.rs` alone, and its estimate's
+    `iroh_carrier.rs` share (`GladeDirectoryCheckpoints.md:651`) goes.
+  - Its test row `a_protocol_3_node_fails_at_connect` (`:619`) fails at HELLO only, over the port:
+    the acceptor reports `peer refused: endpoint <tag>: HELLO refused: protocol 3, not 4`, and the
+    dialer's link ends with no reason. 4.5b's `a_hello_of_another_protocol_is_refused_on_a_link` is
+    the gate it turns.
+  - The serve order goes into `serve_home`, now a conversation's handler, with the same code; and into
+    `serve_sync`, which stays (question 9). A pushed checkpoint rides the push's one `Ops` frame, well
+    under the limit. Its line references into `mesh.rs`, `peer.rs` and `iroh_carrier.rs` move.
+- **4.6.**
+  - "4.4's journeys over the real carrier" can swap the fake network for two `IrohCarrier`s, their
+    test code playing the receiving node as it does over the fakes; that proves the carrier, not the
+    mesh. The mesh's evidence is the route script over two binaries. 4.6's design should say which it
+    means, and whether the record transport is re-based on the mesh's conversations.
+  - A lost link is not dialed again, so a restarted accepting node is not linked again until its
+    dialer restarts: 4.6's restart outcome needs a re-dial or a stated manual step.
+  - The route runs one link per peer, with the 16 MiB frame limit and the two 10 s bounds, at
+    protocol 4 once 4.5c lands.
+
+### Questions for the owner (4.5b)
+
+1. **The unit of a link** (section 2). Recommend (a): one carrier link per peer, as 4.2c's adapter
+   makes it, with the node's exchanges as conversations on it under a 5-byte header, one writer and
+   one reader per link. The alternatives: (b) a link per exchange, the adapter carrying a peer's links
+   on one connection, as `dev-docs/IrohGladeMapping.md` §7.1 leans, which keeps QUIC's per-stream
+   flow control but makes the adapter a connection manager and needs the contract to promise reuse;
+   (c) a connection per exchange, a handshake and HELLO each; (d) sub-streams in the contract.
+2. **HELLO's binding through the port** (section 4). Recommend `CarrierLink::channel_binding(label)
+   -> Option<ChannelBinding>`, a required method with its line in the contracts' policy for the
+   owner's review, and CA-006; HELLO asks it for `glade/v1/peer-hello`, so D6 is unchanged. The
+   alternatives: the fixed RFC 9266 label; a nonce each way before HELLO, a round trip more; no
+   binding, which lets an endpoint key speak for its node.
+3. **The version gate** (section 5). Recommend: `glade/node/3` retires, `PROTOCOL` stays 3, HELLO's
+   number is the only gate from here, and there is no window of both ALPNs. An older node then fails
+   at the handshake. The alternatives: `PROTOCOL` 4 now and 4.5c at 5; a window that keeps
+   `PeerEndpoint`'s protocol beside the new one.
+4. **The bounds** (section 7). Recommend 10 s for the first word, over the whole attempt from the
+   connection's arrival, refused with code 0 and no reason, and reported by tag once a key is proved;
+   and 10 s for HELLO, in the accepted link's own task. The alternatives: 5 s or 30 s; the four bytes
+   alone; HELLO left in the accept loop.
+5. **The notes** (section 9). Recommend a node-local port, `LinkNotes` (the path of an endpoint's
+   newest link, the relay watch), implemented by the iroh adapter. The alternative puts a path and a
+   relay state into the carrier contract.
+6. **The frame limit** (section 8). Recommend 16 MiB, every serve path chunking at 64 ops or 1 MiB,
+   and an op over the limit refused where it would be sent, with a line. The alternatives: a smaller
+   limit, near the substrate's 64 KB chunk, which bars more app ops; the wire's `Chunk` frame now.
+7. **The release wait beyond loopback** (section 9). Recommend keeping it: it probes only the sockets
+   the port held, which the owner's file named. The alternatives: loopback only, leaving CA-004's
+   promise to iroh's timing beyond it; none.
+8. **One adapter per node** (section 10). Recommend that both roots build the adapter from the booted
+   instance, the assembled root lending that same adapter to the module's peer role, binding it in
+   `PeerCarrier` and releasing it with the port's `close`. The alternative: `PeerCarrier` builds its
+   own and the module's role stays unlent.
+9. **What retires** (section 11). Recommend retiring `PeerEndpoint`, `PeerLink`, `EndpointSlot`, the
+   ALPN `glade/node/3`, the stream HELLO and the hand-written writers; keeping `serve_sync` and
+   `pull_sync` as they are; and freezing the async witness at part 3's revision, with a README line.
+   The alternatives: retiring the library's driver too, about 120 production lines and 260 of tests,
+   4.5c part 2 then editing `serve_home` alone; keeping `PeerEndpoint` for the witness; porting the
+   witness.
+10. **The split** (section 14). Recommend four parts, about 270, 280, +350/−330 and +20/−330
+    production lines, each gated and replayed, then 4.5's crossing on the Pi and dabeest. The
+    alternative folds part 4 into part 3, one commit of about +370/−660.
