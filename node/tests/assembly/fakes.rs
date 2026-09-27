@@ -14,7 +14,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll, Waker};
 
 use glade_carrier_api::{
-    CarrierAddr, CarrierConfig, CarrierError, CarrierLink, CarrierPort, PortFuture, TransportId,
+    CarrierAddr, CarrierConfig, CarrierError, CarrierLink, CarrierPort, ChannelBinding, PortFuture,
+    TransportId,
 };
 use glade_clock_api::ClockPort;
 use glade_grant_api::conformance::{self as grant_conformance, Record as GrantRecord};
@@ -151,10 +152,13 @@ impl FakePort {
 
     fn link(&self, ends: (usize, usize), max: usize, tx: usize, rx: usize) -> Box<dyn CarrierLink> {
         let (net, (endpoint, remote)) = (self.net.clone(), ends);
+        // The pipe the dialer sends on names the link's session at both ends.
+        let session = tx.min(rx);
         Box::new(FakeLink {
             net,
             endpoint,
             remote,
+            session,
             max,
             tx,
             rx,
@@ -247,6 +251,9 @@ struct FakeLink {
     endpoint: usize,
     /// The far end, whose number is its transport identity on this network.
     remote: usize,
+    /// The link's session, the same at both ends, which its binding is drawn
+    /// from.
+    session: usize,
     max: usize,
     tx: usize,
     rx: usize,
@@ -301,6 +308,26 @@ impl CarrierLink for FakeLink {
     fn remote_id(&self) -> Option<TransportId> {
         Some(TransportId(self.remote.to_le_bytes().to_vec()))
     }
+
+    fn channel_binding(&self, label: &[u8]) -> Option<ChannelBinding> {
+        Some(binding(self.session, label))
+    }
+}
+
+/// A link's binding on the fake network: a checksum of its session and the
+/// label, 32 bytes of FNV-1a in four lanes. Anyone who reads this file can
+/// compute it: it pins `channel_binding`'s shape (CA-006), and is never a
+/// secret or cryptography.
+fn binding(session: usize, label: &[u8]) -> ChannelBinding {
+    let mut bytes = [0; 32];
+    for (lane, out) in (0u8..).zip(bytes.chunks_mut(8)) {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in [&[lane][..], &session.to_le_bytes()[..], label].concat() {
+            hash = (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
+        }
+        out.copy_from_slice(&hash.to_le_bytes());
+    }
+    ChannelBinding(bytes)
 }
 
 /// A keyed test signer: a signature is FNV-1a over a per-node secret, the

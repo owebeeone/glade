@@ -177,7 +177,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use glade_carrier_api::{
-    CarrierAddr, CarrierConfig, CarrierError, CarrierLink, CarrierPort, PortFuture,
+    CarrierAddr, CarrierConfig, CarrierError, CarrierLink, CarrierPort, PortFuture, TransportId,
 };
 use glade_clock_api::ClockPort;
 use glade_grant_api::{Denial, GrantPort, Holder};
@@ -189,13 +189,12 @@ use crate::appdecl::{register, AppDecl, Registered};
 use crate::claims::Leases;
 use crate::envelope;
 use crate::grants::PolicyView;
-use crate::iroh_carrier::IrohCarrier;
+use crate::iroh_carrier::{IrohCarrier, Lent};
 use crate::netconf::Network;
 use crate::peer::NodeIdentity;
 use crate::registry::{MemStore, Record, Registry, RegistryApi, RegistryError, StoreApi, HOME};
 use crate::signing::NodeSigner;
 use crate::sysdir::{now_ms, Boot, Profile};
-use crate::transport::EndpointKey;
 
 /// The stderr line the assembled composition root prints before anything
 /// else, so a reader, and a test, can tell which root started the node.
@@ -382,6 +381,40 @@ pub trait TransportPort: Send + Sync {
         peer: &'a CarrierAddr,
         records: &'a [Vec<u8>],
     ) -> PortFuture<'a, Result<usize, CarrierError>>;
+}
+
+/// What a peer carrier can note beyond the carrier port (plan Step 4.5b, the
+/// owner's ruling of 2026-09-27): the path the newest live link to an endpoint
+/// sends on, and the home relays' states, for the node's `link` and `relay`
+/// lines. Node-local: status lines are not the carrier contract's, and no
+/// transport's own types cross it.
+pub trait LinkNotes: Send + Sync {
+    /// The path the newest live link to `remote` sends on, if the carrier has
+    /// selected one; none for an endpoint no live link reaches.
+    fn path(&self, remote: &TransportId) -> Option<PathSeen>;
+
+    /// Hand `seen` the home relays' states, now and at each change, until the
+    /// port closes. A port bound with no relays, or not bound, has none to
+    /// report, and the watch ends at once. It holds no handle on the endpoint.
+    fn relay_watch(&self, seen: Box<dyn FnMut(Vec<RelayState>) + Send>) -> PortFuture<'static, ()>;
+}
+
+/// The path a link sends on, as its `link` line reads it: where it goes,
+/// `relay <url>` or `direct <ip:port>`, and the carrier's round-trip estimate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PathSeen {
+    pub via: String,
+    pub rtt_ms: u128,
+}
+
+/// A home relay's state, as the `relay` lines read it: its URL as the node
+/// prints it, whether the endpoint is connected to it, and while it is not,
+/// the last error, if one has been seen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RelayState {
+    pub url: String,
+    pub connected: bool,
+    pub error: Option<String>,
 }
 
 /// Why the record host refused.
@@ -759,20 +792,18 @@ impl CarrierPort for PendingCarrier {
 }
 
 /// `peer_carrier_binding`'s registration: the iroh adapter (plan Step 4.2c,
-/// `iroh_carrier.rs`), bound with the endpoint key the composition root lends
-/// as this component's parameters. Neither root lends one yet, so the peer
-/// role refuses to bind and fails closed: the node's peer transport is still
-/// the `PeerEndpoint` the root binds and `Server::enable_mesh` runs.
+/// `iroh_carrier.rs`), bound as the composition root lends it, in this
+/// component's parameters: the endpoint key, the door, the relays and the
+/// first word's bound (plan Step 4.5b). Neither root lends it anything yet, so
+/// the peer role refuses to bind and fails closed: the node's peer transport
+/// is still the `PeerEndpoint` the root binds and `Server::enable_mesh` runs.
 impl<M: Module + HasComponent<dyn Constructions>> Component<M> for IrohCarrier {
     type Interface = dyn PeerCarrier;
-    type Parameters = Option<EndpointKey>;
+    type Parameters = Option<Lent>;
 
-    fn build(
-        context: &mut ModuleBuildContext<M>,
-        key: Option<EndpointKey>,
-    ) -> Box<dyn PeerCarrier> {
+    fn build(context: &mut ModuleBuildContext<M>, lent: Option<Lent>) -> Box<dyn PeerCarrier> {
         constructed::<M, IrohCarrier>(context);
-        Box::new(IrohCarrier::new(key))
+        Box::new(IrohCarrier::new(lent))
     }
 }
 

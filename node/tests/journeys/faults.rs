@@ -11,7 +11,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use glade_carrier_api::conformance::{self as carrier, Fixture};
 use glade_carrier_api::{
-    CarrierAddr, CarrierConfig, CarrierError, CarrierLink, CarrierPort, PortFuture, TransportId,
+    CarrierAddr, CarrierConfig, CarrierError, CarrierLink, CarrierPort, ChannelBinding, PortFuture,
+    TransportId,
 };
 use glade_grant_api::conformance::{self as grant, Record as GrantRecord};
 use glade_grant_api::{admits, Denial, GrantPort, Holder};
@@ -134,6 +135,10 @@ impl CarrierLink for FaultyLink {
     fn remote_id(&self) -> Option<TransportId> {
         self.link.remote_id()
     }
+
+    fn channel_binding(&self, label: &[u8]) -> Option<ChannelBinding> {
+        self.link.channel_binding(label)
+    }
 }
 
 /// The engine a test node's record host persists through, which the test
@@ -245,8 +250,8 @@ impl GrantPort for LiveGrants {
     }
 }
 
-/// CA-001..004 need three ports on one network; each is faulty, with no
-/// fault queued.
+/// CA-001..004 and CA-006 need three ports on one network; each is faulty,
+/// with no fault queued.
 fn carrier_fixture() -> Fixture {
     let net = FakeNet::new();
     let port = |net: &Arc<FakeNet>| -> Arc<dyn CarrierPort> {
@@ -267,6 +272,13 @@ fn ca_001_to_004_a_faulty_port_with_no_fault_queued_keeps_the_carrier_contract()
     run(carrier::frame_limit(carrier_fixture()));
     run(carrier::cancellation(carrier_fixture()));
     run(carrier::close_by_value(carrier_fixture()));
+}
+
+/// CA-006 through the faulty link, whose dialed end hands the question to
+/// the fake link it wraps.
+#[test]
+fn ca_006_a_faulty_link_binds_its_transport_session() {
+    run(carrier::channel_binding(carrier_fixture()));
 }
 
 #[test]

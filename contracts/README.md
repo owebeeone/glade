@@ -52,9 +52,13 @@ trait's doctests compile that bridge against a local copy of `shaku::Interface` 
 show the witness's form failing (E0310; rustdoc checks the code only on nightly).
 
 - `glade-carrier-api`: `CarrierPort` (bind, dial, accept, close) and `CarrierLink`
-  (send, recv, close), from the async witness. CA-001 framing and order, CA-002 the
-  frame limit both ways, CA-003 lazy futures and a cancel-safe `recv`, CA-004 close
-  by value: the address re-binds while a clone of the port and a link survive.
+  (send, recv, close, remote_id, channel_binding), from the async witness. CA-001
+  framing and order, CA-002 the frame limit both ways, CA-003 lazy futures and a
+  cancel-safe `recv`, CA-004 close by value: the address re-binds while a clone of
+  the port and a link survive, CA-005 each link names the far end's transport
+  identity, CA-006 each link binds its transport session: both ends derive the same
+  bytes under a label, another label or another link other bytes, or `None` on
+  every link of a transport with no session secret (plan Step 4.5b).
 - `glade-clock-api`: `ClockPort::now_ms`, wall-clock epoch milliseconds. CL-001 one
   instant behind every handle, CL-002 unit and epoch.
 - `glade-grant-api`: `GrantPort::check`, the `grants_for` question as one decision.

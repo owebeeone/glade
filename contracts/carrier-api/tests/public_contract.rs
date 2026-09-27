@@ -2,7 +2,8 @@
 //! no sleep. It proves the contract's shape, never a transport.
 use glade_carrier_api::conformance::{self, Fixture};
 use glade_carrier_api::{
-    CarrierAddr, CarrierConfig, CarrierError, CarrierLink, CarrierPort, PortFuture, TransportId,
+    CarrierAddr, CarrierConfig, CarrierError, CarrierLink, CarrierPort, ChannelBinding, PortFuture,
+    TransportId,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::{Future, poll_fn, ready};
@@ -20,6 +21,11 @@ enum Wrong {
     KeepsAddress,
     /// A link names its own end, not the far one.
     NamesItself,
+    /// Every link answers one binding, as a secret of the transport's own,
+    /// not its session's, would give.
+    SharesBinding,
+    /// A link's binding is the same under every label.
+    IgnoresLabel,
 }
 
 #[derive(Default)]
@@ -70,6 +76,9 @@ struct Link {
     endpoint: usize,
     /// The endpoint at the far end, whose number is its identity here.
     remote: usize,
+    /// The link's session, the same at both ends, which its binding is drawn
+    /// from: none on a transport with no session secret.
+    session: Option<usize>,
     max: usize,
     tx: usize,
     rx: usize,
@@ -141,6 +150,30 @@ impl CarrierLink for Link {
         };
         Some(TransportId(named.to_le_bytes().to_vec()))
     }
+
+    fn channel_binding(&self, label: &[u8]) -> Option<ChannelBinding> {
+        let session = self.session?;
+        Some(match self.wrong {
+            Some(Wrong::SharesBinding) => binding(0, label),
+            Some(Wrong::IgnoresLabel) => binding(session, b""),
+            _ => binding(session, label),
+        })
+    }
+}
+
+/// A checksum of a link's session and a label, 32 bytes of FNV-1a in four
+/// lanes. Anyone who reads this file can compute it: it pins
+/// `channel_binding`'s shape (CA-006), and is never a secret or cryptography.
+fn binding(session: usize, label: &[u8]) -> ChannelBinding {
+    let mut bytes = [0; 32];
+    for (lane, out) in (0u8..).zip(bytes.chunks_mut(8)) {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in [&[lane][..], &session.to_le_bytes()[..], label].concat() {
+            hash = (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
+        }
+        out.copy_from_slice(&hash.to_le_bytes());
+    }
+    ChannelBinding(bytes)
 }
 
 enum Phase {
@@ -157,6 +190,9 @@ struct Port {
     net: Arc<Net>,
     phase: Mutex<Phase>,
     wrong: Option<Wrong>,
+    /// Whether the transport has a session secret: without one no link has a
+    /// binding.
+    secret: bool,
 }
 
 impl Port {
@@ -170,10 +206,13 @@ impl Port {
     fn link(&self, ends: (usize, usize), max: usize, tx: usize, rx: usize) -> Box<dyn CarrierLink> {
         let (net, wrong) = (self.net.clone(), self.wrong);
         let (endpoint, remote) = ends;
+        // The pipe the dialer sends on names the link's session at both ends.
+        let session = self.secret.then_some(tx.min(rx));
         Box::new(Link {
             net,
             endpoint,
             remote,
+            session,
             max,
             tx,
             rx,
@@ -261,6 +300,15 @@ impl CarrierPort for Port {
 }
 
 fn fixture(wrong: Option<Wrong>) -> Fixture {
+    fixture_of(wrong, true)
+}
+
+/// Three ports on a transport with no session secret.
+fn secretless() -> Fixture {
+    fixture_of(None, false)
+}
+
+fn fixture_of(wrong: Option<Wrong>, secret: bool) -> Fixture {
     let net = Arc::new(Net::default());
     let port = || -> Arc<dyn CarrierPort> {
         let phase = Mutex::new(Phase::Unbound);
@@ -268,6 +316,7 @@ fn fixture(wrong: Option<Wrong>) -> Fixture {
             net: net.clone(),
             phase,
             wrong,
+            secret,
         })
     };
     Fixture {
@@ -318,6 +367,12 @@ fn ca_005_each_link_names_the_far_ends_transport_identity() {
 }
 
 #[test]
+fn ca_006_each_link_binds_its_transport_session() {
+    run(conformance::channel_binding(fixture(None)));
+    run(conformance::channel_binding(secretless()));
+}
+
+#[test]
 #[should_panic(expected = "CA-001 whole, once, in order")]
 fn rejects_reordered_frames() {
     run(conformance::frames(fixture(Some(Wrong::Reorders))));
@@ -348,5 +403,21 @@ fn rejects_a_close_that_keeps_the_address() {
 fn rejects_a_link_that_names_its_own_end() {
     run(conformance::remote_identity(fixture(Some(
         Wrong::NamesItself,
+    ))));
+}
+
+#[test]
+#[should_panic(expected = "CA-006 links to two far ends are bound apart")]
+fn rejects_a_binding_every_link_shares() {
+    run(conformance::channel_binding(fixture(Some(
+        Wrong::SharesBinding,
+    ))));
+}
+
+#[test]
+#[should_panic(expected = "CA-006 another label gives other bytes")]
+fn rejects_a_binding_that_ignores_its_label() {
+    run(conformance::channel_binding(fixture(Some(
+        Wrong::IgnoresLabel,
     ))));
 }

@@ -7265,6 +7265,61 @@ sources, and the message it prints is recorded, as in the steps before.
 
 CA-001..005 run on iroh as before, each port lent a key and no door, and pass.
 
+**Part 1, as built** on 2026-09-27 against glade `4f49fe6`. The tests use part 1's API, so each was
+run red in one sources-only copy of the final tree (glade's `node`, `wire-rs` and `contracts`, with
+`glade-decl-rs` beside them for the contracts' workspace), the part it guards switched off by one edit
+and put back before the next. The message is what the red run printed; `<id>` is an endpoint id and
+`<tag>` its tag.
+
+| Test | Red first |
+| --- | --- |
+| contracts: `ca_006_each_link_binds_its_transport_session` | every link of the fixture answering one value under every label: `assertion left != right failed: CA-006 another label gives other bytes` |
+| contracts: `rejects_a_binding_every_link_shares`, `rejects_a_binding_that_ignores_its_label` | none: they guard the probe, each expecting its own message, `CA-006 links to two far ends are bound apart` and `CA-006 another label gives other bytes` |
+| node: `ca_006_the_fake_network_binds_each_link_to_its_session` (`tests/assembly`); `ca_006_a_faulty_link_binds_its_transport_session` (`tests/journeys`, and `tests/durable`, which includes the file) | the fake's bytes drawn from its own end, not the link's: `assertion left == right failed: CA-006 both ends of a link derive the same bytes`, in each of the three binaries |
+| `iroh_carrier`: `ca_006_iroh_binds_each_link_to_its_tls_session` | an export under HELLO's label whatever label is asked: `assertion left != right failed: CA-006 another label gives other bytes`; for its D6 half (below), an export with a context HELLO does not use: `assertion left == right failed: the bytes HELLO signs` |
+| `iroh_carrier`: `the_first_word_is_awaited_within_its_bound` | no bound (a day): `the accept still waiting after 5 s: Elapsed(())`; the door's report off: `reported by its tag`, `left: None`, `right: Some("peer refused: endpoint <tag>: no first word within 200 ms")` |
+| `iroh_carrier`: `a_carrier_behind_a_door_refuses_an_unknown_key_at_accept` | the adapter bound with no door: `the unknown key linked` |
+| `iroh_carrier`: `a_carrier_binds_the_sockets_it_is_given_and_dials_every_address` | the first socket alone bound: `both, IPv4 first`, `left: "<id>@[::1]:61330"`, `right: "<id>@127.0.0.1:60399,[::1]:61330"`; one address dialed, as `PeerAddr::parse` reads it: `linked: Transport("expected <endpoint-id>@<ip:port or relay-url>[,…] to dial")` |
+| `iroh_carrier`: `a_carrier_notes_each_links_path` | the notes port answering `None`: `a path noted within 2 s`; with no relays, a watch that never ends: `the watch ends at once: Elapsed(())` |
+
+As built, beside the design:
+
+- **The contract's words.** `ChannelBinding(pub [u8; 32])`, and `channel_binding(&self, label: &[u8]) ->
+  Option<ChannelBinding>`, required, in `CarrierLink`'s row of the contracts' policy. A link that has
+  ended MAY answer `None`: the iroh adapter answers while the link holds its connection. CA-006 asks
+  each link while it lives, under `glade/v1/ca-006` and `glade/v1/ca-006-other`, and a transport binds
+  every link or none. The fakes' bytes are FNV-1a over the link's session (the pipe its dialer sends
+  on, the same at both ends) and the label, in four lanes; the contract's fixture also runs with no
+  session secret, answering `None` on every link.
+- **D6, pinned.** `ca_006_iroh_binds_each_link_to_its_tls_session` also shows that under
+  `glade/v1/peer-hello` a link answers the very bytes `channel()` exports for HELLO on its connection
+  today, so part 2's transcript over the port is D6's, byte for byte.
+- **`Lent`** (`key`, `door`, `relays`, `first_word`) is `IrohCarrier::new`'s argument, and
+  `Option<Lent>` the component's parameters; `FIRST_WORD` is 10 s. Lent nothing, the adapter refuses
+  to bind in the words it had, `the iroh adapter was lent no endpoint key`, so
+  `tests/assembly_registration` is unchanged. `IrohCarrier` is a clone over one shared port.
+- **The two syntax helpers**: `carrier_addr(&PeerEntry)`, an entry as `<endpoint-id>@<via>[,<via>]`,
+  the form `bind` answers, and `entry_of(&CarrierAddr)`, the parse `dial` uses. A dial naming a relay
+  URL from a port not lent `relay n0` is refused before anything is sent, `a relay URL needs relay
+  n0`. The `peer` line's tag and socket come from `entry_of` and `transport::tag`; a helper for the
+  roots waits for part 3, which prints the line.
+- **The notes' two types**, `PathSeen` and `RelayState`, moved to `assembly.rs` beside `LinkNotes`, and
+  are public; `mesh.rs` imports them from there. The relay watch is one function, `watch_relays`, which
+  `PeerEndpoint::relay_watch` and the port's `relay_watch` both call. The port's takes a boxed sink and
+  answers a `PortFuture`, so `LinkNotes` is dyn-compatible.
+- **The first word's bound** runs from the endpoint's hand-over of the attempt to the word's fourth
+  byte. At expiry during the handshake the attempt is dropped and nothing is reported: noq closes a
+  connection whose last handle drops with code 0 and no reason (read in its source; no test holds a
+  handshake open). After the handshake, the connection is closed, code 0 and no reason, and the door
+  reports `peer refused: endpoint <tag>: no first word within 10 s`. A bound that is not whole seconds
+  is written in ms, as the tests' 200 ms.
+- **The tests dial through one bounded helper**, `dial_accept`, which the existing `linked` now uses:
+  a failed dial fails the test at once, with its error. Found in the first red runs: with the dial
+  switched to one address, `tokio::join!` of the dial and the accept left the accept waiting, and the
+  test binary hung until it was killed.
+- **The node's policy text** (`node/architecture-policy.json`) says the adapter runs CA-001..006 on
+  real iroh, where it said CA-001..005.
+
 **Part 2** (the link's conversations and HELLO on a link):
 
 | Test | Proves | Red against |
@@ -7452,3 +7507,62 @@ port; 6 frames at most 16 MiB, served in chunks of 64 ops or 1 MiB, an op over t
 beyond loopback; 8 one adapter per node, lent to the module and bound by `PeerCarrier`; 9 `PeerEndpoint`, `PeerLink`, `EndpointSlot`,
 the old ALPN and the stream HELLO retire, `serve_sync`/`pull_sync` stay, and the async witness is frozen at part 3's revision; 10 four
 parts, then 4.5's crossing again.
+
+### Measured (4.5b, part 1)
+
+2026-09-27, Apple M3 Pro, Rust 1.96.0, on the final tree (glade `4f49fe6` plus part 1):
+
+- **The gate** passes all 9 components, in 107 s from an empty scratch target, with 386 node tests on
+  each path across 17 test binaries, where there were 378: `iroh_carrier` 5, `tests/assembly` 1, and
+  the faulty link's 1 in `tests/journeys` and again in `tests/durable`, which includes its file.
+  - rustfmt: glade-node 293 hunks and glade-wire 43, at their baselines; no hunk is new or gone, so
+    no line this part wrote is in one.
+  - clippy: glade-node 11 warnings and glade-wire 7, at their baselines, none at a line this part
+    wrote.
+  - process-globals: 54 files, 3 permanent entries, 0 debt, nothing new.
+  - confinement: no new crate; each `Cargo.toml` and `Cargo.lock` untouched.
+  - the contracts gate: 94 tests, where there were 91 (CA-006 and its two guards); the checker
+    requires `channel_binding`; fmt clean, and clippy clean under `-D warnings`.
+- **Nothing reached beyond loopback.** Every socket this part's tests bind is on `127.0.0.1` or
+  `[::1]`; the relay URL and `10.1.1.236:4545` in the dial test are parsed, never dialed.
+- **Time.** The library's 257 tests take 3.3 s, of which CA-004 alone takes 3.05 s, at HEAD as now
+  (below). The five new `iroh_carrier` tests take 0.02 to 0.06 s each, but the first word's, 0.47 s
+  for its two 200 ms bounds.
+- **The replay**, from `glade-wz/grazel` as grazel starts the desk's node (`--profile local --name grazel
+  --app apps/grazel-app.glade --app apps/gyld-app.glade 0`), with only `PATH`, `HOME` and `GLADE_HOME`
+  set, on one scratch instance. Each start lived 5 s past `listening`, had its sockets listed with
+  `lsof`, and was stopped with SIGTERM to its PID; each ended the same way, exit 143, the hand-written
+  root taking SIGTERM's default. Today's binary (inode 408222621, glade `4f49fe6`) and this build
+  (inode 408343159, copied from the gate's scratch target):
+
+  | Start | Lines | Sockets |
+  | --- | --- | --- |
+  | today's, the first boot | `instance`, `node`, `app grazel registered (+12 record(s), 0 unchanged)`, `app gyld registered (+10 record(s), 2 unchanged)`, `registry ready (home served: true)`, `peer 38a3835429 127.0.0.1:<port>`, `workspace ws-razel serving` twice, `listening <port>` | UDP `127.0.0.1:<port>` and TCP `127.0.0.1:<port>` (LISTEN), nothing else |
+  | this build | the same, `+0 record(s), 12 unchanged` for each app | the same |
+  | today's again | the same as this build's, line for line apart from ports | the same |
+  | today's, then this build | the same, line for line apart from ports | the same |
+
+  Every start printed one stderr line, the recovery warning, naming its own binary; nothing followed
+  `listening`. The downstream suites were not run: the desk's binary is not rebuilt by this part.
+- **CA-004 and the release wait.** Part 1 changes neither `close` nor the probe, and CA-004 takes 3.05 s
+  at HEAD as it does now. Measured on a scratch copy with `close`'s phases timed: the drain ends in
+  about 1 ms and iroh's close in about 2 ms, and then the release wait runs its whole 3 s and gives up
+  with the socket still held, every run. The probe's own pending `accept`, polled once and not again
+  until `close` resolves, holds an endpoint handle, and iroh keeps the socket while any handle lives.
+  The rebind that follows succeeds only if iroh lets the socket go, a few milliseconds after that
+  `accept` ends, before `fresh` binds; under load it can lose, which is, by all signs, the failure of
+  F14's first gate run. With the pending `accept` driven alongside `close` (the scratch copy only), the
+  wait saw the socket free within 2.5 ms and CA-004 took 0.03 to 0.05 s. Nothing in the ruled design
+  makes the release more robust than the probe: question 7 keeps it as it is.
+
+**Size**, in lines added and removed in `.rs` files, doc comments included:
+
+- production: +307/−104, net +203, of which +213/−82 are code (comments counted as the lines that
+  begin `//`): `iroh_carrier.rs` +245/−89, `assembly.rs` +44/−13, the carrier contract +16/−1 (the
+  type, the method and their words), `mesh.rs` +2/−1; about 30 of the adapter's lines are the relay
+  watch and the notes' types moved, not new. Beside them, CA-006 in the contract's `conformance`
+  module, +42: net +245 with it, against the design's estimate of about 270;
+- tests: +383/−28: `iroh_carrier.rs` +262/−22, the contract's fixture and tests +72/−1,
+  `tests/assembly` +34/−2, `tests/journeys/faults.rs` +15/−3;
+- beside them, one line in each policy file: `channel_binding` in the contracts' `CarrierLink` row,
+  and CA-001..006 in the node's reason text.

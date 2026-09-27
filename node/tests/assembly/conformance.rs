@@ -7,7 +7,7 @@
 //! no fold, as the module builds it; its Ed25519
 //! signer (plan Step 4.1a) runs the whole of SI-001..003, SI-003 with no key
 //! lent; its system clock runs CL-002 (CL-001 needs a clock a test can set).
-//! CA-001..005 run here on the fake network. The assembled path's iroh
+//! CA-001..006 run here on the fake network. The assembled path's iroh
 //! adapter (plan Step 4.2c) runs them on real iroh over loopback in its own
 //! module's tests (`src/iroh_carrier.rs`), since this binary opens no socket.
 
@@ -88,6 +88,11 @@ fn ca_004_a_fake_port_gives_its_endpoint_up_by_value() {
 #[test]
 fn ca_005_the_fake_network_names_each_far_end() {
     run(carrier::remote_identity(carrier_fixture()));
+}
+
+#[test]
+fn ca_006_the_fake_network_binds_each_link_to_its_session() {
+    run(carrier::channel_binding(carrier_fixture()));
 }
 
 #[test]

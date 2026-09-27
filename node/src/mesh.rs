@@ -41,10 +41,11 @@ use glade_wire::generated::{
     Error, ErrorCode, Head, Heads, Op, Ops, Priority, StreamHeads, Subscribe,
 };
 
+use crate::assembly::{PathSeen, RelayState};
 use crate::envelope;
 use crate::frame::Frame;
 use crate::grants::{refusal, READ_SUBSCRIBE};
-use crate::iroh_carrier::{selected_path, PathSeen, PeerAddr, PeerEndpoint, PeerLink, RelayState};
+use crate::iroh_carrier::{selected_path, PeerAddr, PeerEndpoint, PeerLink};
 use crate::netconf::{PeerEntry, Relays};
 use crate::peer::{read_frame, write_frame, SyncOutcome, OPS_PER_CHUNK};
 use crate::registry::HOME;

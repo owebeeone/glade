@@ -29,6 +29,13 @@ pub struct CarrierAddr(pub String);
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TransportId(pub Vec<u8>);
 
+/// 32 bytes both ends of a link's transport session derive under a label,
+/// and no other session derives: TLS's exporter (RFC 8446 §7.5), as RFC 9266
+/// uses it for a channel binding. A HELLO that signs them is bound to its
+/// session, so it verifies on no other. Opaque to this contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ChannelBinding(pub [u8; 32]);
+
 /// What `bind` is given. The limit holds for every link of the endpoint, both ways.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CarrierConfig {
@@ -132,7 +139,9 @@ pub trait CarrierPort: Send + Sync {
 /// A carrier authenticates no node: who is at the other end is for the session's
 /// HELLO to establish through a signer, never the carrier's word. It reports
 /// only the transport identity its transport authenticated (`remote_id`),
-/// which the HELLO checks against the node's binding record. Frames arrive
+/// which the HELLO checks against the node's binding record, and the bytes its
+/// transport session exports (`channel_binding`), which the HELLO signs so that
+/// it holds on this session alone. Frames arrive
 /// whole, once and in send order; none is split, merged or interleaved, and
 /// `send` and `recv` may run concurrently. `send` resolves when the transport has
 /// taken the frame, not when the peer has read it: it is not an acknowledgement.
@@ -168,6 +177,12 @@ pub trait CarrierLink: Send + Sync {
     /// or `None` from a transport that has none. It is the same for the
     /// link's whole life, close included.
     fn remote_id(&self) -> Option<TransportId>;
+
+    /// The 32 bytes both ends of this link's transport session derive under
+    /// `label`, which no other session derives, or `None` from a transport
+    /// with no session secret. Links an adapter carries over one session share
+    /// them. A link that has ended MAY answer `None`.
+    fn channel_binding(&self, label: &[u8]) -> Option<ChannelBinding>;
 }
 
 // The conformance probes exist only with the `conformance` feature. The
@@ -439,5 +454,47 @@ pub mod conformance {
             link.close().await;
         }
         assert_eq!(a_to_b.remote_id(), b, "CA-005 a name outlives the close");
+    }
+
+    /// CA-006. Each link binds its transport session: both ends of a link
+    /// derive the same bytes under a label, another label gives other bytes,
+    /// and a link to another far end other bytes again. `a` dials `b`, then,
+    /// once `b` has closed, `fresh`, as in CA-005; each link is asked while it
+    /// lives. A transport with no session secret answers `None` on every link.
+    /// It assumes, as CA-005 does, that the fixture's three ports are three
+    /// endpoints, so that its two links are two sessions.
+    pub async fn channel_binding(f: Fixture) {
+        const LABEL: &[u8] = b"glade/v1/ca-006";
+        const OTHER: &[u8] = b"glade/v1/ca-006-other";
+        let (_, a_to_b, b_from_a) = link(&f, 64, 64).await;
+        let to_b = [
+            a_to_b.channel_binding(LABEL),
+            b_from_a.channel_binding(LABEL),
+        ];
+        let other = a_to_b.channel_binding(OTHER);
+        f.b.close().await;
+        let at_fresh = f.fresh.bind(config(&f.at_b, 64)).await;
+        let at_fresh = at_fresh.expect("bind fresh where b was");
+        let (a_to_fresh, fresh_from_a) = join(f.a.dial(&at_fresh), f.fresh.accept()).await;
+        let a_to_fresh = a_to_fresh.expect("dial");
+        let fresh_from_a = fresh_from_a.expect("accept").expect("an inbound link");
+        let to_fresh = [
+            a_to_fresh.channel_binding(LABEL),
+            fresh_from_a.channel_binding(LABEL),
+        ];
+        match (to_b, other, to_fresh) {
+            ([Some(b), Some(b_back)], Some(other), [Some(fresh), Some(fresh_back)]) => {
+                let alike = "CA-006 both ends of a link derive the same bytes";
+                assert_eq!(b, b_back, "{alike}");
+                assert_eq!(fresh, fresh_back, "{alike}");
+                assert_ne!(b, other, "CA-006 another label gives other bytes");
+                assert_ne!(b, fresh, "CA-006 links to two far ends are bound apart");
+            }
+            ([None, None], None, [None, None]) => {}
+            _ => panic!("CA-006 a transport binds every link, or none"),
+        }
+        for link in [&a_to_b, &b_from_a, &a_to_fresh, &fresh_from_a] {
+            link.close().await;
+        }
     }
 }

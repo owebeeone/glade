@@ -28,6 +28,16 @@
 //! its tag, never its id. For the notes the crossing reads (part 2), this
 //! module describes a link's selected path and the home relays' states as
 //! text and numbers, so iroh's types stop here.
+//!
+//! Plan Step 4.5b, part 1: the adapter's half of the mesh's move onto the
+//! carrier port. [`IrohCarrier`] binds as a composition root lends it
+//! ([`Lent`]: the key, the door, the relays and the first word's bound), on
+//! every socket its configuration names; dials every address a carrier
+//! address names; waits for an inbound attempt's first word within its bound;
+//! gives each link's TLS exporter bytes as its channel binding; and notes each
+//! link's path and the home relays' states through the node-local
+//! `LinkNotes` port. No root lends it anything yet, so the mesh still runs on
+//! `PeerEndpoint`.
 
 use std::fmt;
 use std::future::{ready, Future};
@@ -38,7 +48,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
 use glade_carrier_api::{
-    CarrierAddr, CarrierConfig, CarrierError, CarrierLink, CarrierPort, PortFuture, TransportId,
+    CarrierAddr, CarrierConfig, CarrierError, CarrierLink, CarrierPort, ChannelBinding, PortFuture,
+    TransportId,
 };
 use iroh::endpoint::presets;
 use iroh::endpoint::RelayStatus;
@@ -47,9 +58,10 @@ use iroh::endpoint::{Connection, ConnectionError, ReadError, RecvStream, SendStr
 use iroh::Watcher;
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey, TransportAddr};
 
+use crate::assembly::{LinkNotes, PathSeen, RelayState};
 use crate::netconf::{Network, PeerEntry, Relays, Via};
 use crate::peer::{hello_accept, hello_dial, Channel, NodeIdentity, PeerHello};
-use crate::transport::{tag, Door, EndpointKey};
+use crate::transport::{hex, key_of, tag, Door, EndpointKey};
 
 /// ALPN for the glade node<->node protocol 3 (`peer::PROTOCOL`, plan Step
 /// 4.1b), whose `home` records are signed envelopes and whose HELLO is signed
@@ -328,34 +340,13 @@ impl PeerEndpoint {
         self.relays
     }
 
-    /// Watch this endpoint's home relays until it closes: `seen` has their
-    /// states now, and again at each change (plan Step 4.5). iroh's status
-    /// becomes text and flags here, and the future holds no handle on the
-    /// endpoint, so it keeps no socket bound.
+    /// Watch this endpoint's home relays until it closes (plan Step 4.5), as
+    /// [`watch_relays`] does.
     pub(crate) fn relay_watch(
         &self,
-        mut seen: impl FnMut(Vec<RelayState>) + Send + 'static,
+        seen: impl FnMut(Vec<RelayState>) + Send + 'static,
     ) -> impl Future<Output = ()> + Send + 'static {
-        let mut statuses = self.endpoint.home_relay_status();
-        let closed = self.endpoint.closed();
-        async move {
-            let states = |held: &[RelayStatus]| held.iter().map(RelayState::of).collect();
-            seen(states(&statuses.get()));
-            let mut closed = std::pin::pin!(closed);
-            loop {
-                tokio::select! {
-                    () = &mut closed => {
-                        return;
-                    }
-                    changed = statuses.updated() => {
-                        let Ok(now) = changed else {
-                            return;
-                        };
-                        seen(states(&now));
-                    }
-                }
-            }
-        }
+        watch_relays(&self.endpoint, seen)
     }
 
     /// Report a refused HELLO, naming the endpoint key it came from.
@@ -415,14 +406,6 @@ impl PeerEndpoint {
 
 // ---- the notes the crossing reads (plan Step 4.5, part 2) -------------------
 
-/// The path a link sends on, as its `link` line reads it: where it goes,
-/// `relay <url>` or `direct <ip:port>`, and iroh's round-trip estimate.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct PathSeen {
-    pub(crate) via: String,
-    pub(crate) rtt_ms: u128,
-}
-
 /// Where a path to `addr` goes, in a line's words.
 fn described(addr: &TransportAddr) -> String {
     match addr {
@@ -441,22 +424,41 @@ pub(crate) fn selected_path(conn: &Connection) -> Option<PathSeen> {
     Some(PathSeen { via, rtt_ms })
 }
 
-/// A home relay's state, as the `relay` lines read it: its URL as the node
-/// prints it, whether the endpoint is connected to it, and while it is not,
-/// the last error, if one has been seen.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct RelayState {
-    pub(crate) url: String,
-    pub(crate) connected: bool,
-    pub(crate) error: Option<String>,
+/// A home relay's state, as iroh reports it, in a line's words.
+fn relay_state(status: &RelayStatus) -> RelayState {
+    RelayState {
+        url: status.url().to_string(),
+        connected: status.is_connected(),
+        error: status.last_error().map(|e| e.to_string()),
+    }
 }
 
-impl RelayState {
-    fn of(status: &RelayStatus) -> RelayState {
-        RelayState {
-            url: status.url().to_string(),
-            connected: status.is_connected(),
-            error: status.last_error().map(|e| e.to_string()),
+/// Watch `endpoint`'s home relays until it closes: `seen` has their states
+/// now, and again at each change (plan Step 4.5). iroh's status becomes text
+/// and flags here, and the future holds no handle on the endpoint, so it
+/// keeps no socket bound.
+fn watch_relays(
+    endpoint: &Endpoint,
+    mut seen: impl FnMut(Vec<RelayState>) + Send + 'static,
+) -> impl Future<Output = ()> + Send + 'static {
+    let mut statuses = endpoint.home_relay_status();
+    let closed = endpoint.closed();
+    async move {
+        let states = |held: &[RelayStatus]| held.iter().map(relay_state).collect();
+        seen(states(&statuses.get()));
+        let mut closed = std::pin::pin!(closed);
+        loop {
+            tokio::select! {
+                () = &mut closed => {
+                    return;
+                }
+                changed = statuses.updated() => {
+                    let Ok(now) = changed else {
+                        return;
+                    };
+                    seen(states(&now));
+                }
+            }
         }
     }
 }
@@ -475,6 +477,24 @@ const PREAMBLE: &[u8; 4] = b"gcl1";
 /// own bound for a drain on a bad link.
 const LINGER: Duration = Duration::from_secs(3);
 
+/// How long an inbound attempt has, from the moment the endpoint hands it
+/// over, to finish its handshake, pass the door, open its stream and send the
+/// first word (plan Step 4.5b, the owner's ruling of 2026-09-27): more than
+/// ten times the crossing's whole HELLO through n0's relay.
+pub const FIRST_WORD: Duration = Duration::from_secs(10);
+
+/// What a composition root lends the adapter (plan Step 4.5b): the node's
+/// endpoint key; the door its accept hook asks, if any; whether it has n0's
+/// relays; and how long an inbound attempt has to send its first word,
+/// [`FIRST_WORD`] but in tests.
+#[derive(Clone, Debug)]
+pub struct Lent {
+    pub key: EndpointKey,
+    pub door: Option<Arc<Door>>,
+    pub relays: Relays,
+    pub first_word: Duration,
+}
+
 fn transport(e: impl fmt::Display) -> CarrierError {
     CarrierError::Transport(e.to_string())
 }
@@ -488,15 +508,22 @@ type Link = Box<dyn CarrierLink>;
 /// `glade_carrier_api::CarrierPort` over iroh (plan Step 4.2c): one endpoint,
 /// bound with the key the port was lent, and a QUIC connection per link, of
 /// frames that are a `u32` little-endian length and the bytes. The address is
-/// `<endpoint-id>@<ip:port>`; `remote_id` is the id the TLS session proved.
+/// a peer entry's form with the full id, `<endpoint-id>@<via>[,<via>]`;
+/// `remote_id` is the id the TLS session proved, and `channel_binding` the
+/// bytes its exporter gives (plan Step 4.5b).
 /// `close` ends every link the port tracks and takes their handles, since a
 /// surviving connection keeps the port bound (the async witness's finding).
 /// A link holds the endpoint too, so a port dropped without `close` does not
-/// take its links' transport with it. It binds the socket
-/// `CarrierConfig::local` names (plan Step 4.5), with no relay, has no door,
-/// and lent no key refuses to bind.
-pub struct IrohCarrier {
-    key: Option<EndpointKey>,
+/// take its links' transport with it. It binds the sockets
+/// `CarrierConfig::local` names, behind the door and with the relays it was
+/// lent (plan Step 4.5b), and lent nothing refuses to bind. `Clone` shares
+/// the one port: every clone binds, dials, accepts and closes one endpoint.
+#[derive(Clone)]
+pub struct IrohCarrier(Arc<Adapter>);
+
+/// The port every clone of an [`IrohCarrier`] shares.
+struct Adapter {
+    lent: Option<Lent>,
     state: Mutex<PortState>,
 }
 
@@ -521,15 +548,20 @@ fn refusal(state: &PortState) -> Option<CarrierError> {
 }
 
 impl IrohCarrier {
-    /// A port that binds with `key`; lent none, it refuses to.
-    pub fn new(key: Option<EndpointKey>) -> IrohCarrier {
+    /// A port that binds as `lent` says; lent nothing, it refuses to.
+    pub fn new(lent: Option<Lent>) -> IrohCarrier {
         let state = Mutex::new(PortState::Unbound);
-        IrohCarrier { key, state }
+        IrohCarrier(Arc::new(Adapter { lent, state }))
+    }
+
+    /// The relays this port was lent: none unless lent n0's.
+    fn relays(&self) -> Relays {
+        self.0.lent.as_ref().map_or(Relays::Off, |lent| lent.relays)
     }
 
     /// Keep `endpoint` as this port's, unless a bind or a close came first.
     fn place(&self, endpoint: &Endpoint, max: usize) -> Result<(), CarrierError> {
-        let mut state = lock(&self.state);
+        let mut state = lock(&self.0.state);
         if let Some(refused) = refusal(&state) {
             return Err(refused);
         }
@@ -540,7 +572,7 @@ impl IrohCarrier {
 
     /// The bound endpoint: none before `bind` and after `close`.
     fn endpoint(&self) -> Option<Endpoint> {
-        match &*lock(&self.state) {
+        match &*lock(&self.0.state) {
             PortState::Bound { ep, .. } => Some(ep.clone()),
             _ => None,
         }
@@ -548,7 +580,7 @@ impl IrohCarrier {
 
     /// Track a new link; none, dropping it, once the port has closed.
     fn track(&self, conn: Connection, send: SendStream, recv: RecvStream) -> Option<Link> {
-        let mut state = lock(&self.state);
+        let mut state = lock(&self.0.state);
         let PortState::Bound { ep, max, links } = &mut *state else {
             return None;
         };
@@ -574,64 +606,152 @@ impl IrohCarrier {
         Some(Box::new(IrohLink(link)))
     }
 
-    async fn accept_on(&self, endpoint: &Endpoint) -> Result<Option<Link>, CarrierError> {
+    /// One inbound attempt, under one bound from the moment the endpoint
+    /// hands it over: the handshake, the door's hook, the stream and the first
+    /// word (plan Step 4.5b). At the bound the attempt is refused and its
+    /// connection closed with code 0 and no reason, and once the handshake has
+    /// proved a key the door reports it; the port then takes the next.
+    async fn accept_on(
+        &self,
+        endpoint: &Endpoint,
+        lent: &Lent,
+    ) -> Result<Option<Link>, CarrierError> {
         let Some(incoming) = endpoint.accept().await else {
             return Ok(None);
         };
+        let deadline = tokio::time::Instant::now() + lent.first_word;
+        let late = format!("no first word within {}", spelled(lent.first_word));
         let accepting = incoming.accept().map_err(transport)?;
-        let conn = accepting.await.map_err(transport)?;
-        let (send, mut recv) = conn.accept_bi().await.map_err(transport)?;
-        let mut preamble = [0; 4];
-        recv.read_exact(&mut preamble).await.map_err(transport)?;
-        if &preamble != PREAMBLE {
-            return Err(transport("not a carrier link"));
-        }
+        let conn = tokio::time::timeout_at(deadline, accepting).await;
+        let conn = conn.map_err(|_| transport(&late))?.map_err(transport)?;
+        let Ok(opened) = tokio::time::timeout_at(deadline, first_stream(&conn)).await else {
+            conn.close(0u32.into(), b"");
+            if let Some(door) = &lent.door {
+                door.refused(conn.remote_id().as_bytes(), &late);
+            }
+            return Err(transport(late));
+        };
+        let (send, recv) = opened?;
         Ok(self.track(conn, send, recv))
     }
 }
 
-/// The socket a carrier address names, `<ip:port>` or
-/// `<endpoint-id>@<ip:port>`: the address says where, and the key a port is
-/// lent says who, so an id is ignored (plan Step 4.5).
-fn local_socket(local: &CarrierAddr) -> Option<SocketAddr> {
+/// The stream a dialer opened on `conn`, once it has sent the adapter's first
+/// word; another word refuses the attempt.
+async fn first_stream(conn: &Connection) -> Result<(SendStream, RecvStream), CarrierError> {
+    let (send, mut recv) = conn.accept_bi().await.map_err(transport)?;
+    let mut word = [0; 4];
+    recv.read_exact(&mut word).await.map_err(transport)?;
+    if &word != PREAMBLE {
+        return Err(transport("not a carrier link"));
+    }
+    Ok((send, recv))
+}
+
+/// A bound as a line says it: `10 s` for whole seconds, else milliseconds.
+fn spelled(bound: Duration) -> String {
+    match bound.subsec_nanos() {
+        0 => format!("{} s", bound.as_secs()),
+        _ => format!("{} ms", bound.as_millis()),
+    }
+}
+
+/// The sockets a carrier address names to bind, `<ip:port>[,<ip:port>]`, at
+/// most one per family, as a configuration file's `bind` lines allow: the
+/// address says where, and the key a port is lent says who, so an
+/// `<endpoint-id>@` prefix is ignored (plan Steps 4.5 and 4.5b).
+fn local_sockets(local: &CarrierAddr) -> Option<Vec<SocketAddr>> {
     let at = match local.0.rsplit_once('@') {
         Some((_, at)) => at,
         None => &local.0,
     };
-    at.parse().ok()
+    let parse = |socket: &str| socket.parse::<SocketAddr>().ok();
+    let sockets: Vec<SocketAddr> = at.split(',').map(parse).collect::<Option<_>>()?;
+    let v4 = sockets.iter().filter(|socket| socket.is_ipv4()).count();
+    (v4 <= 1 && sockets.len() - v4 <= 1).then_some(sockets)
+}
+
+/// A bound endpoint's carrier address: its id and every socket it bound,
+/// IPv4 first (plan Step 4.5b).
+fn bound_at(endpoint: &Endpoint) -> io::Result<CarrierAddr> {
+    let mut sockets = endpoint.bound_sockets();
+    sockets.sort_by_key(|socket| !socket.is_ipv4());
+    let via = sockets.into_iter().map(Via::Ip).collect();
+    let entry = PeerEntry {
+        key: *endpoint.id().as_bytes(),
+        via,
+    };
+    carrier_addr(&entry).ok_or_else(|| other("no socket bound"))
+}
+
+/// A peer entry as the adapter dials it, `<endpoint-id>@<via>[,<via>]`: its
+/// full id and every address it names (plan Step 4.5b). An entry that names
+/// none is no address to dial.
+pub fn carrier_addr(entry: &PeerEntry) -> Option<CarrierAddr> {
+    let vias: Vec<String> = entry.via.iter().map(Via::to_string).collect();
+    let id = hex(&entry.key);
+    (!vias.is_empty()).then(|| CarrierAddr(format!("{id}@{}", vias.join(","))))
+}
+
+/// The peer entry a carrier address names, `<endpoint-id>@<via>[,<via>]`,
+/// each via an `ip:port` or one of n0's relay URLs, as `bind` answers it and
+/// `dial` takes it (plan Step 4.5b).
+pub fn entry_of(addr: &CarrierAddr) -> Option<PeerEntry> {
+    let (id, vias) = addr.0.split_once('@')?;
+    let key = key_of(id)?;
+    let via = |text: &str| match text.parse() {
+        Ok(socket) => Some(Via::Ip(socket)),
+        Err(_) => n0_relay(text).map(Via::Relay),
+    };
+    let via = vias.split(',').map(via).collect::<Option<Vec<Via>>>()?;
+    Some(PeerEntry { key, via })
+}
+
+/// Where `addr` is dialed: one iroh address with every via it names. A relay
+/// URL needs a port lent n0's relays, as a configuration file's load demands
+/// (plan Step 4.5b).
+fn dial_target(addr: &CarrierAddr, relays: Relays) -> Result<EndpointAddr, CarrierError> {
+    let malformed = || transport("expected <endpoint-id>@<ip:port or relay-url>[,…] to dial");
+    let entry = entry_of(addr).ok_or_else(malformed)?;
+    let relayed = entry.via.iter().any(|via| matches!(via, Via::Relay(_)));
+    if relayed && relays != Relays::N0 {
+        return Err(transport("a relay URL needs relay n0"));
+    }
+    endpoint_addr(&entry).map_err(transport)
 }
 
 impl CarrierPort for IrohCarrier {
     fn bind(&self, config: CarrierConfig) -> PortFuture<'_, Result<CarrierAddr, CarrierError>> {
         Box::pin(async move {
-            if let Some(refused) = refusal(&lock(&self.state)) {
+            if let Some(refused) = refusal(&lock(&self.0.state)) {
                 return Err(refused);
             }
             let unkeyed = || transport("the iroh adapter was lent no endpoint key");
-            let key = self.key.ok_or_else(unkeyed)?;
-            let nowhere = || transport("expected <ip:port> or <endpoint-id>@<ip:port> to bind");
-            let socket = local_socket(&config.local).ok_or_else(nowhere)?;
+            let lent = self.0.lent.as_ref().ok_or_else(unkeyed)?;
+            let nowhere = || transport("expected <ip:port>[,<ip:port>], one per family, to bind");
+            let bind = local_sockets(&config.local).ok_or_else(nowhere)?;
+            let (relays, peers) = (lent.relays, Vec::new());
             let network = Network {
-                bind: vec![socket],
-                ..Network::default()
+                relays,
+                bind,
+                peers,
             };
-            let endpoint = bind_endpoint(key, None, CARRIER_ALPN, &network).await;
+            let door = lent.door.clone();
+            let endpoint = bind_endpoint(lent.key, door, CARRIER_ALPN, &network).await;
             let endpoint = endpoint.map_err(transport)?;
-            let at = bound_addr(&endpoint).map_err(transport)?;
+            let at = bound_at(&endpoint).map_err(transport)?;
             if let Err(refused) = self.place(&endpoint, config.max_frame_bytes.get()) {
                 endpoint.close().await;
                 return Err(refused);
             }
-            Ok(CarrierAddr(format!("{}@{}", at.endpoint_id, at.socket)))
+            Ok(at)
         })
     }
 
     fn dial<'a>(&'a self, peer: &'a CarrierAddr) -> PortFuture<'a, Result<Link, CarrierError>> {
         Box::pin(async move {
             let endpoint = self.endpoint().ok_or(CarrierError::Closed)?;
-            let malformed = || transport(format!("{}: expected <endpoint-id>@<ip:port>", peer.0));
-            let at = PeerAddr::parse(&peer.0).ok_or_else(malformed)?;
-            let at = EndpointAddr::from_parts(at.endpoint_id, [TransportAddr::Ip(at.socket)]);
+            let at = dial_target(peer, self.relays())?;
             let conn = endpoint.connect(at, CARRIER_ALPN).await;
             let conn = conn.map_err(transport)?;
             let (mut send, recv) = conn.open_bi().await.map_err(transport)?;
@@ -642,10 +762,10 @@ impl CarrierPort for IrohCarrier {
 
     fn accept(&self) -> PortFuture<'_, Result<Option<Link>, CarrierError>> {
         Box::pin(async move {
-            let Some(endpoint) = self.endpoint() else {
+            let (Some(endpoint), Some(lent)) = (self.endpoint(), &self.0.lent) else {
                 return Ok(None);
             };
-            match self.accept_on(&endpoint).await {
+            match self.accept_on(&endpoint, lent).await {
                 // A close that cuts a handshake short ends the accept too.
                 Err(_) if self.endpoint().is_none() => Ok(None),
                 accepted => accepted,
@@ -657,7 +777,7 @@ impl CarrierPort for IrohCarrier {
         Box::pin(async move {
             // Out of the port at the first poll, the links' handles too: a
             // close dropped part-way gives up the drain, never the handles.
-            let taken = std::mem::replace(&mut *lock(&self.state), PortState::Closed);
+            let taken = std::mem::replace(&mut *lock(&self.0.state), PortState::Closed);
             let PortState::Bound { ep, links, .. } = taken else {
                 return;
             };
@@ -675,6 +795,31 @@ impl CarrierPort for IrohCarrier {
             drop(ep);
             released(&bound).await;
         })
+    }
+}
+
+/// The notes port (plan Step 4.5b): a link's path, read off its connection,
+/// and the home relays' states, for a port lent n0's relays.
+impl LinkNotes for IrohCarrier {
+    fn path(&self, remote: &TransportId) -> Option<PathSeen> {
+        let links: Vec<Arc<LinkState>> = match &*lock(&self.0.state) {
+            PortState::Bound { links, .. } => links.iter().filter_map(Weak::upgrade).collect(),
+            _ => Vec::new(),
+        };
+        let mut to_remote = links.iter().rev().filter(|link| link.remote == *remote);
+        let newest_live = to_remote.find_map(|link| {
+            let held = lock(&link.held);
+            held.as_ref().map(|(conn, _)| selected_path(conn))
+        });
+        newest_live.flatten()
+    }
+
+    fn relay_watch(&self, seen: Box<dyn FnMut(Vec<RelayState>) + Send>) -> PortFuture<'static, ()> {
+        let relays = self.relays() == Relays::N0;
+        match self.endpoint() {
+            Some(endpoint) if relays => Box::pin(watch_relays(&endpoint, seen)),
+            _ => Box::pin(ready(())),
+        }
     }
 }
 
@@ -884,6 +1029,17 @@ impl CarrierLink for IrohLink {
     fn remote_id(&self) -> Option<TransportId> {
         Some(self.0.remote.clone())
     }
+
+    /// The connection's TLS exporter under `label`, with no context, as
+    /// HELLO draws its bytes today (D6), while the link lives (plan Step
+    /// 4.5b).
+    fn channel_binding(&self, label: &[u8]) -> Option<ChannelBinding> {
+        let held = lock(&self.0.held);
+        let (conn, _) = held.as_ref()?;
+        let mut bytes = [0; 32];
+        conn.export_keying_material(&mut bytes, label, b"").ok()?;
+        Some(ChannelBinding(bytes))
+    }
 }
 
 #[cfg(test)]
@@ -893,7 +1049,7 @@ mod tests {
     use crate::store::Store;
     use glade_wire::generated::{Op, Shape};
     use std::collections::BTreeSet;
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::path::{Path, PathBuf};
 
     /// Plan Step 4.5: `relay off` is no relay, and `relay n0` is n0's
@@ -1249,10 +1405,26 @@ mod tests {
     use glade_carrier_api::conformance::{self as carrier, Fixture};
     use std::num::NonZeroUsize;
 
+    /// A fresh endpoint key, as a booted node's own would be.
+    fn key() -> EndpointKey {
+        EndpointKey::from_seed(crate::signing::random_seed().unwrap())
+    }
+
+    /// What a root lends a port with `key`: no door, no relays, and the
+    /// first word's bound a node has.
+    fn lent(key: EndpointKey) -> Lent {
+        let (door, relays, first_word) = (None, Relays::Off, FIRST_WORD);
+        Lent {
+            key,
+            door,
+            relays,
+            first_word,
+        }
+    }
+
     /// A port lent a fresh endpoint key, as a booted node would lend its own.
     fn keyed() -> IrohCarrier {
-        let seed = crate::signing::random_seed().unwrap();
-        IrohCarrier::new(Some(EndpointKey::from_seed(seed)))
+        IrohCarrier::new(Some(lent(key())))
     }
 
     /// A configuration with this frame limit. The address is plan Step
@@ -1315,8 +1487,17 @@ mod tests {
     async fn linked(a: &IrohCarrier, b: &IrohCarrier, max: usize) -> [Box<dyn CarrierLink>; 2] {
         let at_b = b.bind(limit(max)).await.unwrap();
         a.bind(limit(max)).await.unwrap();
-        let (dialed, accepted) = tokio::join!(a.dial(&at_b), b.accept());
-        [dialed.unwrap(), accepted.unwrap().unwrap()]
+        dial_accept(a, &at_b, b).await
+    }
+
+    /// `a` dials `b` at `at`, and `b` accepts, within 5 s. A dial or an
+    /// accept that fails fails the test at once, with its error, rather than
+    /// leave the other waiting.
+    async fn dial_accept(a: &IrohCarrier, at: &CarrierAddr, b: &IrohCarrier) -> [Link; 2] {
+        let both = async { tokio::try_join!(a.dial(at), b.accept()) };
+        let both = tokio::time::timeout(Duration::from_secs(5), both).await;
+        let (dialed, accepted) = both.expect("linked within 5 s").expect("linked");
+        [dialed, accepted.expect("an inbound link")]
     }
 
     /// Plan Step 4.2c: closing the port ends every link it made and takes
@@ -1324,19 +1505,16 @@ mod tests {
     /// themselves survive. The far end sees its stream end.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_closed_carrier_frees_its_port_though_its_links_survive() {
-        let key = EndpointKey::from_seed(crate::signing::random_seed().unwrap());
-        let (a, b) = (keyed(), IrohCarrier::new(Some(key)));
+        let b_key = key();
+        let (a, b) = (keyed(), IrohCarrier::new(Some(lent(b_key))));
         let [dialed, accepted] = linked(&a, &b, 64).await;
-        let proved = Some(TransportId(key.endpoint_id.to_vec()));
+        let proved = Some(TransportId(b_key.endpoint_id.to_vec()));
         assert_eq!(
             dialed.remote_id(),
             proved,
             "the endpoint id b's TLS session proved"
         );
-        let port = match &*lock(&b.state) {
-            PortState::Bound { ep, .. } => bound_addr(ep).unwrap().socket.port(),
-            _ => unreachable!("b is bound"),
-        };
+        let port = bound_socket(&b).port();
 
         b.close().await;
 
@@ -1348,10 +1526,13 @@ mod tests {
         assert_eq!(dialed.recv().await, Ok(None), "the far end's stream ends");
     }
 
-    /// A dialer with the adapter's ALPN that writes `first` on its stream,
-    /// raw.
-    async fn raw_dial(to: &CarrierAddr, first: &[u8]) -> (Endpoint, SendStream) {
+    /// A raw dialer with `key`, on the adapter's ALPN: it connects to `to`
+    /// and writes `first` on a stream, opening none when `first` is empty.
+    /// It holds its endpoint, its connection, or why it has none, and its
+    /// stream, which keep the attempt open.
+    async fn raw(to: &CarrierAddr, key: EndpointKey, first: &[u8]) -> Raw {
         let endpoint = Endpoint::builder(presets::Minimal)
+            .secret_key(SecretKey::from_bytes(&key.seed()))
             .portmapper_config(PortmapperConfig::Disabled)
             .clear_ip_transports()
             .bind_addr((Ipv4Addr::LOCALHOST, 0))
@@ -1359,12 +1540,58 @@ mod tests {
             .bind()
             .await
             .unwrap();
-        let at = PeerAddr::parse(&to.0).unwrap();
-        let at = EndpointAddr::from_parts(at.endpoint_id, [TransportAddr::Ip(at.socket)]);
-        let conn = endpoint.connect(at, CARRIER_ALPN).await.unwrap();
-        let (mut send, _) = conn.open_bi().await.unwrap();
-        send.write_all(first).await.unwrap();
-        (endpoint, send)
+        let at = dial_target(to, Relays::Off).unwrap();
+        let conn = endpoint.connect(at, CARRIER_ALPN).await;
+        let conn = conn.map_err(|e| format!("{e:?}"));
+        let mut send = None;
+        if let (Ok(conn), false) = (&conn, first.is_empty()) {
+            if let Ok((mut stream, _)) = conn.open_bi().await {
+                let _ = stream.write_all(first).await;
+                send = Some(stream);
+            }
+        }
+        (endpoint, conn, send)
+    }
+
+    type Raw = (Endpoint, Result<Connection, String>, Option<SendStream>);
+
+    /// A dialer with the adapter's ALPN that writes `first` on its stream,
+    /// raw.
+    async fn raw_dial(to: &CarrierAddr, first: &[u8]) -> (Endpoint, SendStream) {
+        let (endpoint, _, send) = raw(to, key(), first).await;
+        (endpoint, send.expect("a stream"))
+    }
+
+    /// How the far end ended `conn`, as its `Debug` form reads, within 5 s:
+    /// [`REFUSED`] for a refusal.
+    async fn closed(conn: Result<Connection, String>) -> String {
+        let Ok(conn) = conn else {
+            return conn.err().unwrap_or_default();
+        };
+        let closed = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
+        format!("{:?}", closed.expect("closed within 5 s"))
+    }
+
+    /// A connection an adapter refused: closed with code 0 and no reason.
+    const REFUSED: &str = r#"ApplicationClosed(ApplicationClose { error_code: 0, reason: b"" })"#;
+
+    /// The socket `port` bound first, IPv4 first.
+    fn bound_socket(port: &IrohCarrier) -> SocketAddr {
+        match &*lock(&port.0.state) {
+            PortState::Bound { ep, .. } => bound_addr(ep).unwrap().socket,
+            _ => unreachable!("the port is bound"),
+        }
+    }
+
+    /// The refusal lines a door reported.
+    type Lines = Arc<Mutex<Vec<String>>>;
+
+    /// A door that admits `keys` on first contact, and the lines it reports.
+    fn door_of(keys: &[EndpointKey]) -> (Arc<Door>, Lines) {
+        let (lines, configured) = (Lines::default(), keys.iter().map(|key| key.endpoint_id));
+        let sink = lines.clone();
+        let door = Door::new(configured, move |line: &str| lock(&sink).push(line.into()));
+        (Arc::new(door), lines)
     }
 
     /// Plan Step 4.2c: a link that does not open with the adapter's word is
@@ -1436,7 +1663,7 @@ mod tests {
             ..limit(64)
         };
         let at_fresh = fresh.bind(again).await.unwrap();
-        let socket = |at: &CarrierAddr| local_socket(at).unwrap();
+        let socket = |at: &CarrierAddr| local_sockets(at).unwrap();
         assert_eq!(socket(&at_fresh), socket(&at_b), "where b was");
         assert_ne!(at_fresh, at_b, "under another key");
         fresh.close().await;
@@ -1454,5 +1681,174 @@ mod tests {
             Ok(Ok(Some(b"after".to_vec()))),
             "the transport went with its port"
         );
+    }
+
+    // ---- the adapter's half of the mesh's move (plan Step 4.5b, part 1) ----
+
+    /// CA-006 on real iroh over loopback: each link's bytes are its TLS
+    /// session's exporter. And under HELLO's label a link gives the very
+    /// bytes HELLO exports on a connection today (D6), so its transcript is
+    /// unchanged over the port.
+    #[tokio::test]
+    async fn ca_006_iroh_binds_each_link_to_its_tls_session() {
+        bounded(carrier::channel_binding(iroh_fixture())).await;
+        let (a, b) = (keyed(), keyed());
+        let [dialed, _accepted] = linked(&a, &b, 64).await;
+        let links = match &*lock(&a.0.state) {
+            PortState::Bound { links, .. } => links.clone(),
+            _ => unreachable!("a is bound"),
+        };
+        let link = links[0].upgrade().expect("a's link lives");
+        let conn = lock(&link.held).as_ref().map(|(conn, _)| conn.clone());
+        let conn = conn.expect("a's link holds its connection");
+        let today = channel(&conn, conn.remote_id(), conn.remote_id()).unwrap();
+        let binding = dialed.channel_binding(HELLO_EXPORTER);
+        assert_eq!(
+            binding,
+            Some(ChannelBinding(today.exported)),
+            "the bytes HELLO signs"
+        );
+    }
+
+    /// Plan Step 4.5b: an inbound attempt has one bound, from its arrival to
+    /// its first word. A dialer the door admits that sends nothing, and one
+    /// that sends half the word, are each refused at the bound, closed with
+    /// code 0 and no reason, and reported by their tags; the port then
+    /// accepts a genuine link.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_first_word_is_awaited_within_its_bound() {
+        let bound = Duration::from_millis(200);
+        let (silent, short, genuine) = (key(), key(), key());
+        let (door, lines) = door_of(&[silent, short, genuine]);
+        let (door, first_word) = (Some(door), bound);
+        let port = IrohCarrier::new(Some(Lent {
+            door,
+            first_word,
+            ..lent(key())
+        }));
+        let at = port.bind(limit(64)).await.unwrap();
+        for (dialer, first) in [(silent, &b""[..]), (short, &b"gc"[..])] {
+            let began = tokio::time::Instant::now();
+            let accepting = tokio::time::timeout(Duration::from_secs(5), port.accept());
+            let (refused, (_endpoint, conn, _send)) =
+                tokio::join!(accepting, raw(&at, dialer, first));
+            let refused = refused.expect("the accept still waiting after 5 s");
+            let late = "no first word within 200 ms";
+            let why = CarrierError::Transport(late.into());
+            assert_eq!(refused.err(), Some(why), "refused at the bound");
+            assert!(began.elapsed() >= bound, "refused before its bound");
+            let tag = tag(&dialer.endpoint_id);
+            let line = format!("peer refused: endpoint {tag}: {late}");
+            assert_eq!(lock(&lines).last(), Some(&line), "reported by its tag");
+            let why = closed(conn).await;
+            assert!(why.contains(REFUSED), "closed as a refusal: {why}");
+        }
+        let dialer = IrohCarrier::new(Some(lent(genuine)));
+        dialer.bind(limit(64)).await.unwrap();
+        let [dialed, accepted] = dial_accept(&dialer, &at, &port).await;
+        dialed.send(b"word").await.unwrap();
+        assert_eq!(accepted.recv().await, Ok(Some(b"word".to_vec())));
+    }
+
+    /// Plan Step 4.5b: the door's accept hook on the adapter's endpoint. A
+    /// key the door does not know is refused at accept, though its dialer
+    /// sends the word: its connection is closed with code 0 and no reason,
+    /// and the refusal reported by its tag. A key the door was configured
+    /// with links.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_carrier_behind_a_door_refuses_an_unknown_key_at_accept() {
+        let (known, unknown) = (key(), key());
+        let (door, lines) = door_of(&[known]);
+        let door = Some(door);
+        let port = IrohCarrier::new(Some(Lent {
+            door,
+            ..lent(key())
+        }));
+        let at = port.bind(limit(64)).await.unwrap();
+        let (refused, (_endpoint, conn, _send)) =
+            tokio::join!(port.accept(), raw(&at, unknown, PREAMBLE));
+        assert!(refused.is_err(), "the unknown key linked");
+        let why = closed(conn).await;
+        assert!(why.contains(REFUSED), "closed as a refusal: {why}");
+        let line = format!(
+            "peer refused: endpoint {}: unknown endpoint key",
+            tag(&unknown.endpoint_id)
+        );
+        assert_eq!(*lock(&lines), [line]);
+        let dialer = IrohCarrier::new(Some(lent(known)));
+        dialer.bind(limit(64)).await.unwrap();
+        let [dialed, accepted] = dial_accept(&dialer, &at, &port).await;
+        dialed.send(b"known").await.unwrap();
+        assert_eq!(accepted.recv().await, Ok(Some(b"known".to_vec())));
+    }
+
+    /// Plan Step 4.5b: `local` names a socket per family; the port binds both
+    /// and answers with both, IPv4 first; and a dial of that answer reaches
+    /// it. On loopback, at ports found free. Then, pure: an `ip:port` and a
+    /// relay URL become one iroh address with both, and the relay URL needs
+    /// a port lent n0's relays.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_carrier_binds_the_sockets_it_is_given_and_dials_every_address() {
+        let free = |ip: IpAddr| {
+            let socket = std::net::UdpSocket::bind((ip, 0)).unwrap();
+            socket.local_addr().unwrap()
+        };
+        let v4 = free(Ipv4Addr::LOCALHOST.into());
+        let v6 = free(Ipv6Addr::LOCALHOST.into());
+        let b_key = key();
+        let b = IrohCarrier::new(Some(lent(b_key)));
+        let local = CarrierAddr(format!("{v6},{v4}"));
+        let at_b = b.bind(CarrierConfig { local, ..limit(64) }).await.unwrap();
+        let id = hex(&b_key.endpoint_id);
+        assert_eq!(at_b.0, format!("{id}@{v4},{v6}"), "both, IPv4 first");
+        let a = keyed();
+        a.bind(limit(64)).await.unwrap();
+        let [dialed, accepted] = dial_accept(&a, &at_b, &b).await;
+        dialed.send(b"both").await.unwrap();
+        assert_eq!(accepted.recv().await, Ok(Some(b"both".to_vec())));
+
+        let (socket, relay) = ("10.1.1.236:4545", "https://aps1-1.relay.n0.iroh.link./");
+        let far = CarrierAddr(format!("{id}@{socket},{relay}"));
+        let target = dial_target(&far, Relays::N0).unwrap();
+        assert_eq!(target.id.as_bytes(), &b_key.endpoint_id);
+        let ips: Vec<String> = target.ip_addrs().map(|ip| ip.to_string()).collect();
+        let relays: Vec<String> = target.relay_urls().map(|url| url.to_string()).collect();
+        assert_eq!((ips, relays), (vec![socket.into()], vec![relay.into()]));
+        let unrelayed = dial_target(&far, Relays::Off).err();
+        let needs = transport("a relay URL needs relay n0");
+        assert_eq!(unrelayed, Some(needs), "a port with no relays");
+    }
+
+    /// Plan Step 4.5b: the notes port reads the path of an endpoint's newest
+    /// live link, `direct <ip:port>` on loopback, the far end's socket, and
+    /// nothing for an endpoint no link reaches. A port with no relays watches
+    /// none: its watch ends at once, having seen nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_carrier_notes_each_links_path() {
+        let b_key = key();
+        let (a, b) = (keyed(), IrohCarrier::new(Some(lent(b_key))));
+        let [_dialed, _accepted] = linked(&a, &b, 64).await;
+        let far = TransportId(b_key.endpoint_id.to_vec());
+        let mut path = a.path(&far);
+        for _ in 0..200 {
+            if path.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            path = a.path(&far);
+        }
+        let path = path.expect("a path noted within 2 s");
+        assert_eq!(path.via, format!("direct {}", bound_socket(&b)));
+        let nobody = TransportId(key().endpoint_id.to_vec());
+        assert_eq!(a.path(&nobody), None, "no link reaches it");
+
+        let seen = Lines::default();
+        let noting = seen.clone();
+        let watch = a.relay_watch(Box::new(move |states: Vec<RelayState>| {
+            lock(&noting).extend(states.into_iter().map(|state| state.url));
+        }));
+        let ended = tokio::time::timeout(Duration::from_secs(1), watch).await;
+        ended.expect("the watch ends at once");
+        assert!(lock(&seen).is_empty(), "a port with no relays notes none");
     }
 }
