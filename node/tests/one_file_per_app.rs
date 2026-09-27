@@ -11,7 +11,7 @@
 
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use glade_node::appdecl::{load_all, register, Registered};
@@ -39,6 +39,20 @@ fn app_file(dir: &Path, name: &str, text: &str) -> PathBuf {
     let path = dir.join(name);
     std::fs::write(&path, text).unwrap();
     path
+}
+
+/// A spawned `glade-node`, killed when dropped while it still runs (F10), as
+/// `assembled_path.rs`'s `Running` is: a test that fails while its process
+/// runs leaves none behind. Nothing here can panic.
+struct Spawned(Child);
+
+impl Drop for Spawned {
+    fn drop(&mut self) {
+        if let Ok(None) = self.0.try_wait() {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
 }
 
 /// `load_all` refuses two files naming one app, in either order, with one
@@ -73,7 +87,7 @@ fn a_start_with_two_files_naming_one_app_is_refused_and_writes_nothing() {
     let home = dir.join("glade-home");
     std::fs::create_dir(&home).unwrap();
 
-    let mut node = Command::new(env!("CARGO_BIN_EXE_glade-node"))
+    let spawned = Command::new(env!("CARGO_BIN_EXE_glade-node"))
         .args(["--profile", "local", "--name", "t", "--app"])
         .arg(&a1)
         .arg("--app")
@@ -86,6 +100,8 @@ fn a_start_with_two_files_naming_one_app_is_refused_and_writes_nothing() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn glade-node");
+    let mut held = Spawned(spawned);
+    let node = &mut held.0;
     let deadline = Instant::now() + Duration::from_secs(20);
     let status = loop {
         if let Some(status) = node.try_wait().unwrap() {

@@ -12,7 +12,7 @@
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use glade_node::sysdir::{boot_at, now_ms};
@@ -30,6 +30,20 @@ fn scratch(test: &str) -> PathBuf {
     dir
 }
 
+/// A spawned `glade-node`, killed when dropped while it still runs (F10), as
+/// `assembled_path.rs`'s `Running` is: a test that fails while its process
+/// runs leaves none behind. Nothing here can panic.
+struct Spawned(Child);
+
+impl Drop for Spawned {
+    fn drop(&mut self) {
+        if let Ok(None) = self.0.try_wait() {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
 /// `glade-node endpoint-id --name <name>` under `home`, run to its end within
 /// the bound: its exit status, its stdout lines and its stderr. A process
 /// still running at the bound is killed, and the test fails with what it
@@ -43,7 +57,8 @@ fn endpoint_id(home: &Path, name: &str) -> (ExitStatus, Vec<String>, String) {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut node = command.spawn().expect("spawn glade-node");
+    let mut held = Spawned(command.spawn().expect("spawn glade-node"));
+    let node = &mut held.0;
     let deadline = Instant::now() + BOUND;
     let status = loop {
         if let Some(status) = node.try_wait().unwrap() {

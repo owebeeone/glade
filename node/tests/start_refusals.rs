@@ -11,7 +11,7 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 /// A file that loads: the app `x`, with one binding.
@@ -33,6 +33,20 @@ fn app_file(dir: &Path, name: &str, text: &str) -> PathBuf {
     path
 }
 
+/// A spawned `glade-node`, killed when dropped while it still runs (F10), as
+/// `assembled_path.rs`'s `Running` is: a test that fails while its process
+/// runs leaves none behind. Nothing here can panic.
+struct Spawned(Child);
+
+impl Drop for Spawned {
+    fn drop(&mut self) {
+        if let Ok(None) = self.0.try_wait() {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
 /// `glade-node --profile local --name t --app <app>... 0`, with `GLADE_HOME`
 /// and `HOME` at a fresh `dir/glade-home`, required to be refused: the node
 /// exits 1, and nothing is written under its `GLADE_HOME`. A node still
@@ -46,7 +60,7 @@ fn refused_start(dir: &Path, apps: &[&Path]) -> String {
     for app in apps {
         command.arg("--app").arg(app);
     }
-    let mut node = command
+    let spawned = command
         .arg("0")
         .env("GLADE_HOME", &home)
         .env("HOME", &home)
@@ -55,6 +69,8 @@ fn refused_start(dir: &Path, apps: &[&Path]) -> String {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn glade-node");
+    let mut held = Spawned(spawned);
+    let node = &mut held.0;
     let deadline = Instant::now() + Duration::from_secs(20);
     let status = loop {
         if let Some(status) = node.try_wait().unwrap() {

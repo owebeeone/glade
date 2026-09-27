@@ -25,11 +25,13 @@
 //! anything is written, and no line naming an endpoint id; every test that
 //! needs an id reads it with `glade-node endpoint-id`, as an operator does.
 //! One checks F9: a `--name` that is not an instance name is refused before
-//! anything is written.
+//! anything is written. The last checks F10: a test that fails while its node
+//! runs leaves no node running, and its failure is the one reported.
 //! Every file goes under a fresh directory in the system temp dir, and the node
 //! runs with `GLADE_HOME` and `HOME` pointed there: `~/.glade` is never touched.
 
 use std::io::{BufRead, BufReader, Read};
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -112,22 +114,23 @@ fn ended(home: &Path, root: Root, args: &[&str]) -> (ExitStatus, String) {
 }
 
 /// `ended`, for a node `command` spawns.
-fn ended_as(mut command: Command, root: Root) -> (ExitStatus, String) {
-    let mut node = command.spawn().expect("spawn glade-node");
+fn ended_as(command: Command, root: Root) -> (ExitStatus, String) {
+    let mut node = Running::spawn(command);
     let deadline = Instant::now() + BOUND;
     let status = loop {
-        if let Some(status) = node.try_wait().unwrap() {
+        if let Some(status) = node.child.try_wait().unwrap() {
             break status;
         }
         if Instant::now() >= deadline {
-            let _ = node.kill();
-            let _ = node.wait();
+            let _ = node.child.kill();
+            let _ = node.child.wait();
             panic!("glade-node ({root:?}) still ran after {BOUND:?}: the start was not refused");
         }
         std::thread::sleep(Duration::from_millis(20));
     };
     let mut stderr = String::new();
-    node.stderr
+    node.child
+        .stderr
         .take()
         .unwrap()
         .read_to_string(&mut stderr)
@@ -135,22 +138,33 @@ fn ended_as(mut command: Command, root: Root) -> (ExitStatus, String) {
     (status, stderr)
 }
 
-/// A node started from `root`, its stdout read up to its `listening <port>`
-/// line, and left running until `stop`.
+/// A spawned node, held from its first instant: `start` reads its stdout up
+/// to its `listening <port>` line and leaves it running until `stop`, and a
+/// command run to its end is held the same way. One dropped while its node
+/// still runs kills the node (F10).
 struct Running {
-    node: Child,
+    child: Child,
     lines: Vec<String>,
 }
 
 impl Running {
+    /// The node `command` spawns, held before anything else can fail.
+    fn spawn(mut command: Command) -> Running {
+        let child = command.spawn().expect("spawn glade-node");
+        Running {
+            child,
+            lines: Vec::new(),
+        }
+    }
+
     fn start(home: &Path, root: Root, args: &[&str]) -> Running {
         Running::start_as(glade_node(home, root, args), root)
     }
 
     /// `start`, for a node `command` spawns.
-    fn start_as(mut command: Command, root: Root) -> Running {
-        let mut node = command.spawn().expect("spawn glade-node");
-        let stdout = node.stdout.take().unwrap();
+    fn start_as(command: Command, root: Root) -> Running {
+        let mut running = Running::spawn(command);
+        let stdout = running.child.stdout.take().unwrap();
         let (tx, rx) = mpsc::channel();
         let reader = std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {
@@ -164,12 +178,11 @@ impl Running {
             }
         });
         let deadline = Instant::now() + BOUND;
-        let mut lines: Vec<String> = Vec::new();
         let outcome = loop {
             match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                 Ok(line) => {
                     let last = line.starts_with("listening ");
-                    lines.push(line);
+                    running.lines.push(line);
                     if last {
                         break Ok(());
                     }
@@ -178,7 +191,6 @@ impl Running {
                 Err(RecvTimeoutError::Disconnected) => break Err("stopped before `listening`"),
             }
         };
-        let running = Running { node, lines };
         if let Err(why) = outcome {
             let lines = running.lines.clone();
             let stderr = running.stop();
@@ -191,12 +203,25 @@ impl Running {
 
     /// Kill the node; what it wrote to stderr.
     fn stop(mut self) -> String {
-        let _ = self.node.kill();
-        let _ = self.node.wait();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
         let mut stderr = String::new();
-        let pipe = self.node.stderr.take();
+        let pipe = self.child.stderr.take();
         pipe.unwrap().read_to_string(&mut stderr).unwrap();
         stderr
+    }
+}
+
+/// A failing test never leaves its node running (F10): a node this file
+/// spawned and did not see end is killed, by its own handle, when its
+/// `Running` is dropped, as a panic unwinds too. Nothing here can panic, so
+/// the failure a test reports is its own.
+impl Drop for Running {
+    fn drop(&mut self) {
+        if let Ok(None) = self.child.try_wait() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
     }
 }
 
@@ -690,22 +715,22 @@ fn both_roots_check_client_grants_only_when_switched_on() {
 /// status, its stdout lines and its stderr. A process still running at the
 /// bound is killed, and the test fails with what it printed.
 fn bounded(home: &Path, root: Root, args: &[&str]) -> (ExitStatus, Vec<String>, String) {
-    let mut command = glade_node(home, root, args);
-    let mut node = command.spawn().expect("spawn glade-node");
+    let mut node = Running::spawn(glade_node(home, root, args));
     let deadline = Instant::now() + BOUND;
     let status = loop {
-        if let Some(status) = node.try_wait().unwrap() {
+        if let Some(status) = node.child.try_wait().unwrap() {
             break status;
         }
         if Instant::now() >= deadline {
-            let _ = node.kill();
-            let _ = node.wait();
-            let stdout = drained(node.stdout.take());
+            let _ = node.child.kill();
+            let _ = node.child.wait();
+            let stdout = drained(node.child.stdout.take());
             panic!("glade-node {args:?} ({root:?}) still ran after {BOUND:?}: {stdout}");
         }
         std::thread::sleep(Duration::from_millis(20));
     };
-    let (stdout, stderr) = (drained(node.stdout.take()), drained(node.stderr.take()));
+    let stdout = drained(node.child.stdout.take());
+    let stderr = drained(node.child.stderr.take());
     (status, stdout.lines().map(str::to_owned).collect(), stderr)
 }
 
@@ -1314,17 +1339,6 @@ fn both_roots_refuse_a_damaged_records_json_with_a_clear_message() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// A command asked of `glade-node` under `root`, run to its end: its exit
-/// status, its stdout lines, and its stderr.
-fn command(home: &Path, root: Root, args: &[&str]) -> (ExitStatus, Vec<String>, String) {
-    let ran = glade_node(home, root, args)
-        .output()
-        .expect("run glade-node");
-    let stdout = String::from_utf8(ran.stdout).unwrap();
-    let lines = stdout.lines().map(str::to_owned).collect();
-    (ran.status, lines, String::from_utf8(ran.stderr).unwrap())
-}
-
 /// The recovery key the node `node` of the instance at `instance` has
 /// committed, as records.json holds it.
 fn committed_key(instance: &Path, node: &str) -> Option<String> {
@@ -1354,7 +1368,7 @@ fn both_roots_warn_until_a_recovery_key_is_committed() {
 
         let out = dir.join(format!("{name}.recovery"));
         let asked = ["recovery", "--name", name, "--out", out.to_str().unwrap()];
-        let (status, said, stderr) = command(&home, root, &asked);
+        let (status, said, stderr) = bounded(&home, root, &asked);
         assert_eq!(status.code(), Some(0), "{root:?}: {stderr}");
         let node = lines[1].strip_prefix("node ").unwrap();
         let instance = home.join("sys").join(name);
@@ -1455,6 +1469,53 @@ fn both_roots_discard_a_local_json_that_fails_its_check() {
         );
         assert!(stderr.lines().any(|l| l == discarded), "{root:?}: {stderr}");
         assert_eq!(kinds(&lines).last(), Some(&"listening"), "{root:?}");
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Whether the instance lock at `path` can be taken within the bound, as a
+/// boot takes it (`File::try_lock`): the OS frees it only when the process
+/// that holds it ends, killed or not.
+fn released(path: &Path) -> bool {
+    let deadline = Instant::now() + BOUND;
+    loop {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(false);
+        if options.open(path).unwrap().try_lock().is_ok() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// F10 (the owner's ruling of 2026-09-27), on each root: a test that fails
+/// while its node runs leaves no node running, and the failure it reports is
+/// its own. Here the test panics while its node serves; once the panic has
+/// unwound, the node's instance lock can be taken, which the OS allows only
+/// when the node's process has ended, and the panic caught is the test's.
+/// Before F10, `Running` killed nothing when dropped, and the node served on
+/// after its test had failed.
+#[test]
+fn a_node_does_not_outlive_its_failing_test() {
+    let dir = scratch("failing-test");
+    let home = dir.join("glade-home");
+    for (root, name) in [(Root::HandWritten, "h"), (Root::Assembled, "a")] {
+        let args = ["--profile", "local", "--name", name, "0"];
+        let mut pid = None;
+        let failed = panic::catch_unwind(AssertUnwindSafe(|| {
+            let node = Running::start(&home, root, &args);
+            pid = Some(node.child.id());
+            panic!("the test's own failure");
+        }));
+        let failure = failed.expect_err("the test failed");
+        let own = failure.downcast_ref::<&str>();
+        assert_eq!(own, Some(&"the test's own failure"), "{root:?}");
+        let lock = home.join("sys").join(name).join("instance.lock");
+        let pid = pid.unwrap();
+        assert!(released(&lock), "{root:?}: node {pid} outlived its test");
     }
     std::fs::remove_dir_all(&dir).unwrap();
 }

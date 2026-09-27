@@ -97,6 +97,12 @@ mod unix {
             let mut child = command.spawn().expect("spawn glade-node");
             let stdout = child.stdout.take().unwrap();
             let (tx, rx) = mpsc::channel();
+            // Held before anything else can fail, so `Drop` covers it (F10).
+            let node = Node {
+                child,
+                lines: Vec::new(),
+                rest: rx,
+            };
             std::thread::spawn(move || {
                 for line in BufReader::new(stdout).lines() {
                     let Ok(line) = line else {
@@ -107,11 +113,7 @@ mod unix {
                     }
                 }
             });
-            Node {
-                child,
-                lines: Vec::new(),
-                rest: rx,
-            }
+            node
         }
 
         /// The rest of the first line starting `word `.
