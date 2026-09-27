@@ -36,6 +36,10 @@ glade-carrier-api = { path = "../contracts/carrier-api" }
 glade-clock-api = { path = "../contracts/clock-api" }
 glade-grant-api = { path = "../contracts/grant-api" }
 glade-signer-api = { path = "../contracts/signer-api" }
+# The persistence port (F2, the owner's answer (a) of 2026-09-27): records.json's
+# store (src/records_file.rs) implements `SnapshotStore` for snapshots only, and
+# PS-001..008 run on it in tests/durable, through a fixture.
+glade-persistence-api = { path = "../contracts/persistence-api" }
 # Genuine signing (plan Step 4.1a, src/signing.rs): Ed25519 under the node key,
 # pinned exactly, because another verification library changes which signatures
 # count; the pin also governs iroh's copy (glade/dev-docs/GladeNodeSigning.md D1).
@@ -52,12 +56,14 @@ sdax = { git = "https://github.com/owebeeone/sdax-rs", package = "sdax", rev = "
 sdax-tokio = { git = "https://github.com/owebeeone/sdax-rs", package = "sdax-tokio", rev = "ccf06e76a90e22a454471a71f0cf6f5cb878baac" }
 
 # The same four ports with their conformance suites, which tests/assembly runs
-# against the node's deterministic providers (LBT-009).
+# against the node's deterministic providers (LBT-009), and the persistence
+# port's, which tests/durable runs on records.json's store.
 [dev-dependencies]
 glade-carrier-api = { path = "../contracts/carrier-api", features = ["conformance"] }
 glade-clock-api = { path = "../contracts/clock-api", features = ["conformance"] }
 glade-grant-api = { path = "../contracts/grant-api", features = ["conformance"] }
 glade-signer-api = { path = "../contracts/signer-api", features = ["conformance"] }
+glade-persistence-api = { path = "../contracts/persistence-api", features = ["conformance"] }
 # The scripted driver and plan invariants tests/release_order.rs runs over the
 # node's plan. publish = false upstream, so it can only come from Git.
 sdax-testkit = { git = "https://github.com/owebeeone/sdax-rs", package = "sdax-testkit", rev = "ccf06e76a90e22a454471a71f0cf6f5cb878baac" }

@@ -38,7 +38,10 @@ models are volatile memory, not production implementations. Snapshot-copy reopen
 tests MUST NOT be presented as physical crash or fsync verification. Real adapters
 MUST also test concurrent handles, interrupted writes, pending-future cancellation,
 capacity limits and recovery after known failure. Caller schema/authenticity checks
-remain outside the storage port. There are no current production consumers.
+remain outside the storage port. There are no current production consumers: the node's own saves do not go
+through the port. glade-node's records.json store implements it for snapshots only (plan follow-up F2, 2026-09-27),
+and `glade/node/tests/durable/snapshots.rs` runs PS-001..008 on it through a fixture that wraps each probe's bytes as
+one record.
 
 ## Assembly ports (first-slice plan Step 3.1)
 

@@ -3,7 +3,8 @@
 //! `tests/journeys` by `#[path]`, with each test node persisting through
 //! records.json (`BlobStore`) in a temp directory of its own instead of the
 //! fast loop's in-memory engine; `adapter.rs` holds the tests the contracts
-//! README requires of a real persistence adapter. This binary writes files,
+//! README requires of a real persistence adapter, and `snapshots.rs` the
+//! persistence port's suite, PS-001..008, on records.json's store (F2). This binary writes files,
 //! so it stays out of the fast loop (`--test journeys --test assembly`). The
 //! design is `glade/dev-docs/GladeNodeAssembly.md`, "Durable store and
 //! restart (plan Step 4.4)".
@@ -29,9 +30,10 @@ mod node;
 #[path = "../journeys/restart.rs"]
 mod restart;
 
-// This binary's engine, and the adapter tests on it.
+// This binary's engine, the adapter tests on it, and the port's suite.
 mod adapter;
 mod disk;
+mod snapshots;
 
 pub use disk::DiskStore as Engine;
 pub use node::{pair, TestNode, T0, WS};

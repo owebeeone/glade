@@ -8,7 +8,9 @@
 //! one answers [`FileError::Corrupt`], never a panic, and a save compares the
 //! revision it expects with the one held, under a lock, before it writes. The
 //! design is `glade/dev-docs/GladeNodeAssembly.md`, "The persistence suite on
-//! records.json".
+//! records.json". The store is also the persistence port, `SnapshotStore`,
+//! for snapshots only (F2, the owner's answer (a) of 2026-09-27), and the
+//! node's own saves go through [`RecordsFile::compare_exchange`] as before.
 
 use std::fmt;
 use std::fs;
@@ -16,6 +18,7 @@ use std::io::{self, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
+use glade_persistence_api::{Snapshot, SnapshotStore, StoreError};
 use glade_wire::cbor::{self, Cbor};
 
 use crate::envelope::{self, head};
@@ -194,6 +197,46 @@ impl RecordsFile {
         let file = file.map_err(FileError::Unavailable)?;
         file.lock().map_err(FileError::Unavailable)?;
         Ok(file)
+    }
+}
+
+/// records.json's store as the persistence port (F2, the owner's answer (a)
+/// of 2026-09-27): records.json holds snapshots only. The bytes committed must
+/// be a snapshot as the node writes one, a canonical CBOR map without key 3;
+/// any other bytes are refused before anything is written, as `Capacity`, the
+/// nearest outcome the contract has. The revision is the file's. Each future
+/// does its work when first polled and finishes in that poll: an unpolled one
+/// writes nothing, and a polled one leaves nothing pending to cancel.
+/// PS-001..008 run on it in `tests/durable`, through a fixture that carries
+/// each probe's bytes as the one record of a snapshot.
+impl SnapshotStore for RecordsFile {
+    async fn load(&self) -> Result<Option<Snapshot>, StoreError> {
+        let loaded = RecordsFile::load(self)?;
+        Ok(loaded.map(|(revision, bytes)| Snapshot { revision, bytes }))
+    }
+
+    async fn compare_exchange(
+        &self,
+        expected: Option<u64>,
+        bytes: Vec<u8>,
+    ) -> Result<Snapshot, StoreError> {
+        let revision = RecordsFile::compare_exchange(self, expected, &bytes)?;
+        Ok(Snapshot { revision, bytes })
+    }
+}
+
+/// The port's outcome for each of the store's (F2): bytes that are not a
+/// snapshot are `Capacity`.
+impl From<FileError> for StoreError {
+    fn from(e: FileError) -> StoreError {
+        match e {
+            FileError::Unavailable(_) => StoreError::Unavailable,
+            FileError::Corrupt(_) => StoreError::Corrupt,
+            FileError::Conflict { .. } => StoreError::Conflict,
+            FileError::Exhausted => StoreError::Exhausted,
+            FileError::OutcomeUnknown(_) => StoreError::OutcomeUnknown,
+            FileError::NotASnapshot => StoreError::Capacity,
+        }
     }
 }
 
@@ -653,6 +696,49 @@ mod tests {
             Some((1, encode(&snap))),
             "revision 1 again"
         );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// F2 (the owner's answer (a) of 2026-09-27): as the persistence port,
+    /// records.json holds snapshots only. Bytes that are not a snapshot as
+    /// the node writes one, here a probe's `[1, 2, 3]`, empty bytes, the
+    /// snapshot with its key 3 as the generated codec writes it, and a map
+    /// whose keys are out of order, are refused as `Capacity`, and nothing is
+    /// written. The node's snapshot commits at revision 1 and loads back byte
+    /// for byte. Each of the store's outcomes is the port's of the same name,
+    /// but for bytes that are not a snapshot.
+    #[tokio::test]
+    async fn as_the_port_it_takes_snapshots_only() {
+        let dir = fresh("port");
+        let file = RecordsFile::new(&dir);
+        // `{2: [], 1: []}`, by hand: glade-wire's encoder sorts a map's keys.
+        let unordered = vec![0xa2, 0x02, 0x80, 0x01, 0x80];
+        let with_key_3 = cbor::encode(&snapshot(1).to_cbor());
+        for bytes in [vec![1, 2, 3], vec![], with_key_3, unordered] {
+            let refused = SnapshotStore::compare_exchange(&file, None, bytes).await;
+            assert_eq!(refused, Err(StoreError::Capacity));
+            assert!(!file.path().exists(), "nothing written");
+        }
+        let bytes = encode(&snapshot(1));
+        let committed = Snapshot { revision: 1, bytes };
+        let answer = SnapshotStore::compare_exchange(&file, None, committed.bytes.clone());
+        assert_eq!(answer.await, Ok(committed.clone()));
+        assert_eq!(SnapshotStore::load(&file).await, Ok(Some(committed)));
+
+        let io = || io::Error::other("the test's");
+        let (held, expected) = (Some(2), Some(1));
+        let conflict = FileError::Conflict { held, expected };
+        let outcomes = [
+            (FileError::Unavailable(io()), StoreError::Unavailable),
+            (FileError::Corrupt("the test's"), StoreError::Corrupt),
+            (conflict, StoreError::Conflict),
+            (FileError::Exhausted, StoreError::Exhausted),
+            (FileError::OutcomeUnknown(io()), StoreError::OutcomeUnknown),
+            (FileError::NotASnapshot, StoreError::Capacity),
+        ];
+        for (outcome, port) in outcomes {
+            assert_eq!(StoreError::from(outcome), port);
+        }
         fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -3,11 +3,9 @@
 //! real engine, records.json through `BlobStore`. Each says what it proves and
 //! what it cannot. records.json now carries its revision, and each save is a
 //! compare-and-swap against it (`records_file.rs`, whose own tests cover the
-//! format, a damaged file, the lock and the last revision). It is not yet
-//! `SnapshotStore`: the node does not depend on the persistence port, so
-//! PS-001..008 do not run here until part 2 of "The persistence suite on
-//! records.json" (`glade/dev-docs/GladeNodeAssembly.md`), which waits on a
-//! question for the owner. Cancellation of a pending future has no test here:
+//! format, a damaged file, the lock and the last revision). The store is
+//! also the persistence port, `SnapshotStore`, for snapshots only (F2), and
+//! PS-001..008 run on it in `snapshots.rs`. Cancellation of a pending future has no test here:
 //! `StoreApi` is synchronous, and `claims.rs` tests the one future that waits
 //! around a save. Capacity has none either: neither store enforces one, and a
 //! full disk cannot be produced here.

@@ -857,6 +857,7 @@ dependencies = [
  "glade-carrier-api",
  "glade-clock-api",
  "glade-grant-api",
+ "glade-persistence-api",
  "glade-signer-api",
  "glade-wire",
  "iroh",
@@ -867,6 +868,10 @@ dependencies = [
  "shaku",
  "tokio",
 ]
+
+[[package]]
+name = "glade-persistence-api"
+version = "0.0.0"
 
 [[package]]
 name = "glade-signer-api"
