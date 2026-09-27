@@ -7320,6 +7320,19 @@ As built, beside the design:
 - **The node's policy text** (`node/architecture-policy.json`) says the adapter runs CA-001..006 on
   real iroh, where it said CA-001..005.
 
+**Part 1's CA-004 finding, fixed** on 2026-09-27 as the owner ruled (plan line 914), on glade `cde604d`.
+A pending `accept` or `dial` holds the endpoint on a counted `Loan`. `close` waits for the release only
+when no loan is out; otherwise the last loan to end waits for it, within `LINGER`, before its accept or
+dial answers. A loan dropped with its future is uncounted and waits for nothing. CA-004 took 3.04 to
+3.06 s, its release wait running out every run, and takes 0.03 s; with the release tests it passed 20
+runs in a row, 8 of them beside a workspace `cargo test`. Red first, in a sources-only copy:
+`close_leaves_the_release_to_a_pending_accept` and `_dial`, unfixed, `close waits on no accept's
+handle: 3.006s`, and with the loan's wait off, `the accept answers once the address binds again`;
+`only_the_last_loan_to_end_waits_for_the_release`, every loan waiting, `the first waits for no
+release: 3.000s`; `a_dropped_accept_leaves_the_release_to_close`, a dropped loan left counted, `close
+answers once the address binds again`. The tests hold one handle 100 ms more, so a missing wait fails
+every run. For part 3: a root that rebinds an address after `close` lets its accept loop answer first.
+
 **Part 2** (the link's conversations and HELLO on a link):
 
 | Test | Proves | Red against |

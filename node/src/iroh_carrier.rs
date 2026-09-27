@@ -43,7 +43,7 @@ use std::fmt;
 use std::future::{ready, Future};
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
@@ -525,6 +525,8 @@ pub struct IrohCarrier(Arc<Adapter>);
 struct Adapter {
     lent: Option<Lent>,
     state: Mutex<PortState>,
+    /// How many [`Loan`]s of the endpoint pending accepts and dials hold.
+    loans: AtomicUsize,
 }
 
 enum PortState {
@@ -550,8 +552,8 @@ fn refusal(state: &PortState) -> Option<CarrierError> {
 impl IrohCarrier {
     /// A port that binds as `lent` says; lent nothing, it refuses to.
     pub fn new(lent: Option<Lent>) -> IrohCarrier {
-        let state = Mutex::new(PortState::Unbound);
-        IrohCarrier(Arc::new(Adapter { lent, state }))
+        let (state, loans) = (Mutex::new(PortState::Unbound), AtomicUsize::new(0));
+        IrohCarrier(Arc::new(Adapter { lent, state, loans }))
     }
 
     /// The relays this port was lent: none unless lent n0's.
@@ -576,6 +578,18 @@ impl IrohCarrier {
             PortState::Bound { ep, .. } => Some(ep.clone()),
             _ => None,
         }
+    }
+
+    /// The bound endpoint, lent to a pending accept or dial and counted until
+    /// its [`Loan`] ends: none before `bind` and after `close`.
+    fn loan(&self) -> Option<(Endpoint, Loan<'_>)> {
+        let state = lock(&self.0.state);
+        let PortState::Bound { ep, .. } = &*state else {
+            return None;
+        };
+        self.0.loans.fetch_add(1, Ordering::SeqCst);
+        let port = &*self.0;
+        Some((ep.clone(), Loan { port, out: true }))
     }
 
     /// Track a new link; none, dropping it, once the port has closed.
@@ -633,6 +647,17 @@ impl IrohCarrier {
         };
         let (send, recv) = opened?;
         Ok(self.track(conn, send, recv))
+    }
+
+    /// One dial of `peer` from `endpoint`: the connection, the stream and the
+    /// first word, then the link, tracked.
+    async fn dial_on(&self, endpoint: &Endpoint, peer: &CarrierAddr) -> Result<Link, CarrierError> {
+        let at = dial_target(peer, self.relays())?;
+        let conn = endpoint.connect(at, CARRIER_ALPN).await;
+        let conn = conn.map_err(transport)?;
+        let (mut send, recv) = conn.open_bi().await.map_err(transport)?;
+        send.write_all(PREAMBLE).await.map_err(transport)?;
+        self.track(conn, send, recv).ok_or(CarrierError::Closed)
     }
 }
 
@@ -742,22 +767,24 @@ impl CarrierPort for IrohCarrier {
 
     fn dial<'a>(&'a self, peer: &'a CarrierAddr) -> PortFuture<'a, Result<Link, CarrierError>> {
         Box::pin(async move {
-            let endpoint = self.endpoint().ok_or(CarrierError::Closed)?;
-            let at = dial_target(peer, self.relays())?;
-            let conn = endpoint.connect(at, CARRIER_ALPN).await;
-            let conn = conn.map_err(transport)?;
-            let (mut send, recv) = conn.open_bi().await.map_err(transport)?;
-            send.write_all(PREAMBLE).await.map_err(transport)?;
-            self.track(conn, send, recv).ok_or(CarrierError::Closed)
+            let (endpoint, loan) = self.loan().ok_or(CarrierError::Closed)?;
+            let dialed = self.dial_on(&endpoint, peer).await;
+            loan.end(endpoint).await;
+            dialed
         })
     }
 
     fn accept(&self) -> PortFuture<'_, Result<Option<Link>, CarrierError>> {
         Box::pin(async move {
-            let (Some(endpoint), Some(lent)) = (self.endpoint(), &self.0.lent) else {
+            let Some(lent) = &self.0.lent else {
                 return Ok(None);
             };
-            match self.accept_on(&endpoint, lent).await {
+            let Some((endpoint, loan)) = self.loan() else {
+                return Ok(None);
+            };
+            let accepted = self.accept_on(&endpoint, lent).await;
+            loan.end(endpoint).await;
+            match accepted {
                 // A close that cuts a handshake short ends the accept too.
                 Err(_) if self.endpoint().is_none() => Ok(None),
                 accepted => accepted,
@@ -785,7 +812,11 @@ impl CarrierPort for IrohCarrier {
             let bound = ep.bound_sockets();
             ep.close().await;
             drop(ep);
-            released(&bound).await;
+            // A loan out keeps the sockets bound until it ends, and the last
+            // one to end waits for their release: close does not.
+            if self.0.loans.load(Ordering::SeqCst) == 0 {
+                released(&bound).await;
+            }
         })
     }
 }
@@ -820,7 +851,8 @@ impl LinkNotes for IrohCarrier {
 /// milliseconds after its last handle drops, and gives no signal when it
 /// has, so a port whose `close` frees its address by value (CA-004), now
 /// that it binds where `CarrierConfig::local` says, waits for it: binding
-/// each address itself is the only witness.
+/// each address itself is the only witness. `close` waits here when no
+/// [`Loan`] is out, and otherwise the last loan to end does.
 async fn released(bound: &[SocketAddr]) {
     let deadline = tokio::time::Instant::now() + LINGER;
     for socket in bound {
@@ -830,6 +862,45 @@ async fn released(bound: &[SocketAddr]) {
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+    }
+}
+
+/// The endpoint's handle, out on loan to a pending accept or dial (the
+/// owner's ruling of 2026-09-27). iroh frees the sockets only once every
+/// handle is gone, so a `close` that finds a loan out does not wait for the
+/// release, which it would bar: the last loan to end waits for it, and its
+/// accept or dial answers after. A loan dropped with its future is
+/// uncounted all the same, and waits for nothing.
+struct Loan<'a> {
+    port: &'a Adapter,
+    out: bool,
+}
+
+impl Loan<'_> {
+    /// Give `endpoint` back. The last loan out of a closed port waits,
+    /// within `LINGER`, until its sockets bind again.
+    async fn end(mut self, endpoint: Endpoint) {
+        let bound = endpoint.bound_sockets();
+        drop(endpoint);
+        if self.uncount() {
+            released(&bound).await;
+        }
+    }
+
+    /// Uncount the loan, once: true when it was the last out of a port that
+    /// has closed.
+    fn uncount(&mut self) -> bool {
+        if !std::mem::take(&mut self.out) {
+            return false;
+        }
+        let last = self.port.loans.fetch_sub(1, Ordering::SeqCst) == 1;
+        last && matches!(*lock(&self.port.state), PortState::Closed)
+    }
+}
+
+impl Drop for Loan<'_> {
+    fn drop(&mut self) {
+        self.uncount();
     }
 }
 
@@ -1468,6 +1539,120 @@ mod tests {
     #[tokio::test]
     async fn ca_004_an_iroh_port_gives_its_endpoint_up_by_value() {
         bounded(carrier::close_by_value(iroh_fixture())).await;
+    }
+
+    /// Poll `future` once, with a waker that does nothing, as the contract's
+    /// probes do.
+    fn polled_once<T>(future: &mut PortFuture<'_, T>) -> std::task::Poll<T> {
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        future.as_mut().poll(&mut cx)
+    }
+
+    /// A port bound on loopback, and the one socket it bound.
+    async fn bound_on_loopback() -> (IrohCarrier, SocketAddr) {
+        let port = keyed();
+        let at = port.bind(limit(64)).await.unwrap();
+        let socket = local_sockets(&at).unwrap()[0];
+        (port, socket)
+    }
+
+    /// Hold `port`'s endpoint, on no loan, for 100 ms more: iroh's release,
+    /// made late, so that a wait for it shows and a missing one fails every
+    /// run, not only under load.
+    fn release_late(port: &IrohCarrier) {
+        let kept = port.endpoint();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            drop(kept);
+        });
+    }
+
+    /// A pending accept holds an endpoint handle through `close`, and iroh
+    /// frees the sockets only once it lets go, so `close` does not wait for
+    /// the release: the accept it ends does, before it answers (the owner's
+    /// ruling of 2026-09-27).
+    #[tokio::test]
+    async fn close_leaves_the_release_to_a_pending_accept() {
+        let (port, socket) = bound_on_loopback().await;
+        let mut accepting = port.accept();
+        assert!(polled_once(&mut accepting).is_pending(), "the accept waits");
+        release_late(&port);
+
+        let started = std::time::Instant::now();
+        port.close().await;
+        let closing = started.elapsed();
+        let answer = accepting.await;
+        let rebinds = std::net::UdpSocket::bind(socket).is_ok();
+
+        let quick = closing < Duration::from_secs(1);
+        assert!(quick, "close waits on no accept's handle: {closing:?}");
+        assert!(matches!(answer, Ok(None)), "close ends the pending accept");
+        assert!(rebinds, "the accept answers once the address binds again");
+    }
+
+    /// A pending dial holds a handle too, here to a peer that never accepts:
+    /// `close` does not wait for the release, and the dial it ends answers
+    /// once the address binds again.
+    #[tokio::test]
+    async fn close_leaves_the_release_to_a_pending_dial() {
+        let (port, socket) = bound_on_loopback().await;
+        let silent = keyed();
+        let peer = silent.bind(limit(64)).await.unwrap();
+        let mut dialing = port.dial(&peer);
+        assert!(polled_once(&mut dialing).is_pending(), "the dial waits");
+        release_late(&port);
+
+        let started = std::time::Instant::now();
+        port.close().await;
+        let closing = started.elapsed();
+        let answer = dialing.await;
+        let rebinds = std::net::UdpSocket::bind(socket).is_ok();
+        silent.close().await;
+
+        let quick = closing < Duration::from_secs(1);
+        assert!(quick, "close waits on no dial's handle: {closing:?}");
+        assert!(answer.is_err(), "close ends the pending dial");
+        assert!(rebinds, "the dial answers once the address binds again");
+    }
+
+    /// With two loans out, the first to end answers at once, since the other
+    /// still holds the address, and the last answers once it binds again.
+    #[tokio::test]
+    async fn only_the_last_loan_to_end_waits_for_the_release() {
+        let (port, socket) = bound_on_loopback().await;
+        let (mut first, mut last) = (port.accept(), port.accept());
+        assert!(polled_once(&mut first).is_pending(), "the first waits");
+        assert!(polled_once(&mut last).is_pending(), "the last waits");
+        port.close().await;
+
+        let started = std::time::Instant::now();
+        let first_ended = matches!(first.await, Ok(None));
+        let answering = started.elapsed();
+        let held = std::net::UdpSocket::bind(socket).is_err();
+        let last_ended = matches!(last.await, Ok(None));
+        let rebinds = std::net::UdpSocket::bind(socket).is_ok();
+
+        let quick = answering < Duration::from_secs(1);
+        assert!(quick, "the first waits for no release: {answering:?}");
+        assert!(first_ended && last_ended, "close ends both accepts");
+        assert!(held, "the last loan out holds the address");
+        assert!(rebinds, "the last answers once the address binds again");
+    }
+
+    /// An accept dropped before it answers is uncounted with its loan, so a
+    /// `close` that finds no loan out waits for the release itself.
+    #[tokio::test]
+    async fn a_dropped_accept_leaves_the_release_to_close() {
+        let (port, socket) = bound_on_loopback().await;
+        let mut accepting = port.accept();
+        assert!(polled_once(&mut accepting).is_pending(), "the accept waits");
+        drop(accepting);
+        release_late(&port);
+
+        port.close().await;
+
+        let rebinds = std::net::UdpSocket::bind(socket).is_ok();
+        assert!(rebinds, "close answers once the address binds again");
     }
 
     #[tokio::test]
