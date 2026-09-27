@@ -1002,25 +1002,34 @@ fn both_roots_refuse_a_bad_config_file_before_writing() {
 }
 
 /// F9 (the owner's ruling of 2026-09-27), on each root: an instance name
-/// must match `[A-Za-z0-9._-]{1,63}` and be neither `.` nor `..`. A start
-/// named `../../outside`, which climbs out of `GLADE_HOME`, `..`, `.`, a name
-/// with a `/`, the empty name or one of 64 characters is refused before
-/// anything is written: exit 1, a stderr line quoting the name, and nothing
-/// under `GLADE_HOME` or beside it. Before the check, `../../outside` booted
-/// and served from a directory beside `GLADE_HOME`.
+/// must match `[A-Za-z0-9._-]{1,63}` and not end in `.`. A start named
+/// `../../outside`, which climbs out of `GLADE_HOME`, `..`, `.`, a name with
+/// a `/`, the empty name, one of 64 characters or (F9 (b)) `n.`, which
+/// Windows would take for `n`, is refused before anything is written: exit
+/// 1, a stderr line quoting the name, and nothing under `GLADE_HOME` or
+/// beside it. Before the check, `../../outside` booted and served from a
+/// directory beside `GLADE_HOME`, and before F9 (b), `n.` served.
 #[test]
 fn both_roots_refuse_a_name_outside_sys_before_writing() {
     let dir = scratch("bad-name");
     let home = dir.join("glade-home");
     let too_long = "n".repeat(64);
-    let names = ["../../outside", "..", ".", "a/b", "", too_long.as_str()];
+    let names = [
+        "../../outside",
+        "..",
+        ".",
+        "a/b",
+        "",
+        too_long.as_str(),
+        "n.",
+    ];
     for root in [Root::HandWritten, Root::Assembled] {
         for name in names {
             let args = ["--profile", "local", "--name", name, "0"];
             let (status, stderr) = refused(&home, root, &args);
             assert_eq!(status.code(), Some(1), "{root:?} {name:?}: {stderr}");
             let said = format!(
-                "--name {name:?}: an instance name must match [A-Za-z0-9._-]{{1,63}} and be neither . nor .."
+                "--name {name:?}: an instance name must match [A-Za-z0-9._-]{{1,63}} and not end in a dot"
             );
             assert!(stderr.lines().any(|l| l == said), "{root:?}: {stderr}");
         }

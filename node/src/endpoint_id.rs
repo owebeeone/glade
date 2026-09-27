@@ -119,7 +119,7 @@ mod tests {
             let refused = command(&root, args(&["--name", name])).unwrap_err();
             assert_eq!(refused.kind(), io::ErrorKind::InvalidInput, "{name}");
             let said = format!(
-                "--name {name:?}: an instance name must match [A-Za-z0-9._-]{{1,63}} and be neither . nor .."
+                "--name {name:?}: an instance name must match [A-Za-z0-9._-]{{1,63}} and not end in a dot"
             );
             assert_eq!(refused.to_string(), said);
         }

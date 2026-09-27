@@ -249,17 +249,19 @@ pub fn instance_dir(root: &Path, profile: Profile, name: Option<&str>) -> io::Re
 }
 
 /// The instance `<root>/sys/<name>` (F9, the owner's ruling of 2026-09-27):
-/// `name` must match `[A-Za-z0-9._-]{1,63}` and be neither `.` nor `..`, so
-/// the path names a directory in `<root>/sys` and nowhere else. Any other
-/// name is refused (`InvalidInput`), quoted as given, before anything is
-/// written: both roots' boots, `glade-node recovery` and `glade-node
-/// endpoint-id` take their instance here.
+/// `name` must match `[A-Za-z0-9._-]{1,63}` and not end in `.`, so the path
+/// names a directory in `<root>/sys` and nowhere else (`.` and `..` end in
+/// one), and one instance on every platform: Windows trims a trailing dot,
+/// so there `n.` would be `n` (F9 (b)). Any other name is refused
+/// (`InvalidInput`), quoted as given, before anything is written: both
+/// roots' boots, `glade-node recovery` and `glade-node endpoint-id` take
+/// their instance here.
 pub(crate) fn named_instance(root: &Path, name: &str) -> io::Result<PathBuf> {
     let allowed = |c: char| c.is_ascii_alphanumeric() || "._-".contains(c);
     let fits = (1..=63).contains(&name.len()) && name.chars().all(allowed);
-    if !fits || name == "." || name == ".." {
+    if !fits || name.ends_with('.') {
         let why = format!(
-            "--name {name:?}: an instance name must match [A-Za-z0-9._-]{{1,63}} and be neither . nor .."
+            "--name {name:?}: an instance name must match [A-Za-z0-9._-]{{1,63}} and not end in a dot"
         );
         return Err(io::Error::new(io::ErrorKind::InvalidInput, why));
     }
@@ -1050,17 +1052,19 @@ mod tests {
     }
 
     /// F9 (the owner's ruling of 2026-09-27): an instance name matches
-    /// `[A-Za-z0-9._-]{1,63}` and is neither `.` nor `..`, so
-    /// `<root>/sys/<name>` is a directory in `<root>/sys`; the profiles'
-    /// default names are such names. Any other is refused (`InvalidInput`),
-    /// the message quoting what was given: one that climbs out, the empty
-    /// name, a separator of either platform, a drive's colon, a space,
-    /// a letter outside ASCII, a NUL and 64 characters.
+    /// `[A-Za-z0-9._-]{1,63}` and does not end in `.`, so `<root>/sys/<name>`
+    /// is a directory in `<root>/sys`, one on every platform; the profiles'
+    /// default names are such names, and a dot may begin a name or sit
+    /// inside one. Any other is refused (`InvalidInput`), the message
+    /// quoting what was given: one that climbs out, the empty name, a
+    /// separator of either platform, a drive's colon, a space, a letter
+    /// outside ASCII, a NUL, 64 characters, and (F9 (b)) a name ending in a
+    /// dot, which Windows trims, even at 63 characters.
     #[test]
     fn an_instance_name_is_checked() {
         let root = Path::new("/r");
         let longest = "n".repeat(63);
-        let names = ["grazel", "gwzit", "A.b_c-9", "...", ".x", "x."];
+        let names = ["grazel", "gwzit", "A.b_c-9", ".x", "..x", "x.y"];
         for name in names.into_iter().chain([longest.as_str()]) {
             let dir = named_instance(root, name);
             assert_eq!(dir.unwrap(), root.join("sys").join(name), "{name:?}");
@@ -1070,13 +1074,15 @@ mod tests {
             assert_eq!(dir, root.join("sys").join(profile.default_name()));
         }
         let too_long = "n".repeat(64);
+        let dotted = format!("{}.", "n".repeat(62));
+        let trimmed = ["n.", "x.", "a..", "...", "x.y.", dotted.as_str()];
         let climbing = ["..", ".", "../x", "/r", "a/b", "a\\b", "c:x"];
         let others = ["", "a b", "é", "a\0", too_long.as_str()];
-        for name in climbing.into_iter().chain(others) {
+        for name in trimmed.into_iter().chain(climbing).chain(others) {
             let err = named_instance(root, name).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{name:?}");
             let said = format!(
-                "--name {name:?}: an instance name must match [A-Za-z0-9._-]{{1,63}} and be neither . nor .."
+                "--name {name:?}: an instance name must match [A-Za-z0-9._-]{{1,63}} and not end in a dot"
             );
             assert_eq!(err.to_string(), said);
             let unnamed = instance_dir(root, Profile::Local, Some(name));
