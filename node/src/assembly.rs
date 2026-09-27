@@ -190,6 +190,7 @@ use crate::claims::Leases;
 use crate::envelope;
 use crate::grants::PolicyView;
 use crate::iroh_carrier::IrohCarrier;
+use crate::netconf::Network;
 use crate::peer::NodeIdentity;
 use crate::registry::{MemStore, Record, Registry, RegistryApi, RegistryError, StoreApi, HOME};
 use crate::signing::NodeSigner;
@@ -269,14 +270,23 @@ pub struct Settings {
     /// How long the node's claims live and how often it renews them (F1),
     /// from the entry point: by default five minutes, renewed every 100 s.
     pub leases: Leases,
+    /// `--config PATH` (plan Step 4.5): the node's network file, which must
+    /// be an absolute path. The legacy form ignores it, as it ignores
+    /// `--peer`.
+    pub config: Option<String>,
+    /// The node's network: the `--config` file's, then the `--peer` flags'
+    /// (`netconf::load`), which the composition root loads before it builds
+    /// `NodeStart`. With no file, `127.0.0.1:0` alone, relays off.
+    pub network: Network,
 }
 
 impl Settings {
     /// Parse the arguments after the program name exactly as the hand-written
     /// root does: an unknown `--profile` is no profile, a flag given no value
     /// reads as absent, and anything that is not a flag is positional. The
-    /// instance root, the program's path and the leases are not arguments;
-    /// the composition root sets them.
+    /// instance root, the program's path and the leases are not arguments,
+    /// and the network is loaded from the file and the flags: the
+    /// composition root sets them.
     pub fn from_args(args: impl IntoIterator<Item = String>) -> Settings {
         let mut settings = Settings::default();
         let mut args = args.into_iter();
@@ -288,6 +298,7 @@ impl Settings {
                 "--app" => settings.apps.extend(args.next()),
                 "--recovery-out" => settings.recovery_out = args.next(),
                 "--peer" => settings.peers.extend(args.next()),
+                "--config" => settings.config = args.next(),
                 "--enforce-client-grants" => settings.enforce_client_grants = true,
                 _ => settings.positional.push(arg),
             }
@@ -314,10 +325,16 @@ impl Settings {
     }
 }
 
-/// The configuration binding's port. Node-local: plan Step 4.5's `ConfigPort`
-/// (relay mode, bind address) grows from it.
+/// The configuration binding's port. Node-local (plan Step 4.5, the owner's
+/// ruling of 2026-09-27): its consumers are all in glade-node.
 pub trait ConfigPort: Send + Sync {
     fn settings(&self) -> &Settings;
+
+    /// The node's network: where its endpoint binds, its relays and its
+    /// peers.
+    fn network(&self) -> &Network {
+        &self.settings().network
+    }
 }
 
 // ---- the node-local ports -------------------------------------------------

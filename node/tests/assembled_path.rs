@@ -20,7 +20,10 @@
 //! before plan Step 4.1b signed its records, and on a damaged records.json.
 //! Three check plan Step 4.1c on each root: the warning until a recovery key
 //! is committed and the command it names, `--recovery-out` at a first boot
-//! only, and a `local.json` that fails its check.
+//! only, and a `local.json` that fails its check. Three check plan Step 4.5:
+//! the network taken from a `--config` file, a bad file refused before
+//! anything is written, and no line naming an endpoint id; every test that
+//! needs an id reads it with `glade-node endpoint-id`, as an operator does.
 //! Every file goes under a fresh directory in the system temp dir, and the node
 //! runs with `GLADE_HOME` and `HOME` pointed there: `~/.glade` is never touched.
 
@@ -620,17 +623,76 @@ fn both_roots_check_client_grants_only_when_switched_on() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// The endpoint id of a `peer <endpoint-id> <ip:port>` line among `lines`.
-fn endpoint_id(lines: &[String]) -> String {
+/// Run `glade-node` under `root` to its end, within the bound: its exit
+/// status, its stdout lines and its stderr. A process still running at the
+/// bound is killed, and the test fails with what it printed.
+fn bounded(home: &Path, root: Root, args: &[&str]) -> (ExitStatus, Vec<String>, String) {
+    let mut command = glade_node(home, root, args);
+    let mut node = command.spawn().expect("spawn glade-node");
+    let deadline = Instant::now() + BOUND;
+    let status = loop {
+        if let Some(status) = node.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = node.kill();
+            let _ = node.wait();
+            let stdout = drained(node.stdout.take());
+            panic!("glade-node {args:?} ({root:?}) still ran after {BOUND:?}: {stdout}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let (stdout, stderr) = (drained(node.stdout.take()), drained(node.stderr.take()));
+    (status, stdout.lines().map(str::to_owned).collect(), stderr)
+}
+
+/// What a process that has ended wrote to `pipe`.
+fn drained(pipe: Option<impl Read>) -> String {
+    let mut pipe = pipe.expect("a piped stream");
+    let mut text = String::new();
+    pipe.read_to_string(&mut text).unwrap();
+    text
+}
+
+/// The endpoint id of the instance `name` under `home`, as `glade-node
+/// endpoint-id` prints it (plan Step 4.5), its key minted first if it has
+/// none. No line of a node's holds it.
+fn endpoint_id(home: &Path, name: &str) -> String {
+    let asked = ["endpoint-id", "--name", name];
+    let (status, lines, stderr) = bounded(home, Root::HandWritten, &asked);
+    assert_eq!(status.code(), Some(0), "{stderr}");
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    lines[0].clone()
+}
+
+/// The tag a line names the endpoint `id` by (plan Step 4.5): its first 10
+/// hex digits.
+fn tag(id: &str) -> &str {
+    &id[..10]
+}
+
+/// The line a node's door refuses the endpoint `id` with, not knowing it.
+fn refusal(id: &str) -> String {
+    let tag = tag(id);
+    format!("peer refused: endpoint {tag}: unknown endpoint key")
+}
+
+/// The value of the `peer <tag> <ip:port>` line among `lines`.
+fn peer_line(lines: &[String]) -> &str {
     let peer = lines.iter().find_map(|line| line.strip_prefix("peer "));
-    let peer = peer.unwrap_or_else(|| panic!("no `peer` line in {lines:?}"));
-    peer.split(' ').next().unwrap().to_string()
+    peer.unwrap_or_else(|| panic!("no `peer` line in {lines:?}"))
+}
+
+/// The tag of the `peer <tag> <ip:port>` line among `lines`.
+fn peer_tag(lines: &[String]) -> String {
+    peer_line(lines).split(' ').next().unwrap().to_string()
 }
 
 /// Plan Step 4.2 (the signing note's F1), on each root: a booted node's
-/// endpoint id, which its `peer` line prints, is the same at every start of
-/// one instance, and it is not the node id. Before, iroh drew a new endpoint
-/// key at every bind. It does not dial the endpoint.
+/// endpoint id is the same at every start of one instance, and it is not the
+/// node id. Before, iroh drew a new endpoint key at every bind. The `peer`
+/// line names it by its tag, and `glade-node endpoint-id` prints it whole
+/// (plan Step 4.5). It does not dial the endpoint.
 #[test]
 fn both_roots_keep_one_endpoint_id_across_restarts() {
     let dir = scratch("endpoint-key");
@@ -639,8 +701,10 @@ fn both_roots_keep_one_endpoint_id_across_restarts() {
         let args = ["--profile", "local", "--name", name, "0"];
         let (first, _) = start_and_stop(&home, root, &args);
         let (second, stderr) = start_and_stop(&home, root, &args);
-        let id = endpoint_id(&first);
-        assert_eq!(endpoint_id(&second), id, "{root:?}: {second:?}, {stderr}");
+        let named = peer_tag(&first);
+        assert_eq!(peer_tag(&second), named, "{root:?}: {second:?}, {stderr}");
+        let id = endpoint_id(&home, name);
+        assert_eq!(tag(&id), named, "{root:?}: named by its tag");
         let node = second[1].strip_prefix("node ").unwrap();
         assert_ne!(id, node, "{root:?}: the endpoint key is not the node key");
     }
@@ -648,9 +712,10 @@ fn both_roots_keep_one_endpoint_id_across_restarts() {
 }
 
 /// Plan Step 4.2, on each root: an operator replaces the endpoint key by
-/// moving `endpoint.key` aside. The next start prints a new endpoint id and,
-/// after `node`, that it revoked the old key's binding; records.json then
-/// binds the new key and revokes the old one, both under the node's id.
+/// moving `endpoint.key` aside. The next start names a new endpoint and,
+/// after `node`, says that it revoked the old key's binding; records.json
+/// then binds the new key and revokes the old one, both under the node's
+/// id. The ids come from `glade-node endpoint-id` (plan Step 4.5).
 #[test]
 fn both_roots_revoke_a_replaced_endpoint_keys_binding() {
     let dir = scratch("endpoint-replaced");
@@ -665,15 +730,17 @@ fn both_roots_revoke_a_replaced_endpoint_keys_binding() {
     ];
     for (root, name) in [(Root::HandWritten, "h"), (Root::Assembled, "a")] {
         let args = ["--profile", "local", "--name", name, "0"];
-        let (first, _) = start_and_stop(&home, root, &args);
+        start_and_stop(&home, root, &args);
+        let old = endpoint_id(&home, name);
         let instance = home.join("sys").join(name);
         let key = instance.join("endpoint.key");
         std::fs::rename(&key, instance.join("endpoint.key.old")).unwrap();
         let (lines, stderr) = start_and_stop(&home, root, &args);
         assert_eq!(kinds(&lines), expected, "{root:?}: {lines:?}, {stderr}");
         assert_eq!(lines[2], "revoked 1 binding(s) of replaced endpoint key(s)");
-        let (old, new) = (endpoint_id(&first), endpoint_id(&lines));
+        let new = endpoint_id(&home, name);
         assert_ne!(old, new, "{root:?}");
+        assert_eq!(peer_tag(&lines), tag(&new), "{root:?}");
 
         let node = lines[1].strip_prefix("node ").unwrap();
         let saved = BlobStore::new(&instance).load().unwrap();
@@ -696,9 +763,11 @@ fn both_roots_revoke_a_replaced_endpoint_keys_binding() {
 }
 
 /// Plan Step 4.2b, on each root: B's door refuses A, whose key it does not
-/// know. B says so on stderr, naming A's endpoint id, and A's line about
-/// the failed dial carries no reason. B started again with `--peer <A's
-/// endpoint id>` admits A, which links.
+/// know. B says so on stderr, naming A's endpoint by its tag, and A's line
+/// about the failed dial, which names B by its tag and the address it
+/// dialed, carries no reason. B started again with `--peer <A's endpoint
+/// id>` admits A, which links. Each id is minted and read with `glade-node
+/// endpoint-id` before its node's first start (plan Step 4.5).
 #[test]
 fn both_roots_refuse_an_unknown_dialer_and_admit_a_configured_one() {
     let dir = scratch("door");
@@ -716,19 +785,18 @@ fn both_roots_refuse_an_unknown_dialer_and_admit_a_configured_one() {
                 .collect();
             Running::start(&home, root, &args)
         };
-        let dial = |b: &Running| format!("{}@{}", endpoint_id(&b.lines), port_line(&b.lines));
+        let (a_key, b_key) = (endpoint_id(&home, a), endpoint_id(&home, b));
+        let dial = |b: &Running| format!("{b_key}@{}", port_line(&b.lines));
         let b_node = start(b, None);
-        let target = dial(&b_node);
-        let a_node = start(a, Some(&target));
-        let a_key = endpoint_id(&a_node.lines);
+        let at_b = port_line(&b_node.lines);
+        let a_node = start(a, Some(&dial(&b_node)));
         let linked = a_node.lines.iter().any(|l| l.starts_with("peer-connected"));
         assert!(!linked, "{root:?}: {:?}", a_node.lines);
         let (a_err, b_err) = (a_node.stop(), b_node.stop());
-        let refused = format!("peer refused: endpoint {a_key}: unknown endpoint key");
+        let refused = refusal(&a_key);
         assert!(b_err.lines().any(|l| l == refused), "{root:?}: {b_err}");
-        let failed = a_err
-            .lines()
-            .find(|l| l.starts_with(&format!("peer {target}: ")));
+        let failed = format!("peer {}@{at_b}: ", tag(&b_key));
+        let failed = a_err.lines().find(|l| l.starts_with(&failed));
         assert!(
             failed.is_some_and(|l| !l.contains("unknown")),
             "{root:?}: {a_err}"
@@ -747,10 +815,173 @@ fn both_roots_refuse_an_unknown_dialer_and_admit_a_configured_one() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// The `<ip:port>` of a `peer <endpoint-id> <ip:port>` line among `lines`.
+/// The `<ip:port>` of the `peer <tag> <ip:port>` line among `lines`.
 fn port_line(lines: &[String]) -> String {
-    let peer = lines.iter().find_map(|line| line.strip_prefix("peer "));
-    peer.unwrap().split(' ').nth(1).unwrap().to_string()
+    peer_line(lines).split(' ').nth(1).unwrap().to_string()
+}
+
+// A file's mode is a Unix notion. Each platform's branch is one braced
+// module, so the condition encloses the whole section.
+#[cfg(unix)]
+mod files {
+    use std::fs::{self, OpenOptions, Permissions};
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::path::Path;
+
+    /// Write `text` to a new file at `path`, mode `mode` whatever the umask.
+    pub fn write(path: &Path, text: &str, mode: u32) {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true).mode(mode);
+        let mut file = options.open(path).unwrap();
+        file.write_all(text.as_bytes()).unwrap();
+        fs::set_permissions(path, Permissions::from_mode(mode)).unwrap();
+    }
+}
+
+#[cfg(not(unix))]
+mod files {
+    use std::path::Path;
+
+    /// Write `text` to a new file at `path`. Off Unix no mode is set, and the
+    /// node checks none (F5).
+    pub fn write(path: &Path, text: &str, _mode: u32) {
+        std::fs::write(path, text).unwrap();
+    }
+}
+
+/// Plan Step 4.5, on each root: a node takes its network from its
+/// `--config` file. B, with no file, refuses A, whose file dials B at its
+/// loopback address, and says so. B's file then admits A, and they link.
+/// Each file is 0600, and each id comes from `glade-node endpoint-id`. Every
+/// socket is on loopback, and no file names a relay.
+#[test]
+fn both_roots_take_their_network_from_the_config_file() {
+    let dir = scratch("config");
+    let home = dir.join("glade-home");
+    for (root, a, b) in [
+        (Root::HandWritten, "ha", "hb"),
+        (Root::Assembled, "aa", "ab"),
+    ] {
+        let config = |name: String, text: String| {
+            let path = dir.join(name);
+            files::write(&path, &text, 0o600);
+            path.display().to_string()
+        };
+        let start = |name: &str, config: Option<&str>| {
+            let config = config.map(|path| ["--config", path]);
+            let args = ["--profile", "local", "--name", name].into_iter();
+            let args: Vec<&str> = args
+                .chain(config.into_iter().flatten())
+                .chain(["0"])
+                .collect();
+            Running::start(&home, root, &args)
+        };
+        let (a_key, b_key) = (endpoint_id(&home, a), endpoint_id(&home, b));
+        let dials_b = |b: &Running, n: u32| {
+            let text = format!("# A dials B\npeer {b_key}@{}\n", port_line(&b.lines));
+            config(format!("{a}-{n}.conf"), text)
+        };
+
+        let b_node = start(b, None);
+        let a_node = start(a, Some(&dials_b(&b_node, 1)));
+        let linked = a_node.lines.iter().any(|l| l.starts_with("peer-connected"));
+        assert!(!linked, "{root:?}: {:?}", a_node.lines);
+        let (_, b_err) = (a_node.stop(), b_node.stop());
+        let refused = refusal(&a_key);
+        assert!(b_err.lines().any(|l| l == refused), "{root:?}: {b_err}");
+
+        let text = format!("relay off\nbind 127.0.0.1:0\n\npeer {a_key} # A\n");
+        let b_conf = config(format!("{b}.conf"), text);
+        let b_node = start(b, Some(&b_conf));
+        let a_node = start(a, Some(&dials_b(&b_node, 2)));
+        let b_id = b_node.lines[1].strip_prefix("node ").unwrap().to_string();
+        let linked = a_node
+            .lines
+            .iter()
+            .find_map(|l| l.strip_prefix("peer-connected "));
+        assert_eq!(linked, Some(b_id.as_str()), "{root:?}: {:?}", a_node.lines);
+        drop((a_node.stop(), b_node.stop()));
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Plan Step 4.5, on each root: a `--config` file with one bad line, and on
+/// Unix one that others can read, refuses the start before anything is
+/// written: exit 1, the message naming the file, and no instance directory.
+#[test]
+fn both_roots_refuse_a_bad_config_file_before_writing() {
+    let dir = scratch("bad-config");
+    let home = dir.join("glade-home");
+    let file = |name: &str, text: &str, mode: u32| {
+        let path = dir.join(name);
+        files::write(&path, text, mode);
+        path.display().to_string()
+    };
+    let bad = file("bad.conf", "relay off\n# again\nrelay n0\n", 0o600);
+    let mut cases = vec![(bad.clone(), format!("{bad}: line 3: a second relay line"))];
+    if cfg!(unix) {
+        let open = file("open.conf", "relay off\n", 0o644);
+        let said = format!("{open} is group/world-accessible (mode 644) — refusing");
+        cases.push((open, said));
+    }
+    for root in [Root::HandWritten, Root::Assembled] {
+        for (path, said) in &cases {
+            let args = ["--profile", "local", "--name", "n", "--config", path, "0"];
+            let (status, stderr) = refused(&home, root, &args);
+            assert_eq!(status.code(), Some(1), "{root:?}: {stderr}");
+            assert!(stderr.lines().any(|l| l == said), "{root:?}: {stderr}");
+        }
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Plan Step 4.5, on each root: no line a node prints holds an endpoint id.
+/// A links to B, and C, whose key B's door does not know, is refused. None
+/// of the three ids is in any line any of them printed, on stdout or
+/// stderr; where a line names an endpoint, it names it by its tag: each
+/// node's `peer` line, B's refusal of C, and C's failed dial of B.
+#[test]
+fn no_line_names_an_endpoint_id() {
+    let dir = scratch("no-ids");
+    let home = dir.join("glade-home");
+    for (root, names) in [
+        (Root::HandWritten, ["ha", "hb", "hc"]),
+        (Root::Assembled, ["aa", "ab", "ac"]),
+    ] {
+        let ids = names.map(|name| endpoint_id(&home, name));
+        let start = |name: &str, peer: &str| {
+            let args = ["--profile", "local", "--name", name, "--peer", peer, "0"];
+            Running::start(&home, root, &args)
+        };
+        let b_node = start(names[1], &ids[0]);
+        let at_b = format!("{}@{}", ids[1], port_line(&b_node.lines));
+        let a_node = start(names[0], &at_b);
+        let c_node = start(names[2], &at_b);
+        let said = [a_node, b_node, c_node].map(|node| (node.lines.clone(), node.stop()));
+        for id in &ids {
+            let lines = said.iter().flat_map(|(out, err)| {
+                let out = out.iter().map(String::as_str);
+                out.chain(err.lines())
+            });
+            let holding: Vec<&str> = lines.filter(|line| line.contains(id.as_str())).collect();
+            assert_eq!(holding, Vec::<&str>::new(), "{root:?}");
+        }
+        let [(a_out, _), (b_out, b_err), (c_out, c_err)] = &said;
+        for (out, id) in [a_out, b_out, c_out].into_iter().zip(&ids) {
+            assert_eq!(peer_tag(out), tag(id), "{root:?}: {out:?}");
+        }
+        let b_id = b_out[1].strip_prefix("node ").unwrap();
+        let linked = a_out.iter().find_map(|l| l.strip_prefix("peer-connected "));
+        assert_eq!(linked, Some(b_id), "{root:?}: {a_out:?}");
+        let refused = refusal(&ids[2]);
+        assert!(b_err.lines().any(|l| l == refused), "{root:?}: {b_err}");
+        let failed = format!("peer {}@", tag(&ids[1]));
+        let reported = c_err.lines().any(|l| l.starts_with(&failed));
+        assert!(reported, "{root:?}: {c_err}");
+        assert!(c_out.iter().all(|l| !l.starts_with("peer-connected")));
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 /// A key or a name as the store names its journals: lower-case hex.

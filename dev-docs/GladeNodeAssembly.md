@@ -5678,7 +5678,9 @@ pub trait ConfigPort: Send + Sync {
 - `Settings` gains `config`, the `--config` path, and `network`, which the root
   fills by loading the file before it builds `NodeStart`. `Settings.peers`
   stays the raw `--peer` flags, which the load merges in. `CommandLine` still
-  reads nothing: it hands back what the root gave it.
+  reads nothing: it hands back what the root gave it. As built, `network()`
+  is a provided method of the port, `&self.settings().network`, so no
+  implementor changes.
 - 4.2b's `PeerEntry` in `iroh_carrier.rs` gives way to this one. `PeerAddr`
   stays the endpoint's own dialable address, and converts into a dial target
   with one `Via::Ip`, so the tests that dial a `PeerAddr` are unchanged.
@@ -5717,6 +5719,14 @@ as `<ip:port>` or as `<endpoint-id>@<ip:port>`. It ignores the id: the address
 names where, and the lent key says who. That makes CA-004's re-bind real on
 iroh, where it was vacuous (4.2c's named gap). The adapter gets no relay mode
 here, and no root lends it a key. Both wait for 4.5b.
+
+- **As built, its `close` also waits for the address** (not in the design
+  above). iroh lets a closed endpoint's sockets go a few milliseconds after
+  its last handle drops, and gives no signal when it has. With the re-bind
+  real, CA-004's `fresh` port was refused, `Failed to bind sockets`, in 21 of
+  25 runs of the module. So `close` resolves once each socket it bound can be
+  bound again, within `LINGER` (3 s), binding each address itself to see:
+  the only witness iroh leaves (`released` in `iroh_carrier.rs`).
 
 ### 5. The portmapper
 
@@ -6071,34 +6081,47 @@ run stops there. The `version_pin` ruling says what follows.
 
 ### 11. Tests, each begun red
 
-Each test will be run first against the code with the part it guards switched
-off, in a scratch copy, and the message it prints is recorded. The "red
-against" column says what is switched off.
+Each test is run first against the code with the part it guards switched off,
+in a scratch copy, and the message it prints is recorded.
 
-**Part 1.**
+**Part 1**, built on 2026-09-27 against glade `4a976de`. The tests use this
+step's API, so each was run red in one sources-only copy of the final tree
+(glade's `node`, `wire-rs` and `contracts`), with the part it guards switched
+off by one edit, or two where the part sits in two places, and put back
+before the next. The message is what each red run printed. `<id>` stands for
+an endpoint id, `<node>` for a node id, and `<s>` for the scratch directory.
 
-| Test | Proves | Red against |
+| Test | Proves | Red first |
 | --- | --- | --- |
-| `netconf`: `no_file_is_loopback_with_relays_off_and_no_peers` | the default network: `[127.0.0.1:0]`, `Off`, no peers | a default with `N0` |
-| `netconf`: `the_file_takes_relay_bind_and_peer_lines` | each form parses, the relay URL as the node prints it included; lines for one key merge; comments and blank lines are skipped | a parser that knows no `@<relay-url>` form |
-| `netconf`: `each_bad_line_is_refused_by_its_number_and_never_echoed` | refused, each for its reason, naming the line and holding no id: an unknown keyword, a second `relay`, `relay` with a URL, a second IPv4 `bind`, a bad socket, an upper-case or short id, a key iroh rejects, a relay URL under `relay off`, one that is not n0's | a parser that skips bad lines |
-| `netconf::unix`: `a_config_file_others_can_read_is_refused` | 0640 and 0644 are refused, naming the file; 0600 is taken | no mode check |
-| `netconf`: `a_relative_config_path_is_refused` | the path must be absolute | a load that opens any path |
-| `iroh_carrier`: `the_recipe_maps_off_to_disabled_and_n0_to_the_production_relays` | pure: `Off` gives `RelayMode::Disabled`, and `N0` gives `RelayMode::Default`, whose map is `defaults::prod` | `N0` mapped to `Staging` |
-| `iroh_carrier`: `an_endpoint_binds_where_its_network_says` | on loopback: a fixed free port is the one bound, and the `peer` line's address is the bound one | a recipe that ignores `bind` |
-| `iroh_carrier`: `an_endpoint_listens_on_loopback_alone` (kept) | now over `Network::default()` | a default binding `0.0.0.0` |
-| `iroh_carrier`: `a_dial_target_names_each_address_it_was_given` | pure: `Via::Ip` and `Via::Relay` become one `EndpointAddr` with both | a target that drops the relay |
-| `iroh_carrier`: `an_iroh_port_binds_where_its_config_says` | `IrohCarrier` binds `local`'s socket, so CA-004's re-bind lands at `b`'s own address | the adapter's loopback-anywhere bind |
-| `iroh_carrier`: `no_production_code_names_irohs_environment_readers` | a source check over `src/`: no `presets::N0`, `N0DisableRelay`, `default_relay_mode`, `force_staging_infra` or `proxy_from_env` | `presets::N0` put back in `bind_endpoint` |
-| `endpoint_id`: `the_command_mints_a_key_that_the_first_start_binds` | on a new instance: one line of 64 hex digits; `endpoint.key` at 0600; no `node.key`, no records.json; the first boot binds that key | the command absent: its name read as a positional |
-| `endpoint_id`: `the_command_reads_a_running_nodes_key_and_writes_nothing` | with the instance held by a boot: the same id, nothing written, no lock taken; a group-readable key is refused | a command that takes the lock to read |
-| `tests/assembled_path`: `both_roots_take_their_network_from_the_config_file` | B's file admits A, and A's file dials B at `127.0.0.1`: they link. B with no file refuses A | `--config` ignored |
-| `tests/assembled_path`: `both_roots_refuse_a_bad_config_file_before_writing` | a group-readable file, and one bad line: exit 1, the message, and no instance directory | a load after the boot |
-| `tests/assembled_path`: `no_line_names_an_endpoint_id` | two linked nodes and a refused third: none of the three ids is in any line; the tags are | today's lines |
+| `netconf`: `no_file_is_loopback_with_relays_off_and_no_peers` | the default network: `[127.0.0.1:0]`, `Off`, no peers | with a default of `N0`: `left: Network { relays: N0, bind: [127.0.0.1:0], peers: [] }`, `right: Network { relays: Off, bind: [127.0.0.1:0], peers: [] }` |
+| `netconf`: `the_file_takes_relay_bind_and_peer_lines` | each form parses, the relay URL as the node prints it included; lines for one key merge; comments and blank lines are skipped; the flags join after the file, a key the file names gaining the flag's address. Parsed only: nothing binds or dials | with no `@<relay-url>` form: `called Result::unwrap() on an Err value: Custom { kind: InvalidInput, error: "net.conf: line 8: expected <endpoint-id>, <endpoint-id>@<ip:port> or <endpoint-id>@<relay-url>" }` |
+| `netconf`: `each_bad_line_is_refused_by_its_number_and_never_echoed` | refused, each for its reason, naming the line, the message exactly the file, the line and a fixed reason: an unknown keyword, a second `relay`, `relay` with a URL, a second IPv4 and a second IPv6 `bind`, a bad socket, an upper-case and a short id, a key iroh rejects (y = 2, on no point of the curve), a relay URL under `relay off`, one that is not n0's; a flag naming a relay with no file is refused by its place | with bad lines and flags skipped: `called Result::unwrap_err() on an Ok value: Network { relays: N0, bind: [127.0.0.1:0], peers: [] }` |
+| `netconf`: `a_peer_entry_names_a_key_and_perhaps_where_to_dial_it` (moved from `iroh_carrier`) | an entry without an address configures the door, one with an address is dialed too, and junk is refused, `--peer entry 1: expected …`, where it was skipped | the same edit: `called Result::unwrap_err() on an Ok value: Network { relays: Off, bind: [127.0.0.1:0], peers: [] }` |
+| `netconf`: `an_entry_is_named_by_its_tag` (added) | a failed dial's line names the peer `<tag>@<address>,<address>` | with `transport::tag` the whole id: `left: "<id>@127.0.0.1:4711,https://aps1-1.relay.n0.iroh.link./"`, `right: "6e7a1cdd29@127.0.0.1:4711,https://aps1-1.relay.n0.iroh.link./"` |
+| `netconf::tests::unix`: `a_config_file_others_can_read_is_refused` | 0640 and 0644 are refused, naming the file and the mode; 0600 is taken | with no mode check: `called Result::unwrap_err() on an Ok value: Network { relays: Off, bind: [127.0.0.1:0], peers: [] }` |
+| `netconf`: `a_relative_config_path_is_refused` | the path must be absolute | with the path not checked: `left: "glade/net.conf: No such file or directory (os error 2)"`, `right: "glade/net.conf: not an absolute path"` |
+| `iroh_carrier`: `the_recipe_maps_off_to_disabled_and_n0_to_the_production_relays` | pure: `Off` gives `RelayMode::Disabled`, and `N0` gives `RelayMode::Default`, whose map is `defaults::prod`'s four relays; a relay URL is taken as the node prints it when it is one of the four, and never one of the staging relays | with `N0` mapped to `Staging`: `left: Staging`, `right: Default` |
+| `iroh_carrier`: `an_endpoint_binds_where_its_network_says` | on loopback: a port found free is the one bound, and the `peer` line's address is the bound one | with a recipe that binds `127.0.0.1:0` whatever the network says: `left: [127.0.0.1:58770]`, `right: [127.0.0.1:54295]` |
+| `iroh_carrier`: `an_endpoint_listens_on_loopback_alone` (kept) | now over `Network::default()` | not run red: its red form binds `0.0.0.0`, beyond loopback, which no run of this step may do. It was seen red when it was written (glade `1192bf2`) |
+| `iroh_carrier`: `a_dial_target_names_each_address_it_was_given` | pure: `Via::Ip` and `Via::Relay` become one `EndpointAddr` with both; the entry is named by the tag iroh's own `fmt_short` prints | with relays dropped: `left: ([10.1.1.236:4545], [])`, `right: ([10.1.1.236:4545], ["https://aps1-1.relay.n0.iroh.link./"])` |
+| `iroh_carrier`: `an_iroh_port_binds_where_its_config_says` | `IrohCarrier` binds `local`'s socket, so a fresh port asked to bind where a closed one was lands at its very address | with the adapter binding `127.0.0.1:0` whatever `local` says: `assertion left == right failed: where b was`, `left: 127.0.0.1:62362`, `right: 127.0.0.1:60715` |
+| `iroh_carrier`: `no_production_code_names_irohs_environment_readers` | a source check over `src/`, each file's code before its tests with comments set aside: no `presets::N0`, `N0DisableRelay`, `default_relay_mode`, `force_staging_infra` or `proxy_from_env` | with `presets::N0` in `bind_endpoint`: `left: ["<s>/red/glade/node/src/iroh_carrier.rs:94: presets::N0"]`, `right: []` |
+| `iroh_carrier`: the release wait, through `ca_004_an_iroh_port_gives_its_endpoint_up_by_value` and the test above (section 4, as built) | `close` resolves once its address can be bound again | with the wait off, the module run 25 times: 21 runs failed, on `CA-004 close frees the address by value: Err(Transport("Failed to bind sockets"))` or on the test above's `called Result::unwrap() on an Err value: Transport("Failed to bind sockets")`. With it on, 25 of 25 passed |
+| `endpoint_id`: `the_command_takes_a_name_and_nothing_else` (added) | `--name <name>` and nothing else; anything else is the usage line | with a third argument taken: `called Result::unwrap_err() on an Ok value: "n"` |
+| `endpoint_id`: `a_held_instance_with_no_key_is_refused` (added) | while a node holds an instance whose key is missing, the command mints nothing and says to stop the node | with the mint going on without the lock: `called Result::unwrap_err() on an Ok value: "<id>"` |
+| `tests/endpoint_id`: `the_command_mints_a_key_that_the_first_start_binds` | on a new instance: one line of 64 lower-case hex digits, the same when asked again; `endpoint.key` alone, 0600 on Unix: no `node.key`, no records.json, no lock left; the first boot takes that key and binds it to its node, `Live` | with the command absent: `glade-node endpoint-id still ran after 20s: instance <s>/…/glade-home/sys/n`, `node <node>`, `registry ready (home served: true)`, `peer 26cd4a5ee8 127.0.0.1:51728`: a node started, the name read as a positional |
+| `tests/endpoint_id`: `the_command_reads_a_running_nodes_key_and_writes_nothing` | with the instance held by a boot: the same id, no lock taken, every file of the instance as it was | with a command that takes the lock to read: `instance already locked: <s>/…/sys/n/instance.lock: …: stop the node first`, `left: Some(1)`, `right: Some(0)` |
+| `tests/endpoint_id`: `platform::a_group_readable_key_is_refused` (split from the row above: modes are Unix's) | a key at 0640 is refused as a boot refuses it: exit 1, `endpoint.key is group/world-accessible (mode 640) — refusing`, nothing on stdout | with the key read without its mode checked: `left: Some(0)`, `right: Some(1)`, the id printed |
+| `tests/assembled_path`: `both_roots_take_their_network_from_the_config_file` | B, with no file, refuses A, whose 0600 file dials B at `127.0.0.1`, and says so by A's tag; B's file (`relay off`, `bind 127.0.0.1:0`, a blank line, `peer <A>` and a comment) admits A, and they link | with `--config` ignored on both roots: `HandWritten: no recovery key is committed for this node: …`, B's whole stderr: no refusal, since A, its file ignored, dialed nothing |
+| `tests/assembled_path`: `both_roots_refuse_a_bad_config_file_before_writing` | a file with a second `relay` line, and on Unix one at 0644: exit 1, the message naming the file, and nothing under `GLADE_HOME` | with the hand-written root loading after its boot: `written under GLADE_HOME: [Ok(DirEntry("<s>/…/glade-home/sys"))]`; then, that put back, with the assembled root loading in its `Instance` step after the boot: the same, on the assembled root |
+| `tests/assembled_path`: `no_line_names_an_endpoint_id` | on each root, A links to B and C is refused: none of the three ids is in any line of the three, stdout or stderr; each `peer` line carries its tag, B's refusal names C's, and C's failed dial B's | with `transport::tag` the whole id, today's lines: `assertion left == right failed: HandWritten`, `left: ["peer <id> 127.0.0.1:64975"]`, `right: []` |
 
-Changed and passing: the door tests' refusal lines carry the tag; the
-two-node tests take ids from `endpoint-id` or an in-process boot; 4.2b's
-`a_peer_entry_names_a_key_and_perhaps_where_to_dial_it` moves to `netconf`.
+Changed and passing: the door tests' refusal lines carry the tag
+(`transport`'s and three of `mesh`'s); the two-node tests take the full id
+from `endpoint-id` (`tests/assembled_path.rs`'s three endpoint tests) or from
+an in-process boot (`tests/lifecycle.rs`, `tests/stop_signal.rs`), and the
+address from the `peer` line; `tests/lifecycle.rs`'s start loads the network
+as a root does; `mesh`'s door helper binds `Network::default()`.
 
 **Part 2.**
 
@@ -6171,6 +6194,14 @@ commit, that the ruling of 2026-09-22 governs:
   `node.status` through bindings later (`IrohGladeMapping.md` §7.6).
 - **The 4.2c gap stays for 4.5b:** the adapter still waits for its first word
   without a bound.
+- **The adapter's release wait binds each address it had**, for an instant, to
+  see that it is free (section 4, as built). Every test binds it on loopback;
+  bound beyond loopback in 4.5b, its close would probe beyond loopback too. A
+  port another process takes meanwhile ends the wait at 3 s, not the close.
+- **`an_endpoint_listens_on_loopback_alone` was not run red** in part 1: its
+  red form binds `0.0.0.0` (section 11).
+- **The `endpoint-id` command checks no `--name`**, as the boot checks none: a
+  name with `..` reaches outside `<root>/sys`.
 
 ### Default-path changes (4.5)
 
@@ -6183,7 +6214,9 @@ commit, that the ruling of 2026-09-22 governs:
    before.
 4. A malformed `--peer` entry refuses the start, where it printed a line and
    was skipped.
-5. `IrohCarrier` binds where `CarrierConfig::local` says. No root binds it.
+5. `IrohCarrier` binds where `CarrierConfig::local` says, and its `close`
+   resolves once that address can be bound again, within 3 s. No root binds
+   it.
 6. Part 2: a linked node prints `link` and `home round` lines, and a node with
    `relay n0` prints `relay` lines. The desk prints none.
 
@@ -6258,3 +6291,71 @@ relay URL is one of n0's four; 7 iroh's net-report defaults; 8 the node prints t
 then run 2, the Pi accepting and dabeest dialing, the scratch instances deleted afterwards; 10 the
 record names the ALPN and the pairing too, our own relay being the remedy; 11 part 1, part 2, then
 the crossing.
+
+### Measured (4.5, part 1)
+
+2026-09-27, Apple M3 Pro, Rust 1.96.0, on the final tree (glade `4a976de`
+plus part 1):
+
+- **The gate** passes all 9 components, in 100 s from an empty scratch
+  target, with 348 node tests on each path, across 17 test binaries, where
+  there were 329 across 16: `netconf` 7 (one moved in from `iroh_carrier`),
+  `iroh_carrier` 5 new, `endpoint_id` 2, `tests/endpoint_id` 3 (a new binary)
+  and `tests/assembled_path` 3.
+  - rustfmt: glade-node 294 hunks, at its baseline; no line this step wrote
+    is in one, and the two new modules and the new test file are
+    rustfmt-clean. glade-wire 43.
+  - clippy: glade-node 11 warnings and glade-wire 7, at their baselines.
+  - process-globals: 53 files (the two new modules), 3 permanent entries, 0
+    debt, nothing new. No production code reads the environment:
+    `glade-node endpoint-id` takes the instance root `start` read.
+  - confinement: no new crate; `Cargo.toml` and `Cargo.lock` are untouched.
+    The contracts gate passes, untouched.
+- **Nothing reached beyond loopback.** No test or run binds anything but
+  loopback, and none contacts a relay: `relay n0` and the non-loopback `bind`
+  lines are parsed and mapped, never bound or dialed. The only relay URLs
+  the tests name are parsed, and n0's map is iroh's constant.
+- **The release wait**: the `iroh_carrier` module, run 25 times, passed 25
+  times with it and 4 times without it (section 11).
+- **Time.** The `netconf` and `endpoint_id` unit tests take under 0.01 s;
+  `tests/endpoint_id`'s three 0.1 to 0.9 s; `tests/assembled_path`'s 21 about
+  1.6 to 1.9 s; the `iroh_carrier` module about 0.3 s.
+- **The replay**, from `glade-wz/grazel` as grazel starts the desk's node
+  (`--profile local --name grazel --app apps/grazel-app.glade --app
+  apps/gyld-app.glade 0`), with only `PATH`, `HOME` and `GLADE_HOME` set, on
+  one scratch instance. Each start lived 11 s past `listening`, had its
+  sockets listed with `lsof`, and was stopped with SIGTERM. Today's binary
+  (inode 405329410), this build (inode 405439944, from the gate's scratch
+  target), then today's again:
+
+  | Start | Lines | Sockets |
+  | --- | --- | --- |
+  | today's, the first boot | `instance`, `node`, `app grazel registered (+12 record(s), 0 unchanged)`, `app gyld registered (+10 record(s), 2 unchanged)`, `registry ready (home served: true)`, `peer <id> 127.0.0.1:<port>`, `workspace ws-razel serving` twice, `listening <port>` | UDP `127.0.0.1:<port>` and TCP `127.0.0.1:<port>` (LISTEN), nothing else |
+  | this build | the same, `+0 record(s), 12 unchanged` for each app, and `peer cbf33c61e0 127.0.0.1:<port>`: the tag of the same id | the same |
+  | today's, again | the same as this build's, with the `peer` line's full id | the same |
+
+  Every start printed one stderr line, the recovery warning, naming its own
+  binary. records.json gained the same records from each start: a renewal of
+  `home` and `ws-razel`'s first claim at its next epoch. `glade-node
+  endpoint-id --name grazel` on the stopped instance then printed one line of
+  64 characters whose first 10 are `cbf33c61e0`, and wrote nothing.
+- **Downstream**: grazel, glade-gyld and glade-gwz pass no `--peer`, no
+  `--config` and no first argument `endpoint-id` (their sources, read only),
+  and read `listening` alone. Their suites, client-rs's, client-ts's and
+  grip-share's were not run, as asked.
+
+**Size**, in lines added and removed in `.rs` files, doc comments included:
+
+- production: +675/−145, net +530, over section 12's estimate of about 440:
+  `netconf.rs` +322, new (240 of them code); `iroh_carrier.rs` +157/−66;
+  `endpoint_id.rs` +69, new; `bin/glade-node.rs` +55/−36; `lifecycle.rs`
+  +22/−26; `assembly.rs` +21/−4; `transport.rs` +13/−5; `mesh.rs` +7/−5;
+  `sysdir.rs` +7/−3; `lib.rs` +2. The adapter's release wait is not in the
+  estimate;
+- tests: +866/−67: `tests/assembled_path.rs` +260/−29; `netconf.rs` +195;
+  `tests/endpoint_id.rs` +192, new; `iroh_carrier.rs` +139/−16;
+  `endpoint_id.rs` +35; `tests/lifecycle.rs` +26/−12; `tests/stop_signal.rs`
+  +12/−5; `mesh.rs` +6/−4; `transport.rs` +1/−1.
+- Beside them, the two one-line notes at the glade-wz root:
+  `dev-docs/IrohGladeMapping.md` §7.6 and `dev-docs/glade/GladeDiscoveryModel.md`
+  (the v1 relay).

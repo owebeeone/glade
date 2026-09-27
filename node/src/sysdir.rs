@@ -121,7 +121,10 @@ pub struct InstanceLock {
 }
 
 impl InstanceLock {
-    fn acquire(path: PathBuf) -> io::Result<InstanceLock> {
+    /// Take the lock at `path`, or say the instance is locked already
+    /// (`AddrInUse`). Boot takes it, and so does `glade-node endpoint-id`
+    /// while it mints a key (`endpoint_id.rs`).
+    pub(crate) fn acquire(path: PathBuf) -> io::Result<InstanceLock> {
         let locked = || {
             let what = format!("instance already locked: {}", path.display());
             io::Error::new(io::ErrorKind::AddrInUse, what)
@@ -352,8 +355,9 @@ pub fn boot_at_with(
 /// Load the class-1 secret `name`, `node.key` or `endpoint.key` (refusing
 /// group/world-readable, the ssh discipline, and any length but the 32 bytes
 /// of an Ed25519 seed), or create it 0600 on first boot from the OS's
-/// randomness. Never shipped, never in any snapshot.
-fn load_or_create_secret(dir: &Path, name: &str) -> io::Result<[u8; 32]> {
+/// randomness. Never shipped, never in any snapshot. `glade-node
+/// endpoint-id` reads and mints `endpoint.key` with it too.
+pub(crate) fn load_or_create_secret(dir: &Path, name: &str) -> io::Result<[u8; 32]> {
     let path = dir.join(name);
     if path.exists() {
         platform::check_key_perms(&path)?;

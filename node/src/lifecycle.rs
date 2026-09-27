@@ -43,8 +43,9 @@ use crate::assembly::{
     CommandLine, Config, Directory, InstanceSlot, NodeAssembly, Records, Settings,
 };
 use crate::grants::{CLIENT_GRANTS_ENFORCED, GRANTS_UNAVAILABLE};
-use crate::iroh_carrier::{PeerEndpoint, PeerEntry};
+use crate::iroh_carrier::PeerEndpoint;
 use crate::mesh::{release_links, EndpointSlot};
+use crate::netconf::Network;
 use crate::peer::NodeIdentity;
 use crate::recovery;
 use crate::registry::HOME;
@@ -178,9 +179,11 @@ struct Booted {
     node_id: String,
     identity: NodeIdentity,
     endpoint: EndpointKey,
-    /// The endpoint's door (plan Step 4.2b): the `--peer` keys, and refusals
-    /// reported on the console's stderr.
+    /// The endpoint's door (plan Step 4.2b): the network's peer keys, and
+    /// refusals reported on the console's stderr.
     door: Arc<Door>,
+    /// Where the endpoint binds and its relays (plan Step 4.5).
+    network: Network,
 }
 
 impl Instance {
@@ -195,21 +198,17 @@ impl Instance {
         let recovery_out = start.settings.recovery_out.as_deref().map(Path::new);
         let lease_ms = start.settings.leases.lease_ms;
         let boot = boot_at_with(at.dir.clone(), &at.operator, recovery_out, lease_ms)?;
-        let entries = start
-            .settings
-            .peers
-            .iter()
-            .filter_map(|p| PeerEntry::parse(p));
+        let network = start.settings.network.clone();
+        let keys = network.peers.iter().map(|entry| entry.key);
         let console = start.console.clone();
-        let door = Door::new(entries.map(|entry| entry.key()), move |line: &str| {
-            console.err(line)
-        });
+        let door = Door::new(keys, move |line: &str| console.err(line));
         let booted = Booted {
             dir: boot.dir.clone(),
             node_id: boot.node_id.clone(),
             identity: boot.identity()?,
             endpoint: boot.endpoint_key(),
             door: Arc::new(door),
+            network,
         };
         start
             .console
@@ -428,23 +427,19 @@ fn assemble(start: &NodeStart, instance: &Instance) -> Result<Declared, Error> {
     Ok(workspaces)
 }
 
-/// Dial each `--peer` target that has an address, as the hand-written root
-/// does; an entry with none only configures the door. The legacy form has no
-/// mesh and dials nothing.
+/// Dial each of the network's peers that has an address, as the hand-written
+/// root does; an entry with none only configures the door. A failed dial is
+/// named by the peer's tag and the addresses dialed (plan Step 4.5). The
+/// legacy form has no mesh and dials nothing.
 async fn dial_peers(start: &NodeStart, server: &Server) {
     if start.instance.is_none() {
         return;
     }
-    for p in &start.settings.peers {
-        match PeerEntry::parse(p) {
-            Some(PeerEntry::Dial(target)) => match server.connect_peer(&target).await {
-                Ok(id) => start.console.out(&format!("peer-connected {id}")),
-                Err(e) => start.console.err(&format!("peer {p}: {e}")),
-            },
-            Some(PeerEntry::Known(_)) => {}
-            None => start.console.err(&format!(
-                "peer {p}: expected <endpoint-id> or <endpoint-id>@<ip:port>"
-            )),
+    let dialed = start.settings.network.peers.iter();
+    for entry in dialed.filter(|entry| !entry.via.is_empty()) {
+        match server.connect_peer(entry.clone()).await {
+            Ok(id) => start.console.out(&format!("peer-connected {id}")),
+            Err(e) => start.console.err(&format!("peer {entry}: {e}")),
         }
     }
 }
@@ -557,8 +552,9 @@ pub fn node_plan() -> Plan<(), NodeStart> {
                     return Ok(cx.hold_value(EndpointSlot::empty()));
                 };
                 let (identity, key, door) = (booted.identity, booted.endpoint, booted.door.clone());
+                let network = booted.network.clone();
                 cx.hold(move || async move {
-                    PeerEndpoint::bind_door(identity, key, door)
+                    PeerEndpoint::bind_door(identity, key, door, &network)
                         .await
                         .map(EndpointSlot::new)
                 })
@@ -621,7 +617,7 @@ pub fn node_plan() -> Plan<(), NodeStart> {
                         .await?;
                     start
                         .console
-                        .out(&format!("peer {} {}", addr.endpoint_id, addr.socket));
+                        .out(&format!("peer {} {}", addr.tag(), addr.socket));
                 }
                 let (admit, admitted) = watch::channel(false);
                 let serve = SessionsServe {

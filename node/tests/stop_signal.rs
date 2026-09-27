@@ -207,13 +207,19 @@ mod unix {
             || line.starts_with(glade_node::recovery::NOT_COMMITTED)
     }
 
-    /// The UDP port of a `peer <endpoint-id> <ip:port>` line's value.
+    /// The UDP port of a `peer <tag> <ip:port>` line's value.
     fn udp_port(peer: &str) -> u16 {
         peer.rsplit(':').next().unwrap().parse().unwrap()
     }
 
+    /// Where a `peer <tag> <ip:port>` line's value says the node is dialed,
+    /// with its full id, which no line holds (plan Step 4.5): `id@ip:port`.
+    fn target(id: &str, peer: &str) -> String {
+        format!("{id}@{}", peer.rsplit(' ').next().unwrap())
+    }
+
     /// The endpoint id of the instance `name` under `home`, booted once so
-    /// its keys exist: what an operator reads from a node's first start.
+    /// its keys exist: what `glade-node endpoint-id` prints.
     fn endpoint_id(home: &Path, name: &str) -> String {
         let boot = glade_node::sysdir::boot_at(home.join("sys").join(name), "local").unwrap();
         glade_node::transport::hex(&boot.endpoint_key().endpoint_id)
@@ -228,13 +234,13 @@ mod unix {
     fn a_stop_signal_stops_the_assembled_node_cleanly() {
         let dir = scratch("stop-signal");
         let home = dir.join("glade-home");
-        let a_key = endpoint_id(&home, "a");
+        let (a_key, b_key) = (endpoint_id(&home, "a"), endpoint_id(&home, "b"));
         let b = Node::start(
             &home,
             true,
             &["--profile", "local", "--name", "b", "--peer", &a_key, "0"],
         );
-        let target = b.value("peer").replacen(' ', "@", 1);
+        let target = target(&b_key, &b.value("peer"));
         let args = ["--profile", "local", "--name", "a", "--peer", &target, "0"];
         let a = Node::start(&home, true, &args);
         assert_eq!(a.value("peer-connected"), b.value("node"), "A linked to B");
@@ -275,8 +281,9 @@ mod unix {
     fn a_stop_during_start_up_cancels_it_and_still_releases_everything() {
         let dir = scratch("stop-signal-start-up");
         let home = dir.join("glade-home");
+        let b_key = endpoint_id(&home, "b");
         let mut b = Node::start(&home, true, &["--profile", "local", "--name", "b", "0"]);
-        let gone = b.value("peer").replacen(' ', "@", 1);
+        let gone = target(&b_key, &b.value("peer"));
         b.signal("-TERM");
         assert_eq!(b.wait().0.code(), Some(0), "B stopped first");
 

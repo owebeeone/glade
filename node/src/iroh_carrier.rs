@@ -18,11 +18,19 @@
 //! not know, and HELLO refuses a node not bound to its connection's key.
 //! [`IrohCarrier`] is the `CarrierPort` over iroh (plan Step 4.2c), which
 //! tracks its links; the mesh still runs on `PeerEndpoint`.
+//!
+//! Plan Step 4.5: the endpoint's recipe takes the node's network
+//! (`netconf.rs`): the sockets it binds and whether it has n0's relays, and
+//! nothing else. The portmapper stays off, no address lookup is added, and
+//! the node calls none of iroh's helpers that read the environment: it names
+//! n0's production relays itself. A dial names every address its entry
+//! gives, IP or relay, and iroh chooses among them. Lines name an endpoint by
+//! its tag, never its id.
 
 use std::fmt;
 use std::future::{ready, Future};
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
@@ -33,10 +41,11 @@ use glade_carrier_api::{
 use iroh::endpoint::presets;
 use iroh::endpoint::{AfterHandshakeOutcome, EndpointHooks, PortmapperConfig, Side, VarInt};
 use iroh::endpoint::{Connection, ConnectionError, ReadError, RecvStream, SendStream};
-use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr};
+use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey, TransportAddr};
 
+use crate::netconf::{Network, PeerEntry, Relays, Via};
 use crate::peer::{hello_accept, hello_dial, Channel, NodeIdentity, PeerHello};
-use crate::transport::{Door, EndpointKey};
+use crate::transport::{tag, Door, EndpointKey};
 
 /// ALPN for the glade node<->node protocol 3 (`peer::PROTOCOL`, plan Step
 /// 4.1b), whose `home` records are signed envelopes and whose HELLO is signed
@@ -64,18 +73,23 @@ fn channel(conn: &Connection, dialer: EndpointId, acceptor: EndpointId) -> io::R
     })
 }
 
-/// The one endpoint recipe every constructor shares: localhost,
-/// `presets::Minimal` (relay + discovery disabled), the ALPN `alpn`, the
-/// endpoint key `key`, and the accept hook of `door`, if any. iroh comes
-/// with `0.0.0.0` and `[::]` pre-bound, every interface, and a loopback bind
-/// replaces only its own family's, so both are cleared first; and its
-/// portmapper, which opens a UDP socket on every interface to find the
-/// router over UPnP, is off. Nothing listens beyond this machine, and
-/// macOS's firewall has nothing to ask. The bind address is plan Step 4.5's.
+/// The one endpoint recipe every constructor shares (plan Step 4.5):
+/// `presets::Minimal` (no relay, no address lookup), the ALPN `alpn`, the
+/// endpoint key `key`, the accept hook of `door`, if any, and `network`'s
+/// sockets and relays. iroh comes with `0.0.0.0` and `[::]` pre-bound, every
+/// interface, so both are cleared first and only `network`'s sockets bind;
+/// and its portmapper, which opens a UDP socket on every interface to find
+/// the router over UPnP, is off whatever the network says. With relays off
+/// no relay call is made. So `Network::default()` gives the endpoint it
+/// always had, call for call: loopback alone, no relay, and nothing for
+/// macOS's firewall to ask about. No address lookup, proxy or net-report
+/// setting is made, and none of iroh's helpers that read the environment is
+/// called.
 async fn bind_endpoint(
     key: EndpointKey,
     door: Option<Arc<Door>>,
     alpn: &[u8],
+    network: &Network,
 ) -> io::Result<Endpoint> {
     let mut builder = Endpoint::builder(presets::Minimal)
         .secret_key(SecretKey::from_bytes(&key.seed()))
@@ -83,14 +97,56 @@ async fn bind_endpoint(
     if let Some(door) = door {
         builder = builder.hooks(DoorHook(door));
     }
-    builder
+    let mut builder = builder
         .portmapper_config(PortmapperConfig::Disabled)
-        .clear_ip_transports()
-        .bind_addr((Ipv4Addr::LOCALHOST, 0))
-        .map_err(other)?
-        .bind()
-        .await
-        .map_err(other)
+        .clear_ip_transports();
+    for socket in &network.bind {
+        builder = builder.bind_addr(*socket).map_err(other)?;
+    }
+    if network.relays == Relays::N0 {
+        builder = builder.relay_mode(relay_mode(network.relays));
+    }
+    builder.bind().await.map_err(other)
+}
+
+/// The relay mode `relays` names: none, or n0's production relays, named
+/// here rather than by `default_relay_mode()`, which an environment variable
+/// can turn to n0's staging relays.
+fn relay_mode(relays: Relays) -> RelayMode {
+    match relays {
+        Relays::Off => RelayMode::Disabled,
+        Relays::N0 => RelayMode::Default,
+    }
+}
+
+/// Whether `key` is an endpoint id iroh accepts, a point on Ed25519's curve:
+/// the configuration's check at load (`netconf.rs`).
+pub(crate) fn accepts_endpoint_id(key: &[u8; 32]) -> bool {
+    EndpointId::from_bytes(key).is_ok()
+}
+
+/// The relay `text` names, as the node prints its URL, if it is one of the
+/// relays `relay n0` gives: n0's production map, as iroh defines it. The
+/// configuration's check at load (`netconf.rs`).
+pub(crate) fn n0_relay(text: &str) -> Option<String> {
+    let url: RelayUrl = text.parse().ok()?;
+    let n0 = relay_mode(Relays::N0).relay_map();
+    n0.contains(&url).then(|| url.to_string())
+}
+
+/// Where `entry` is dialed: one iroh address holding its id and every
+/// address it names, IP or relay. iroh sends a connection's first packets to
+/// every address it knows, and chooses among them.
+fn endpoint_addr(entry: &PeerEntry) -> io::Result<EndpointAddr> {
+    let id = EndpointId::from_bytes(&entry.key).map_err(other)?;
+    let mut addrs = Vec::new();
+    for via in &entry.via {
+        addrs.push(match via {
+            Via::Ip(socket) => TransportAddr::Ip(*socket),
+            Via::Relay(url) => TransportAddr::Relay(url.parse().map_err(other)?),
+        });
+    }
+    Ok(EndpointAddr::from_parts(id, addrs))
 }
 
 /// The door's accept-time half (plan Step 4.2b), in iroh's one hook after
@@ -125,20 +181,22 @@ impl EndpointHooks for DoorHook {
     }
 }
 
-/// An endpoint's dialable address: its id, and its IPv4 port on loopback.
-fn loopback_addr(endpoint: &Endpoint) -> io::Result<PeerAddr> {
-    let sockets = endpoint.bound_sockets();
-    let socket = sockets.into_iter().find(|s| s.is_ipv4());
-    let socket = socket.ok_or_else(|| other("no bound IPv4 socket"))?;
-    let socket = SocketAddr::from((Ipv4Addr::LOCALHOST, socket.port()));
+/// An endpoint's dialable address: its id, and a socket as bound, IPv4 first
+/// (plan Step 4.5). For the default bind that is `127.0.0.1:<port>`, as it
+/// always was.
+fn bound_addr(endpoint: &Endpoint) -> io::Result<PeerAddr> {
+    let mut sockets = endpoint.bound_sockets();
+    sockets.sort_by_key(|socket| !socket.is_ipv4());
+    let socket = sockets.first().copied();
+    let socket = socket.ok_or_else(|| other("no socket bound"))?;
     Ok(PeerAddr {
         endpoint_id: endpoint.id(),
         socket,
     })
 }
 
-/// A dialable address for a peer: its endpoint id + a direct socket address
-/// (localhost, no relay). Enough for `Endpoint::connect` with discovery off.
+/// A dialable address for a peer: its endpoint id + a direct socket address.
+/// Enough for `Endpoint::connect` with no address lookup.
 #[derive(Clone, Copy, Debug)]
 pub struct PeerAddr {
     pub endpoint_id: EndpointId,
@@ -146,8 +204,7 @@ pub struct PeerAddr {
 }
 
 impl PeerAddr {
-    /// Parse a `--peer` target, `<endpoint-id-hex>@<ip:port>`: the two values
-    /// a node prints as `peer <id> <addr>`.
+    /// Parse `<endpoint-id-hex>@<ip:port>`, a carrier address.
     pub fn parse(s: &str) -> Option<PeerAddr> {
         let (id, sock) = s.split_once('@')?;
         Some(PeerAddr {
@@ -155,30 +212,20 @@ impl PeerAddr {
             socket: sock.parse().ok()?,
         })
     }
-}
 
-/// A `--peer` entry (plan Step 4.2b): `<endpoint-id>`, a key the door admits
-/// on first contact and nothing dials, or `<endpoint-id>@<ip:port>`, which is
-/// dialed as well. Either way the operator has configured the key.
-#[derive(Clone, Copy, Debug)]
-pub enum PeerEntry {
-    Known(EndpointId),
-    Dial(PeerAddr),
-}
-
-impl PeerEntry {
-    pub fn parse(s: &str) -> Option<PeerEntry> {
-        if s.contains('@') {
-            return PeerAddr::parse(s).map(PeerEntry::Dial);
-        }
-        s.parse().ok().map(PeerEntry::Known)
+    /// The endpoint's tag, which the `peer` line prints for its id.
+    pub fn tag(&self) -> String {
+        tag(self.endpoint_id.as_bytes())
     }
+}
 
-    /// The endpoint key the entry configures.
-    pub fn key(&self) -> [u8; 32] {
-        match self {
-            PeerEntry::Known(id) => *id.as_bytes(),
-            PeerEntry::Dial(addr) => *addr.endpoint_id.as_bytes(),
+/// A peer's own address as a dial target: its key, dialed at that one
+/// socket.
+impl From<&PeerAddr> for PeerEntry {
+    fn from(addr: &PeerAddr) -> PeerEntry {
+        PeerEntry {
+            key: *addr.endpoint_id.as_bytes(),
+            via: vec![Via::Ip(addr.socket)],
         }
     }
 }
@@ -207,9 +254,10 @@ pub struct PeerEndpoint {
 }
 
 impl PeerEndpoint {
-    /// Bind a localhost QUIC endpoint (relay + discovery disabled) with a fresh
-    /// random glade identity, which dies with it: for tests, which boot no
-    /// instance. A booted node binds with its own ([`PeerEndpoint::bind_with`]).
+    /// Bind a localhost QUIC endpoint (no relay, no address lookup) with a
+    /// fresh random glade identity, which dies with it: for tests, which boot
+    /// no instance. A booted node binds with its own
+    /// ([`PeerEndpoint::bind_with`]).
     pub async fn bind() -> io::Result<PeerEndpoint> {
         let identity = NodeIdentity::generate()?;
         PeerEndpoint::bind_with(identity).await
@@ -230,8 +278,9 @@ impl PeerEndpoint {
     /// (`sysdir::Boot::identity`), and its endpoint key, `endpoint.key`
     /// (`sysdir::Boot::endpoint_key`), so its endpoint id is the same at every
     /// start (plan Step 4.2) and its binding record names it.
+    /// It binds the default network, `127.0.0.1:0` alone.
     pub async fn bind_as(identity: NodeIdentity, key: EndpointKey) -> io::Result<PeerEndpoint> {
-        let endpoint = bind_endpoint(key, None, ALPN).await?;
+        let endpoint = bind_endpoint(key, None, ALPN, &Network::default()).await?;
         Ok(PeerEndpoint {
             endpoint,
             identity,
@@ -239,14 +288,16 @@ impl PeerEndpoint {
         })
     }
 
-    /// [`PeerEndpoint::bind_as`], behind `door` (plan Step 4.2b): how both
-    /// roots bind a booted node, whose door is closed to keys it does not know.
+    /// [`PeerEndpoint::bind_as`], behind `door` (plan Step 4.2b) and on
+    /// `network` (plan Step 4.5): how both roots bind a booted node, whose
+    /// door is closed to keys it does not know.
     pub async fn bind_door(
         identity: NodeIdentity,
         key: EndpointKey,
         door: Arc<Door>,
+        network: &Network,
     ) -> io::Result<PeerEndpoint> {
-        let endpoint = bind_endpoint(key, Some(door.clone()), ALPN).await?;
+        let endpoint = bind_endpoint(key, Some(door.clone()), ALPN, network).await?;
         Ok(PeerEndpoint {
             endpoint,
             identity,
@@ -270,14 +321,16 @@ impl PeerEndpoint {
         }
     }
 
-    /// This endpoint's dialable address (its id + first IPv4 bound socket).
+    /// This endpoint's dialable address: its id, and a socket as bound, IPv4
+    /// first.
     pub fn addr(&self) -> io::Result<PeerAddr> {
-        loopback_addr(&self.endpoint)
+        bound_addr(&self.endpoint)
     }
 
-    /// Dial a peer (DIAL), open a bidirectional stream, and run the HELLO seam.
-    pub async fn dial(&self, addr: &PeerAddr) -> io::Result<PeerLink> {
-        let ea = EndpointAddr::from_parts(addr.endpoint_id, [TransportAddr::Ip(addr.socket)]);
+    /// Dial a peer (DIAL) at every address `target` names, open a
+    /// bidirectional stream, and run the HELLO seam.
+    pub async fn dial(&self, target: impl Into<PeerEntry>) -> io::Result<PeerLink> {
+        let ea = endpoint_addr(&target.into())?;
         let conn = self.endpoint.connect(ea, ALPN).await.map_err(other)?;
         let channel = channel(&conn, self.endpoint.id(), conn.remote_id())?;
         let (mut send, mut recv) = conn.open_bi().await.map_err(other)?;
@@ -347,9 +400,9 @@ type Link = Box<dyn CarrierLink>;
 /// `close` ends every link the port tracks and takes their handles, since a
 /// surviving connection keeps the port bound (the async witness's finding).
 /// A link holds the endpoint too, so a port dropped without `close` does not
-/// take its links' transport with it. It binds loopback, on a port the OS
-/// picks (`CarrierConfig::local` is plan Step 4.5's), has no door, and lent
-/// no key refuses to bind.
+/// take its links' transport with it. It binds the socket
+/// `CarrierConfig::local` names (plan Step 4.5), with no relay, has no door,
+/// and lent no key refuses to bind.
 pub struct IrohCarrier {
     key: Option<EndpointKey>,
     state: Mutex<PortState>,
@@ -445,6 +498,17 @@ impl IrohCarrier {
     }
 }
 
+/// The socket a carrier address names, `<ip:port>` or
+/// `<endpoint-id>@<ip:port>`: the address says where, and the key a port is
+/// lent says who, so an id is ignored (plan Step 4.5).
+fn local_socket(local: &CarrierAddr) -> Option<SocketAddr> {
+    let at = match local.0.rsplit_once('@') {
+        Some((_, at)) => at,
+        None => &local.0,
+    };
+    at.parse().ok()
+}
+
 impl CarrierPort for IrohCarrier {
     fn bind(&self, config: CarrierConfig) -> PortFuture<'_, Result<CarrierAddr, CarrierError>> {
         Box::pin(async move {
@@ -453,9 +517,15 @@ impl CarrierPort for IrohCarrier {
             }
             let unkeyed = || transport("the iroh adapter was lent no endpoint key");
             let key = self.key.ok_or_else(unkeyed)?;
-            let endpoint = bind_endpoint(key, None, CARRIER_ALPN).await;
+            let nowhere = || transport("expected <ip:port> or <endpoint-id>@<ip:port> to bind");
+            let socket = local_socket(&config.local).ok_or_else(nowhere)?;
+            let network = Network {
+                bind: vec![socket],
+                ..Network::default()
+            };
+            let endpoint = bind_endpoint(key, None, CARRIER_ALPN, &network).await;
             let endpoint = endpoint.map_err(transport)?;
-            let at = loopback_addr(&endpoint).map_err(transport)?;
+            let at = bound_addr(&endpoint).map_err(transport)?;
             if let Err(refused) = self.place(&endpoint, config.max_frame_bytes.get()) {
                 endpoint.close().await;
                 return Err(refused);
@@ -508,8 +578,29 @@ impl CarrierPort for IrohCarrier {
             };
             let _ = tokio::time::timeout(LINGER, drained).await;
             drop(ended);
+            let bound = ep.bound_sockets();
             ep.close().await;
+            drop(ep);
+            released(&bound).await;
         })
+    }
+}
+
+/// Wait, within `LINGER`, until each socket in `bound` can be bound again
+/// (plan Step 4.5). iroh lets a closed endpoint's sockets go a few
+/// milliseconds after its last handle drops, and gives no signal when it
+/// has, so a port whose `close` frees its address by value (CA-004), now
+/// that it binds where `CarrierConfig::local` says, waits for it: binding
+/// each address itself is the only witness.
+async fn released(bound: &[SocketAddr]) {
+    let deadline = tokio::time::Instant::now() + LINGER;
+    for socket in bound {
+        while std::net::UdpSocket::bind(socket).is_err() {
+            if tokio::time::Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 }
 
@@ -709,23 +800,123 @@ mod tests {
     use crate::peer::{pull_sync, serve_sync};
     use crate::store::Store;
     use glade_wire::generated::{Op, Shape};
+    use std::collections::BTreeSet;
+    use std::net::Ipv4Addr;
+    use std::path::{Path, PathBuf};
 
-    /// Plan Step 4.2b: a `--peer` entry is an endpoint id, perhaps with an
-    /// address. Without one it only configures the door; with one it is
-    /// dialed too; anything else is no entry.
+    /// Plan Step 4.5: `relay off` is no relay, and `relay n0` is n0's
+    /// production relays, the four of iroh's `defaults::prod`, never its
+    /// staging relays, which an environment variable can choose through
+    /// iroh's own default. A peer's relay URL may name those four alone, as
+    /// the node prints them. Pure: nothing binds.
     #[test]
-    fn a_peer_entry_names_a_key_and_perhaps_where_to_dial_it() {
-        let key = EndpointKey::from_seed([5; 32]).endpoint_id;
-        let id = crate::transport::hex(&key);
-        let known = PeerEntry::parse(&id);
-        assert!(matches!(known, Some(PeerEntry::Known(_))), "{known:?}");
-        let dialed = PeerEntry::parse(&format!("{id}@127.0.0.1:4711"));
-        assert!(matches!(dialed, Some(PeerEntry::Dial(at)) if at.socket.port() == 4711));
-        let keys = (known.map(|e| e.key()), dialed.map(|e| e.key()));
-        assert_eq!(keys, (Some(key), Some(key)));
-        for junk in ["", "nope", &format!("{id}@"), "@127.0.0.1:1", &id[1..]] {
-            assert!(PeerEntry::parse(junk).is_none(), "{junk:?}");
+    fn the_recipe_maps_off_to_disabled_and_n0_to_the_production_relays() {
+        assert_eq!(relay_mode(Relays::Off), RelayMode::Disabled);
+        assert_eq!(relay_mode(Relays::N0), RelayMode::Default);
+        let urls = |map: iroh::RelayMap| map.urls::<BTreeSet<RelayUrl>>();
+        let n0 = urls(relay_mode(Relays::N0).relay_map());
+        assert_eq!(n0, urls(iroh::defaults::prod::default_relay_map()));
+        assert_eq!(n0.len(), 4);
+        for url in &n0 {
+            let printed = url.to_string();
+            assert_eq!(n0_relay(&printed), Some(printed.clone()));
         }
+        let staging = urls(iroh::defaults::staging::default_relay_map());
+        for url in &staging {
+            assert_eq!(n0_relay(&url.to_string()), None, "{url}");
+        }
+    }
+
+    /// Plan Step 4.5: an endpoint binds where its network says, and the
+    /// `peer` line's address is the socket bound. On loopback, at a port
+    /// found free, so nothing listens beyond this machine.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_endpoint_binds_where_its_network_says() {
+        let free = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let socket = free.local_addr().unwrap();
+        drop(free);
+        let network = Network {
+            bind: vec![socket],
+            ..Network::default()
+        };
+        let key = EndpointKey::from_seed([8; 32]);
+        let endpoint = bind_endpoint(key, None, ALPN, &network).await.unwrap();
+        assert_eq!(endpoint.bound_sockets(), [socket]);
+        let printed = bound_addr(&endpoint).unwrap().socket;
+        assert_eq!(printed, socket, "the peer line's address");
+        endpoint.close().await;
+    }
+
+    /// Plan Step 4.5: a dial target names each address its entry gives, IP
+    /// and relay, in one iroh address, and a line names the entry by the tag
+    /// iroh itself prints for the key. Pure: nothing dials.
+    #[test]
+    fn a_dial_target_names_each_address_it_was_given() {
+        let key = EndpointKey::from_seed([9; 32]).endpoint_id;
+        let socket: SocketAddr = "10.1.1.236:4545".parse().unwrap();
+        let relay = "https://aps1-1.relay.n0.iroh.link./";
+        let via = vec![Via::Ip(socket), Via::Relay(relay.into())];
+        let entry = PeerEntry { key, via };
+        let target = endpoint_addr(&entry).unwrap();
+        assert_eq!(target.id.as_bytes(), &key);
+        let ips: Vec<SocketAddr> = target.ip_addrs().copied().collect();
+        let relays: Vec<String> = target.relay_urls().map(|url| url.to_string()).collect();
+        assert_eq!((ips, relays), (vec![socket], vec![relay.to_string()]));
+        let short = target.id.fmt_short().to_string();
+        assert_eq!(entry.to_string(), format!("{short}@{socket},{relay}"));
+    }
+
+    /// The `.rs` files under `dir`, at any depth.
+    fn rust_files(dir: &Path) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                files.extend(rust_files(&path));
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                files.push(path);
+            }
+        }
+        files
+    }
+
+    /// A source file's production code, line by line with its number: each
+    /// file's code before its first `#[cfg(test)]`, where this crate's test
+    /// modules begin, with every comment set aside.
+    fn production_lines(text: &str) -> Vec<(usize, &str)> {
+        let lines = text.lines().enumerate();
+        let code = lines.take_while(|(_, line)| line.trim() != "#[cfg(test)]");
+        let code = code.map(|(i, line)| (i + 1, line.split("//").next().unwrap_or_default()));
+        code.collect()
+    }
+
+    /// Plan Step 4.5: no production code asks iroh for what reads the
+    /// environment or adds n0's lookups: `presets::N0` (its DNS lookup and
+    /// `default_relay_mode()`), `presets::N0DisableRelay`,
+    /// `default_relay_mode` and `force_staging_infra`
+    /// (`IROH_FORCE_STAGING_RELAYS`), and `Builder::proxy_from_env` (the
+    /// proxy variables). A source check over `src/`.
+    #[test]
+    fn no_production_code_names_irohs_environment_readers() {
+        let readers = [
+            "presets::N0",
+            "N0DisableRelay",
+            "default_relay_mode",
+            "force_staging_infra",
+            "proxy_from_env",
+        ];
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let files = rust_files(&src);
+        assert!(files.len() > 20, "the check read {} files", files.len());
+        let mut named = Vec::new();
+        for path in &files {
+            let text = std::fs::read_to_string(path).unwrap();
+            for (n, code) in production_lines(&text) {
+                let found = readers.iter().filter(|reader| code.contains(*reader));
+                named.extend(found.map(|reader| format!("{}:{n}: {reader}", path.display())));
+            }
+        }
+        assert_eq!(named, Vec::<String>::new());
     }
 
     /// The DIAL over REAL iroh QUIC: dialer binds, acceptor binds, dialer dials
@@ -771,10 +962,13 @@ mod tests {
     /// pre-binds `0.0.0.0` and `[::]`, and a loopback IPv4 bind replaced only
     /// the first: the `[::]` socket stayed, open to the LAN over IPv6, and
     /// macOS's firewall asked about every new node and test binary.
+    /// Plan Step 4.5: `Network::default()`, what every profile binds with no
+    /// `--config` file.
     #[tokio::test(flavor = "multi_thread")]
     async fn an_endpoint_listens_on_loopback_alone() {
         let key = EndpointKey::from_seed([7; 32]);
-        let endpoint = bind_endpoint(key, None, ALPN).await.unwrap();
+        let network = Network::default();
+        let endpoint = bind_endpoint(key, None, ALPN, &network).await.unwrap();
         let sockets = endpoint.bound_sockets();
         assert!(!sockets.is_empty(), "no socket bound");
         for socket in &sockets {
@@ -1035,7 +1229,7 @@ mod tests {
             "the endpoint id b's TLS session proved"
         );
         let port = match &*lock(&b.state) {
-            PortState::Bound { ep, .. } => loopback_addr(ep).unwrap().socket.port(),
+            PortState::Bound { ep, .. } => bound_addr(ep).unwrap().socket.port(),
             _ => unreachable!("b is bound"),
         };
 
@@ -1121,6 +1315,26 @@ mod tests {
             !matches!(after, Ok(Some(_))),
             "a frame arrived after a torn one: {after:?}"
         );
+    }
+
+    /// Plan Step 4.5: the adapter binds the socket `CarrierConfig::local`
+    /// names, so CA-004's re-bind is real on iroh: a fresh port asked to bind
+    /// where a closed one was lands at its very address, where before it
+    /// bound anywhere on loopback.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_iroh_port_binds_where_its_config_says() {
+        let (b, fresh) = (keyed(), keyed());
+        let at_b = b.bind(limit(64)).await.unwrap();
+        b.close().await;
+        let again = CarrierConfig {
+            local: at_b.clone(),
+            ..limit(64)
+        };
+        let at_fresh = fresh.bind(again).await.unwrap();
+        let socket = |at: &CarrierAddr| local_socket(at).unwrap();
+        assert_eq!(socket(&at_fresh), socket(&at_b), "where b was");
+        assert_ne!(at_fresh, at_b, "under another key");
+        fresh.close().await;
     }
 
     /// Plan Step 4.2c: a link holds its endpoint, so a port dropped without

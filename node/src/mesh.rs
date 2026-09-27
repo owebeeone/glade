@@ -35,6 +35,7 @@ use crate::envelope;
 use crate::frame::Frame;
 use crate::grants::{refusal, READ_SUBSCRIBE};
 use crate::iroh_carrier::{PeerAddr, PeerEndpoint, PeerLink};
+use crate::netconf::PeerEntry;
 use crate::peer::{read_frame, write_frame, SyncOutcome, OPS_PER_CHUNK};
 use crate::registry::HOME;
 use crate::router::SessionId;
@@ -261,12 +262,13 @@ impl Server {
         Ok(addr)
     }
 
-    /// Dial a peer, run the HELLO seam, register the link, and converge the
-    /// home share (a pull each way rides the connection). Returns the peer's
-    /// directory node id (hex).
-    pub async fn connect_peer(&self, addr: &PeerAddr) -> io::Result<String> {
+    /// Dial a peer at every address `target` names (plan Step 4.5), run the
+    /// HELLO seam, register the link, and converge the home share (a pull
+    /// each way rides the connection). Returns the peer's directory node id
+    /// (hex).
+    pub async fn connect_peer(&self, target: impl Into<PeerEntry>) -> io::Result<String> {
         let mesh = self.shared.mesh.get().cloned().ok_or_else(|| other("mesh not enabled"))?;
-        let link = mesh.endpoint.get()?.dial(addr).await?;
+        let link = mesh.endpoint.get()?.dial(target).await?;
         let peer = hex_id(&link.peer.peer_id);
         run_link(self.shared.clone(), mesh, link, true).await?;
         Ok(peer)
@@ -1214,7 +1216,8 @@ mod tests {
             crate::peer::NodeIdentity::from_key(seed),
             crate::transport::EndpointKey::from_seed(key),
         );
-        let endpoint = PeerEndpoint::bind_door(identity, key, Arc::new(door))
+        let network = crate::netconf::Network::default();
+        let endpoint = PeerEndpoint::bind_door(identity, key, Arc::new(door), &network)
             .await
             .unwrap();
         let addr = server.enable_mesh(endpoint).await.unwrap();
@@ -1255,7 +1258,7 @@ mod tests {
         );
         let line = format!(
             "peer refused: endpoint {}: unknown endpoint key",
-            hex_id(&endpoint_of(A_KEY))
+            crate::transport::tag(&endpoint_of(A_KEY))
         );
         assert_eq!(*b_lines.lock().unwrap(), [line]);
         assert_eq!(links(&b).await, 0);
@@ -1294,7 +1297,8 @@ mod tests {
         a.connect_peer(&at_b)
             .await
             .expect_err("a revoked key linked");
-        let (key, node) = (hex_id(&endpoint_of(A_KEY)), hex_id(&node_of(A_SEED)));
+        let key = crate::transport::tag(&endpoint_of(A_KEY));
+        let node = hex_id(&node_of(A_SEED));
         let line = format!("peer refused: endpoint {key}: revoked by node {node}");
         assert_eq!(*b_lines.lock().unwrap(), [line]);
     }
@@ -1323,7 +1327,7 @@ mod tests {
         let why = format!("HELLO refused: bound to node {m}, not {n}");
         let line = format!(
             "peer refused: endpoint {}: {why}",
-            hex_id(&endpoint_of(A_KEY))
+            crate::transport::tag(&endpoint_of(A_KEY))
         );
         assert_eq!(*b_lines.lock().unwrap(), [line]);
         assert_eq!(links(&b).await, 0);

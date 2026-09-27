@@ -14,9 +14,13 @@
 //! must never write $HOME).
 //!
 //! **Booted profile form** (opt-in): `glade-node --profile local|peer|server
-//! [--name NAME] [--operator OP] [--app FILE.glade]... [--peer ID[@IP:PORT]]...
-//! [--enforce-client-grants] [PORT] [STORE_DIR]` —
-//! reads every `--app` file, then boots the system-data instance (GDL-036): acquires
+//! [--name NAME] [--operator OP] [--app FILE.glade]... [--config PATH]
+//! [--peer ID[@IP:PORT|@RELAY-URL]]... [--enforce-client-grants] [PORT]
+//! [STORE_DIR]` —
+//! reads every `--app` file, then the network (plan Step 4.5: the `--config`
+//! file, an absolute path no one else may read, and the `--peer` flags; a
+//! file that cannot be read, a bad line or a bad flag refuses the start
+//! before anything is written), then boots the system-data instance (GDL-036): acquires
 //! `~/.glade/sys/<name>/` (the profile picks the default name; `--name`
 //! overrides; `GLADE_HOME` overrides `$HOME/.glade`, and each composition root
 //! reads the two once, as it starts, and passes the root down), runs the load-validation
@@ -32,17 +36,22 @@
 //! the node's `home` claim is renewed, as it is every 100 s while the node runs,
 //! before the node prints `registry ready (home served: …)`. The iroh peer
 //! endpoint binds with the node's directory identity and its `endpoint.key`,
-//! and accepts inbound peer links
-//! (prints `peer <endpoint-id> <ip:port>` — the dial target for a `--peer`
-//! flag on another node, the same at every start), and each `--peer` target
-//! is dialed and the home share converged. Then it serves the app-data
-//! carrier as before.
+//! where the network says (with no file, `127.0.0.1:0` alone, no relay, no
+//! portmapper, on every profile), and accepts inbound peer links (prints
+//! `peer <tag> <ip:port>`: the first 10 hex digits of its endpoint id, the
+//! same at every start, and its address as bound), and each peer with an
+//! address is dialed and the home share converged. Then it serves the
+//! app-data carrier as before.
 //!
 //! The endpoint has a door (plan Step 4.2b): it admits an endpoint key bound
-//! by a record the node holds, or one a `--peer` entry names on first
-//! contact, and refuses every other, reporting `peer refused: endpoint <id>:
-//! <reason>` on stderr. `--peer ID` names a key to admit and dial nothing;
-//! `--peer ID@IP:PORT` names one and dials it.
+//! by a record the node holds, or one a peer entry names on first contact,
+//! and refuses every other, reporting `peer refused: endpoint <tag>:
+//! <reason>` on stderr. An entry `ID` names a key to admit and dial nothing;
+//! `ID@IP:PORT`, or `ID@RELAY-URL` with `relay n0`, names one and dials it.
+//! A failed dial says `peer <tag>@<address>: <error>` on stderr. No line
+//! holds an endpoint id: `glade-node endpoint-id --name NAME` prints one, and
+//! starts no node (plan Step 4.5): it reads the instance's `endpoint.key`, or
+//! mints one first, and prints its id alone.
 //!
 //! Each `--app FILE.glade` is LOADED as data and REGISTERED (GDL-037): its
 //! declarations append as ordinary records, its ACL seeds compile to grant
@@ -116,9 +125,11 @@ use std::sync::Arc;
 
 use glade_node::assembly::{Settings, ASSEMBLED_ROOT_LINE};
 use glade_node::claims::Leases;
+use glade_node::endpoint_id;
 use glade_node::grants::{CLIENT_GRANTS_ENFORCED, GRANTS_UNAVAILABLE};
-use glade_node::iroh_carrier::{PeerEndpoint, PeerEntry};
+use glade_node::iroh_carrier::PeerEndpoint;
 use glade_node::lifecycle::{conclude, node_plan, Console, NodeStart, StdConsole};
+use glade_node::netconf;
 use glade_node::recovery;
 use glade_node::registry::{RegistryApi, StoreApi, HOME};
 use glade_node::server::Server;
@@ -133,9 +144,10 @@ const ASSEMBLED: &str = "GLADE_NODE_ASSEMBLED";
 /// The line a start the command line cannot run is refused with.
 const USAGE: &str = "usage: glade-node <port> <store_dir> (the legacy form requires its \
     store directory), or glade-node --profile local|peer|server [--name NAME] \
-    [--operator OP] [--app FILE.glade]... [--peer ID[@IP:PORT]]... \
-    [--enforce-client-grants] [--recovery-out PATH] [port] [store_dir], or \
-    glade-node recovery --name NAME --out PATH";
+    [--operator OP] [--app FILE.glade]... [--config PATH] \
+    [--peer ID[@IP:PORT|@RELAY-URL]]... [--enforce-client-grants] [--recovery-out PATH] \
+    [port] [store_dir], or glade-node recovery --name NAME --out PATH, or \
+    glade-node endpoint-id --name NAME";
 
 /// The refusal of a legacy start with no store directory: the usage line on
 /// stderr, and exit 1, as every refused start.
@@ -189,6 +201,11 @@ async fn start() -> std::io::Result<ExitCode> {
         }
         return Ok(ExitCode::SUCCESS);
     }
+    if args.first().is_some_and(|arg| arg == "endpoint-id") {
+        let root = instance_root_from_env();
+        println!("{}", endpoint_id::command(&root, args.into_iter().skip(1))?);
+        return Ok(ExitCode::SUCCESS);
+    }
     let program = program_path();
     let leases = Leases::default();
     if assembled(std::env::var_os(ASSEMBLED))? {
@@ -217,6 +234,7 @@ async fn run(args: Vec<String>, program: Option<PathBuf>, leases: Leases) -> std
     let mut name: Option<String> = None;
     let mut operator: Option<String> = None;
     let mut apps: Vec<String> = Vec::new();
+    let mut config: Option<String> = None;
     let mut peers: Vec<String> = Vec::new();
     let mut enforce_client_grants = false;
     let mut recovery_out: Option<String> = None;
@@ -229,6 +247,7 @@ async fn run(args: Vec<String>, program: Option<PathBuf>, leases: Leases) -> std
             "--name" => name = args.next(),
             "--operator" => operator = args.next(),
             "--app" => apps.extend(args.next()),
+            "--config" => config = args.next(),
             "--peer" => peers.extend(args.next()),
             "--enforce-client-grants" => enforce_client_grants = true,
             "--recovery-out" => recovery_out = args.next(),
@@ -246,6 +265,9 @@ async fn run(args: Vec<String>, program: Option<PathBuf>, leases: Leases) -> std
         // before `boot` opens the instance (L1-14): a refused start writes
         // nothing.
         let decls = glade_node::appdecl::load_all(&apps)?;
+        // The network (plan Step 4.5): the file, then the flags, each checked
+        // before the instance boots.
+        let network = netconf::load(config.as_deref(), &peers)?;
         let profile = profile.unwrap_or(Profile::Local);
         let recovery_out = recovery_out.as_deref().map(Path::new);
         let (name, operator, lease_ms) = (name.as_deref(), operator.as_deref(), leases.lease_ms);
@@ -292,7 +314,7 @@ async fn run(args: Vec<String>, program: Option<PathBuf>, leases: Leases) -> std
             println!("app {} registered (+{} record(s), {} unchanged)", decl.app, reg.appended, reg.unchanged);
             workspaces.extend(decl.workspaces.iter().map(|w| (w.share.clone(), w.name.clone())));
         }
-        Some((node, workspaces))
+        Some((node, workspaces, network))
     } else {
         None
     };
@@ -304,7 +326,7 @@ async fn run(args: Vec<String>, program: Option<PathBuf>, leases: Leases) -> std
     // refused here, having read and written nothing.
     let dir = match (positional.get(1), &booted) {
         (Some(dir), _) => dir.clone(),
-        (None, Some((node, _))) => {
+        (None, Some((node, ..))) => {
             let store = node.dir.join("cache").join("store");
             store.to_string_lossy().into_owned()
         }
@@ -327,26 +349,21 @@ async fn run(args: Vec<String>, program: Option<PathBuf>, leases: Leases) -> std
     // DIRECTORY identity, run the accept loop, converge with each `--peer`
     // target, then start SERVING the declared workspaces: mint WorkspaceEntry +
     // ServeClaim and renew while serving (audit F1).
-    if let Some((node, workspaces)) = booted {
+    if let Some((node, workspaces, network)) = booted {
         let (identity, key) = (node.identity()?, node.endpoint_key());
         let (lease_ms, renew_ms) = (leases.lease_ms, leases.renew_ms);
         server.adopt_boot_tuned(node, lease_ms, renew_ms).await?;
         let serves_home = server.serves(HOME).await.is_some();
         println!("registry ready (home served: {serves_home})");
-        let entries: Vec<Option<PeerEntry>> = peers.iter().map(|p| PeerEntry::parse(p)).collect();
-        let configured = entries.iter().flatten().map(PeerEntry::key);
+        let configured = network.peers.iter().map(|entry| entry.key);
         let door = Arc::new(Door::new(configured, |line: &str| eprintln!("{line}")));
-        let endpoint = PeerEndpoint::bind_door(identity, key, door).await?;
+        let endpoint = PeerEndpoint::bind_door(identity, key, door, &network).await?;
         let addr = server.enable_mesh(endpoint).await?;
-        println!("peer {} {}", addr.endpoint_id, addr.socket);
-        for (p, entry) in peers.iter().zip(&entries) {
-            match entry {
-                Some(PeerEntry::Dial(target)) => match server.connect_peer(target).await {
-                    Ok(id) => println!("peer-connected {id}"),
-                    Err(e) => eprintln!("peer {p}: {e}"),
-                },
-                Some(PeerEntry::Known(_)) => {}
-                None => eprintln!("peer {p}: expected <endpoint-id> or <endpoint-id>@<ip:port>"),
+        println!("peer {} {}", addr.tag(), addr.socket);
+        for entry in network.peers.iter().filter(|entry| !entry.via.is_empty()) {
+            match server.connect_peer(entry.clone()).await {
+                Ok(id) => println!("peer-connected {id}"),
+                Err(e) => eprintln!("peer {entry}: {e}"),
             }
         }
         for (share, name) in &workspaces {
@@ -375,7 +392,7 @@ async fn run_assembled(
     leases: Leases,
 ) -> std::io::Result<ExitCode> {
     eprintln!("{ASSEMBLED_ROOT_LINE}");
-    let settings = Settings {
+    let mut settings = Settings {
         instance_root: Some(instance_root_from_env()),
         program,
         leases,
@@ -386,11 +403,13 @@ async fn run_assembled(
     if !settings.booted() && settings.store_dir().is_none() {
         return Err(usage());
     }
-    // Every `--app` file is loaded, and two naming one app are refused,
-    // before the plan boots the instance (L1-14): a refused start writes
-    // nothing.
+    // Every `--app` file is loaded, and two naming one app are refused, then
+    // the network (plan Step 4.5), before the plan boots the instance
+    // (L1-14): a refused start writes nothing.
     let decls = if settings.booted() {
-        glade_node::appdecl::load_all(&settings.apps)?
+        let decls = glade_node::appdecl::load_all(&settings.apps)?;
+        settings.network = netconf::load(settings.config.as_deref(), &settings.peers)?;
+        decls
     } else {
         Vec::new()
     };

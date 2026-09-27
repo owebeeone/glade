@@ -26,7 +26,7 @@ use crate::sysdir::now_ms;
 /// second class-1 secret beside `node.key` and not derived from it, so the
 /// node's identity survives the key's replacement. Its Ed25519 public key is
 /// the endpoint id that peers dial and bindings name. `Debug` prints only
-/// the id.
+/// the id's tag (plan Step 4.5).
 #[derive(Clone, Copy)]
 pub struct EndpointKey {
     seed: [u8; 32],
@@ -47,9 +47,9 @@ impl EndpointKey {
 
 impl fmt::Debug for EndpointKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let id = hex(&self.endpoint_id);
+        let tag = tag(&self.endpoint_id);
         f.debug_struct("EndpointKey")
-            .field("endpoint_id", &id)
+            .field("endpoint_id", &tag)
             .finish_non_exhaustive()
     }
 }
@@ -57,6 +57,14 @@ impl fmt::Debug for EndpointKey {
 /// A key as the directory writes it: 64 lower-case hex digits.
 pub fn hex(key: &[u8; 32]) -> String {
     key.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// How a line names an endpoint key (plan Step 4.5): its first 10 hex digits,
+/// iroh's own short form (`PublicKey::fmt_short`). Enough to match a line to
+/// a configuration file's entry, and no use for dialing; the full id comes
+/// only from `glade-node endpoint-id`, the files and the store.
+pub fn tag(key: &[u8; 32]) -> String {
+    hex(key)[..10].to_string()
 }
 
 /// The key `text` writes, if it is exactly 64 lower-case hex digits.
@@ -362,9 +370,9 @@ impl Door {
         (self.report)(line);
     }
 
-    /// Report a refusal of the key `endpoint`, with its reason.
+    /// Report a refusal of the key `endpoint`, by its tag, with its reason.
     pub fn refused(&self, endpoint: &[u8; 32], why: &dyn fmt::Display) {
-        (self.report)(&format!("peer refused: endpoint {}: {why}", hex(endpoint)));
+        (self.report)(&format!("peer refused: endpoint {}: {why}", tag(endpoint)));
     }
 }
 
@@ -778,7 +786,7 @@ mod tests {
         door.refused(&E1, &revoked);
         let line = format!(
             "peer refused: endpoint {}: revoked by node {}",
-            hex(&E1),
+            tag(&E1),
             hex(&id(&NODE))
         );
         assert_eq!(*lines.lock().unwrap(), [line]);

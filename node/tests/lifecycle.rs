@@ -28,6 +28,7 @@ use glade_node::cbor;
 use glade_node::claims::Leases;
 use glade_node::envelope;
 use glade_node::lifecycle::{node_plan, Console, InstanceAt, NodeStart};
+use glade_node::netconf;
 use glade_node::registry::{BlobStore, StoreApi, HOME};
 use glade_node::sysdata::ServeClaim;
 use glade_node::sysdir::now_ms;
@@ -83,14 +84,17 @@ fn scratch(test: &str) -> PathBuf {
 }
 
 /// The endpoint id of the instance `name` under `dir`, booted once so its
-/// keys exist: what an operator reads from a node's first start.
+/// keys exist: what `glade-node endpoint-id` prints, since no line of a
+/// node's holds it (plan Step 4.5).
 fn endpoint_id(dir: &Path, name: &str) -> String {
     let boot = glade_node::sysdir::boot_at(dir.join("sys").join(name), "local").unwrap();
     glade_node::transport::hex(&boot.endpoint_key().endpoint_id)
 }
 
 /// A booted start of the instance `name` under `dir`, with `peers` as its
-/// `--peer` entries: dialed with an address, only admitted without one.
+/// `--peer` entries: dialed with an address, only admitted without one. The
+/// test is the composition root here, so it loads the network as a root
+/// does (plan Step 4.5).
 fn booted(dir: &Path, name: &str, peers: &[String], lines: &Arc<Lines>) -> NodeStart {
     let mut args = vec![
         "--profile".to_owned(),
@@ -107,8 +111,10 @@ fn booted(dir: &Path, name: &str, peers: &[String], lines: &Arc<Lines>) -> NodeS
         dir: dir.join("sys").join(name),
         operator: "local".into(),
     };
+    let mut settings = Settings::from_args(args);
+    settings.network = netconf::load(None, &settings.peers).unwrap();
     NodeStart {
-        settings: Settings::from_args(args),
+        settings,
         decls: Vec::new(),
         instance: Some(instance),
         console: lines.clone(),
@@ -142,10 +148,15 @@ fn tcp(port: u16) -> bool {
     TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok()
 }
 
-/// The UDP port of a `peer <endpoint-id> <ip:port>` line.
+/// The address of a `peer <tag> <ip:port>` line (plan Step 4.5).
+fn peer_address(line: &str) -> &str {
+    line.rsplit(' ').next().unwrap()
+}
+
+/// The UDP port of a `peer <tag> <ip:port>` line.
 fn peer_port(line: &str) -> u16 {
-    let socket = line.rsplit(' ').next().unwrap();
-    socket.rsplit(':').next().unwrap().parse().unwrap()
+    let port = peer_address(line).rsplit(':').next().unwrap();
+    port.parse().unwrap()
 }
 
 fn shown(report: &Report) -> String {
@@ -186,12 +197,12 @@ async fn a_node_links_to_a_peer_and_stops_clean_with_its_ports_free() {
     let rt = runtime();
 
     let b_lines = Arc::new(Lines::default());
-    let a_key = endpoint_id(&dir, "a");
+    let (a_key, b_key) = (endpoint_id(&dir, "a"), endpoint_id(&dir, "b"));
     let mut b = node_plan().start(rt.clone(), booted(&dir, "b", &[a_key], &b_lines));
     let steady = tokio::time::timeout(BOUND, b.ready()).await;
     assert_eq!(steady.ok(), Some(Ok(())), "B steady: {:?}", b_lines.all());
     let b_peer = b_lines.value("peer");
-    let b_target = b_peer.replacen(' ', "@", 1);
+    let b_target = format!("{b_key}@{}", peer_address(&b_peer));
 
     let a_lines = Arc::new(Lines::default());
     let mut a = node_plan().start(rt.clone(), booted(&dir, "a", &[b_target], &a_lines));
@@ -266,20 +277,23 @@ async fn a_dialer_its_peer_does_not_know_is_refused_and_reported() {
     let dir = scratch("lifecycle-door");
     let rt = runtime();
     let b_lines = Arc::new(Lines::default());
+    let b_key = endpoint_id(&dir, "b");
     let mut b = node_plan().start(rt.clone(), booted(&dir, "b", &[], &b_lines));
     let steady = tokio::time::timeout(BOUND, b.ready()).await;
     assert_eq!(steady.ok(), Some(Ok(())), "B steady: {:?}", b_lines.all());
-    let target = b_lines.value("peer").replacen(' ', "@", 1);
+    let b_address = peer_address(&b_lines.value("peer")).to_owned();
+    let target = format!("{b_key}@{b_address}");
 
     let a_lines = Arc::new(Lines::default());
     let a_start = booted(&dir, "a", std::slice::from_ref(&target), &a_lines);
     let mut a = node_plan().start(rt.clone(), a_start);
     let steady = tokio::time::timeout(BOUND, a.ready()).await;
     assert_eq!(steady.ok(), Some(Ok(())), "A steady: {:?}", a_lines.all());
-    let a_key = a_lines.value("peer").split(' ').next().unwrap().to_owned();
-    let refused = format!("stderr: peer refused: endpoint {a_key}: unknown endpoint key");
+    // Lines name an endpoint by its tag (plan Step 4.5).
+    let a_tag = a_lines.value("peer").split(' ').next().unwrap().to_owned();
+    let refused = format!("stderr: peer refused: endpoint {a_tag}: unknown endpoint key");
     assert!(b_lines.all().contains(&refused), "{:?}", b_lines.all());
-    let failed = a_lines.value(&format!("stderr: peer {target}:"));
+    let failed = a_lines.value(&format!("stderr: peer {}@{b_address}:", &b_key[..10]));
     assert!(!failed.contains("unknown"), "a reason crossed: {failed}");
     assert!(!a_lines
         .all()
