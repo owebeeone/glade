@@ -1,9 +1,8 @@
 //! Node<->node session (Lane R step 2): the HELLO seam + heads/gap sync.
 //!
-//! Carrier-free by construction — everything here runs over any `AsyncRead +
-//! AsyncWrite` pair, so the protocol is unit-tested over an in-memory duplex and
-//! rides real iroh QUIC (`iroh_carrier.rs`) unchanged. HELLO also runs on any
-//! `CarrierLink`, as a link's first frame each way (plan Step 4.5b). Two layers:
+//! Carrier-free by construction: HELLO runs on any `CarrierLink`, as a link's
+//! first frame each way (plan Step 4.5b), and the sync driver over any
+//! `AsyncRead + AsyncWrite` pair, so both are unit-tested in memory. Two layers:
 //!
 //!   1. **Framed IO** — a `u32`-length prefix around each `Frame` (the exact
 //!      framing the WS carrier uses, minus the websocket).
@@ -83,12 +82,6 @@ impl NodeIdentity {
     pub fn from_key(seed: [u8; 32]) -> Self {
         let node_id = signing::public_key(&seed);
         NodeIdentity { seed, node_id }
-    }
-
-    /// A fresh identity from the operating system's randomness, for an
-    /// endpoint bound without an instance (`PeerEndpoint::bind`).
-    pub fn generate() -> io::Result<Self> {
-        signing::random_seed().map(NodeIdentity::from_key)
     }
 
     /// This node's signature on `message`, for `purpose`.
@@ -202,80 +195,10 @@ fn bound(door: Option<&Door>, peer: &PeerHello, endpoint: &[u8; 32]) -> io::Resu
     })
 }
 
-/// Dialer side of the node<->node HELLO: send `NodeHello`, await `NodeWelcome`,
-/// and return the peer once its WELCOME verifies for `channel` and, with a
-/// door, its node is bound to the acceptor's endpoint key.
-pub async fn hello_dial<R, W>(
-    r: &mut R,
-    w: &mut W,
-    me: &NodeIdentity,
-    channel: &Channel,
-    door: Option<&Door>,
-) -> io::Result<PeerHello>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let hello = NodeHello {
-        node_id: me.node_id.to_vec(),
-        protocol: PROTOCOL,
-        sig: hello_sig(me, Role::Dialer, channel),
-    };
-    write_frame(w, &Frame::NodeHello(hello)).await?;
-    let peer = match read_frame(r).await? {
-        Frame::NodeWelcome(nw) => {
-            verify_peer(&nw.node_id, nw.protocol, &nw.sig, Role::Acceptor, channel)?
-        }
-        other => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("expected NodeWelcome, got {other:?}"),
-            ))
-        }
-    };
-    bound(door, &peer, &channel.acceptor)?;
-    Ok(peer)
-}
-
-/// Acceptor side: await `NodeHello` and check it for `channel` and, with a
-/// door, its node's binding to the dialer's endpoint key; only then reply
-/// `NodeWelcome`. A refused HELLO gets no answer.
-pub async fn hello_accept<R, W>(
-    r: &mut R,
-    w: &mut W,
-    me: &NodeIdentity,
-    channel: &Channel,
-    door: Option<&Door>,
-) -> io::Result<PeerHello>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let peer = match read_frame(r).await? {
-        Frame::NodeHello(nh) => {
-            verify_peer(&nh.node_id, nh.protocol, &nh.sig, Role::Dialer, channel)?
-        }
-        other => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("expected NodeHello, got {other:?}"),
-            ))
-        }
-    };
-    bound(door, &peer, &channel.dialer)?;
-    let welcome = NodeWelcome {
-        node_id: me.node_id.to_vec(),
-        protocol: PROTOCOL,
-        sig: hello_sig(me, Role::Acceptor, channel),
-    };
-    write_frame(w, &Frame::NodeWelcome(welcome)).await?;
-    Ok(peer)
-}
-
 // ---- HELLO on a carrier link (plan Step 4.5b) ------------------------------
 
-/// The label a link's channel binding is drawn under for HELLO: the label its
-/// bytes are exported under today, so D6's transcript is unchanged.
+/// The label a link's channel binding is drawn under for HELLO: the label the
+/// stream HELLO's bytes were exported under, so D6's transcript is unchanged.
 pub const HELLO_LABEL: &[u8] = b"glade/v1/peer-hello";
 
 /// How long HELLO has on a link (plan Step 4.5b, the owner's ruling of
@@ -430,7 +353,7 @@ pub async fn hello_accept_link(
 }
 
 /// Report a refused HELLO through the door, naming the endpoint key it came
-/// from, as `PeerEndpoint::accept` does on a stream.
+/// from.
 fn report(door: Option<&Door>, endpoint: &[u8; 32], e: &io::Error) {
     if let (Some(door), io::ErrorKind::PermissionDenied) = (door, e.kind()) {
         door.refused(endpoint, e);
@@ -574,7 +497,6 @@ where
 #[cfg(test)]
 mod hello_tests {
     use super::*;
-    use tokio::io::split;
 
     fn hex32(hex: &str) -> [u8; 32] {
         let byte = |at: usize| u8::from_str_radix(&hex[at..at + 2], 16).unwrap();
@@ -598,37 +520,6 @@ mod hello_tests {
         acceptor: [2; 32],
         exported: [3; 32],
     };
-
-    /// The DIAL gate over an in-memory duplex: dialer and acceptor complete the
-    /// HELLO and each learns the OTHER's node_id (not its own). The genuine
-    /// case: accepted before plan Step 4.1a signed it, and after.
-    #[tokio::test]
-    async fn hello_handshake_exchanges_identities() {
-        let dialer = NodeIdentity::from_key([7u8; 32]);
-        let acceptor = NodeIdentity::from_key([9u8; 32]);
-
-        // duplex(a,b): writing a is readable on b. Split each end into (r, w).
-        let (a, b) = tokio::io::duplex(4096);
-        let (mut ar, mut aw) = split(a);
-        let (mut br, mut bw) = split(b);
-
-        let acc = tokio::spawn(async move {
-            let (me, channel) = (&acceptor, &CHANNEL);
-            hello_accept(&mut br, &mut bw, me, channel, None).await
-        });
-        let dialed = hello_dial(&mut ar, &mut aw, &dialer, &CHANNEL, None).await;
-        let seen_by_dialer = dialed.unwrap();
-        let seen_by_acceptor = acc.await.unwrap().unwrap();
-
-        assert_eq!(
-            seen_by_dialer.peer_id, acceptor.node_id,
-            "dialer learns acceptor id"
-        );
-        assert_eq!(
-            seen_by_acceptor.peer_id, dialer.node_id,
-            "acceptor learns dialer id"
-        );
-    }
 
     /// The HELLO `me` sends as the dialer on `channel`.
     fn hello_from(me: &NodeIdentity, channel: &Channel) -> NodeHello {
@@ -686,141 +577,12 @@ mod hello_tests {
         ]
     }
 
-    /// Present `hello` to an acceptor on `channel`: its verdict, and whether
-    /// it answered with a WELCOME.
-    async fn present(hello: NodeHello, channel: Channel) -> (io::Result<PeerHello>, bool) {
-        present_to(hello, channel, None).await
-    }
-
-    /// [`present`], to an acceptor behind `door`.
-    async fn present_to(
-        hello: NodeHello,
-        channel: Channel,
-        door: Option<&Door>,
-    ) -> (io::Result<PeerHello>, bool) {
-        let acceptor = NodeIdentity::from_key([9u8; 32]);
-        let (a, b) = tokio::io::duplex(4096);
-        let (mut ar, mut aw) = split(a);
-        let (mut br, mut bw) = split(b);
-        let hello = Frame::NodeHello(hello);
-        write_frame(&mut aw, &hello).await.unwrap();
-        let verdict = hello_accept(&mut br, &mut bw, &acceptor, &channel, door).await;
-        drop((br, bw));
-        let answered = read_frame(&mut ar).await.is_ok();
-        (verdict, answered)
-    }
-
-    /// Plan Step 4.1a: a tampered HELLO is refused and gets no answer: a
-    /// flipped signature byte, another node's id under the signature, protocol
-    /// 1, and no signature. The untouched HELLO is accepted and answered. It
-    /// does not try every byte.
-    #[tokio::test]
-    async fn a_tampered_hello_is_refused() {
-        let dialer = NodeIdentity::from_key([7u8; 32]);
-        let genuine = hello_from(&dialer, &CHANNEL);
-        for (what, hello) in tampered(&genuine) {
-            let (verdict, answered) = present(hello, CHANNEL).await;
-            assert!(verdict.is_err(), "{what}: accepted");
-            assert!(!answered, "{what}: answered");
-        }
-        let (verdict, answered) = present(genuine, CHANNEL).await;
-        assert_eq!(verdict.unwrap().peer_id, dialer.node_id);
-        assert!(answered, "the genuine HELLO is answered");
-    }
-
-    /// Plan Step 4.1a: a HELLO recorded on one connection is refused on
-    /// another, where the exported bytes differ, or the endpoint ids do. The
-    /// real carrier's bytes differ per connection (`iroh_carrier.rs`).
-    #[tokio::test]
-    async fn a_hello_replayed_from_another_connection_is_refused() {
-        let dialer = NodeIdentity::from_key([7u8; 32]);
-        let recorded = hello_from(&dialer, &CHANNEL);
-        let another_session = Channel {
-            exported: [4; 32],
-            ..CHANNEL
-        };
-        let another_endpoint = Channel {
-            dialer: [5; 32],
-            ..CHANNEL
-        };
-        for channel in [another_session, another_endpoint] {
-            let (verdict, answered) = present(recorded.clone(), channel).await;
-            assert!(verdict.is_err(), "replayed onto {channel:?}: accepted");
-            assert!(!answered, "replayed onto {channel:?}: answered");
-        }
-    }
-
-    /// Plan Step 4.1a: a HELLO reflected with the roles swapped is refused. The
-    /// dialer's own HELLO, mirrored back as the WELCOME, is checked as the
-    /// acceptor's and fails; an acceptor's WELCOME, presented to it as a HELLO,
-    /// is checked as a dialer's and fails.
-    #[tokio::test]
-    async fn a_reflected_hello_is_refused() {
-        let dialer = NodeIdentity::from_key([7u8; 32]);
-        let (a, b) = tokio::io::duplex(4096);
-        let (mut ar, mut aw) = split(a);
-        let (mut br, mut bw) = split(b);
-        let mirror = tokio::spawn(async move {
-            let Frame::NodeHello(hello) = read_frame(&mut br).await.unwrap() else {
-                panic!("expected the dialer's HELLO");
-            };
-            let welcome = NodeWelcome {
-                node_id: hello.node_id,
-                protocol: hello.protocol,
-                sig: hello.sig,
-            };
-            write_frame(&mut bw, &Frame::NodeWelcome(welcome)).await.unwrap();
-        });
-        let verdict = hello_dial(&mut ar, &mut aw, &dialer, &CHANNEL, None).await;
-        mirror.await.unwrap();
-        assert!(verdict.is_err(), "the dialer took its own HELLO back");
-
-        let acceptor = NodeIdentity::from_key([9u8; 32]);
-        let reflected = NodeHello {
-            node_id: acceptor.node_id.to_vec(),
-            protocol: PROTOCOL,
-            sig: hello_sig(&acceptor, Role::Acceptor, &CHANNEL),
-        };
-        let (verdict, answered) = present(reflected, CHANNEL).await;
-        assert!(verdict.is_err(), "the acceptor took its own WELCOME back");
-        assert!(!answered);
-    }
-
-    /// Plan Step 4.2b: HELLO completes only for a node bound to the endpoint
-    /// key its connection came from (the channel's endpoint ids). The
-    /// dialer's key `[1; 32]`: unknown to the door, refused, unanswered;
-    /// configured, admitted on first contact; bound to another node, refused;
-    /// bound to the dialer, admitted. And the dialer refuses a WELCOME whose
-    /// node its door binds to no key the acceptor's endpoint holds.
-    #[tokio::test]
-    async fn a_hello_completes_only_for_a_node_bound_to_its_endpoint_key() {
-        use crate::transport::testing::bound_by;
-        let dialer = NodeIdentity::from_key([7u8; 32]);
-        let hello = hello_from(&dialer, &CHANNEL);
-        for (what, door, admitted) in doors() {
-            let (verdict, answered) = present_to(hello.clone(), CHANNEL, Some(&door)).await;
-            assert_eq!(verdict.is_ok(), admitted, "{what}: {verdict:?}");
-            assert_eq!(answered, admitted, "{what}: answered");
-        }
-        let acceptor = NodeIdentity::from_key([9u8; 32]);
-        let (a, b) = tokio::io::duplex(4096);
-        let ((mut ar, mut aw), (mut br, mut bw)) = (split(a), split(b));
-        let welcomes = tokio::spawn(async move {
-            let (me, channel) = (&acceptor, &CHANNEL);
-            hello_accept(&mut br, &mut bw, me, channel, None).await
-        });
-        let not_its = bound_by(&[8u8; 32], &CHANNEL.acceptor);
-        let verdict = hello_dial(&mut ar, &mut aw, &dialer, &CHANNEL, Some(&not_its)).await;
-        assert!(welcomes.await.unwrap().is_ok(), "the acceptor answered");
-        let refused = verdict.expect_err("the dialer took a WELCOME from an unbound node");
-        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
-    }
-
     /// F12, on the peer link: a frame holding a value its enum does not name
     /// is refused as `InvalidData`, naming the value, where decoding it
     /// panicked the task reading the link. A HELLO whose tag names no frame
-    /// type fails the acceptor's handshake, and an `Ops` frame holding an
-    /// unknown shape fails `read_frame`, the mesh's framed read.
+    /// type fails the acceptor's handshake on a link, and an `Ops` frame
+    /// holding an unknown shape fails `read_frame`, the sync driver's framed
+    /// read.
     #[tokio::test]
     async fn a_frame_with_an_unknown_value_is_refused_as_invalid_data() {
         use glade_wire::cbor::{self, Cbor};
@@ -836,17 +598,19 @@ mod hello_tests {
         let shaped = [&[4][..], &cbor::encode(&ops)].concat();
         let cases = [(hello, "frame type 15", true), (shaped, "shape 9", false)];
         for (bytes, value, handshake) in cases {
-            let (a, b) = tokio::io::duplex(4096);
-            let ((_ar, mut aw), (mut br, mut bw)) = (split(a), split(b));
-            let len = (bytes.len() as u32).to_le_bytes();
-            aw.write_all(&len).await.unwrap();
-            aw.write_all(&bytes).await.unwrap();
-            let me = NodeIdentity::from_key([9u8; 32]);
             let refused = if handshake {
-                let accepted = hello_accept(&mut br, &mut bw, &me, &CHANNEL, None).await;
-                accepted.map(|_| ())
+                let [dialer, accepting] = on(&CHANNEL);
+                dialer.send(&bytes).await.unwrap();
+                let me = NodeIdentity::from_key([9u8; 32]);
+                let own = &CHANNEL.acceptor;
+                let accepted = hello_accept_link(&*accepting, own, &me, None, HELLO_WITHIN);
+                accepted.await.map(|_| ())
             } else {
-                read_frame(&mut br).await.map(|_| ())
+                let (mut near, mut far) = tokio::io::duplex(4096);
+                let len = (bytes.len() as u32).to_le_bytes();
+                near.write_all(&len).await.unwrap();
+                near.write_all(&bytes).await.unwrap();
+                read_frame(&mut far).await.map(|_| ())
             };
             let refused = refused.expect_err(value);
             assert_eq!(refused.kind(), io::ErrorKind::InvalidData, "{value}");
@@ -929,9 +693,9 @@ mod hello_tests {
 
     // ---- HELLO on a carrier link (plan Step 4.5b) ------------------------
     //
-    // Each rule above, on an in-memory link pair, and the rules a link adds:
-    // its transport session's binding, its protocol gate, a link that cannot
-    // HELLO, and HELLO's bound.
+    // The stream HELLO's rules (plan Steps 4.1a and 4.2b), on an in-memory
+    // link pair, and the rules a link adds: its transport session's binding,
+    // its protocol gate, a link that cannot HELLO, and HELLO's bound.
 
     use crate::conversation::testing::{endpoint_key, iroh_link, iroh_port, pair, MemLink};
     use std::sync::{Arc, Mutex};
@@ -944,7 +708,8 @@ mod hello_tests {
         pair(ids, Some(channel.exported), 1 << 16)
     }
 
-    /// [`present_to`], on a link on `channel`.
+    /// Present `hello` to an acceptor behind `door` on a link on `channel`:
+    /// its verdict, and whether it answered with a WELCOME.
     async fn presented_on_link(
         hello: NodeHello,
         channel: Channel,

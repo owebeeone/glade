@@ -1,23 +1,20 @@
 //! iroh QUIC carrier for the node<->node link (Lane R step 2).
 //!
 //! The client-facing WS carrier (`ws.rs`) is untouched: iroh rides ONLY the peer
-//! path. A `PeerEndpoint` binds a localhost QUIC endpoint (relay + discovery
-//! disabled — `presets::Minimal`, direct dial by socket address only), dials a
-//! peer (the s-sync DIAL), runs the `peer::hello_*` seam over a bidirectional
-//! stream, and hands back a `PeerLink` whose framed streams the sync driver
-//! then speaks over — the SAME `Frame` bytes the websocket carries.
+//! path. [`IrohCarrier`] is the `CarrierPort` over iroh (plan Step 4.2c) and
+//! the port the mesh runs on (plan Step 4.5b): it binds a QUIC endpoint
+//! (`presets::Minimal`, no address lookup), dials a peer (the s-sync DIAL),
+//! accepts one, and tracks its links.
 //!
 //! The iroh key is transport-only. The glade identity is the node key, whose
 //! Ed25519 public key is the node id (plan Step 4.1a), and each HELLO is signed
-//! for the connection it rides: this module reads both endpoint ids and 32
-//! bytes exported from the connection's TLS session, and hands them to
-//! `peer::hello_*` as the [`Channel`]. A booted node's endpoint key is its
+//! for the link it rides: a link names the far end's endpoint id, and gives 32
+//! bytes exported from its TLS session as its channel binding, which
+//! `peer::hello_*_link` sign. A booted node's endpoint key is its
 //! `endpoint.key`, the same at every start (plan Step 4.2), which a record in
 //! its chain binds to the node (`transport.rs`). A booted node's endpoint has a
 //! door (plan Step 4.2b): an accept hook refuses an endpoint key the door does
-//! not know, and HELLO refuses a node not bound to its connection's key.
-//! [`IrohCarrier`] is the `CarrierPort` over iroh (plan Step 4.2c), which
-//! tracks its links, and the port the mesh runs on (plan Step 4.5b).
+//! not know, and HELLO refuses a node not bound to its link's key.
 //!
 //! Plan Step 4.5: the endpoint's recipe takes the node's network
 //! (`netconf.rs`): the sockets it binds and whether it has n0's relays, and
@@ -37,8 +34,9 @@
 //! gives each link's TLS exporter bytes as its channel binding; and notes each
 //! link's path and the home relays' states through the node-local
 //! `LinkNotes` port. Part 3: both roots lend it and bind it on the node's
-//! network ([`IrohCarrier::bind_network`]), and the mesh runs on it;
-//! `PeerEndpoint` stays, unused by the node, until part 4 retires it.
+//! network ([`IrohCarrier::bind_network`]), and the mesh runs on it. Part 4
+//! retired the endpoint the node bound before, with its ALPN `glade/node/3`
+//! and the stream HELLO.
 
 use std::fmt;
 use std::future::{ready, Future};
@@ -63,33 +61,11 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey, T
 use crate::assembly::{LinkNotes, PathSeen, RelayState};
 use crate::frame::MAX_FRAME_BYTES;
 use crate::netconf::{Network, PeerEntry, Relays, Via};
-use crate::peer::{carried, hello_accept, hello_dial, spelled, Channel, NodeIdentity, PeerHello};
+use crate::peer::{carried, spelled};
 use crate::transport::{hex, key_of, tag, Door, EndpointKey};
-
-/// ALPN for the glade node<->node protocol 3 (`peer::PROTOCOL`, plan Step
-/// 4.1b), whose `home` records are signed envelopes and whose HELLO is signed
-/// (4.1a): a node of protocol 1 or 2 fails at connect, not mid-sync.
-pub const ALPN: &[u8] = b"glade/node/3";
 
 fn other<E: Into<Box<dyn std::error::Error + Send + Sync>>>(e: E) -> io::Error {
     io::Error::new(io::ErrorKind::Other, e)
-}
-
-/// The exporter label the HELLO's keying material is drawn under (RFC 8446
-/// §7.5), with no context.
-const HELLO_EXPORTER: &[u8] = b"glade/v1/peer-hello";
-
-/// What both ends of `conn` know without sending it: the endpoint ids, and 32
-/// bytes exported from its TLS session, the same at both ends.
-fn channel(conn: &Connection, dialer: EndpointId, acceptor: EndpointId) -> io::Result<Channel> {
-    let mut exported = [0u8; 32];
-    conn.export_keying_material(&mut exported, HELLO_EXPORTER, b"")
-        .map_err(|_| other("the TLS session exported no keying material"))?;
-    Ok(Channel {
-        dialer: *dialer.as_bytes(),
-        acceptor: *acceptor.as_bytes(),
-        exported,
-    })
 }
 
 /// The one endpoint recipe every constructor shares (plan Step 4.5):
@@ -200,194 +176,6 @@ impl EndpointHooks for DoorHook {
     }
 }
 
-/// An endpoint's dialable address: its id, and a socket as bound, IPv4 first
-/// (plan Step 4.5). For the default bind that is `127.0.0.1:<port>`, as it
-/// always was.
-fn bound_addr(endpoint: &Endpoint) -> io::Result<PeerAddr> {
-    let mut sockets = endpoint.bound_sockets();
-    sockets.sort_by_key(|socket| !socket.is_ipv4());
-    let socket = sockets.first().copied();
-    let socket = socket.ok_or_else(|| other("no socket bound"))?;
-    Ok(PeerAddr {
-        endpoint_id: endpoint.id(),
-        socket,
-    })
-}
-
-/// A dialable address for a peer: its endpoint id + a direct socket address.
-/// Enough for `Endpoint::connect` with no address lookup.
-#[derive(Clone, Copy, Debug)]
-pub struct PeerAddr {
-    pub endpoint_id: EndpointId,
-    pub socket: SocketAddr,
-}
-
-impl PeerAddr {
-    /// Parse `<endpoint-id-hex>@<ip:port>`, a carrier address.
-    pub fn parse(s: &str) -> Option<PeerAddr> {
-        let (id, sock) = s.split_once('@')?;
-        Some(PeerAddr {
-            endpoint_id: id.parse().ok()?,
-            socket: sock.parse().ok()?,
-        })
-    }
-
-    /// The endpoint's tag, which the `peer` line prints for its id.
-    pub fn tag(&self) -> String {
-        tag(self.endpoint_id.as_bytes())
-    }
-}
-
-/// A peer's own address as a dial target: its key, dialed at that one
-/// socket.
-impl From<&PeerAddr> for PeerEntry {
-    fn from(addr: &PeerAddr) -> PeerEntry {
-        PeerEntry {
-            key: *addr.endpoint_id.as_bytes(),
-            via: vec![Via::Ip(addr.socket)],
-        }
-    }
-}
-
-/// An established peer connection after HELLO: the verified peer identity plus
-/// the bidirectional stream (kept as split halves for the sync driver).
-pub struct PeerLink {
-    pub peer: PeerHello,
-    pub conn: Connection,
-    pub send: SendStream,
-    pub recv: RecvStream,
-}
-
-/// A bound iroh endpoint that speaks the glade peer protocol.
-///
-/// `Clone` shares the one underlying iroh endpoint (it is `Arc`-backed). A node
-/// owns a `PeerEndpoint` for its whole lifetime; **it MUST outlive every
-/// `PeerLink` it produces** — dropping the last handle closes the endpoint and
-/// tears down live connections. Clone it into an accept loop rather than moving
-/// the sole handle in.
-#[derive(Clone)]
-pub struct PeerEndpoint {
-    endpoint: Endpoint,
-    identity: NodeIdentity,
-    door: Option<Arc<Door>>,
-}
-
-impl PeerEndpoint {
-    /// Bind a localhost QUIC endpoint (no relay, no address lookup) with a
-    /// fresh random glade identity, which dies with it: for tests, which boot
-    /// no instance. A booted node binds with its own
-    /// ([`PeerEndpoint::bind_with`]).
-    pub async fn bind() -> io::Result<PeerEndpoint> {
-        let identity = NodeIdentity::generate()?;
-        PeerEndpoint::bind_with(identity).await
-    }
-
-    /// Bind with an EXPLICIT glade identity and a fresh endpoint key, which
-    /// dies with the endpoint: for tests and the async witness, which boot no
-    /// instance. A booted node binds with its own key ([`PeerEndpoint::bind_as`]).
-    /// The iroh key stays transport-only; the glade node_id spoken on the HELLO
-    /// seam is the identity the directory's records attribute — which is what
-    /// lets a folded `ServeClaim.node` match a live peer link.
-    pub async fn bind_with(identity: NodeIdentity) -> io::Result<PeerEndpoint> {
-        let key = EndpointKey::from_seed(crate::signing::random_seed()?);
-        PeerEndpoint::bind_as(identity, key).await
-    }
-
-    /// Bind as a booted node: its identity, from `node.key`
-    /// (`sysdir::Boot::identity`), and its endpoint key, `endpoint.key`
-    /// (`sysdir::Boot::endpoint_key`), so its endpoint id is the same at every
-    /// start (plan Step 4.2) and its binding record names it.
-    /// It binds the default network, `127.0.0.1:0` alone.
-    pub async fn bind_as(identity: NodeIdentity, key: EndpointKey) -> io::Result<PeerEndpoint> {
-        let endpoint = bind_endpoint(key, None, ALPN, &Network::default()).await?;
-        Ok(PeerEndpoint {
-            endpoint,
-            identity,
-            door: None,
-        })
-    }
-
-    /// [`PeerEndpoint::bind_as`], behind `door` (plan Step 4.2b) and on
-    /// `network` (plan Step 4.5): how both roots bound a booted node, whose
-    /// door is closed to keys it does not know, until plan Step 4.5b.
-    pub async fn bind_door(
-        identity: NodeIdentity,
-        key: EndpointKey,
-        door: Arc<Door>,
-        network: &Network,
-    ) -> io::Result<PeerEndpoint> {
-        let endpoint = bind_endpoint(key, Some(door.clone()), ALPN, network).await?;
-        Ok(PeerEndpoint {
-            endpoint,
-            identity,
-            door: Some(door),
-        })
-    }
-
-    pub fn identity(&self) -> &NodeIdentity {
-        &self.identity
-    }
-
-    /// The door this endpoint was bound behind, if any.
-    pub fn door(&self) -> Option<Arc<Door>> {
-        self.door.clone()
-    }
-
-    /// Report a refused HELLO, naming the endpoint key it came from.
-    fn report(&self, endpoint: &[u8; 32], e: &io::Error) {
-        if let (Some(door), io::ErrorKind::PermissionDenied) = (&self.door, e.kind()) {
-            door.refused(endpoint, e);
-        }
-    }
-
-    /// This endpoint's dialable address: its id, and a socket as bound, IPv4
-    /// first.
-    pub fn addr(&self) -> io::Result<PeerAddr> {
-        bound_addr(&self.endpoint)
-    }
-
-    /// Dial a peer (DIAL) at every address `target` names, open a
-    /// bidirectional stream, and run the HELLO seam.
-    pub async fn dial(&self, target: impl Into<PeerEntry>) -> io::Result<PeerLink> {
-        let ea = endpoint_addr(&target.into())?;
-        let conn = self.endpoint.connect(ea, ALPN).await.map_err(other)?;
-        let channel = channel(&conn, self.endpoint.id(), conn.remote_id())?;
-        let (mut send, mut recv) = conn.open_bi().await.map_err(other)?;
-        let door = self.door.as_deref();
-        let peer = hello_dial(&mut recv, &mut send, &self.identity, &channel, door).await?;
-        Ok(PeerLink { peer, conn, send, recv })
-    }
-
-    /// Accept one inbound peer connection and run the HELLO seam. Returns
-    /// `Ok(None)` when the endpoint is closed.
-    pub async fn accept(&self) -> io::Result<Option<PeerLink>> {
-        let Some(incoming) = self.endpoint.accept().await else { return Ok(None) };
-        let conn = incoming.accept().map_err(other)?.await.map_err(other)?;
-        let channel = channel(&conn, conn.remote_id(), self.endpoint.id())?;
-        let (mut send, mut recv) = conn.accept_bi().await.map_err(other)?;
-        let door = self.door.as_deref();
-        let peer = hello_accept(&mut recv, &mut send, &self.identity, &channel, door).await;
-        let peer = peer.inspect_err(|e| self.report(&channel.dialer, e))?;
-        Ok(Some(PeerLink { peer, conn, send, recv }))
-    }
-
-    /// Close the endpoint gracefully and give up this handle.
-    ///
-    /// Dropping the last handle also closes the endpoint, but abruptly: a peer
-    /// sees its connection time out even when every byte arrived. `close` AWAITS
-    /// iroh's own drain (about three seconds on a bad link, usually far less), so
-    /// each open connection is told it is over. It consumes the handle because
-    /// iroh frees the UDP socket only when EVERY clone is gone: once `close`
-    /// resolves, `accept` on a remaining clone answers `Ok(None)`, the accept
-    /// loop ends and drops its clone, and iroh's driver task then releases the
-    /// port a few milliseconds later. iroh gives no signal for that moment, so a
-    /// caller that must bind the same port again has to wait for it. A clone that
-    /// never goes away keeps the port bound, which is how a leaked handle shows up.
-    pub async fn close(self) {
-        self.endpoint.close().await;
-    }
-}
-
 // ---- the notes the crossing reads (plan Step 4.5, part 2) -------------------
 
 /// Where a path to `addr` goes, in a line's words.
@@ -449,8 +237,9 @@ fn watch_relays(
 
 // ---- the CarrierPort adapter (plan Step 4.2c) --------------------------------
 
-/// The adapter's ALPN, apart from the node's: its links carry opaque frames,
-/// not the node protocol, so a node's endpoint and an adapter never connect.
+/// The adapter's ALPN, the one a node's endpoint offers (plan Step 4.5b): its
+/// links carry opaque frames, so an endpoint offering only the node's old
+/// `glade/node/3` fails at connect.
 pub const CARRIER_ALPN: &[u8] = b"glade/carrier/1";
 
 /// What a dialer sends first, so that its acceptor sees the link at once:
@@ -1117,9 +906,7 @@ impl CarrierLink for IrohLink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::peer::{pull_sync, serve_sync};
-    use crate::store::Store;
-    use glade_wire::generated::{Op, Shape};
+    use crate::peer::HELLO_LABEL;
     use std::collections::BTreeSet;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::path::{Path, PathBuf};
@@ -1173,9 +960,11 @@ mod tests {
             ..Network::default()
         };
         let key = EndpointKey::from_seed([8; 32]);
-        let endpoint = bind_endpoint(key, None, ALPN, &network).await.unwrap();
+        let endpoint = bind_endpoint(key, None, CARRIER_ALPN, &network)
+            .await
+            .unwrap();
         assert_eq!(endpoint.bound_sockets(), [socket]);
-        let printed = bound_addr(&endpoint).unwrap().socket;
+        let printed = local_sockets(&bound_at(&endpoint).unwrap()).unwrap()[0];
         assert_eq!(printed, socket, "the peer line's address");
         endpoint.close().await;
     }
@@ -1252,45 +1041,6 @@ mod tests {
         assert_eq!(named, Vec::<String>::new());
     }
 
-    /// The DIAL over REAL iroh QUIC: dialer binds, acceptor binds, dialer dials
-    /// by direct address, both complete the node<->node HELLO and each learns
-    /// the other's node_id. No relay, no discovery — pure localhost QUIC.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn dial_and_hello_over_iroh() {
-        let acceptor = PeerEndpoint::bind().await.unwrap();
-        let dialer = PeerEndpoint::bind().await.unwrap();
-        let acc_id = acceptor.identity().node_id;
-        let dial_id = dialer.identity().node_id;
-        let acc_addr = acceptor.addr().unwrap();
-
-        // Clone the acceptor into the accept task; the original stays alive here
-        // so the endpoint (hence the connection) outlives the link.
-        let acc_ep = acceptor.clone();
-        let acc = tokio::spawn(async move { acc_ep.accept().await });
-        let link = dialer.dial(&acc_addr).await.unwrap();
-        assert_eq!(link.peer.peer_id, acc_id, "dialer learns acceptor node_id over iroh");
-
-        let served = acc.await.unwrap().unwrap().unwrap();
-        assert_eq!(served.peer.peer_id, dial_id, "acceptor learns dialer node_id over iroh");
-
-        // Plan Step 4.1a's premise: both ends of one connection export the
-        // same bytes, and a second connection between the same two endpoints
-        // exports other bytes, which is what refuses a replayed HELLO.
-        let acc_ep = acceptor.clone();
-        let again = tokio::spawn(async move { acc_ep.accept().await });
-        let second = dialer.dial(&acc_addr).await.unwrap();
-        let _served_again = again.await.unwrap().unwrap().unwrap();
-        let (me, it) = (dialer.endpoint.id(), acceptor.endpoint.id());
-        let at_dialer = channel(&link.conn, me, link.conn.remote_id()).unwrap();
-        let at_acceptor = channel(&served.conn, served.conn.remote_id(), it).unwrap();
-        let other = channel(&second.conn, me, second.conn.remote_id()).unwrap();
-        assert_eq!(at_dialer, at_acceptor, "one connection, one channel");
-        assert_ne!(
-            at_dialer.exported, other.exported,
-            "another connection, other bytes"
-        );
-    }
-
     /// Every endpoint the node binds listens on loopback alone. iroh
     /// pre-binds `0.0.0.0` and `[::]`, and a loopback IPv4 bind replaced only
     /// the first: the `[::]` socket stayed, open to the LAN over IPv6, and
@@ -1301,7 +1051,9 @@ mod tests {
     async fn an_endpoint_listens_on_loopback_alone() {
         let key = EndpointKey::from_seed([7; 32]);
         let network = Network::default();
-        let endpoint = bind_endpoint(key, None, ALPN, &network).await.unwrap();
+        let endpoint = bind_endpoint(key, None, CARRIER_ALPN, &network)
+            .await
+            .unwrap();
         let sockets = endpoint.bound_sockets();
         assert!(!sockets.is_empty(), "no socket bound");
         for socket in &sockets {
@@ -1311,112 +1063,6 @@ mod tests {
             );
         }
         endpoint.close().await;
-    }
-
-    /// Plan Steps 4.1a and 4.1b: the ALPN names the protocol, 3 since 4.1b,
-    /// so a node of protocol 2, an endpoint offering only `glade/node/2` as
-    /// every build from 4.1a to 4.3 does, fails at connect in either
-    /// direction, before any HELLO is sent.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_protocol_2_node_fails_at_connect() {
-        let bound = std::time::Duration::from_secs(10);
-        let v2: &[u8] = b"glade/node/2";
-        let old = Endpoint::builder(presets::Minimal)
-            .alpns(vec![v2.to_vec()])
-            .portmapper_config(PortmapperConfig::Disabled)
-            .clear_ip_transports()
-            .bind_addr((Ipv4Addr::LOCALHOST, 0))
-            .unwrap()
-            .bind()
-            .await
-            .unwrap();
-        let old_accepts = old.clone();
-        tokio::spawn(async move {
-            while let Some(incoming) = old_accepts.accept().await {
-                if let Ok(connecting) = incoming.accept() {
-                    let _ = connecting.await;
-                }
-            }
-        });
-        let new = PeerEndpoint::bind().await.unwrap();
-        let new_accepts = new.clone();
-        tokio::spawn(async move { new_accepts.accept().await });
-
-        let at_new = new.addr().unwrap();
-        let ea = EndpointAddr::from_parts(at_new.endpoint_id, [TransportAddr::Ip(at_new.socket)]);
-        let dialed = tokio::time::timeout(bound, old.connect(ea, v2)).await;
-        let refused = dialed.expect("bounded").is_err();
-        assert!(refused, "a protocol-2 dialer connected");
-
-        let sockets = old.bound_sockets();
-        let port = sockets.iter().find(|s| s.is_ipv4()).unwrap().port();
-        let socket = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-        let at_old = PeerAddr {
-            endpoint_id: old.id(),
-            socket,
-        };
-        let dialed = tokio::time::timeout(bound, new.dial(&at_old)).await;
-        let refused = dialed.expect("bounded").is_err();
-        assert!(refused, "it accepted a protocol-3 dialer");
-    }
-
-    /// Full s-sync over REAL iroh QUIC: the acceptor serves a store with a
-    /// prev-linked chain; the dialer pulls it over the same HELLO'd connection
-    /// and converges, verified per op. Carrier + sync, end to end on localhost.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn sync_over_iroh() {
-        let dir = std::env::temp_dir().join("glade-iroh-sync-srv");
-        let _ = std::fs::remove_dir_all(&dir);
-        let mut server = Store::open(&dir).unwrap();
-        let mut prev = None;
-        for seq in 0..4 {
-            let o = Op {
-                share: "sh".into(), glade_id: "g".into(), key: vec![], origin: "a".into(),
-                seq, prev: prev.clone(), lamport: seq, refs: vec![], shape: Shape::Value,
-                payload: format!("a{seq}").into_bytes(),
-            };
-            server.append(o.clone()).unwrap();
-            prev = Some(crate::chain::op_hash(&o).to_vec());
-        }
-
-        let acceptor = PeerEndpoint::bind().await.unwrap();
-        let dialer = PeerEndpoint::bind().await.unwrap();
-        let acc_addr = acceptor.addr().unwrap();
-
-        let acc_ep = acceptor.clone();
-        let acc = tokio::spawn(async move {
-            let mut link = acc_ep.accept().await.unwrap().unwrap();
-            // The dialer, as its HELLO proved it, may read `sh` (plan Step 4.3).
-            let dialer = link.peer.peer_id;
-            let mut policy = crate::grants::Policy::default();
-            policy.grant(
-                &crate::mesh::hex_id(&dialer),
-                "sh",
-                ["read.subscribe".to_string()],
-            );
-            let grants = crate::grants::PolicyView::of(Some(policy));
-            let holder = glade_grant_api::Holder::Node(dialer);
-            let sent = serve_sync(&mut link.recv, &mut link.send, &server, &holder, &grants).await;
-            // Keep `link` (hence the connection) alive until the dialer has read
-            // the finished stream — dropping it early would reset the stream.
-            (link, sent)
-        });
-
-        let cdir = std::env::temp_dir().join("glade-iroh-sync-cli");
-        let _ = std::fs::remove_dir_all(&cdir);
-        let mut client = Store::open(&cdir).unwrap();
-        let mut link = dialer.dial(&acc_addr).await.unwrap();
-        let anyone = |_: &str| true;
-        let out = pull_sync(&mut link.recv, &mut link.send, &mut client, &anyone)
-            .await
-            .unwrap();
-        let (_served, sent) = acc.await.unwrap();
-        let sent = sent.unwrap();
-
-        assert_eq!(sent, 4);
-        assert_eq!(out.applied, 4);
-        assert!(out.rejected.is_empty());
-        assert_eq!(client.scan("sh", "g", &[], "a", -1).len(), 4);
     }
 
     /// iroh gives no signal for "the socket is released": its driver task ends a
@@ -1434,42 +1080,6 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-    }
-
-    /// `close` awaits iroh's drain and gives up the handle, so with no clone left
-    /// the UDP socket is released: the recorded port binds again.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn close_frees_the_bound_port() {
-        let endpoint = PeerEndpoint::bind().await.unwrap();
-        let port = endpoint.addr().unwrap().socket.port();
-        assert!(
-            std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).is_err(),
-            "the port is held while the endpoint lives"
-        );
-
-        endpoint.close().await;
-
-        assert!(port_is_freed(port).await, "the port is free once the last handle has closed");
-    }
-
-    /// After `close` a clone's `accept` answers `Ok(None)`, which is what ends an
-    /// accept loop; until that clone is dropped it keeps the port, so a handle
-    /// that never goes away shows up as a port that never frees.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn close_ends_an_accept_loop_and_a_kept_clone_keeps_the_port() {
-        let endpoint = PeerEndpoint::bind().await.unwrap();
-        let kept = endpoint.clone();
-        let port = endpoint.addr().unwrap().socket.port();
-
-        endpoint.close().await;
-
-        assert!(kept.accept().await.unwrap().is_none(), "a closed endpoint accepts nothing");
-        assert!(
-            std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).is_err(),
-            "a clone that is still alive still holds the port"
-        );
-        drop(kept);
-        assert!(port_is_freed(port).await, "the port is free once every clone is gone");
     }
 
     // ---- the CarrierPort adapter (plan Step 4.2c) ----
@@ -1764,7 +1374,7 @@ mod tests {
     /// The socket `port` bound first, IPv4 first.
     fn bound_socket(port: &IrohCarrier) -> SocketAddr {
         match &*lock(&port.0.state) {
-            PortState::Bound { ep, .. } => bound_addr(ep).unwrap().socket,
+            PortState::Bound { ep, .. } => local_sockets(&bound_at(ep).unwrap()).unwrap()[0],
             _ => unreachable!("the port is bound"),
         }
     }
@@ -1873,8 +1483,9 @@ mod tests {
 
     /// CA-006 on real iroh over loopback: each link's bytes are its TLS
     /// session's exporter. And under HELLO's label a link gives the very
-    /// bytes HELLO exports on a connection today (D6), so its transcript is
-    /// unchanged over the port.
+    /// bytes the stream HELLO exported from its connection (D6): its
+    /// connection's exporter under that label, with no context, so its
+    /// transcript is unchanged over the port.
     #[tokio::test]
     async fn ca_006_iroh_binds_each_link_to_its_tls_session() {
         bounded(carrier::channel_binding(iroh_fixture())).await;
@@ -1887,11 +1498,13 @@ mod tests {
         let link = links[0].upgrade().expect("a's link lives");
         let conn = lock(&link.held).as_ref().map(|(conn, _)| conn.clone());
         let conn = conn.expect("a's link holds its connection");
-        let today = channel(&conn, conn.remote_id(), conn.remote_id()).unwrap();
-        let binding = dialed.channel_binding(HELLO_EXPORTER);
+        let mut exported = [0u8; 32];
+        let read = conn.export_keying_material(&mut exported, HELLO_LABEL, b"");
+        assert!(read.is_ok(), "the TLS session exported no keying material");
+        let binding = dialed.channel_binding(HELLO_LABEL);
         assert_eq!(
             binding,
-            Some(ChannelBinding(today.exported)),
+            Some(ChannelBinding(exported)),
             "the bytes HELLO signs"
         );
     }

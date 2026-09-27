@@ -7458,6 +7458,19 @@ by `a_hello_on_a_link_binds_its_transport_session`; `a_protocol_2_node_fails_at_
 tests over the port; the two close tests by CA-004 on iroh and
 `a_closed_carrier_frees_its_port_though_its_links_survive`; the stream HELLO's by part 2's.
 
+**Part 4, as built** on 2026-09-28 against glade `a869697`, with no red run. Removed, with holders that passed
+before and after: `dial_and_hello_over_iroh` (`a_hello_on_a_link_binds_its_transport_session`),
+`a_protocol_2_node_fails_at_connect` (`a_glade_node_3_endpoint_fails_at_connect_either_way`), `sync_over_iroh`
+(`two_booted_nodes_converge_home_share`, `s_discovery_golden_path_end_to_end`), the two close tests (CA-004 on
+iroh, `a_closed_carrier_frees_its_port_though_its_links_survive`), the five stream HELLO tests (part 2's five on a
+link). Retired: `PeerEndpoint`, `PeerLink`, the ALPN `glade/node/3`, the exporter read `channel` and its label,
+`hello_dial`, `hello_accept`; and, their callers gone, `bound_addr`, `PeerAddr` and `NodeIdentity::generate` (the
+adapter answers its address with part 1's `bound_at`). Part 3 left no hand-written `u32` writer. Changed: F12's
+HELLO case runs on a link; CA-006 reads its connection's exporter itself; two bind tests take `CARRIER_ALPN` and
+`bound_at`. Production +21/−309, tests +36/−370. The async witness is frozen at `5e7d238` (its README; on an export
+`--locked` is refused, the README's command passes 46 tests). Gate 9/9, 413 tests each path, rustfmt 274, clippy
+11; contracts 94.
+
 **4.5's crossing again**, the done-when's third part, after part 4: section 10 of 4.5 as run on
 2026-09-27, with the same machines, roles, runs and teardown. Before it, the Pi's sibling checkouts
 are pulled `--ff-only` so their two suites count, and each machine's temporary directory is set inside

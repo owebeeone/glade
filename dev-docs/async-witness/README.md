@@ -1,5 +1,11 @@
 # The async witness — `async_witness`
 
+**Frozen at glade `5e7d238`** (plan Step 4.5b part 3), the last revision with
+the `PeerEndpoint` it builds on. To build it, from glade's root:
+`mkdir DIR && git archive 5e7d238 | tar -x -C DIR`, then from
+`DIR/dev-docs/async-witness`: `cargo test --offline -p async-witness-real --lib --tests`
+(not `--locked`: its `Cargo.lock` has lacked `glade-persistence-api` since F2).
+
 **A harness workspace, not production code.** Nothing here is a production Cargo
 installation, a repository-wide architecture-gate adoption, or a proposed Glade
 API. It is one bounded experiment, following the precedent of
