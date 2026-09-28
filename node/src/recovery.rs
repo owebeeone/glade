@@ -46,12 +46,7 @@ pub struct Committed {
 /// (F11; the owner's ruling of 2026-09-27), and on Unix as it is.
 impl fmt::Display for Committed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let path = self.file.display().to_string();
-        let file = if platform::VERBATIM_PREFIX {
-            without_verbatim(&path)
-        } else {
-            Cow::Borrowed(path.as_str())
-        };
+        let file = displayed(&self.file);
         let key = &self.key;
         write!(
             f,
@@ -120,9 +115,10 @@ fn stop_first(e: io::Error) -> io::Error {
 
 /// A save that failed after the secret was written: the file is not known to
 /// be committed, and is kept, since a save whose outcome is unknown may have
-/// landed.
+/// landed. The file is written as [`Committed`] writes it (the owner's ruling
+/// of 2026-09-28).
 fn unsaved(e: io::Error, out: &Path) -> io::Error {
-    let out = out.display();
+    let out = displayed(out);
     let why = format!(
         "{e}; {out} was written, and its key is not known to be committed: while a start still warns that no recovery key is committed, the file is unused"
     );
@@ -201,15 +197,19 @@ pub(crate) fn mint(node: &str, out: &Path) -> io::Result<(NodeRecoveryKey, Commi
 /// entry. A file already there is refused; a write that fails removes what
 /// it created.
 fn write_secret(path: &Path, seed: &[u8; 32]) -> io::Result<()> {
-    let mut file = platform::create_new(path).map_err(|e| {
-        let why = format!("{}: cannot be created ({e})", path.display());
-        io::Error::new(e.kind(), why)
-    })?;
+    let mut file = platform::create_new(path).map_err(|e| uncreated(e, path))?;
     if let Err(e) = file.write_all(seed).and_then(|()| file.sync_all()) {
         let _ = fs::remove_file(path);
         return Err(e);
     }
     entry_sync::sync(path.parent().unwrap_or(path))
+}
+
+/// The secret's file could not be created at `path`: say where, writing it as
+/// [`Committed`] does (the owner's ruling of 2026-09-28).
+fn uncreated(e: io::Error, path: &Path) -> io::Error {
+    let why = format!("{}: cannot be created ({e})", displayed(path));
+    io::Error::new(e.kind(), why)
 }
 
 /// The line a start prints after its boot lines while `boot`'s node has
@@ -240,6 +240,17 @@ pub fn program_word(program: &Path) -> String {
         return shell(&without_verbatim(&path));
     }
     shell(&path)
+}
+
+/// `path` as the lines naming the secret's file write it: without Windows'
+/// verbatim prefix where this platform gives one, as [`program_word`] writes
+/// the program (F11), and on Unix as it is. Not quoted.
+fn displayed(path: &Path) -> String {
+    let path = path.display().to_string();
+    if platform::VERBATIM_PREFIX {
+        return without_verbatim(&path).into_owned();
+    }
+    path
 }
 
 /// `word` as a POSIX shell reads it back: as it is when no character in it is
@@ -625,6 +636,38 @@ mod tests {
         assert_eq!(line(r"\\?\E:\offline\n.recovery"), said(written));
         let unix = "/offline/a b/n.recovery";
         assert_eq!(line(unix), said(unix));
+    }
+
+    /// The owner's ruling of 2026-09-28: the two other lines naming the
+    /// secret's file, a save that failed after it was written and a file
+    /// that cannot be created, write it as the line naming where the secret
+    /// went does: without the verbatim prefix where this platform gives one
+    /// (F11), not quoted, and on Unix byte for byte as they were.
+    #[test]
+    fn the_failure_lines_write_their_file_without_the_verbatim_prefix() {
+        let failed = || io::Error::other("the disk is full");
+        let lines = |file: &str| {
+            let file = Path::new(file);
+            let was_written = unsaved(failed(), file).to_string();
+            (was_written, uncreated(failed(), file).to_string())
+        };
+        let written = if platform::VERBATIM_PREFIX {
+            r"E:\offline\n.recovery"
+        } else {
+            r"\\?\E:\offline\n.recovery"
+        };
+        let said = |file: &str| {
+            let was_written = format!(
+                "the disk is full; {file} was written, and its key is not known to be \
+                 committed: while a start still warns that no recovery key is committed, \
+                 the file is unused"
+            );
+            let not_created = format!("{file}: cannot be created (the disk is full)");
+            (was_written, not_created)
+        };
+        assert_eq!(lines(r"\\?\E:\offline\n.recovery"), said(written));
+        let unix = "/offline/a b/n.recovery";
+        assert_eq!(lines(unix), said(unix));
     }
 
     // File modes are a Unix notion. A braced module, so the condition

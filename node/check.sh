@@ -422,7 +422,10 @@ c_contracts_gate() {
 # without one it fails closed. It reads sources only and builds nothing. The
 # checker always prints its verdict, so a python3 that prints nothing at all,
 # such as an asdf shim failing under a scratch HOME, ran no checker: that
-# fails too, whatever its exit status (owner, 2026-09-27).
+# fails too, whatever its exit status (owner, 2026-09-27). So does exit status
+# 126 or 127, the shell's for a python3 it found and could not execute or did
+# not find, whatever it printed; the reason carries its first line (owner,
+# 2026-09-28).
 c_process_globals() {
     checker="$glade_root/scripts/checks/check_process_globals.py"
     if [ ! -f "$checker" ]; then
@@ -435,6 +438,13 @@ c_process_globals() {
         why "checker could not run: python3 printed nothing (exit status $ran)"
         return 1
     fi
+    case "$ran" in
+        126 | 127)
+            printf '%s\n' "$out"
+            why "checker could not run: $(printf '%s\n' "$out" | head -n 1) (exit status $ran)"
+            return 1
+            ;;
+    esac
     if [ "$ran" -eq 0 ]; then
         why "$(printf '%s\n' "$out" | tail -n 1)"
         return 0
