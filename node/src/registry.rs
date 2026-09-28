@@ -29,14 +29,15 @@ use glade_wire::generated::{Head, Op, Shape, StreamHeads};
 use glade_wire::wellformed::{self, Malformed};
 
 use crate::chain::op_hash;
+use crate::checkpoint::{self, Against, Checkpoint, Floor, Placement};
 use crate::envelope::{self, Refused};
 use crate::grants::Policy;
 use crate::peer::NodeIdentity;
 use crate::records_file::{self, FileError, RecordsFile};
 use crate::sysdata::{
-    BindingDecl, BindingRetraction, CapabilityGrant, CapabilityRevocation, NodeRecord,
-    NodeRecoveryKey, NodeTransportBinding, NodeTransportRevocation, PrincipalRecord, ServeClaim,
-    ServiceDefinition, SystemSnapshot, WorkspaceEntry,
+    BindingDecl, BindingRetraction, CapabilityGrant, CapabilityRevocation, ChainCheckpoint,
+    NodeRecord, NodeRecoveryKey, NodeTransportBinding, NodeTransportRevocation, PrincipalRecord,
+    ServeClaim, ServiceDefinition, SystemSnapshot, WorkspaceEntry,
 };
 use crate::transport::{self, TransportFold};
 
@@ -68,6 +69,9 @@ pub const G_TRANSPORT_REVOCATIONS: &str = "dir.transport-revocations";
 // The recovery key (plan Step 4.1c): the public half a node commits to, in its
 // own chain (`recovery.rs`).
 pub const G_RECOVERY_KEYS: &str = "dir.recovery-keys";
+// Signed checkpoints (plan Step 4.5c): a register of each node's own, one for
+// each chain it compacts (`checkpoint.rs`).
+pub const G_CHECKPOINTS: &str = "dir.checkpoints";
 
 /// One home-share record (WD §2). Each variant folds by its own semantics; the
 /// enum is the append surface so `append` stays typed and the glade-id/shape
@@ -86,6 +90,7 @@ pub enum Record {
     Transport(NodeTransportBinding),
     TransportRevoke(NodeTransportRevocation),
     Recovery(NodeRecoveryKey),
+    Checkpoint(ChainCheckpoint),
 }
 
 impl Record {
@@ -104,6 +109,7 @@ impl Record {
             Record::Transport(_) => G_TRANSPORT_BINDINGS,
             Record::TransportRevoke(_) => G_TRANSPORT_REVOCATIONS,
             Record::Recovery(_) => G_RECOVERY_KEYS,
+            Record::Checkpoint(_) => G_CHECKPOINTS,
         }
     }
 
@@ -134,6 +140,7 @@ impl Record {
             Record::Transport(r) => r.to_cbor(),
             Record::TransportRevoke(r) => r.to_cbor(),
             Record::Recovery(r) => r.to_cbor(),
+            Record::Checkpoint(r) => r.to_cbor(),
         };
         cbor::encode(&c)
     }
@@ -148,6 +155,8 @@ impl Record {
 /// (plan Step 4.1b), and `NotOurs` an append a sealed registry was asked to
 /// make under another node's origin. `Malformed` is an op an unsealed
 /// registry was handed whose record `wellformed::decode` refuses (F15b).
+/// `Rewrite` is a checkpoint whose base moves back from the one held, or
+/// names another hash there (plan Step 4.5c).
 #[derive(Debug, PartialEq)]
 pub enum RegistryError {
     Gap { expected: i64, got: i64 },
@@ -156,15 +165,19 @@ pub enum RegistryError {
     Unverified { origin: String, why: Refused },
     NotOurs { origin: String },
     Malformed { origin: String, why: Malformed },
+    Rewrite { origin: String, seq: i64 },
 }
 
-/// Where an ingested op landed: appended to its chain, or already held there
-/// byte for byte, a re-delivery that changes nothing (the wire store's
-/// `Append`, `store.rs`).
+/// Where an ingested op landed: appended to its chain, or a checkpoint placed;
+/// already held there byte for byte, a re-delivery that changes nothing (the
+/// wire store's `Append`, `store.rs`); or covered, at or below its chain's
+/// floor, or a checkpoint older than the one held, seen and not held (plan
+/// Step 4.5c).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ingested {
     Appended,
     Duplicate,
+    Covered,
 }
 
 // ============================================================================
@@ -365,7 +378,16 @@ pub struct Registry {
     ops: Vec<Op>,
     /// Per (glade_id, origin) chain tip: (last_seq, last_hash) — for assigning
     /// the next append's seq/prev and for chain-continuity checks on ingest.
+    /// A chain with a floor and no op above it has the floor as its tip.
     tips: BTreeMap<(String, String), (i64, [u8; 32])>,
+    /// The register (plan Step 4.5c): per (stream, origin), the newest
+    /// checkpoint held, and the floor it gives that chain. Its ops are held
+    /// here, not in `ops`, and a snapshot lists them first.
+    checkpoints: BTreeMap<(String, String), (Op, Floor)>,
+    /// How many ops and checkpoints this registry has taken, which
+    /// [`Registry::accept`] saves on: a checkpoint can leave the fold no
+    /// longer, or shorter.
+    changes: u64,
     /// Whether the load that built this registry quarantined a grant or a
     /// revocation ([`Registry::from_snapshot`]), so its grant fold cannot be
     /// read ([`Registry::policy`]).
@@ -413,18 +435,24 @@ impl Registry {
         let mut rejected = 0usize;
         // Track chains whose tail is poisoned so the suffix is dropped too.
         let mut poisoned: BTreeMap<(String, String), bool> = BTreeMap::new();
+        let mut ops = Vec::new();
         for (at, bytes) in snap.records.iter().enumerate() {
             // An op that cannot be read may be on any stream, a grant's or a
             // revocation's, so the grant fold fails closed (F15b).
-            let op = match envelope::decode_op(bytes) {
-                Ok(op) => op,
+            match envelope::decode_op(bytes) {
+                Ok(op) => ops.push(op),
                 Err(why) => {
                     eprintln!("{}", envelope::unreadable_op("quarantined", at, why));
                     rejected += 1;
                     reg.policy_quarantined = true;
-                    continue;
                 }
-            };
+            }
+        }
+        // Two passes (plan Step 4.5c): checkpoints first, whatever the order,
+        // so that each chain they fold starts at its floor.
+        let (checkpoints, rest): (Vec<Op>, Vec<Op>) =
+            ops.into_iter().partition(|op| op.glade_id == G_CHECKPOINTS);
+        for op in checkpoints.into_iter().chain(rest) {
             let chain = (op.glade_id.clone(), op.origin.clone());
             let policy = Record::is_policy(&op.glade_id);
             if *poisoned.get(&chain).unwrap_or(&false) {
@@ -494,9 +522,23 @@ impl Registry {
     }
 
     /// The chain checks of [`Registry::ingest`], for an op verified there or
-    /// built here.
+    /// built here. A chain with a floor (plan Step 4.5c) takes an op at or
+    /// below it as covered, and one at its base with another hash as a fork.
     fn link(&mut self, op: Op) -> Result<Ingested, RegistryError> {
+        if op.glade_id == G_CHECKPOINTS {
+            return self.place(op);
+        }
         let chain = (op.glade_id.clone(), op.origin.clone());
+        if let Some(&(_, floor)) = self.checkpoints.get(&chain) {
+            match checkpoint::against(floor, &op) {
+                Against::Above => {}
+                Against::Covered => return Ok(Ingested::Covered),
+                Against::Fork => {
+                    let (origin, seq) = (op.origin, op.seq);
+                    return Err(RegistryError::Equivocation { origin, seq });
+                }
+            }
+        }
         if let Some(&(last_seq, last_hash)) = self.tips.get(&chain) {
             if op.seq <= last_seq {
                 // At or below the tip: the same op again is a duplicate, as
@@ -521,6 +563,47 @@ impl Registry {
         let hash = op_hash(&op);
         self.tips.insert(chain, (op.seq, hash));
         self.ops.push(op);
+        self.changes += 1;
+        Ok(Ingested::Appended)
+    }
+
+    /// Place `op`, a checkpoint, in the register (plan Step 4.5c): its own
+    /// check, then [`checkpoint::place`]. The op this registry holds at its
+    /// base must hash to it, or it is a fork. Placed, it replaces the one
+    /// held, and the chain it names keeps no op at or below its base.
+    fn place(&mut self, op: Op) -> Result<Ingested, RegistryError> {
+        let (origin, seq) = (op.origin.clone(), op.seq);
+        let unverified = |why| {
+            let origin = origin.clone();
+            RegistryError::Unverified { origin, why }
+        };
+        let Checkpoint { stream, floor } = checkpoint::check(&op).map_err(unverified)?;
+        let chain = (stream, origin.clone());
+        let held = self.checkpoints.get(&chain).map(|(held, at)| (held, *at));
+        match checkpoint::place((&op, floor), held) {
+            Placement::Placed => {}
+            Placement::Duplicate => return Ok(Ingested::Duplicate),
+            Placement::Seen => return Ok(Ingested::Covered),
+            Placement::Fork => return Err(RegistryError::Equivocation { origin, seq }),
+            Placement::ChainBreak => return Err(RegistryError::ChainBreak { origin, seq }),
+            Placement::Rewrite => return Err(RegistryError::Rewrite { origin, seq }),
+        }
+        let base = floor.0;
+        let named = |held: &Op| held.glade_id == chain.0 && held.origin == chain.1;
+        let at_base = self.ops.iter().find(|held| named(held) && held.seq == base);
+        if at_base.is_some_and(|held| checkpoint::against(floor, held) == Against::Fork) {
+            return Err(RegistryError::Equivocation { origin, seq: base });
+        }
+        self.ops.retain(|held| !named(held) || held.seq > base);
+        // The chain's tip is its floor while nothing above the floor is held.
+        let tip = self.tips.entry(chain.clone()).or_insert(floor);
+        if tip.0 <= base {
+            *tip = floor;
+        }
+        let own = (G_CHECKPOINTS.to_string(), origin);
+        self.tips.insert(own, (seq, op_hash(&op)));
+        self.checkpoints.insert(chain, (op, floor));
+        self.changes += 1;
         Ok(Ingested::Appended)
     }
 
@@ -640,9 +723,11 @@ impl Registry {
     /// `store`, and only then does the copy become the fold. A change the
     /// registry refuses, or a save that fails, leaves the fold and the stored
     /// snapshot as they were: nothing unsaved is read or sent, and a retry is
-    /// judged against what was accepted. A change that appends nothing, a
-    /// duplicate among them, saves nothing. The copy costs what the save
-    /// does, one pass over every op.
+    /// judged against what was accepted. A change that takes nothing, a
+    /// duplicate or a covered op among them, saves nothing. It counts what
+    /// was taken, not ops, since a checkpoint can leave the fold no longer
+    /// (plan Step 4.5c). The copy costs what the save does, one pass over
+    /// every op.
     pub fn accept<T, E: From<io::Error>>(
         &mut self,
         store: &mut dyn StoreApi,
@@ -650,8 +735,7 @@ impl Registry {
     ) -> Result<T, E> {
         let mut staged = self.clone();
         let out = change(&mut staged)?;
-        // The fold only grows, so a copy no longer than the fold is the fold.
-        if staged.ops.len() == self.ops.len() {
+        if staged.changes == self.changes {
             return Ok(out);
         }
         store.save(&staged.snapshot())?;
@@ -736,7 +820,11 @@ impl RegistryApi for Registry {
     }
 
     fn snapshot(&self) -> SystemSnapshot {
-        let records = self.ops.iter().map(|o| cbor::encode(&o.to_cbor())).collect();
+        // Checkpoints first (plan Step 4.5c), so that a load or a served store
+        // seeded from the snapshot starts each chain they fold at its floor.
+        let held = self.checkpoints.values().map(|(op, _)| op);
+        let encode = |o: &Op| cbor::encode(&o.to_cbor());
+        let records = held.chain(&self.ops).map(encode).collect();
         // heads: one StreamHeads per (share, glade_id, key) with per-origin
         // chain heads — the resume vector a peer needs (degenerate sync).
         let mut by_stream: BTreeMap<String, Vec<Head>> = BTreeMap::new();
@@ -1055,6 +1143,148 @@ mod tests {
         assert_eq!(policy_cut.policy(), None);
         let answer = PolicyView::of(policy_cut.policy()).check(&alice, "read", "ws-a");
         assert_eq!(answer, Err(Denial::Unavailable));
+    }
+
+    /// Plan Step 4.5c: a sealed registry's own checkpoint at base B leaves
+    /// no claim at or below B in its fold, and its next claim goes above its
+    /// tip; its snapshot lists the checkpoint first. A sealed reload of that
+    /// snapshot quarantines nothing, the chain starting at its floor, and has
+    /// the same tips.
+    #[test]
+    fn a_sealed_registry_keeps_its_claims_from_its_checkpoints_floor() {
+        let identity = NodeIdentity::from_key([14; 32]);
+        let me = transport::hex(&identity.node_id);
+        let mut r = Registry::sealed(identity);
+        let mut claims = Vec::new();
+        for expiry in 1..=6 {
+            let op = r.append_returning(claim(&me, "ws", expiry * 1_000, 1), &me);
+            claims.push(op.unwrap());
+        }
+        let hash = op_hash(&claims[3]).to_vec();
+        let record = ChainCheckpoint {
+            node: me.clone(),
+            stream: G_CLAIMS.into(),
+            seq: 3,
+            hash,
+        };
+        let placed = r.append_returning(Record::Checkpoint(record), &me).unwrap();
+        let held: Vec<i64> = r.fold_iter(G_CLAIMS).iter().map(|o| o.seq).collect();
+        assert_eq!(held, [4, 5], "no claim at or below the base");
+        let next = r.append_returning(claim(&me, "ws", 9_000, 1), &me).unwrap();
+        let above = (6, Some(op_hash(&claims[5]).to_vec()));
+        assert_eq!((next.seq, next.prev), above, "the next claim above the tip");
+        let snap = r.snapshot();
+        let first = envelope::decode_op(&snap.records[0]);
+        assert_eq!(first, Ok(placed), "the checkpoint first");
+        let (again, rejected) = Registry::from_snapshot_as(&snap, identity);
+        assert_eq!(rejected, 0, "the reload quarantined {rejected} record(s)");
+        assert_eq!(again.tips, r.tips, "the same tips");
+        assert_eq!(again.snapshot(), snap);
+    }
+
+    /// Plan Step 4.5c, section 6's rules at a node holding another's chain:
+    /// an op at or below the floor is covered, not a fork, where one at the
+    /// base with another hash is one; a checkpoint two seqs ahead of the one
+    /// held is placed, across the gap, and an older one is seen; another at
+    /// the held seq is a fork; one whose base moves back is refused. None of
+    /// those refused changes the fold.
+    #[test]
+    fn a_covered_op_is_seen_and_a_newer_checkpoint_crosses_a_gap() {
+        use crate::envelope::testing::checkpoint;
+        let seed = [15; 32];
+        let identity = NodeIdentity::from_key(seed);
+        let peer = transport::hex(&identity.node_id);
+        let mut origin = Registry::sealed(identity);
+        let mut claims = Vec::new();
+        for expiry in 1..=6 {
+            let op = origin.append_returning(claim(&peer, "ws", expiry * 1_000, 1), &peer);
+            claims.push(op.unwrap());
+        }
+        let mut node = Registry::sealed(NodeIdentity::from_key([16; 32]));
+        for op in &claims {
+            assert_eq!(node.ingest(op.clone()), Ok(Ingested::Appended));
+        }
+        let at = |base: usize| ChainCheckpoint {
+            node: peer.clone(),
+            stream: G_CLAIMS.into(),
+            seq: base as i64,
+            hash: op_hash(&claims[base]).to_vec(),
+        };
+        let mut sent = Vec::new();
+        for base in 1..=3 {
+            let appended = origin.append_returning(Record::Checkpoint(at(base)), &peer);
+            sent.push(appended.unwrap());
+        }
+        let unsealed = Op {
+            payload: claim(&peer, "ws", 99, 1).encode(),
+            ..claims[1].clone()
+        };
+        let another = Op {
+            payload: envelope::seal(&identity, &unsealed),
+            ..unsealed
+        };
+        let (origin, seq) = (peer.clone(), 1);
+        let fork = Err(RegistryError::Equivocation { origin, seq });
+        let steps = [
+            (&sent[0], Ok(Ingested::Appended), "placed"),
+            (&claims[0], Ok(Ingested::Covered), "below the floor"),
+            (&claims[1], Ok(Ingested::Covered), "at it"),
+            (&another, fork, "at the base, another hash"),
+            (&sent[2], Ok(Ingested::Appended), "two seqs ahead"),
+            (&sent[1], Ok(Ingested::Covered), "an older one"),
+        ];
+        for (op, taken, what) in steps {
+            assert_eq!(node.ingest(op.clone()), taken, "{what}");
+        }
+        let held: Vec<i64> = node.fold_iter(G_CLAIMS).iter().map(|o| o.seq).collect();
+        assert_eq!(held, [4, 5]);
+        let held = node.snapshot();
+        let prev = |op: &Op| Some(op_hash(op).to_vec());
+        let forked = checkpoint(seed, at(4), 2, prev(&sent[1]));
+        let (origin, seq) = (peer.clone(), 2);
+        let fork = RegistryError::Equivocation { origin, seq };
+        assert_eq!(node.ingest(forked), Err(fork), "another at the held seq");
+        let back = checkpoint(seed, at(2), 3, prev(&sent[2]));
+        let (origin, seq) = (peer, 3);
+        let rewrite = RegistryError::Rewrite { origin, seq };
+        assert_eq!(node.ingest(back), Err(rewrite), "a base that moves back");
+        assert_eq!(node.snapshot(), held, "nothing refused changes the fold");
+    }
+
+    /// Plan Step 4.5c: `accept` saves when the change took something, not
+    /// when the fold grew. A tick's renewal and a checkpoint that drops one
+    /// claim leave the fold no longer, and are saved all the same.
+    #[test]
+    fn a_change_that_drops_as_many_as_it_appends_is_saved() {
+        let identity = NodeIdentity::from_key([17; 32]);
+        let me = transport::hex(&identity.node_id);
+        let (mut r, mut store) = (Registry::sealed(identity), MemStore::default());
+        let append = |r: &mut Registry, record: Record| {
+            let appended = r.append_returning(record, &me);
+            appended.map_err(|e| io::Error::other(format!("{e:?}")))
+        };
+        let base = r.accept(&mut store, |r| {
+            let base = append(r, claim(&me, "ws", 1_000, 1))?;
+            append(r, claim(&me, "ws", 2_000, 1)).map(|_| base)
+        });
+        let hash = op_hash(&base.unwrap()).to_vec();
+        let record = ChainCheckpoint {
+            node: me.clone(),
+            stream: G_CLAIMS.into(),
+            seq: 0,
+            hash,
+        };
+        let before = store.load().unwrap();
+        let ticked = r.accept(&mut store, |r| {
+            append(r, claim(&me, "ws", 3_000, 1))?;
+            append(r, Record::Checkpoint(record))
+        });
+        assert!(ticked.is_ok());
+        assert_eq!(r.fold_iter(G_CLAIMS).len(), 2, "the fold no longer");
+        let after = store.load().unwrap();
+        let saved = after != before;
+        assert!(saved, "the engine's snapshot unchanged");
+        assert!(after == r.snapshot(), "the fold saved");
     }
 
     /// A byte-identical re-delivery is a duplicate (plan Step 4.4; owner,

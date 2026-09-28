@@ -569,6 +569,8 @@ fn reg_io(e: crate::registry::RegistryError) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry::G_CLAIMS;
+    use crate::sysdata::ChainCheckpoint;
     use glade_wire::generated::Op;
 
     fn fresh(name: &str) -> PathBuf {
@@ -644,6 +646,48 @@ mod tests {
             .filter(|record| **record == repeat)
             .count();
         assert_eq!(held, 1, "and is saved once");
+    }
+
+    /// Plan Step 4.5c: a records.json that lists a checkpoint after the
+    /// claims above its floor, the order a tick appends them in. Boot loads
+    /// checkpoints first, whatever the order, so it quarantines nothing and
+    /// folds the claims above the floor. The records are another node's.
+    #[test]
+    fn a_boot_loads_a_checkpointed_records_json_in_any_order() {
+        let dir = fresh("checkpointed");
+        let peer_key = NodeIdentity::from_key([6; 32]);
+        let peer_id = hex(&peer_key.node_id);
+        let mut peer = Registry::sealed(peer_key);
+        let claim = |lease_expiry_ms| {
+            let (node, share) = (peer_id.clone(), "ws-x".into());
+            Record::Serve(ServeClaim {
+                node,
+                share,
+                lease_expiry_ms,
+                epoch: 1,
+            })
+        };
+        peer.append(claim(1_000), &peer_id).unwrap();
+        let base = peer.append_returning(claim(2_000), &peer_id).unwrap();
+        peer.append(claim(5_000), &peer_id).unwrap();
+        let (node, stream) = (peer_id.clone(), G_CLAIMS.into());
+        let hash = crate::chain::op_hash(&base).to_vec();
+        let checkpoint = ChainCheckpoint {
+            node,
+            stream,
+            seq: 1,
+            hash,
+        };
+        let checkpoint = Record::Checkpoint(checkpoint);
+        peer.append(checkpoint, &peer_id).unwrap();
+        let mut snap = peer.snapshot();
+        snap.records.rotate_left(1);
+        BlobStore::new(&dir).save(&snap).unwrap();
+
+        let boot = boot_at(dir, "gianni").unwrap();
+        assert_eq!(boot.rejected, 0, "quarantined {}", boot.rejected);
+        let serves = boot.registry.who_serves("ws-x", 3_000);
+        assert_eq!(serves, Some(peer_id), "the claim above the floor folds");
     }
 
     /// Plan Step 4.1b (`GladeNodeSigning.md` D8 (a)): an instance written

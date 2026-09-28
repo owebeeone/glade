@@ -18,13 +18,15 @@ use glade_wire::cbor::{self, Cbor};
 use glade_wire::generated::{Op, Shape};
 use glade_wire::wellformed::{self, Malformed};
 
+use crate::checkpoint;
 use crate::peer::NodeIdentity;
 use crate::registry::{
-    G_BINDINGS, G_BINDING_RETRACTIONS, G_CLAIMS, G_GRANTS, G_NODES, G_PRINCIPALS, G_RECOVERY_KEYS,
-    G_REVOCATIONS, G_SERVICES, G_TRANSPORT_BINDINGS, G_TRANSPORT_REVOCATIONS, G_WORKSPACES, HOME,
+    G_BINDINGS, G_BINDING_RETRACTIONS, G_CHECKPOINTS, G_CLAIMS, G_GRANTS, G_NODES, G_PRINCIPALS,
+    G_RECOVERY_KEYS, G_REVOCATIONS, G_SERVICES, G_TRANSPORT_BINDINGS, G_TRANSPORT_REVOCATIONS,
+    G_WORKSPACES, HOME,
 };
 use crate::signing;
-use crate::sysdata::SignedRecord;
+use crate::sysdata::{ChainCheckpoint, SignedRecord};
 use crate::transport::key_of;
 
 /// Why a `home` op was refused: the first of [`verify`]'s rules it breaks.
@@ -45,6 +47,10 @@ pub enum Refused {
     Origin,
     /// The signature does not verify under the origin's key.
     Signature,
+    /// A checkpoint that names another node, a stream this build does not
+    /// compact, a negative base or a hash that is not 32 bytes (plan Step
+    /// 4.5c, `checkpoint.rs`).
+    Checkpoint,
 }
 
 impl fmt::Display for Refused {
@@ -57,6 +63,7 @@ impl fmt::Display for Refused {
             Refused::Kind => "not its stream's kind",
             Refused::Origin => "its origin is not a node id",
             Refused::Signature => "its signature does not verify",
+            Refused::Checkpoint => "not a checkpoint this build takes",
         })
     }
 }
@@ -96,8 +103,9 @@ pub enum Format {
     /// plan Step 4.1b, whose kinds were only ever added, never changed.
     Unsigned,
     /// Anything else: another envelope, a stream or a kind this build does
-    /// not know, a map whose field 1 is bytes, bytes that are not CBOR. A
-    /// newer build's format, or damage; the start is refused.
+    /// not know, a checkpoint of a stream it does not compact, a map whose
+    /// field 1 is bytes, bytes that are not CBOR. A newer build's format, or
+    /// damage; the start is refused.
     Unknown,
 }
 
@@ -105,7 +113,11 @@ pub enum Format {
 pub fn format(op: &Op) -> Format {
     if let Some((record, _)) = open(&op.payload) {
         let known = kind(&op.glade_id).is_some_and(|fields| is_kind(&record, fields));
-        return match known {
+        // A checkpoint of a stream this build does not compact is a later
+        // build's: quarantined, it would strand that chain above its floor.
+        let compacted = |record: ChainCheckpoint| checkpoint::compacts(&record.stream);
+        let ours = op.glade_id != G_CHECKPOINTS || checkpoint::read(&record).is_some_and(compacted);
+        return match known && ours {
             true => Format::Sealed,
             false => Format::Unknown,
         };
@@ -198,7 +210,8 @@ pub(crate) fn unreadable_op(done: &str, at: usize, why: Malformed) -> String {
 /// The check every `home` ingest makes, its rules in this order: an envelope;
 /// the directory's form; seq 0 with no `prev` and every later seq with one;
 /// a directory stream; that stream's kind; a node id as origin; and the
-/// origin's signature, checked strictly. Chain continuity is the caller's.
+/// origin's signature, checked strictly. A checkpoint then has its own check
+/// (plan Step 4.5c, [`checkpoint::check`]). Chain continuity is the caller's.
 pub fn verify(op: &Op) -> Result<(), Refused> {
     let (record, sig) = open(&op.payload).ok_or(Refused::Unsigned)?;
     let form = op.share == HOME && op.key.is_empty() && op.shape == Shape::Log;
@@ -218,10 +231,13 @@ pub fn verify(op: &Op) -> Result<(), Refused> {
         ..op.clone()
     };
     let message = cbor::encode(&signed.to_cbor());
-    match signing::verify(&signer, Purpose::OriginOp, &message, &sig) {
-        SignatureStatus::Valid => Ok(()),
-        SignatureStatus::Invalid => Err(Refused::Signature),
+    if signing::verify(&signer, Purpose::OriginOp, &message, &sig) == SignatureStatus::Invalid {
+        return Err(Refused::Signature);
     }
+    if op.glade_id == G_CHECKPOINTS {
+        checkpoint::check(op)?;
+    }
+    Ok(())
 }
 
 /// Whether `glade_id` is one of the directory's streams: the ones the
@@ -250,7 +266,7 @@ fn kind(glade_id: &str) -> Option<&'static [Field]> {
         G_BINDINGS => &[Text, Text, Text, Text, Text, Text],
         G_SERVICES => &[Text, Text, Text],
         G_PRINCIPALS => &[Text],
-        G_TRANSPORT_BINDINGS => &[Text, Text, Int, Bytes],
+        G_TRANSPORT_BINDINGS | G_CHECKPOINTS => &[Text, Text, Int, Bytes],
         G_TRANSPORT_REVOCATIONS => &[Text, Text, Bytes],
         _ => return None,
     };
@@ -366,6 +382,33 @@ pub(crate) mod testing {
         let origin = crate::transport::hex(&identity.node_id);
         let appended = Registry::sealed(identity).append_returning(record, &origin);
         appended.expect("a sealed registry appends as its own node")
+    }
+
+    /// `record`, a checkpoint, sealed by the node whose key is `seed` at `seq`
+    /// of its chain on `dir.checkpoints`, naming `prev`: built here, not
+    /// appended, so a record its check refuses is sealed too (plan Step 4.5c).
+    pub(crate) fn checkpoint(
+        seed: [u8; 32],
+        record: ChainCheckpoint,
+        seq: i64,
+        prev: Option<Vec<u8>>,
+    ) -> Op {
+        let identity = NodeIdentity::from_key(seed);
+        let op = Op {
+            share: HOME.into(),
+            glade_id: G_CHECKPOINTS.into(),
+            origin: crate::transport::hex(&identity.node_id),
+            seq,
+            prev,
+            lamport: seq,
+            shape: Shape::Log,
+            payload: Record::Checkpoint(record).encode(),
+            ..Op::default()
+        };
+        Op {
+            payload: seal(&identity, &op),
+            ..op
+        }
     }
 
     /// What a newer build might write, as a record of rotation (plan Step
@@ -638,6 +681,15 @@ mod tests {
                 }
                 .to_cbor(),
             ),
+            (
+                G_CHECKPOINTS,
+                ChainCheckpoint {
+                    seq: 7,
+                    hash: vec![1; 32],
+                    ..ChainCheckpoint::default()
+                }
+                .to_cbor(),
+            ),
         ];
         for (stream, record) in &records {
             let bytes = cbor::encode(record);
@@ -714,6 +766,33 @@ mod tests {
         ];
         for (what, op) in unknown {
             assert_eq!(format(&op), Format::Unknown, "{what}");
+        }
+    }
+
+    /// Plan Step 4.5c: a checkpoint of a stream this build does not compact
+    /// is a later build's, which, quarantined here, would strand that
+    /// stream's chain above its floor. So `format` calls it `Unknown`, and
+    /// the start is refused; one of `dir.claims` is this build's own.
+    #[test]
+    fn format_calls_a_checkpoint_of_a_stream_this_build_does_not_compact_unknown() {
+        let origin = crate::transport::hex(&NodeIdentity::from_key(SEED).node_id);
+        let of = |stream: &str| {
+            let stream = stream.into();
+            let record = ChainCheckpoint {
+                node: origin.clone(),
+                stream,
+                seq: 4,
+                hash: vec![1; 32],
+            };
+            testing::checkpoint(SEED, record, 0, None)
+        };
+        assert_eq!(format(&of(G_CLAIMS)), Format::Sealed, "this build's");
+        let later = [
+            ("a stream this build does not compact", G_PRINCIPALS),
+            ("a stream this build does not know", "dir.later"),
+        ];
+        for (what, stream) in later {
+            assert_eq!(format(&of(stream)), Format::Unknown, "{what}");
         }
     }
 

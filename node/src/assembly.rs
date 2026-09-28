@@ -551,7 +551,7 @@ impl<M: Module + HasComponent<dyn Constructions>> Component<M> for CommandLine {
     }
 }
 
-/// The directory profile on its own: the home share and its eleven record
+/// The directory profile on its own: the home share and its thirteen record
 /// streams, the ones whose kinds a signed `home` record is checked against
 /// (`envelope.rs`, plan Step 4.1b). Pure, with nothing injected, which is
 /// what breaks the Directory-Records constructor cycle

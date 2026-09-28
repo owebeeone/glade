@@ -159,6 +159,19 @@ SCHEMA = schema(
         F("node", 1, STR),
         F("recovery_key", 2, STR)),
 
+    # ---- signed checkpoints (plan Step 4.5c; AZ-12) --------------------------
+    # Node N's chain on `stream`, a directory stream this build compacts
+    # (dir.claims alone), is folded at `seq`, whose op hashes to `hash`: every
+    # op of that chain at or below `seq` is covered, and what of it the stream's
+    # fold still reads was appended again above it. A record in N's own chain on
+    # dir.checkpoints, sealed by the origin-op envelope, which is its proof. The
+    # newest for a stream supersedes the older ones.
+    Msg("ChainCheckpoint",
+        F("node", 1, STR),
+        F("stream", 2, STR),
+        F("seq", 3, INT),
+        F("hash", 4, BYTES)),
+
     # ---- the signed envelope (plan Step 4.1b) --------------------------------
     # GladeNodeSigning.md D4 (c): every home-share op's payload is one of
     # these, sealed by the op's origin. `record` is the canonical CBOR of the

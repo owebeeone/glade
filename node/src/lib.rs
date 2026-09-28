@@ -9,6 +9,7 @@
 pub mod appdecl;
 pub mod assembly;
 pub mod chain;
+pub mod checkpoint;
 pub mod claims;
 pub mod conversation;
 pub mod echo;

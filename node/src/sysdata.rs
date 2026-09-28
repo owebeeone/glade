@@ -277,6 +277,32 @@ impl NodeRecoveryKey {
 }
 
 #[derive(Clone, Debug, PartialEq, Default)]
+pub struct ChainCheckpoint {
+    pub node: String,
+    pub stream: String,
+    pub seq: i64,
+    pub hash: Vec<u8>,
+}
+impl ChainCheckpoint {
+    pub fn to_cbor(&self) -> Cbor {
+        Cbor::Map(vec![
+            (1, Cbor::Text(self.node.clone())),
+            (2, Cbor::Text(self.stream.clone())),
+            (3, Cbor::Int(self.seq)),
+            (4, Cbor::Bytes(self.hash.clone())),
+        ])
+    }
+    pub fn from_cbor(c: &Cbor) -> Self {
+        Self {
+            node: c.get(1).text(),
+            stream: c.get(2).text(),
+            seq: c.get(3).int(),
+            hash: c.get(4).bytes(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Default)]
 pub struct SignedRecord {
     pub record: Vec<u8>,
     pub sig: Vec<u8>,

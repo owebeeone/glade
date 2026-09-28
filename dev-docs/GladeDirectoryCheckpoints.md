@@ -594,6 +594,21 @@ of the sources, and the message recorded, as in the steps before.
 | `registry`: `a_change_that_drops_as_many_as_it_appends_is_saved` | `accept` saves a checkpoint that leaves the fold no longer | the length test (`registry.rs:633-636`): the engine's snapshot unchanged |
 | `sysdir`: `a_boot_loads_a_checkpointed_records_json_in_any_order` | a records.json whose checkpoint follows the claims above its floor boots with nothing quarantined | a load in file order: `quarantined N` |
 
+**Part 1, as built** (2026-09-28, on `b4599ef`). 310 production `.rs` lines added and 32 removed,
+against 250-330: `checkpoint.rs` 147 (the reader, `check`, and the two rules as pure functions,
+`against` for the floor and `place` for the register, which part 2's store calls as the registry
+does); `registry.rs` +107 −19; `envelope.rs` +28 −12, where `verify` makes the record's check after
+its seven rules; `sysdata.rs` 26, generated. Tests: 335 lines, the six above, each first shown red
+in a copy against its named form, and the kind added to two tests that list every kind. As built,
+the register keeps its checkpoints apart from the fold's ops, per (stream, origin), and a snapshot
+lists them first; a floor with nothing above it is its chain's tip; a checkpoint's `prev` is checked
+against the held one, which, with one compacted stream, is the one before it; a fork at the base is
+`Equivocation` at B, a rewrite the new `RegistryError::Rewrite`, an older checkpoint `Covered`. The
+lines part 1 cites moved a little and hold. For part 2: `mesh.rs`'s readers (`:903-937`) are now
+`:1250-1287`, `serve_home` (`:570-595`) is `:870`, on 4.5b's conversations, and `serve_sync` and
+`pull_sync` are `peer.rs:404` and `:451`. The gate passed 9/9, 431 tests on each path, and the
+desk replay printed `b4599ef`'s lines.
+
 **Part 2.**
 
 | Test | Proves | Red against |
