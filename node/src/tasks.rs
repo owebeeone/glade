@@ -33,7 +33,7 @@ pub(crate) type Task = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 pub(crate) type Inbox = mpsc::UnboundedReceiver<Task>;
 
 /// Every place the node spawns a task: the eight of `mesh.rs` (plan Step
-/// 4.5b's among them), the renewal loop, and the four of `exchange.rs` and
+/// 4.5b's among them), the renewal loop, and the five of `exchange.rs` and
 /// `server.rs`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Site {
@@ -65,6 +65,9 @@ pub(crate) enum Site {
     ForwardExchange,
     /// `exchange.rs`, `handle_create`: a `workspace.create` forwarded to its target.
     ForwardCreate,
+    /// `exchange.rs`, `handle_local`: a local call's bound, which answers the
+    /// call at its timeout if its provider has not (ruling 4).
+    LocalCallBound,
     /// `server.rs`, the accept loop: one client session.
     ClientSession,
     /// `server.rs`, `handle`: a client session's writer.

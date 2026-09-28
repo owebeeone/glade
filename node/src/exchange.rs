@@ -62,6 +62,12 @@ fn res_err(corr: &str, error: &str) -> Frame {
     })
 }
 
+/// The answer to a call its provider has not answered in time, forwarded or
+/// local (ruling 4): failure as data, on the caller's correlation.
+fn timed_out(corr: &str) -> Frame {
+    res_err(corr, "provider timeout at claim holder")
+}
+
 /// Is `glade_id` a DECLARED exchange surface? A fold over the registered app
 /// declarations in the local replica — base glade reads records, not apps.
 /// `dir.bindings` is read through the binding fold, so only a LIVE
@@ -102,7 +108,9 @@ pub(crate) async fn attach_provider(shared: &Arc<Shared>, sid: SessionId, share:
 /// client counts from `c1`), so under theirs two calls in flight on one
 /// exchange would meet, and one caller would receive the other's reply. Each
 /// is filed against its provider's session too, the one session whose answer
-/// is taken, and whose end answers it (F16b).
+/// is taken, and whose end answers it (F16b). Each is bounded as well: one
+/// still filed when its bound passes is taken, and its caller answered
+/// (ruling 4).
 #[derive(Default)]
 pub(crate) struct Pending {
     /// How many correlations this node has minted.
@@ -146,6 +154,14 @@ impl Pending {
         Some((call.caller, call.corr))
     }
 
+    /// The caller of the call filed as `minted`, whose bound has passed,
+    /// filed no longer: `None`, and nothing changed, once the call has been
+    /// answered, or its caller or its provider has left (ruling 4).
+    fn expired(&mut self, minted: &str) -> Option<(SessionId, String)> {
+        let call = self.calls.remove(minted)?;
+        Some((call.caller, call.corr))
+    }
+
     /// Session `sid` has ended: forget every call it filed, and take every
     /// call still pending on it, returning each one's caller and correlation.
     fn ended(&mut self, sid: SessionId) -> Vec<(SessionId, String)> {
@@ -175,7 +191,12 @@ pub(crate) async fn session_ended(shared: &Arc<Shared>, sid: SessionId) {
 /// the reserved `workspace.create` id → the built-in TARGET-routed handler;
 /// undeclared → the legacy echo provider; declared → the C2 decision on the
 /// SHARE, and the replica never answers regardless of what it caches.
-pub(crate) async fn handle_request(shared: &Arc<Shared>, sid: SessionId, mut req: ExchangeReq, echo: &mut Echo) {
+pub(crate) async fn handle_request(
+    shared: &Arc<Shared>,
+    sid: SessionId,
+    req: ExchangeReq,
+    echo: &mut Echo,
+) {
     if req.glade_id == WORKSPACE_CREATE {
         handle_create(shared, sid, req).await;
         return;
@@ -192,31 +213,7 @@ pub(crate) async fn handle_request(shared: &Arc<Shared>, sid: SessionId, mut req
         return;
     }
     match route_subscribe(shared, &req.share).await {
-        Route::Local => {
-            // looked up under the pending lock, so a provider's session end,
-            // which releases its surfaces before it answers the calls pending
-            // on it, finds this call filed or leaves no provider (F16b).
-            let mut pending = shared.pending.lock().await;
-            let provider =
-                shared.providers.lock().await.get(&(req.share.clone(), req.glade_id.clone())).copied();
-            match provider {
-                Some(psid) => {
-                    // the handler sees a correlation this node minted, never
-                    // the caller's, and echoes it 1:1; handle_response routes
-                    // its ExchangeRes back on it (trace D2, F16), from the
-                    // provider's session alone (F16b).
-                    req.corr = pending.file(sid, req.corr, psid);
-                    drop(pending);
-                    send(shared, psid, &Frame::ExchangeReq(req)).await;
-                }
-                None => {
-                    drop(pending);
-                    let reason =
-                        format!("no authority provider attached for {}/{}", req.share, req.glade_id);
-                    send(shared, sid, &res_err(&req.corr, &reason)).await;
-                }
-            }
-        }
+        Route::Local => handle_local(shared, sid, req, PROVIDER_TIMEOUT).await,
         Route::Forward(peer) => {
             let forward = shared.clone();
             shared.tasks.spawn(Site::ForwardExchange, async move {
@@ -228,6 +225,59 @@ pub(crate) async fn handle_request(shared: &Arc<Shared>, sid: SessionId, mut req
             // the exchange twin of the subscribe path's Error/UnknownShare.
             send(shared, sid, &res_err(&req.corr, &reason)).await;
         }
+    }
+}
+
+/// The local arm of [`handle_request`]: hand `sid`'s call to the provider
+/// attached for its surface on this node, bounded by `wait` as a forwarded
+/// call is (ruling 4, after F16b); production passes [`PROVIDER_TIMEOUT`].
+/// With no provider attached, the caller is answered `ok: false` at once. A
+/// call a claim holder's synthetic session files is bounded so too, and by
+/// its session's own wait (`answer_forwarded`): whichever passes first, the
+/// requester is answered alike.
+async fn handle_local(shared: &Arc<Shared>, sid: SessionId, mut req: ExchangeReq, wait: Duration) {
+    // looked up under the pending lock, so a provider's session end, which
+    // releases its surfaces before it answers the calls pending on it, finds
+    // this call filed or leaves no provider (F16b).
+    let mut pending = shared.pending.lock().await;
+    let surface = (req.share.clone(), req.glade_id.clone());
+    let provider = shared.providers.lock().await.get(&surface).copied();
+    match provider {
+        Some(psid) => {
+            // the handler sees a correlation this node minted, never the
+            // caller's, and echoes it 1:1; handle_response routes its
+            // ExchangeRes back on it (trace D2, F16), from the provider's
+            // session alone (F16b).
+            req.corr = pending.file(sid, req.corr, psid);
+            drop(pending);
+            let (held, minted) = (shared.clone(), req.corr.clone());
+            send(shared, psid, &Frame::ExchangeReq(req)).await;
+            shared.tasks.spawn(Site::LocalCallBound, async move {
+                bound(&held, &minted, wait).await;
+            });
+        }
+        None => {
+            drop(pending);
+            let reason = format!(
+                "no authority provider attached for {}/{}",
+                req.share, req.glade_id
+            );
+            send(shared, sid, &res_err(&req.corr, &reason)).await;
+        }
+    }
+}
+
+/// A local call's bound (ruling 4): after `wait`, the call filed as `minted`,
+/// if it is filed still, is taken and its caller answered as a forwarded call
+/// is at the timeout. The provider stays attached: it leaves only when its
+/// session ends, and an answer it gives after this is dropped, as one on a
+/// correlation not filed is. Taken under the pending lock, so exactly one of
+/// the provider's answer, a session's end and the bound answers the call.
+async fn bound(shared: &Arc<Shared>, minted: &str, wait: Duration) {
+    tokio::time::sleep(wait).await;
+    let expired = shared.pending.lock().await.expired(minted);
+    if let Some((caller, corr)) = expired {
+        send(shared, caller, &timed_out(&corr)).await;
     }
 }
 
@@ -402,7 +452,7 @@ async fn answer_forwarded(shared: &Arc<Shared>, req: ExchangeReq, wait: Duration
     handle_request(shared, sid, req, &mut echo).await;
     let bytes = match tokio::time::timeout(wait, rx.recv()).await {
         Ok(Some(b)) => b,
-        _ => res_err(&corr, "provider timeout at claim holder").to_bytes(),
+        _ => timed_out(&corr).to_bytes(),
     };
 
     shared.out.lock().await.remove(&sid);
@@ -424,6 +474,7 @@ mod tests {
     use crate::ws;
     use glade_wire::generated::{Op, Ops, Shape, Subscribe};
     use std::path::PathBuf;
+    use tokio::sync::mpsc::UnboundedReceiver;
 
     fn fresh(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("glade-exchange-{name}"));
@@ -1288,6 +1339,70 @@ mod tests {
         let got = next_reply(&mut rc, "the kept call's reply").await;
         assert_eq!(got, reply("c1", "late"));
         assert_eq!(filed(&shared).await, 0);
+    }
+
+    /// A caller's session held by hand, as a claim holder's synthetic
+    /// session is: its id, and what the node sends it.
+    async fn held_session(shared: &Arc<Shared>) -> (SessionId, UnboundedReceiver<Vec<u8>>) {
+        let sid = shared.next.fetch_add(1, Ordering::SeqCst);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        shared.out.lock().await.insert(sid, tx);
+        (sid, rx)
+    }
+
+    /// The next frame the node sends a held session, bounded as
+    /// [`next_frame`] is: a hang is a failure.
+    async fn next_heard(heard: &mut UnboundedReceiver<Vec<u8>>, what: &str) -> Frame {
+        let bytes = tokio::time::timeout(Duration::from_secs(5), heard.recv())
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
+            .unwrap();
+        Frame::from_bytes(&bytes).unwrap()
+    }
+
+    /// A caller's call on `d.ops`, as `corr`, for [`handle_local`].
+    fn local(corr: &str) -> ExchangeReq {
+        ExchangeReq {
+            share: "s".into(),
+            glade_id: "d.ops".into(),
+            corr: corr.into(),
+            payload: b"ask".to_vec(),
+        }
+    }
+
+    /// Ruling 4, after F16b: a local call is bounded as a forwarded one is.
+    /// One its provider never answers is filed no longer when its bound
+    /// passes, and its caller is answered as a forwarded call is at the
+    /// timeout. The provider's answer after that is dropped, and the provider
+    /// stays attached: the next call reaches it and is answered, once, though
+    /// its bound passes after the answer.
+    #[tokio::test]
+    async fn a_never_answered_local_call_is_answered_at_the_timeout() {
+        let (shared, _, mut rp, wp) = provided("local-timeout").await;
+        let (caller, mut heard) = held_session(&shared).await;
+        handle_local(&shared, caller, local("c1"), Duration::from_millis(100)).await;
+        let lost = next_call(&mut rp, "the call").await;
+        let timeout = next_heard(&mut heard, "the answer at the timeout").await;
+        let forwarded = res_err("c1", "provider timeout at claim holder");
+        assert_eq!(timeout, forwarded, "the answer a forwarded call gets");
+        assert_eq!(filed(&shared).await, 0, "the call is filed no longer");
+        answer(&wp, &lost.corr, b"late").await;
+        synced(&mut rp, &wp, "the late answer").await;
+        assert!(heard.try_recv().is_err(), "the late answer is dropped");
+
+        handle_local(&shared, caller, local("c2"), PROVIDER_TIMEOUT).await;
+        let next = next_call(&mut rp, "the next call").await;
+        answer(&wp, &next.corr, b"answered").await;
+        let got = next_heard(&mut heard, "the next call's answer").await;
+        let answered = ExchangeRes {
+            corr: "c2".into(),
+            ok: true,
+            payload: Some(b"answered".to_vec()),
+            error: None,
+        };
+        assert_eq!(got, Frame::ExchangeRes(answered));
+        bound(&shared, &next.corr, Duration::ZERO).await;
+        assert!(heard.try_recv().is_err(), "answered once");
     }
 
     /// F16: the handler sees a correlation the node minted, not the caller's,
