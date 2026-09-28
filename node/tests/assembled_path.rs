@@ -1454,6 +1454,17 @@ fn committed_key(instance: &Path, node: &str) -> Option<String> {
     Registry::from_snapshot(&saved).0.recovery_key(node)
 }
 
+/// `file` as the node's recovery lines write it (F11): its canonical path,
+/// without the verbatim prefix `\\?\` that `fs::canonicalize` gives a path on
+/// Windows, since a scratch path reads the same without it; on Unix, as it is.
+fn written(file: impl AsRef<Path>) -> String {
+    let path = std::fs::canonicalize(file).unwrap().display().to_string();
+    match path.strip_prefix(r"\\?\") {
+        Some(plain) => plain.to_string(),
+        None => path,
+    }
+}
+
 /// Plan Step 4.1c (`GladeNodeSigning.md` D10 (a)), on each root: a booted
 /// node that has committed no recovery key says on stderr exactly what to
 /// run, under the instance root the entry point read, and starts. The
@@ -1486,10 +1497,9 @@ fn both_roots_warn_until_a_recovery_key_is_committed() {
         let node = lines[1].strip_prefix("node ").unwrap();
         let instance = home.join("sys").join(name);
         let key = committed_key(&instance, node).expect("committed");
-        let file = std::fs::canonicalize(&out).unwrap();
+        let file = written(&out);
         let committed = format!(
-            "recovery key {key} committed; wrote its secret to {}; this node keeps no copy: move the file offline now",
-            file.display()
+            "recovery key {key} committed; wrote its secret to {file}; this node keeps no copy: move the file offline now"
         );
         assert_eq!(said, [format!("node {node}"), committed], "{root:?}");
         assert_eq!(std::fs::metadata(&out).unwrap().len(), 32, "{root:?}");
@@ -1533,10 +1543,9 @@ fn both_roots_take_recovery_out_at_a_first_boot_only() {
         let node = lines[1].strip_prefix("node ").unwrap();
         let instance = home.join("sys").join(name);
         let key = committed_key(&instance, node).expect("committed");
-        let file = std::fs::canonicalize(out).unwrap();
+        let file = written(out);
         let committed = format!(
-            "recovery key {key} committed; wrote its secret to {}; this node keeps no copy: move the file offline now",
-            file.display()
+            "recovery key {key} committed; wrote its secret to {file}; this node keeps no copy: move the file offline now"
         );
         assert_eq!(lines[2], committed, "{root:?}");
         assert!(!stderr.contains(NOT_COMMITTED), "{root:?}: {stderr}");
