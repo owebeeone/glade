@@ -323,7 +323,7 @@ async fn handle(shared: Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
             }
             Frame::ExchangeRes(res) => {
                 // an attached authority provider answering: 1:1 by corr.
-                crate::exchange::handle_response(&shared, res).await;
+                crate::exchange::handle_response(&shared, sid, res).await;
             }
             Frame::Hello(h) => {
                 // R4: announced heads are taken on the client's word and, as
@@ -499,6 +499,9 @@ async fn handle(shared: Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
     shared.router.lock().await.unsubscribe_all(sid);
     // a departing authority provider releases its exchange surfaces.
     shared.providers.lock().await.retain(|_, v| *v != sid);
+    // then the calls: those it filed are forgotten, and those pending on it
+    // are answered `ok: false` (F16b).
+    crate::exchange::session_ended(&shared, sid).await;
     // the principal binding is session-scoped; the RECORD it minted stays.
     shared.principals.lock().await.remove(&sid);
     wtask.abort();

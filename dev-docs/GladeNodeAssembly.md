@@ -7820,3 +7820,9 @@ delivers; a correlation not filed is dropped. A mesh-forwarded call rides its ow
 requesting node (unchanged); the claim holder files it through its synthetic session, which forgets
 its calls when it ends (`answer_forwarded` takes that wait; production passes `PROVIDER_TIMEOUT`).
 Wire, clients and handlers are unchanged: a handler still echoes `corr` 1:1.
+F16b (ruled 2026-09-28): each call is filed against its provider's session too, whose answer alone
+`handle_response` takes; any other session's, on a real or guessed `n<k>`, is dropped.
+`exchange::session_ended` (beside `providers.retain`, and at a synthetic session's end) forgets a
+session's calls and answers those pending on it `ok: false`, "the provider left before answering";
+the provider is looked up under the pending lock, so none escapes. A displaced provider still
+answers its calls.
