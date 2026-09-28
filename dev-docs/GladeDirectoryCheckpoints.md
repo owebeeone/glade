@@ -621,6 +621,22 @@ desk replay printed `b4599ef`'s lines.
 | `mesh`: `a_peer_behind_a_checkpoint_takes_it_first_and_the_chain_from_its_floor` | over real iroh: B holds A's claims 0 to 3; A holds its checkpoint at 7 and claims 8 and 9, made by a test helper; B's pull leaves B holding the checkpoint, 8 and 9, and routing A's share to A | a store with no floor: `refused 2 home record(s) of node <A> on dir.claims from peer <A>: a gap: expected seq 4, got 8` |
 | `mesh`: `a_pushed_checkpoint_prunes_a_current_peer_with_no_gap` | B holds A's claims to 7; A pushes 8, 9 and its checkpoint at 7; B holds 8, 9 and the checkpoint, no pull starts, and B's journal for A holds those three | the push taken and nothing dropped |
 
+**Part 2, as built** (2026-09-28, on `3ee97a4`). 250 production `.rs` lines added and 52 removed,
+against 200-280: `store.rs` +225 −46 (the register beside the chains, its checkpoints also held as
+their origin's `dir.checkpoints` log, read as any other; `classify_home` and `classify_checkpoint`,
+calling part 1's `against` and `place`; a floor as its chain's tip in the heads; the journal's
+rewrite; `open`'s replay, checkpoints first, in place of 4.1b's `verifies`; `StoreError::Rewrite`);
+`session.rs` +15 (`serve_order`, a stable sort, and the rewrite's error frame); `mesh.rs` and
+`peer.rs` +5 −3 each (both serves walk it; `pull_sync` takes a rewrite as a fork). Tests: 275 lines,
+the seven above, each first shown red in a copy of `3ee97a4` holding them, the names they call
+answering as today; the `peer` test and the peer behind a checkpoint also against a puller with no
+floor. The `mesh` tests name the origin B, as the tests beside them do. On 4.5b's conversations only
+the order changed: `serve_home` still gathers its gap zone by zone, and its chunks keep that order
+on one conversation; the push and the pull on a gap needed nothing. A placed checkpoint is not
+appended before the rewrite, which carries it; an op arriving at a floor's base with another hash is
+a fork, its proof the checkpoint and that op. The gate passed 9/9, 438 tests on each path, rustfmt
+at 272, and the desk replay printed `3ee97a4`'s lines.
+
 **Part 3.**
 
 | Test | Proves | Red against |

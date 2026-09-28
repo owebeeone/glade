@@ -14,6 +14,12 @@
 //! 4.1b): one lands only if it verifies (`envelope.rs`), and its chain starts
 //! at seq 0. `open` checks each `home` journal the same way, and sets aside
 //! one that does not verify.
+//!
+//! A checkpoint (plan Step 4.5c, `checkpoint.rs`) gives the `home` chain it
+//! folds a floor: the chain keeps no op at or below its base, and goes on
+//! above it, and its origin's journal is rewritten without them. The register
+//! keeps the newest checkpoint of each chain, in its origin's chain on
+//! `dir.checkpoints`, which a serve sends first.
 
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
@@ -25,8 +31,9 @@ use glade_wire::generated::{Head, Op, Shape, StreamHeads};
 use glade_wire::swmr::{decode_swmr, SwmrPayloadError};
 
 use crate::chain::op_hash;
+use crate::checkpoint::{self, Against, Checkpoint, Floor, Placement};
 use crate::envelope::{self, Format, Refused};
-use crate::registry::HOME;
+use crate::registry::{entry_sync, G_CHECKPOINTS, HOME};
 use crate::sysdir::today;
 
 /// Outcome of an append.
@@ -78,6 +85,13 @@ pub enum StoreError {
     /// A `home` op that does not verify (plan Step 4.1b): unsigned, forged,
     /// or not the directory's form or kind.
     Unverified { origin: String, seq: i64, why: Refused },
+    /// A checkpoint whose base moves back from the one held, or that names
+    /// another hash there (plan Step 4.5c): refused, the pair kept as its
+    /// proof.
+    Rewrite {
+        origin: String,
+        seq: i64,
+    },
     Io(std::io::Error),
 }
 
@@ -111,6 +125,7 @@ impl std::fmt::Display for StoreError {
             StoreError::Unverified { origin, seq, why } => {
                 write!(f, "({origin},{seq}) does not verify: {why}")
             }
+            StoreError::Rewrite { origin, seq } => write!(f, "a rewrite at ({origin},{seq})"),
             StoreError::Io(e) => write!(f, "io: {e}"),
         }
     }
@@ -125,10 +140,20 @@ fn chain_of(op: &Op) -> ChainId {
     (op.share.clone(), op.glade_id.clone(), op.key.clone(), op.origin.clone())
 }
 
+/// Each chain's ops, in order.
+type Logs = BTreeMap<ChainId, Vec<Op>>;
+
+/// The register (plan Step 4.5c): for each chain a checkpoint folds, the
+/// newest checkpoint held for it, and the floor it gives that chain.
+type Register = BTreeMap<ChainId, (Op, Floor)>;
+
 /// Append-only per-chain op store, persisted under `root`.
 pub struct Store {
     root: PathBuf,
     logs: BTreeMap<ChainId, Vec<Op>>,
+    /// The register (plan Step 4.5c). Each checkpoint in it is also in the
+    /// log of its own chain, on `dir.checkpoints`.
+    register: Register,
     /// Recorded equivocation proofs (persisted under `<root>/proofs/`), in
     /// detection order. A fork is data with a signature on it — kept, not lost.
     proofs: Vec<EquivProof>,
@@ -167,10 +192,14 @@ impl Store {
     /// appended one by one (plan Step 4.1b). One that does not, such as any
     /// journal written before the step, is renamed aside whole, and
     /// [`Store::set_aside`] reports it. One holding a record in a format this
-    /// build does not know refuses the open, and is left as it is.
+    /// build does not know refuses the open, and is left as it is. Its
+    /// checkpoints are replayed first (plan Step 4.5c), and one that still
+    /// holds ops they cover, as a crash before the rewrite would leave it, is
+    /// taken without them and rewritten.
     pub fn open(root: impl Into<PathBuf>) -> Result<Store, StoreError> {
         let root = root.into();
         let mut logs: BTreeMap<ChainId, Vec<Op>> = BTreeMap::new();
+        let (mut register, mut covered) = (Register::new(), Vec::new());
         let mut aside = SetAside {
             journals: 0,
             records: 0,
@@ -198,7 +227,13 @@ impl Store {
                         if let Some(op) = ops.iter().find(unknown) {
                             return Err(envelope::unreadable(&log_ent.path(), op).into());
                         }
-                        if home && !verifies(&ops) {
+                        if !home {
+                            for op in ops {
+                                logs.entry(chain_of(&op)).or_default().push(op);
+                            }
+                            continue;
+                        }
+                        let Some((held, floors, covers)) = replayed(&ops) else {
                             let legacy = format!("{fname}.legacy-{}", aside.date);
                             fs::rename(
                                 log_ent.path(),
@@ -207,22 +242,30 @@ impl Store {
                             aside.journals += 1;
                             aside.records += ops.len();
                             continue;
+                        };
+                        if covers {
+                            covered.extend(ops.first().map(|op| op.origin.clone()));
                         }
-                        for op in ops {
-                            logs.entry(chain_of(&op)).or_default().push(op);
-                        }
+                        logs.extend(held);
+                        register.extend(floors);
                     }
                 }
             }
         }
         let proofs = read_proofs(&proofs_path(&root))?;
         let aside = (aside.journals > 0).then_some(aside);
-        Ok(Store {
+        let store = Store {
             root,
             logs,
+            register,
             proofs,
             aside,
-        })
+        };
+        // Rewritten once the directory is read, so no entry it lists moves.
+        for origin in covered {
+            store.rewrite(&origin)?;
+        }
+        Ok(store)
     }
 
     /// The `home` journals `open` set aside, if any.
@@ -241,8 +284,10 @@ impl Store {
     /// - otherwise a forward **gap**.
     ///
     /// A `home` op must verify before anything new of it is kept, and its
-    /// chain starts at seq 0 (plan Step 4.1b). A byte-identical repeat was
-    /// checked when it first landed.
+    /// chain starts at seq 0 (plan Step 4.1b), or above its floor (plan Step
+    /// 4.5c): an op at or below it is taken as seen, `BelowRetained`. A
+    /// checkpoint placed moves its chain's floor and rewrites its origin's
+    /// journal. A byte-identical repeat was checked when it first landed.
     pub fn append(&mut self, op: Op) -> Result<Append, StoreError> {
         self.validate_surface_contract(&op)?;
         let chain = chain_of(&op);
@@ -250,7 +295,7 @@ impl Store {
         // across the proof write / push (equivocation records into `proofs`).
         let home = op.share == HOME;
         let verdict = match home {
-            true => classify_home(self.logs.get(&chain), &op),
+            true => classify_home(&self.logs, &self.register, &op),
             false => classify(self.logs.get(&chain), &op),
         };
         if home {
@@ -266,12 +311,49 @@ impl Store {
                 self.record_equivocation(EquivProof { a: stored, b: op.clone() })?;
                 Err(StoreError::Equivocation { origin: op.origin, seq: op.seq })
             }
+            Verdict::Rewrite(stored) => {
+                let proof = EquivProof {
+                    a: stored,
+                    b: op.clone(),
+                };
+                self.record_equivocation(proof)?;
+                let (origin, seq) = (op.origin, op.seq);
+                Err(StoreError::Rewrite { origin, seq })
+            }
             Verdict::Appended => {
                 append_to_log(&self.root, &op)?;
                 self.logs.entry(chain).or_default().push(op);
                 Ok(Append::Appended)
             }
+            Verdict::Placed(folded, floor) => {
+                let origin = op.origin.clone();
+                place(&mut self.logs, &mut self.register, op, folded, floor);
+                self.rewrite(&origin)?;
+                Ok(Append::Appended)
+            }
         }
+    }
+
+    /// Rewrite `origin`'s journal of the `home` share to the ops held of it,
+    /// checkpoints first (plan Step 4.5c): into a temporary file, synced,
+    /// renamed over the journal, and the directory synced, 4.4's order. The
+    /// temporary name does not end in `.log`, so `open` never replays one
+    /// that a crash left.
+    fn rewrite(&self, origin: &str) -> Result<(), StoreError> {
+        let ours = |((share, _, _, of), _): &(&ChainId, &Vec<Op>)| share == HOME && of == origin;
+        let first = |((_, stream, _, _), _): &(&ChainId, &Vec<Op>)| stream == G_CHECKPOINTS;
+        let (checkpoints, rest): (Vec<_>, Vec<_>) = self.logs.iter().filter(ours).partition(first);
+        let ops = checkpoints.into_iter().chain(rest).flat_map(|(_, log)| log);
+        let records: Vec<u8> = ops.flat_map(framed).collect();
+        let dir = self.root.join(hex(HOME));
+        let temp = dir.join(format!("{}.rewrite", hex(origin)));
+        fs::create_dir_all(&dir)?;
+        let mut file = fs::File::create(&temp)?;
+        file.write_all(&records)?;
+        file.sync_all()?;
+        fs::rename(&temp, log_path(&self.root, HOME, origin))?;
+        entry_sync::sync(&dir)?;
+        Ok(())
     }
 
     /// Validate exact shape capability before any journal or index mutation.
@@ -339,17 +421,18 @@ impl Store {
     }
 
     /// One zone's version vector: each origin's last seq, with the hash of its
-    /// op there. The subscribe ack names it (GladeSubstrateV1 §6, R5).
+    /// op there, or its floor while it holds none above it (plan Step 4.5c).
+    /// The subscribe ack names it (GladeSubstrateV1 §6, R5).
     pub fn zone_heads(&self, share: &str, glade_id: &str, key: &[u8]) -> StreamHeads {
         let heads = self
             .logs
             .iter()
             .filter(|((s, g, k, _), _)| s == share && g == glade_id && k.as_slice() == key)
-            .filter_map(|((_, _, _, origin), log)| {
-                log.last().map(|o| Head {
-                    origin: origin.clone(),
-                    seq: o.seq,
-                    hash: Some(op_hash(o).to_vec()),
+            .filter_map(|(chain, log)| {
+                self.tip(chain, log).map(|(seq, hash)| Head {
+                    origin: chain.3.clone(),
+                    seq,
+                    hash: Some(hash.to_vec()),
                 })
             })
             .collect();
@@ -371,13 +454,21 @@ impl Store {
     }
 
     /// Per-origin head seq for a zone `(share, glade_id, key)` — its resume
-    /// vector (origin -> max seq). Different zones (keys) never mix.
+    /// vector (origin -> max seq), a floor where nothing is held above it
+    /// (plan Step 4.5c). Different zones (keys) never mix.
     pub fn heads(&self, share: &str, glade_id: &str, key: &[u8]) -> Vec<(String, i64)> {
         self.logs
             .iter()
             .filter(|((s, g, k, _), _)| s == share && g == glade_id && k.as_slice() == key)
-            .filter_map(|((_, _, _, origin), log)| log.last().map(|o| (origin.clone(), o.seq)))
+            .filter_map(|(chain, log)| self.tip(chain, log).map(|(seq, _)| (chain.3.clone(), seq)))
             .collect()
+    }
+
+    /// A chain's tip: its last op's seq and hash, or its floor while it holds
+    /// no op above it (plan Step 4.5c).
+    fn tip(&self, chain: &ChainId, log: &[Op]) -> Option<Floor> {
+        let last = log.last().map(|op| (op.seq, op_hash(op)));
+        last.or_else(|| self.register.get(chain).map(|(_, floor)| *floor))
     }
 }
 
@@ -406,27 +497,95 @@ enum Verdict {
     Gap { expected: i64, got: i64 },
     ChainBreak,
     /// An op already sits at this `(origin, seq)` with a different hash — a fork.
-    /// Carries the stored op so the proof can be assembled.
+    /// Carries the stored op so the proof can be assembled. At a chain's base
+    /// (plan Step 4.5c), the pair is the op there and a checkpoint naming
+    /// another hash.
     Equivocation(Op),
+    /// A checkpoint the register takes (plan Step 4.5c): the chain it folds,
+    /// and the floor it gives that chain.
+    Placed(ChainId, Floor),
+    /// A checkpoint whose base moves back from the one held, or names another
+    /// hash there (plan Step 4.5c). Carries the one held, for the proof.
+    Rewrite(Op),
 }
 
-/// [`classify`], with the `home` share's rule that a chain starts at seq 0
-/// (plan Step 4.1b): an op whose predecessor is not held cannot have it
-/// checked (B5).
-fn classify_home(log: Option<&Vec<Op>>, op: &Op) -> Verdict {
-    if log.is_none_or(|log| log.is_empty()) && op.seq != 0 {
-        return Verdict::Gap {
-            expected: 0,
-            got: op.seq,
-        };
+/// [`classify`], with the `home` share's rules. A checkpoint is judged for
+/// the register ([`classify_checkpoint`]). An op of a chain with a floor (plan
+/// Step 4.5c) is judged against it, and above it from its base. Any other
+/// chain starts at seq 0 (plan Step 4.1b): an op whose predecessor is not
+/// held cannot have it checked (B5).
+fn classify_home(logs: &Logs, register: &Register, op: &Op) -> Verdict {
+    if op.glade_id == G_CHECKPOINTS {
+        return classify_checkpoint(logs, register, op);
     }
-    classify(log, op)
+    let chain = chain_of(op);
+    let log = logs.get(&chain).filter(|log| !log.is_empty());
+    let Some((checkpoint, floor)) = register.get(&chain) else {
+        return match log {
+            None if op.seq != 0 => Verdict::Gap {
+                expected: 0,
+                got: op.seq,
+            },
+            _ => classify(log, op),
+        };
+    };
+    match checkpoint::against(*floor, op) {
+        Against::Covered => Verdict::BelowRetained,
+        Against::Fork => Verdict::Equivocation(checkpoint.clone()),
+        Against::Above if log.is_none() => follows(*floor, op),
+        Against::Above => classify(log, op),
+    }
 }
 
-/// A `home` op that would be kept, or would convict its origin of a fork,
-/// must verify (plan Step 4.1b).
+/// Where a checkpoint lands (plan Step 4.5c): [`checkpoint::place`] against
+/// the one held for the chain it folds, then against the op held at its
+/// base, which must hash to it. One its own check refuses is judged kept, so
+/// that [`checked`] refuses it: `verify` makes that check.
+fn classify_checkpoint(logs: &Logs, register: &Register, op: &Op) -> Verdict {
+    let Ok(Checkpoint { stream, floor }) = checkpoint::check(op) else {
+        return Verdict::Appended;
+    };
+    let folded = (HOME.to_string(), stream, Vec::new(), op.origin.clone());
+    if let Some((held, at)) = register.get(&folded) {
+        match checkpoint::place((op, floor), Some((held, *at))) {
+            Placement::Placed => {}
+            Placement::Duplicate => return Verdict::Duplicate,
+            Placement::Seen => return Verdict::BelowRetained,
+            Placement::Fork => return Verdict::Equivocation(held.clone()),
+            Placement::ChainBreak => return Verdict::ChainBreak,
+            Placement::Rewrite => return Verdict::Rewrite(held.clone()),
+        }
+    }
+    let log = logs.get(&folded).map(Vec::as_slice).unwrap_or_default();
+    match log.iter().find(|held| held.seq == floor.0) {
+        Some(held) if checkpoint::against(floor, held) == Against::Fork => {
+            Verdict::Equivocation(held.clone())
+        }
+        _ => Verdict::Placed(folded, floor),
+    }
+}
+
+/// Place `op`, a checkpoint that folds `folded` at `floor` (plan Step 4.5c):
+/// that chain keeps no op at or below the base, and the checkpoint replaces
+/// the one held for it, in the register and in the log of its own chain,
+/// which holds its origin's newest checkpoint of each chain.
+fn place(logs: &mut Logs, register: &mut Register, op: Op, folded: ChainId, floor: Floor) {
+    let log = logs.entry(folded.clone()).or_default();
+    log.retain(|held| held.seq > floor.0);
+    let own = chain_of(&op);
+    register.insert(folded, (op, floor));
+    let origins = register.iter().filter(|(chain, _)| chain.3 == own.3);
+    let mut newest: Vec<Op> = origins.map(|(_, (op, _))| op.clone()).collect();
+    newest.sort_by_key(|op| op.seq);
+    logs.insert(own, newest);
+}
+
+/// A `home` op that would be kept, or would convict its origin of a fork or
+/// a rewrite, must verify (plan Steps 4.1b and 4.5c).
 fn checked(verdict: &Verdict, op: &Op) -> Result<(), StoreError> {
-    if !matches!(verdict, Verdict::Appended | Verdict::Equivocation(_)) {
+    use Verdict::{Appended, Equivocation, Placed, Rewrite};
+    let convicts = matches!(verdict, Equivocation(_) | Rewrite(_));
+    if !convicts && !matches!(verdict, Appended | Placed(..)) {
         return Ok(());
     }
     envelope::verify(op).map_err(|why| {
@@ -435,17 +594,28 @@ fn checked(verdict: &Verdict, op: &Op) -> Result<(), StoreError> {
     })
 }
 
-/// Whether a `home` journal's ops verify, each as [`Store::append`] would
-/// take it after the ones before it: appended to its chain, and checked.
-fn verifies(ops: &[Op]) -> bool {
-    let mut chains: BTreeMap<ChainId, Vec<Op>> = BTreeMap::new();
-    ops.iter().all(|op| {
-        let chain = chains.entry(chain_of(op)).or_default();
-        let verdict = classify_home(Some(&*chain), op);
-        let taken = matches!(verdict, Verdict::Appended) && checked(&verdict, op).is_ok();
-        chain.push(op.clone());
-        taken
-    })
+/// A `home` journal's ops, each as [`Store::append`] would take it after the
+/// ones before it (plan Step 4.1b), checkpoints first, so that each chain
+/// they fold starts at its floor (plan Step 4.5c): the chains they leave, the
+/// register, and whether one was covered, and so left out; or `None`, if one
+/// would not be taken.
+fn replayed(ops: &[Op]) -> Option<(Logs, Register, bool)> {
+    let (mut logs, mut register, mut covered) = (Logs::new(), Register::new(), false);
+    let (checkpoints, rest): (Vec<&Op>, Vec<&Op>) =
+        ops.iter().partition(|op| op.glade_id == G_CHECKPOINTS);
+    for op in checkpoints.into_iter().chain(rest) {
+        let verdict = classify_home(&logs, &register, op);
+        let taken = checked(&verdict, op).is_ok();
+        match verdict {
+            Verdict::BelowRetained => covered = true,
+            Verdict::Appended if taken => logs.entry(chain_of(op)).or_default().push(op.clone()),
+            Verdict::Placed(folded, floor) if taken => {
+                place(&mut logs, &mut register, op.clone(), folded, floor)
+            }
+            _ => return None,
+        }
+    }
+    Some((logs, register, covered))
 }
 
 fn classify(log: Option<&Vec<Op>>, op: &Op) -> Verdict {
@@ -458,11 +628,20 @@ fn classify(log: Option<&Vec<Op>>, op: &Op) -> Verdict {
             None => Verdict::BelowRetained, // below retained range — seen, not held
         };
     }
-    if op.seq != last.seq + 1 {
-        return Verdict::Gap { expected: last.seq + 1, got: op.seq };
+    follows((last.seq, op_hash(last)), op)
+}
+
+/// Whether `op` follows its chain's tip, `(seq, hash)`: it must be at the
+/// next seq, and a `prev`, when present, must be the tip's hash.
+fn follows((seq, hash): (i64, [u8; 32]), op: &Op) -> Verdict {
+    if op.seq != seq + 1 {
+        return Verdict::Gap {
+            expected: seq + 1,
+            got: op.seq,
+        };
     }
     if let Some(prev) = &op.prev {
-        if prev.as_slice() != op_hash(last) {
+        if prev.as_slice() != hash {
             return Verdict::ChainBreak;
         }
     }
@@ -577,6 +756,52 @@ pub(crate) mod testing {
     /// append did before plan Step 4.1b.
     pub(crate) fn journal(root: &Path, op: &Op) {
         append_to_log(root, op).expect("the journal takes the op");
+    }
+
+    /// The ops of `origin`'s journal of `share` under `root`, in its order.
+    pub(crate) fn journal_of(root: &Path, share: &str, origin: &str) -> Vec<Op> {
+        read_log(&log_path(root, share, origin)).expect("the journal reads")
+    }
+
+    /// The stream and seq of each op, in order.
+    pub(crate) fn slots(ops: &[Op]) -> Vec<(&str, i64)> {
+        ops.iter()
+            .map(|op| (op.glade_id.as_str(), op.seq))
+            .collect()
+    }
+
+    /// The claims chain of ten of the node whose key is `[seed; 32]`, sealed
+    /// as its registry appends them, and its checkpoint at `base`, the first
+    /// of its `dir.checkpoints` chain (plan Step 4.5c): the node's id, the
+    /// claims and the checkpoint.
+    pub(crate) fn folded(seed: u8, base: usize) -> (String, Vec<Op>, Op) {
+        use crate::registry::{Record, Registry, G_CLAIMS};
+        use crate::sysdata::{ChainCheckpoint, ServeClaim};
+        let identity = crate::peer::NodeIdentity::from_key([seed; 32]);
+        let id = crate::transport::hex(&identity.node_id);
+        let mut registry = Registry::sealed(identity);
+        let mut claims = Vec::new();
+        for lease_expiry_ms in 1..=10 {
+            let (node, share, epoch) = (id.clone(), "ws".into(), 1);
+            let claim = ServeClaim {
+                node,
+                share,
+                lease_expiry_ms,
+                epoch,
+            };
+            let claim = registry.append_returning(Record::Serve(claim), &id);
+            claims.push(claim.unwrap());
+        }
+        let hash = op_hash(&claims[base]).to_vec();
+        let (node, stream, seq) = (id.clone(), G_CLAIMS.into(), base as i64);
+        let record = ChainCheckpoint {
+            node,
+            stream,
+            seq,
+            hash,
+        };
+        let checkpoint = registry.append_returning(Record::Checkpoint(record), &id);
+        (id, claims, checkpoint.unwrap())
     }
 }
 
@@ -1028,5 +1253,117 @@ mod tests {
         let proofs = s.equivocation_proofs().iter();
         let slots: Vec<(i64, i64)> = proofs.map(|p| (p.a.seq, p.b.seq)).collect();
         assert_eq!(slots, [(0, 0), (1, 1)]);
+    }
+
+    /// Plan Step 4.5c: a peer's claims chain of ten, then its checkpoint at 7.
+    /// The chain keeps 8 and 9, and the journal is rewritten to the ops held,
+    /// checkpoint first; a reopen holds the same. The heads name 9, and a
+    /// store holding the checkpoint alone names its floor, (7, H). An op at 5
+    /// is below what is held, and a repeat of 8 a duplicate.
+    #[test]
+    fn a_checkpoint_moves_a_chains_floor_and_rewrites_its_journal() {
+        use crate::registry::{G_CHECKPOINTS, G_CLAIMS};
+        let root = fresh("floor");
+        let mut s = Store::open(&root).unwrap();
+        let (peer, claims, checkpoint) = testing::folded(18, 7);
+        for op in &claims {
+            s.append(op.clone()).unwrap();
+        }
+        assert_eq!(s.append(checkpoint.clone()).unwrap(), Append::Appended);
+        let journal = testing::journal_of(&root, HOME, &peer);
+        let retained = [(G_CHECKPOINTS, 0), (G_CLAIMS, 8), (G_CLAIMS, 9)];
+        assert_eq!(testing::slots(&journal), retained, "the journal");
+        let held = [vec![checkpoint.clone()], claims[8..].to_vec()].concat();
+        assert_eq!(journal, held);
+        let again = Store::open(&root).unwrap();
+        for st in [&s, &again] {
+            assert_eq!(st.scan(HOME, G_CLAIMS, &[], &peer, -1), claims[8..]);
+            let checkpoints = st.scan(HOME, G_CHECKPOINTS, &[], &peer, -1);
+            assert_eq!(checkpoints, std::slice::from_ref(&checkpoint));
+            assert_eq!(st.heads(HOME, G_CLAIMS, &[]), [(peer.clone(), 9)]);
+        }
+        assert_eq!(s.append(claims[5].clone()).unwrap(), Append::BelowRetained);
+        assert_eq!(s.append(claims[8].clone()).unwrap(), Append::Duplicate);
+        let mut alone = Store::open(fresh("floor-alone")).unwrap();
+        alone.append(checkpoint).unwrap();
+        let hash = Some(op_hash(&claims[7]).to_vec());
+        let floor = Head {
+            origin: peer,
+            seq: 7,
+            hash,
+        };
+        assert_eq!(alone.zone_heads(HOME, G_CLAIMS, &[]).heads, [floor]);
+    }
+
+    /// Plan Step 4.5c: `open` replays a `home` journal checkpoints first. One
+    /// that begins with its checkpoint, as a rewrite leaves it, opens with
+    /// nothing set aside. One that holds the ops its checkpoint covers, with
+    /// the checkpoint after them, as a crash before the rewrite would leave
+    /// it, opens without them, is not set aside, and is rewritten.
+    #[test]
+    fn open_takes_a_rewritten_journal_and_one_the_rewrite_never_reached() {
+        use crate::registry::G_CLAIMS;
+        let (peer, claims, checkpoint) = testing::folded(19, 7);
+        let rewritten = [vec![checkpoint.clone()], claims[8..].to_vec()].concat();
+        let unreached = [claims.clone(), vec![checkpoint]].concat();
+        for (name, journal) in [("rewritten", rewritten.clone()), ("unreached", unreached)] {
+            let root = fresh(&format!("reopen-{name}"));
+            for op in &journal {
+                testing::journal(&root, op);
+            }
+            let s = Store::open(&root).unwrap();
+            let aside = s.set_aside().map(ToString::to_string);
+            assert_eq!(aside, None, "{name}");
+            let held = s.scan(HOME, G_CLAIMS, &[], &peer, -1);
+            assert_eq!(held, claims[8..], "{name}");
+            assert_eq!(testing::journal_of(&root, HOME, &peer), rewritten, "{name}");
+        }
+    }
+
+    /// Plan Step 4.5c: a checkpoint naming at its base another hash than the
+    /// op held there is refused as a fork, the op and the checkpoint kept as
+    /// its proof, and nothing is dropped. One whose base moves back from the
+    /// checkpoint held is refused as a rewrite, the two kept as its proof.
+    #[test]
+    fn a_checkpoint_that_contradicts_its_base_is_a_fork_and_drops_nothing() {
+        use crate::envelope::testing::checkpoint as sealed;
+        use crate::registry::{G_CHECKPOINTS, G_CLAIMS};
+        use crate::sysdata::ChainCheckpoint;
+        let root = fresh("contradicts");
+        let mut s = Store::open(&root).unwrap();
+        let (peer, claims, checkpoint) = testing::folded(20, 7);
+        for op in &claims {
+            s.append(op.clone()).unwrap();
+        }
+        let naming = |base: i64, op: &Op| ChainCheckpoint {
+            node: peer.clone(),
+            stream: G_CLAIMS.into(),
+            seq: base,
+            hash: op_hash(op).to_vec(),
+        };
+        let forked = sealed([20; 32], naming(7, &claims[6]), 0, None);
+        let refused = s.append(forked.clone());
+        let fork = matches!(refused, Err(StoreError::Equivocation { .. }));
+        assert!(fork, "{refused:?}");
+        let proof = EquivProof {
+            a: claims[7].clone(),
+            b: forked,
+        };
+        assert_eq!(s.equivocation_proofs(), [proof]);
+        let held = s.scan(HOME, G_CLAIMS, &[], &peer, -1);
+        assert_eq!(held, claims, "nothing dropped");
+        s.append(checkpoint.clone()).unwrap();
+        let prev = Some(op_hash(&checkpoint).to_vec());
+        let back = sealed([20; 32], naming(5, &claims[5]), 1, prev);
+        let refused = s.append(back.clone());
+        let rewrite = matches!(refused, Err(StoreError::Rewrite { .. }));
+        assert!(rewrite, "{refused:?}");
+        let proof = EquivProof {
+            a: checkpoint.clone(),
+            b: back,
+        };
+        assert_eq!(s.equivocation_proofs().last(), Some(&proof));
+        assert_eq!(Store::open(&root).unwrap().equivocation_proofs().len(), 2);
+        assert_eq!(s.scan(HOME, G_CHECKPOINTS, &[], &peer, -1), [checkpoint]);
     }
 }

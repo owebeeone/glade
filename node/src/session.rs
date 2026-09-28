@@ -11,6 +11,8 @@ use glade_wire::generated::{Error, ErrorCode, Heads as WireHeads, Op};
 
 use crate::chain::op_hash;
 use crate::frame::Frame;
+use crate::registry::{G_CHECKPOINTS, HOME};
+use crate::router::Zone;
 use crate::store::{Store, StoreError};
 
 /// A peer's per-origin heads for `share` (origin -> highest seq held).
@@ -31,6 +33,15 @@ pub fn missing_for(store: &Store, share: &str, glade_id: &str, key: &[u8], their
         out.extend(store.scan(share, glade_id, key, &origin, from));
     }
     out
+}
+
+/// The zones a serve walks, in the order it sends them: each `home` zone of
+/// `dir.checkpoints` first (plan Step 4.5c), so that a puller places a
+/// checkpoint before the chain it folds, which then starts at its floor; then
+/// the rest, in `zones`' order.
+pub fn serve_order(mut zones: Vec<Zone>) -> Vec<Zone> {
+    zones.sort_by_key(|(share, glade_id, _)| !(share == HOME && glade_id == G_CHECKPOINTS));
+    zones
 }
 
 /// The ack of an accepted subscribe (GladeSubstrateV1 §6, R5): the zone, with
@@ -108,6 +119,10 @@ pub fn error_frame(err: &StoreError, op: &Op) -> Frame {
         StoreError::Unverified { origin, seq, why } => {
             (ErrorCode::Unauthorized, format!("({origin},{seq}) does not verify: {why}"))
         }
+        StoreError::Rewrite { origin, seq } => (
+            ErrorCode::Equivocation,
+            format!("rewritten chain at ({origin},{seq})"),
+        ),
         StoreError::Io(e) => (ErrorCode::Internal, format!("io: {e}")),
     };
     op_status(op, code, message)

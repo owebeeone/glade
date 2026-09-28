@@ -56,7 +56,7 @@ use crate::peer::{HELLO_WITHIN, OPS_PER_CHUNK};
 use crate::registry::HOME;
 use crate::router::{SessionId, Zone};
 use crate::server::{refuse_subscription, send, Server, Shared};
-use crate::session::{heads_map, missing_for, refused_subscribe};
+use crate::session::{heads_map, missing_for, refused_subscribe, serve_order};
 use crate::signing::NodeSigner;
 use crate::store::{Append, Store, StoreError};
 use crate::sysdir::now_ms;
@@ -864,7 +864,9 @@ async fn run_forward(
 
 /// Respond to a peer's home-share pull: ship exactly the home-zone ops the
 /// peer lacks (bulk, in chunks under the link's frame limit, plan Step
-/// 4.5b), then END — END = gap complete. Scoped to HOME: connect-time
+/// 4.5b), `dir.checkpoints` first (plan Step 4.5c), so the chunks, which keep
+/// the order, carry each checkpoint ahead of the chain it folds, then END —
+/// END = gap complete. Scoped to HOME: connect-time
 /// anti-entropy replicates the directory only; app shares move by interest
 /// (see the module note). `node` is the peer, as its HELLO proved it.
 async fn serve_home(
@@ -885,7 +887,7 @@ async fn serve_home(
     let gap: Vec<Op> = {
         let st = shared.store.lock().await;
         let mut gap = Vec::new();
-        for (share, glade_id, key) in st.zones() {
+        for (share, glade_id, key) in serve_order(st.zones()) {
             if share != HOME {
                 continue;
             }
@@ -1944,13 +1946,13 @@ mod tests {
             .collect()
     }
 
-    /// A behind a door, linked to B, which holds `held`, its first records:
-    /// A has pulled them. A's report lines, and B.
-    async fn a_linked_to_b(name: &str, held: &[Op]) -> (Server, Lines, Server) {
+    /// A behind a door, holding `a_held`, linked to B, which holds `held`,
+    /// its first records: A has pulled them. A's report lines, and B.
+    async fn a_linked_to_b(name: &str, a_held: &[Op], held: &[Op]) -> (Server, Lines, Server) {
         let (a_keys, b_keys) = ([endpoint_of(A_KEY)], [endpoint_of(B_KEY)]);
         let at = |node: &str| format!("{name}-{node}");
         let (b, _, at_b) = behind_door(&at("b"), (B_SEED, B_KEY), &a_keys, held).await;
-        let (a, a_lines, _) = behind_door(&at("a"), (A_SEED, A_KEY), &b_keys, &[]).await;
+        let (a, a_lines, _) = behind_door(&at("a"), (A_SEED, A_KEY), &b_keys, a_held).await;
         a.connect_peer(at_b.clone()).await.unwrap();
         (a, a_lines, b)
     }
@@ -2004,7 +2006,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_renewal_pushed_ahead_of_the_one_before_it_heals_by_a_pull() {
         let chain = b_claims(3);
-        let (a, a_lines, b) = a_linked_to_b("gap-order", &chain[..1]).await;
+        let (a, a_lines, b) = a_linked_to_b("gap-order", &[], &chain[..1]).await;
         let b_id = hex_id(&node_of(B_SEED));
         let claims = |st: &Store| st.scan(HOME, G_CLAIMS, &[], &b_id, -1);
         minted(&b, &chain[1..3]).await;
@@ -2029,7 +2031,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_burst_of_gaps_from_one_pusher_is_answered_by_one_pull() {
         let chain = b_claims(4);
-        let (a, a_lines, b) = a_linked_to_b("gap-burst", &chain[..1]).await;
+        let (a, a_lines, b) = a_linked_to_b("gap-burst", &[], &chain[..1]).await;
         let b_id = hex_id(&node_of(B_SEED));
         minted(&b, &chain[1..]).await;
         let mut lines = Vec::new();
@@ -2066,7 +2068,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_deferred_chain_starts_no_pull() {
         let chain = b_claims(2);
-        let (a, a_lines, b) = a_linked_to_b("gap-deferred", &chain[..1]).await;
+        let (a, a_lines, b) = a_linked_to_b("gap-deferred", &[], &chain[..1]).await;
         let b_id = hex_id(&node_of(B_SEED));
         let c_identity = crate::peer::NodeIdentity::from_key(C_SEED);
         let c_id = hex_id(&c_identity.node_id);
@@ -2771,5 +2773,84 @@ mod tests {
         wait_store(&t.a, |st| tree_len(st) == 22, "the whole gap at A").await;
         let sent: Vec<Vec<u8>> = ops().map(|op| op.payload.clone()).collect();
         assert_eq!(tree_payloads(&t.a).await, sent);
+    }
+
+    // ---- signed checkpoints (plan Step 4.5c's part 2) ----------------------
+
+    /// A serve sends each `home` zone of `dir.checkpoints` before every
+    /// other, so that a puller places a checkpoint before the chain it folds,
+    /// which then starts at its floor: given `dir.binding-retractions`, which
+    /// sorts before it, and the rest in the store's order.
+    #[test]
+    fn the_serve_sends_checkpoints_before_every_other_home_zone() {
+        use crate::registry::{G_BINDING_RETRACTIONS as RETRACTIONS, G_CHECKPOINTS};
+        let held = [RETRACTIONS, G_CHECKPOINTS, G_CLAIMS, G_PRINCIPALS];
+        let zones = held.map(|stream| (HOME.to_string(), stream.to_string(), Vec::new()));
+        let order = crate::session::serve_order(zones.to_vec());
+        let streams: Vec<&str> = order.iter().map(|(_, stream, _)| stream.as_str()).collect();
+        let first = [G_CHECKPOINTS, RETRACTIONS, G_CLAIMS, G_PRINCIPALS];
+        assert_eq!(streams, first);
+    }
+
+    /// B's checkpoint of its claims chain at `base`, the first of its
+    /// `dir.checkpoints` chain, sealed as its registry seals it.
+    fn b_checkpoint(chain: &[Op], base: usize) -> Op {
+        let record = crate::sysdata::ChainCheckpoint {
+            node: hex_id(&node_of(B_SEED)),
+            stream: G_CLAIMS.into(),
+            seq: base as i64,
+            hash: crate::chain::op_hash(&chain[base]).to_vec(),
+        };
+        crate::envelope::testing::checkpoint(B_SEED, record, 0, None)
+    }
+
+    /// Each op's seq, in order.
+    fn seqs(ops: Vec<Op>) -> Vec<i64> {
+        ops.iter().map(|op| op.seq).collect()
+    }
+
+    /// Plan Step 4.5c, over real iroh. A holds B's claims 0 to 3, and B has
+    /// folded its chain at 7: it holds the checkpoint, 8 and 9. A's pull at
+    /// the link takes the checkpoint first, and drops its prefix unchecked,
+    /// since it does not hold the op at the base; then the chain from the
+    /// floor, with no refusal. A routes B's share to B.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_peer_behind_a_checkpoint_takes_it_first_and_the_chain_from_its_floor() {
+        use crate::registry::G_CHECKPOINTS;
+        let chain = b_claims(9);
+        let checkpoint = b_checkpoint(&chain, 7);
+        let b_holds = [chain.clone(), vec![checkpoint.clone()]].concat();
+        let (a, a_lines, _b) = a_linked_to_b("behind", &chain[..4], &b_holds).await;
+        let b_id = hex_id(&node_of(B_SEED));
+        assert_eq!(*a_lines.lock().unwrap(), Vec::<String>::new());
+        let st = a.shared.store.lock().await;
+        assert_eq!(seqs(st.scan(HOME, G_CLAIMS, &[], &b_id, -1)), [8, 9]);
+        assert_eq!(st.scan(HOME, G_CHECKPOINTS, &[], &b_id, -1), [checkpoint]);
+        assert_eq!(who_serves(&st, "ws-razel", now_ms()), Some(b_id));
+    }
+
+    /// Plan Step 4.5c, over real iroh. A holds B's claims 0 to 7; B pushes 8,
+    /// 9 and its checkpoint at 7. A takes the three and drops its claims at
+    /// or below 7, having compared the one at 7, with no gap and no pull. A's
+    /// journal for B then holds the checkpoint, 8 and 9.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pushed_checkpoint_prunes_a_current_peer_with_no_gap() {
+        use crate::registry::G_CHECKPOINTS;
+        use crate::store::testing::{journal_of, slots};
+        let chain = b_claims(9);
+        let (a, a_lines, b) = a_linked_to_b("pruned", &[], &chain[..8]).await;
+        let b_id = hex_id(&node_of(B_SEED));
+        let pushed = [chain[8..].to_vec(), vec![b_checkpoint(&chain, 7)]].concat();
+        minted(&b, &pushed).await;
+        b_pushes(&b, &pushed).await;
+        let placed = |st: &Store| !st.scan(HOME, G_CHECKPOINTS, &[], &b_id, -1).is_empty();
+        wait_for(&a, placed, "B's checkpoint at A").await;
+        assert!(!pulling(&a), "a pull started");
+        let claims = |st: &Store| seqs(st.scan(HOME, G_CLAIMS, &[], &b_id, -1));
+        assert_eq!(claims(&*a.shared.store.lock().await), [8, 9]);
+        let root = std::env::temp_dir().join("glade-mesh-pruned-a");
+        let retained = [(G_CHECKPOINTS, 0), (G_CLAIMS, 8), (G_CLAIMS, 9)];
+        assert_eq!(slots(&journal_of(&root, HOME, &b_id)), retained);
+        assert_eq!(*a_lines.lock().unwrap(), Vec::<String>::new());
     }
 }

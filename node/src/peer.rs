@@ -31,7 +31,7 @@ use glade_wire::generated::{Heads, NodeHello, NodeWelcome, Op, Ops, Priority};
 use crate::frame::{frame_len, Frame};
 use crate::grants::READ_SUBSCRIBE;
 use crate::registry::HOME;
-use crate::session::missing_for;
+use crate::session::{missing_for, serve_order};
 use crate::signing;
 use crate::store::{EquivProof, Store, StoreError};
 use crate::transport::Door;
@@ -396,6 +396,7 @@ pub struct SyncOutcome {
 /// Server side of a pull (the s-sync responder): read the peer's HEADS, stream
 /// exactly the ops it lacks for every zone we hold, in size-capped BULK chunks,
 /// then close the write half — that close is the "gap complete" terminator.
+/// The zones go in [`serve_order`], `dir.checkpoints` first (plan Step 4.5c).
 ///
 /// Offers every zone of `home`, how grants arrive, and every other zone whose
 /// share `grants` lets `holder` read (plan Step 4.3's grant check,
@@ -425,7 +426,7 @@ where
         }
     }
     let mut sent = 0usize;
-    for (share, glade_id, key) in store.zones() {
+    for (share, glade_id, key) in serve_order(store.zones()) {
         if share != HOME && grants.check(holder, READ_SUBSCRIBE, &share).is_err() {
             continue;
         }
@@ -485,7 +486,8 @@ where
                 | Err(StoreError::InvalidSwmrPayload { .. })
                 | Err(StoreError::SwmrWriterConflict { .. })
                 | Err(StoreError::ShapeConflict { .. }) => out.rejected.push(ck),
-                Err(StoreError::Equivocation { .. }) => {} // proof recorded in the store
+                // A proof recorded in the store.
+                Err(StoreError::Equivocation { .. }) | Err(StoreError::Rewrite { .. }) => {}
                 Err(StoreError::Io(e)) => return Err(e),
             }
         }
@@ -1301,5 +1303,36 @@ mod sync_tests {
         assert_eq!(out.equivocations[0].a.payload, b"A");
         assert_eq!(out.equivocations[0].b.payload, b"B");
         assert_eq!(client.equivocation_proofs().len(), 1); // persisted in the store
+    }
+
+    /// Plan Step 4.5c, the library's driver: the responder holds the claims
+    /// chain of an origin that folded it at 7, as its checkpoint, 8 and 9. A
+    /// puller holding nothing takes the checkpoint first, then the chain from
+    /// its floor, and rejects nothing.
+    #[tokio::test]
+    async fn pull_sync_takes_a_chain_from_its_checkpoints_floor() {
+        use crate::registry::{G_CHECKPOINTS, G_CLAIMS};
+        let (origin, claims, checkpoint) = crate::store::testing::folded(6, 7);
+        let mut server = Store::open(fresh("floor-srv")).unwrap();
+        for op in claims.iter().chain([&checkpoint]) {
+            server.append(op.clone()).unwrap();
+        }
+        let mut client = Store::open(fresh("floor-cli")).unwrap();
+        let (ca, cb) = tokio::io::duplex(64 * 1024);
+        let (mut ar, mut aw) = split(ca);
+        let (mut br, mut bw) = split(cb);
+        let (holder, grants) = reader();
+        let serve = async move { serve_sync(&mut br, &mut bw, &server, &holder, &grants).await };
+        let srv = tokio::spawn(serve);
+        let out = pull_sync(&mut ar, &mut aw, &mut client, &anyone)
+            .await
+            .unwrap();
+        srv.await.unwrap().unwrap();
+
+        assert!(out.rejected.is_empty(), "rejected {:?}", out.rejected);
+        assert_eq!(out.applied, 3, "the checkpoint, 8 and 9");
+        let checkpoints = client.scan(HOME, G_CHECKPOINTS, &[], &origin, -1);
+        assert_eq!(checkpoints, [checkpoint]);
+        assert_eq!(client.scan(HOME, G_CLAIMS, &[], &origin, -1), claims[8..]);
     }
 }
