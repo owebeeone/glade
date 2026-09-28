@@ -419,14 +419,23 @@ c_contracts_gate() {
 }
 
 # process-globals: the ratchet runs on Python 3.10 or later, found on PATH;
-# without one it fails closed. It reads sources only and builds nothing.
+# without one it fails closed. It reads sources only and builds nothing. The
+# checker always prints its verdict, so a python3 that prints nothing at all,
+# such as an asdf shim failing under a scratch HOME, ran no checker: that
+# fails too, whatever its exit status (owner, 2026-09-27).
 c_process_globals() {
     checker="$glade_root/scripts/checks/check_process_globals.py"
     if [ ! -f "$checker" ]; then
         why "glade/scripts/checks/check_process_globals.py is absent"
         return 1
     fi
-    if out=$(python3 "$checker" --repo "$glade_root" 2>&1); then
+    out=$(python3 "$checker" --repo "$glade_root" 2>&1)
+    ran=$?
+    if [ -z "$out" ]; then
+        why "checker could not run: python3 printed nothing (exit status $ran)"
+        return 1
+    fi
+    if [ "$ran" -eq 0 ]; then
         why "$(printf '%s\n' "$out" | tail -n 1)"
         return 0
     fi

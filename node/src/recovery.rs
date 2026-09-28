@@ -41,10 +41,18 @@ pub struct Committed {
 }
 
 /// The line the command, and a first boot given `--recovery-out`, print once
-/// the key is committed.
+/// the key is committed. It writes the file without Windows' verbatim prefix
+/// where this platform gives one, as [`program_word`] writes the program
+/// (F11; the owner's ruling of 2026-09-27), and on Unix as it is.
 impl fmt::Display for Committed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let (key, file) = (&self.key, self.file.display());
+        let path = self.file.display().to_string();
+        let file = if platform::VERBATIM_PREFIX {
+            without_verbatim(&path)
+        } else {
+            Cow::Borrowed(path.as_str())
+        };
+        let key = &self.key;
         write!(
             f,
             "recovery key {key} committed; wrote its secret to {file}; this node keeps no copy: move the file offline now"
@@ -590,6 +598,33 @@ mod tests {
         };
         assert_eq!(program_word(program), written);
         assert_eq!(program_word(Path::new(bare)), bare);
+    }
+
+    /// The owner's ruling of 2026-09-27: the line naming where the secret
+    /// went writes its file without the verbatim prefix where this platform
+    /// gives one, through the function [`program_word`] uses (F11), for
+    /// `check_out`'s `fs::canonicalize` gives one on Windows. The file is
+    /// not quoted, and on Unix the line is byte for byte as it was.
+    #[test]
+    fn the_secret_line_writes_its_file_without_the_verbatim_prefix() {
+        let line = |file: &str| {
+            let (key, file) = ("k".to_string(), PathBuf::from(file));
+            Committed { key, file }.to_string()
+        };
+        let written = if platform::VERBATIM_PREFIX {
+            r"E:\offline\n.recovery"
+        } else {
+            r"\\?\E:\offline\n.recovery"
+        };
+        let said = |file: &str| {
+            format!(
+                "recovery key k committed; wrote its secret to {file}; this node keeps no copy: \
+                 move the file offline now"
+            )
+        };
+        assert_eq!(line(r"\\?\E:\offline\n.recovery"), said(written));
+        let unix = "/offline/a b/n.recovery";
+        assert_eq!(line(unix), said(unix));
     }
 
     // File modes are a Unix notion. A braced module, so the condition

@@ -64,9 +64,10 @@
 //! for its share: withdrawing a grant on a share nothing serves is its use.
 //! [`load_all`] also warns on a seed a `revoke` line of that start cancels,
 //! and `parse` on the odd spellings: a node's id written with capitals (F4,
-//! the owner's ruling of 2026-09-27), and a verb holding a `*` that does not
+//! the owner's ruling of 2026-09-27), a verb holding a `*` that does not
 //! end a pattern `p.*`, such as `*`, `.*`, `read*` or `*.x` (F14, the same
-//! day's, in place of F4's warning on a verb of just `*`). Each is a
+//! day's, in place of F4's warning on a verb of just `*`), and an empty verb,
+//! as a trailing comma leaves in `read.*,` (the same day's). Each is a
 //! warning: the line still registers.
 
 use std::fs;
@@ -212,6 +213,16 @@ fn stray_star_verb(verb: &str) -> String {
     format!(
         "a `*` in the verb `{verb}` matches only a `*`, for only a `*` that ends a pattern `p.*` \
          stands for more, as `read.*` allows every verb that begins `read.`; the grant registers"
+    )
+}
+/// What a seed whose verbs `verbs` hold an empty one is told, on its line,
+/// once however many it holds (the owner's ruling of 2026-09-27): a comma at
+/// either end, as in `read.*,`, or two together leave a verb that allows
+/// nothing, for no surface or exchange is asked for by the empty verb.
+fn empty_verb(verbs: &str) -> String {
+    format!(
+        "an empty verb in `{verbs}`, which a comma at either end or two commas together leave, \
+         allows nothing; the grant registers"
     )
 }
 /// What a principal written as a node's id with capitals is told, on its
@@ -465,8 +476,9 @@ pub fn parse(text: &str) -> Result<AppDecl, String> {
                     share: toks[2].into(),
                     verbs: toks[3].split(',').map(str::to_string).collect(),
                 };
-                // F4 and F14: the odd spellings, told on the line; the grant
-                // registers. A verb written twice on the line is told once.
+                // F4, F14 and the empty verb: the odd spellings, told on the
+                // line; the grant registers. A verb written twice on the line
+                // is told once.
                 if capitalised_hex(&seed.principal) {
                     let told = capitalised_node_id(&seed.principal);
                     decl.warnings.push(format!("line {n}: {told}"));
@@ -474,6 +486,10 @@ pub fn parse(text: &str) -> Result<AppDecl, String> {
                 for (i, verb) in seed.verbs.iter().enumerate() {
                     if stray_star(verb) && !seed.verbs[..i].contains(verb) {
                         let told = stray_star_verb(verb);
+                        decl.warnings.push(format!("line {n}: {told}"));
+                    }
+                    if verb.is_empty() && !seed.verbs[..i].contains(verb) {
+                        let told = empty_verb(toks[3]);
                         decl.warnings.push(format!("line {n}: {told}"));
                     }
                 }
@@ -2021,5 +2037,46 @@ mod tests {
             "a `*` in the verb `read*` matches only a `*`, for only a `*` that ends a pattern `p.*` \
              stands for more, as `read.*` allows every verb that begins `read.`; the grant registers"
         );
+    }
+
+    /// The owner's ruling of 2026-09-27: an empty verb, which a comma at
+    /// either end of a seed's verbs or two commas together leave, as in
+    /// `read.*,`, allows nothing, for a verb that is no pattern allows only
+    /// itself (`glade_grant_api::admits`), and no surface or exchange is
+    /// asked for by the empty one. It is told on its line once, however many
+    /// the line holds, in the order written among the line's other warnings,
+    /// and the line still registers, its verbs as written. A line with no
+    /// empty verb is told nothing of it.
+    #[test]
+    fn an_empty_verb_is_warned() {
+        let lines = [
+            "seed owner ws-a read.*,",
+            "seed owner ws-a ,read.subscribe",
+            "seed owner ws-a gwz.*,,read.*,,",
+            "seed owner ws-a ,",
+            "seed owner ws-a *,,read*",
+            "seed owner ws-a read.*,gwz.ops",
+        ];
+        let decl = parse(&v1_file(&lines.join("\n"))).unwrap();
+        let empty = |verbs: &str| {
+            format!(
+                "an empty verb in `{verbs}`, which a comma at either end or two commas together \
+                 leave, allows nothing; the grant registers"
+            )
+        };
+        let told = [
+            format!("line 3: {}", empty("read.*,")),
+            format!("line 4: {}", empty(",read.subscribe")),
+            format!("line 5: {}", empty("gwz.*,,read.*,,")),
+            format!("line 6: {}", empty(",")),
+            format!("line 7: {}", stray_star_verb("*")),
+            format!("line 7: {}", empty("*,,read*")),
+            format!("line 7: {}", stray_star_verb("read*")),
+        ];
+        assert_eq!(decl.warnings, told);
+        assert_eq!(decl.seeds.len(), 6, "each registers");
+        assert_eq!(decl.seeds[0].verbs, ["read.*", ""]);
+        assert_eq!(decl.seeds[2].verbs, ["gwz.*", "", "read.*", "", ""]);
+        assert_eq!(decl.seeds[3].verbs, ["", ""]);
     }
 }

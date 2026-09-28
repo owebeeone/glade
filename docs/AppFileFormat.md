@@ -404,6 +404,7 @@ with a `*` anywhere but at the end of a pattern `p.*`, such as `*`, `.*`,
 `read*` or `*.x`, since such a `*` matches only a `*` (the warning names each
 such verb); and a principal of 64 hexadecimal digits with a capital letter,
 which names no node, since a node's id is lower-case (on a `revoke` line too).
+An empty verb, as in `read.*,`, is warned too: it allows nothing.
 
 ## Changing or deleting a line
 

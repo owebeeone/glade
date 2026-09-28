@@ -251,7 +251,9 @@ pub fn instance_dir(root: &Path, profile: Profile, name: Option<&str>) -> io::Re
 /// `name` must match `[A-Za-z0-9._-]{1,63}` and not end in `.`, so the path
 /// names a directory in `<root>/sys` and nowhere else (`.` and `..` end in
 /// one), and one instance on every platform: Windows trims a trailing dot,
-/// so there `n.` would be `n` (F9 (b)). Any other name is refused
+/// so there `n.` would be `n` (F9 (b)). Nor may it be a name Windows keeps
+/// for a device ([`windows_device`]), which there names the device and no
+/// directory. Any other name is refused
 /// (`InvalidInput`), quoted as given, before anything is written: both
 /// roots' boots, `glade-node recovery` and `glade-node endpoint-id` take
 /// their instance here.
@@ -264,7 +266,25 @@ pub(crate) fn named_instance(root: &Path, name: &str) -> io::Result<PathBuf> {
         );
         return Err(io::Error::new(io::ErrorKind::InvalidInput, why));
     }
+    if windows_device(name) {
+        let why = format!(
+            "--name {name:?}: an instance name must not be a Windows device name (con, prn, aux, nul, com1-com9, lpt1-lpt9) in any case, alone or before a dot"
+        );
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, why));
+    }
     Ok(root.join("sys").join(name))
+}
+
+/// Whether Windows reads `name` as a device (the owner's ruling of
+/// 2026-09-27): `con`, `prn`, `aux`, `nul`, `com1`-`com9` or `lpt1`-`lpt9`,
+/// in any case, alone or before a dot, as `con.txt` is `con` there.
+fn windows_device(name: &str) -> bool {
+    let stem = name.split_once('.').map_or(name, |(stem, _)| stem);
+    match stem.to_ascii_lowercase().as_bytes() {
+        b"con" | b"prn" | b"aux" | b"nul" => true,
+        [b'c', b'o', b'm', n] | [b'l', b'p', b't', n] => matches!(n, b'1'..=b'9'),
+        _ => false,
+    }
 }
 
 /// Run the load-validation ladder at an explicit instance dir (tests pass a
@@ -1092,6 +1112,36 @@ mod tests {
             assert_eq!(err.to_string(), said);
             let unnamed = instance_dir(root, Profile::Local, Some(name));
             assert_eq!(unnamed.unwrap_err().to_string(), said);
+        }
+    }
+
+    /// The owner's ruling of 2026-09-27: a name Windows reserves for a
+    /// device, `con`, `prn`, `aux`, `nul`, `com1`-`com9` or `lpt1`-`lpt9`, is
+    /// refused (`InvalidInput`) in any case, alone or before a dot, since
+    /// there `con.txt` is `con`; the message quotes what was given. A name
+    /// that only begins or ends as one does, or holds one after a dot, is a
+    /// name.
+    #[test]
+    fn a_windows_device_name_is_refused() {
+        let root = Path::new("/r");
+        let alone = ["con", "PRN", "Aux", "nUl", "com1", "COM9", "lpt1", "LPT9"];
+        let dotted = ["con.txt", "NUL.x", "aux.tar.gz", "Com5.a-b"];
+        for name in alone.into_iter().chain(dotted) {
+            let err = named_instance(root, name).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{name:?}");
+            let said = format!(
+                "--name {name:?}: an instance name must not be a Windows device name (con, prn, aux, nul, com1-com9, lpt1-lpt9) in any case, alone or before a dot"
+            );
+            assert_eq!(err.to_string(), said);
+            let unnamed = instance_dir(root, Profile::Local, Some(name));
+            assert_eq!(unnamed.unwrap_err().to_string(), said);
+        }
+        let names = [
+            "cons", "icon", "com", "com10", "lpt1x", "con-x", "nul_1", "auxx.txt", "x.con", ".nul",
+        ];
+        for name in names {
+            let dir = named_instance(root, name);
+            assert_eq!(dir.unwrap(), root.join("sys").join(name), "{name:?}");
         }
     }
 
