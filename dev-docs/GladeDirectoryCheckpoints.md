@@ -555,7 +555,9 @@ chain from its floor.
   for each week of renewals at F1's rate since its records were last set aside, and ten times
   that for each week before F1.
 - During adoption, before `registry ready`, one new line: `checkpoint: dir.claims folded at seq
-  <B>, <M> superseded claim(s) dropped, 0 carried`.
+  <B>, <M> superseded claim(s) dropped, 1 carried`: `ws-razel`'s last claim, which adoption's
+  renewal of `home` alone does not supersede, and which the next fold drops (corrected as built,
+  part 3; the owner's ruling of 2026-09-28).
 - records.json falls to a few kilobytes, and the served store's `home` journal with it. The node
   and endpoint ids, the apps, `ws-razel`'s epoch and every other line are as before.
 - Later starts check about 1,000 records at most, about 0.1 s. While it runs, the desk prints the
