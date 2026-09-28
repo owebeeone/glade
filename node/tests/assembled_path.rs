@@ -6,8 +6,9 @@
 //! Either root starts a node that prints the same lines, refuses the legacy
 //! form without its store directory, and boots under `GLADE_HOME`, else
 //! `$HOME/.glade`. One test starts each root on an instance whose `home`
-//! claim lapsed while its node was stopped, and one reads the lease each
-//! root's claims carry by default.
+//! claim lapsed while its node was stopped, one reads the lease each root's
+//! claims carry by default, and one starts each on an instance holding 2,000
+//! renewals, which adoption folds into a checkpoint (plan Step 4.5c).
 //!
 //! Each test sets or removes the variable on the node it spawns, so it reads
 //! the same whichever way the suite runs (the node gate runs it both ways).
@@ -490,6 +491,65 @@ fn both_roots_lease_their_claims_for_five_minutes_by_default() {
             let said = format!("a claim on {share} ends {end} ms after the start: {ends:?}");
             assert!(leased, "{root:?}: {said}");
         }
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Write `ticks` renewals of each of `shares`, a share and its epoch, into the
+/// records.json of the instance at `instance`, under its key, as its node
+/// writes them: a five-minute lease renewed every 100 s, the last one now.
+/// Test-only (plan Step 4.5c): a first boot there mints the node's presence
+/// and its first claim on `home`, and nothing but that instance is written.
+fn renewals(instance: &Path, shares: &[(&str, i64)], ticks: i64) {
+    let mut boot = boot_at(instance.to_path_buf(), "local").unwrap();
+    let node = boot.node_id.clone();
+    let now = now_ms();
+    for tick in 0..ticks {
+        let lease_expiry_ms = now - (ticks - 1 - tick) * 100_000 + 300_000;
+        for &(share, epoch) in shares {
+            let claim = ServeClaim {
+                node: node.clone(),
+                share: share.into(),
+                lease_expiry_ms,
+                epoch,
+            };
+            boot.registry.append(Record::Serve(claim), &node).unwrap();
+        }
+    }
+    boot.store.save(&boot.registry.snapshot()).unwrap();
+}
+
+/// Plan Step 4.5c, on each root: an instance whose records.json holds 2,000
+/// renewals of its `home` claim, written under its key by [`renewals`]. The
+/// start folds its claims chain at adoption's renewal and says so, before
+/// `registry ready`; records.json then holds the checkpoint and the one claim
+/// that renewal made. A second start prints no such line.
+#[test]
+fn both_roots_fold_a_long_claims_chain_at_adoption_and_say_so() {
+    let dir = scratch("folded");
+    let home = dir.join("glade-home");
+    for (root, name) in [(Root::HandWritten, "h"), (Root::Assembled, "a")] {
+        let instance = home.join("sys").join(name);
+        renewals(&instance, &[(HOME, 1)], 2_000);
+        let args = ["--profile", "local", "--name", name, "0"];
+        let (lines, stderr) = start_and_stop(&home, root, &args);
+        let mut expected = vec!["instance", "node", "registry", "peer", "listening"];
+        expected.insert(2, "checkpoint:");
+        assert_eq!(kinds(&lines), expected, "{root:?}: {lines:?}, {stderr}");
+        let dropped = "2001 superseded claim(s) dropped";
+        let line = format!("checkpoint: dir.claims folded at seq 2000, {dropped}, 0 carried");
+        assert_eq!(lines[2], line, "{root:?}");
+        let saved = BlobStore::new(&instance).load().unwrap();
+        let ops = saved.records.iter();
+        let ops = ops.map(|bytes| Op::from_cbor(&cbor::decode(bytes)));
+        let held = ["dir.checkpoints", "dir.claims"];
+        let folded = |op: &Op| held.contains(&op.glade_id.as_str());
+        let streams: Vec<String> = ops.filter(folded).map(|op| op.glade_id).collect();
+        assert_eq!(streams, held, "{root:?}: records.json");
+        let (lines, stderr) = start_and_stop(&home, root, &args);
+        expected.remove(2);
+        let said = format!("{root:?}, started again: {lines:?}, {stderr}");
+        assert_eq!(kinds(&lines), expected, "{said}");
     }
     std::fs::remove_dir_all(&dir).unwrap();
 }

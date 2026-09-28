@@ -2853,4 +2853,80 @@ mod tests {
         assert_eq!(slots(&journal_of(&root, HOME, &b_id)), retained);
         assert_eq!(*a_lines.lock().unwrap(), Vec::<String>::new());
     }
+
+    // ---- signed checkpoints (plan Step 4.5c's part 3) ----------------------
+
+    /// Plan Step 4.5c, the done-when's second clause, over real iroh. A,
+    /// serving `home` and `ws-a` with a threshold of 4, renews by hand while
+    /// linked to B, and folds its claims chain at its third and sixth ticks.
+    /// B follows each push across both checkpoints: it holds A's chain as A
+    /// does, its journal for A keeps one checkpoint and at most 4 + 2 of A's
+    /// claims, and it routes `ws-a` to A, as A does. C, met afterwards, takes
+    /// A's chain from the second checkpoint by its pull, and routes alike.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_linked_peer_and_a_new_one_take_the_checkpointed_chain() {
+        use crate::claims::Leases;
+        use crate::registry::G_CHECKPOINTS;
+        use crate::store::testing::journal_of;
+        let booted = |node: &str| boot_at(fresh(&format!("folded-{node}-sys")), "gianni").unwrap();
+        let (boot_a, boot_b, boot_c) = (booted("a"), booted("b"), booted("c"));
+        let a_id = boot_a.node_id.clone();
+        let ids = [&boot_a, &boot_b, &boot_c].map(|boot| boot.identity().unwrap());
+        let b_root = fresh("folded-b-store");
+        let a = Server::open(fresh("folded-a-store")).unwrap();
+        let b = Server::open(&b_root).unwrap();
+        let c = Server::open(fresh("folded-c-store")).unwrap();
+        let leases = Leases {
+            renew_ms: 3_600_000,
+            checkpoint_after: 4,
+            ..Leases::default()
+        };
+        let adopted = a.adopt_boot_tuned(boot_a, leases, |_: &str| {});
+        adopted.await.unwrap();
+        b.adopt_boot(boot_b).await.unwrap();
+        c.adopt_boot(boot_c).await.unwrap();
+        let [id_a, id_b, id_c] = ids;
+        let at_a = meshed(&a, id_a).await;
+        let at_b = meshed(&b, id_b).await;
+        meshed(&c, id_c).await;
+        a.connect_peer(at_b).await.unwrap();
+        a.serve_workspace("ws-a", "a").await.unwrap();
+
+        let chain = |st: &Store| seqs(st.scan(HOME, G_CLAIMS, &[], &a_id, -1));
+        let checkpoints = |st: &Store| st.scan(HOME, G_CHECKPOINTS, &[], &a_id, -1);
+        for tick in 1..=6 {
+            testing::tick(&a.shared).await;
+            let held = chain(&*a.shared.store.lock().await);
+            let follows = move |st: &Store| chain(st) == held;
+            wait_for(&b, follows, "B to hold A's claims chain as A does").await;
+            if tick >= 3 {
+                let journal = journal_of(&b_root, HOME, &a_id);
+                let on = |stream: &str| {
+                    let held = journal.iter().filter(|op| op.glade_id == stream);
+                    held.count()
+                };
+                let (claims, folded) = (on(G_CLAIMS), on(G_CHECKPOINTS));
+                let said = format!("tick {tick}: B's copy holds {claims} of A's claims");
+                assert!(claims <= 4 + 2, "{said}");
+                assert_eq!(folded, 1, "tick {tick}: B's journal for A");
+            }
+            let now = now_ms();
+            let at_b = who_serves(&*b.shared.store.lock().await, "ws-a", now);
+            assert_eq!(at_b, Some(a_id.clone()), "tick {tick}: B routes ws-a");
+            let at_a = who_serves(&*a.shared.store.lock().await, "ws-a", now);
+            assert_eq!(at_a, at_b, "tick {tick}: as A does");
+        }
+        let (held, folded) = {
+            let st = a.shared.store.lock().await;
+            (chain(&st), checkpoints(&st))
+        };
+        assert_eq!(folded.iter().map(|op| op.seq).collect::<Vec<_>>(), [1]);
+        assert_eq!(checkpoints(&*b.shared.store.lock().await), folded, "B's");
+
+        c.connect_peer(at_a).await.unwrap();
+        let taken = move |st: &Store| chain(st) == held && checkpoints(st) == folded;
+        wait_for(&c, taken, "C to take A's chain from its checkpoint").await;
+        let serves = who_serves(&*c.shared.store.lock().await, "ws-a", now_ms());
+        assert_eq!(serves, Some(a_id), "C routes ws-a to A");
+    }
 }

@@ -37,10 +37,12 @@ use crate::store::{EquivProof, Store, StoreError};
 use crate::transport::Door;
 
 /// Wire protocol version spoken on the peer link: 2 from plan Step 4.1a, whose
-/// HELLO is signed, and 3 from plan Step 4.1b, whose `home` records are
-/// signed envelopes that an older node cannot read. The carrier's ALPN names
-/// it too, so a node of an older protocol fails at connect.
-pub const PROTOCOL: i64 = 3;
+/// HELLO is signed; 3 from plan Step 4.1b, whose `home` records are signed
+/// envelopes that an older node cannot read; and 4 from plan Step 4.5c, whose
+/// nodes fold their claims chains into checkpoints that an older node cannot
+/// follow. HELLO carries it and checks it, so a node of an older protocol
+/// fails at connect; the carrier's ALPN versions only the carrier's framing.
+pub const PROTOCOL: i64 = 4;
 
 // ---- framed IO ------------------------------------------------------------
 
@@ -153,7 +155,7 @@ fn peer_id_of(node_id: &[u8]) -> io::Result<[u8; 32]> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "peer node_id not 32 bytes"))
 }
 
-/// Check the HELLO the other end sent as `role` on `channel` (D6): protocol 2,
+/// Check the HELLO the other end sent as `role` on `channel` (D6): [`PROTOCOL`],
 /// and a signature that verifies under the id it names for the transcript
 /// this end computes. The id is the key, so first contact needs no lookup.
 /// Anything else is refused (`PermissionDenied`).
@@ -956,19 +958,21 @@ mod hello_tests {
         assert!(verdict.is_err(), "the dialer took its own HELLO back");
     }
 
-    /// Plan Step 4.5b: HELLO's `protocol` is the node protocol's only gate on
-    /// a link. A `NodeHello` of protocol 4, its signature good, is refused and
-    /// unanswered, and the door reports it: the gate plan Step 4.5c turns.
+    /// Plan Step 4.5c: `PROTOCOL` is 4, so a node of protocol 3, which could
+    /// not follow a claims chain past its checkpoint's floor, fails at
+    /// connect. HELLO's `protocol`, the node protocol's only gate on a link
+    /// (plan Step 4.5b), refuses its `NodeHello`, its signature good,
+    /// unanswered, and the door reports it.
     #[tokio::test]
-    async fn a_hello_of_another_protocol_is_refused_on_a_link() {
+    async fn a_protocol_3_node_fails_at_connect() {
         let mut hello = hello_from(&NodeIdentity::from_key([7u8; 32]), &CHANNEL);
-        hello.protocol = 4;
+        hello.protocol = 3;
         let (door, lines) = noting(&[CHANNEL.dialer]);
         let (verdict, answered) = presented_on_link(hello, CHANNEL, Some(&door)).await;
-        let refused = verdict.expect_err("a HELLO of protocol 4 taken");
-        let why = format!("HELLO refused: protocol 4, not {PROTOCOL}");
+        let refused = verdict.expect_err("a HELLO of protocol 3 taken");
+        let why = "HELLO refused: protocol 3, not 4";
         assert_eq!(refused.to_string(), why);
-        assert!(!answered, "a HELLO of protocol 4 answered");
+        assert!(!answered, "a HELLO of protocol 3 answered");
         let tag = crate::transport::tag(&CHANNEL.dialer);
         let line = format!("peer refused: endpoint {tag}: {why}");
         assert_eq!(*lines.lock().unwrap(), [line]);

@@ -42,6 +42,7 @@ use tokio::sync::{Mutex, MutexGuard};
 
 use glade_wire::generated::Op;
 
+use crate::checkpoint;
 use crate::envelope;
 use crate::registry::{Record, Registry, RegistryApi, G_CLAIMS, G_PRINCIPALS, HOME};
 use crate::server::{refresh_policy, Server, Shared};
@@ -51,22 +52,29 @@ use crate::sysdir::{now_ms, Boot};
 use crate::tasks::Site;
 
 /// Default serve-lease TTL: five minutes (question 32 (a), the owner's ruling
-/// of 2026-09-27), where it was 30 s. Each renewal is a signed record kept
-/// until signed checkpoints land (plan Step 4.5c), so renewing less often
-/// keeps fewer.
+/// of 2026-09-27), where it was 30 s. Each renewal is a signed record, kept
+/// until a checkpoint folds it (plan Step 4.5c).
 pub const LEASE_TTL_MS: i64 = 300_000;
 /// Default renewal cadence: a third of the TTL, so one missed renewal never
 /// lapses a healthy holder. 100 s; it was 10 s.
 pub const RENEW_EVERY_MS: u64 = 100_000;
+/// Default checkpoint threshold (plan Step 4.5c; the owner's ruling of
+/// 2026-09-27): a tick folds the node's claims chain once 1,000 of its claims
+/// are superseded, about 14 hours of renewals of two shares.
+pub const CHECKPOINT_AFTER: usize = 1_000;
 
 /// The node's leases, which are its settings (question 32 (a)): how long each
-/// claim it mints lives, and how often it renews the claims of what it serves.
-/// A composition root takes them from its entry point and passes them down;
-/// the default is [`LEASE_TTL_MS`] renewed every [`RENEW_EVERY_MS`].
+/// claim it mints lives, how often it renews the claims of what it serves,
+/// and how many of its claims may be superseded before a renewal folds its
+/// claims chain into a checkpoint (plan Step 4.5c). A composition root takes
+/// them from its entry point and passes them down; the default is
+/// [`LEASE_TTL_MS`] renewed every [`RENEW_EVERY_MS`], and a checkpoint once
+/// [`CHECKPOINT_AFTER`] claims are superseded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Leases {
     pub lease_ms: i64,
     pub renew_ms: u64,
+    pub checkpoint_after: usize,
 }
 
 impl Default for Leases {
@@ -74,6 +82,7 @@ impl Default for Leases {
         Leases {
             lease_ms: LEASE_TTL_MS,
             renew_ms: RENEW_EVERY_MS,
+            checkpoint_after: CHECKPOINT_AFTER,
         }
     }
 }
@@ -89,7 +98,10 @@ fn other<E: Into<Box<dyn std::error::Error + Send + Sync>>>(e: E) -> io::Error {
 pub(crate) struct DirState {
     /// Our directory node id — the origin every mint is attributed to.
     pub(crate) node_id: String,
-    lease_ms: i64,
+    leases: Leases,
+    /// Where the line each checkpoint prints goes: the reporter the
+    /// composition root handed adoption (plan Step 4.5c).
+    report: Box<dyn Fn(&str) + Send + Sync>,
     /// The directory lock. Lock order: this one, then the served store's, the
     /// router's or the session table's; never the reverse.
     inner: Mutex<DirAuthority>,
@@ -133,26 +145,30 @@ fn append_diffed(registry: &mut Registry, rec: Record, origin: &str) -> io::Resu
 
 impl Server {
     /// Adopt the boot instance as this server's directory-write authority
-    /// with the default [`Leases`], where a test's lease does not matter. See
-    /// [`Server::adopt_boot_tuned`], which the composition roots call.
+    /// with the default [`Leases`], where a test's lease does not matter, and
+    /// its checkpoint lines going nowhere. See [`Server::adopt_boot_tuned`],
+    /// which the composition roots call.
     pub async fn adopt_boot(&self, boot: Boot) -> io::Result<usize> {
-        self.adopt_boot_tuned(boot, LEASE_TTL_MS, RENEW_EVERY_MS).await
+        let (leases, nowhere) = (Leases::default(), |_: &str| {});
+        self.adopt_boot_tuned(boot, leases, nowhere).await
     }
 
     /// Adopt the boot instance: seed its registry snapshot into the served
     /// replica (the home share stays an ORDINARY share, GDL-038), keep the
     /// registry as the chain authority for this node's own directory writes,
     /// start the renewal set with `home` at its epoch (`home_epoch`), renew
-    /// it at once, and spawn the lease-renewal loop. `lease_ms`/`renew_ms`
-    /// are the claim TTL and renewal cadence, the node's [`Leases`]: each
-    /// composition root passes the ones its entry point gave it, and tests
-    /// shorten them to observe renewal live. Returns how many ops the seed
-    /// newly appended. Call once, before serving.
+    /// it at once, and spawn the lease-renewal loop. `leases` are the claim
+    /// TTL, the renewal cadence and the checkpoint threshold, the node's
+    /// [`Leases`]: each composition root passes the ones its entry point gave
+    /// it, and tests shorten them to observe renewal live. `report` takes the
+    /// line each checkpoint prints (plan Step 4.5c): stdout on the
+    /// hand-written root, the console on the assembled one. Returns how many
+    /// ops the seed newly appended. Call once, before serving.
     ///
     /// The renewal at once makes a `home` claim that lapsed while the node was
-    /// stopped live again before any peer or client can connect. If its save
-    /// fails, it is neither folded nor published, as at any tick, and the next
-    /// tick retries it.
+    /// stopped live again before any peer or client can connect, and folds a
+    /// long claims chain there. If its save fails, it is neither folded nor
+    /// published, as at any tick, and the next tick retries it.
     ///
     /// The replica holds none of this node's `home` records from before plan
     /// Step 4.1b, unsigned: its `open` set those aside (as it did plan Step
@@ -161,14 +177,20 @@ impl Server {
     ///
     /// The registry's grant fold becomes the one the serve paths check (plan
     /// Step 4.3): until adoption they had none, and refused.
-    pub async fn adopt_boot_tuned(&self, boot: Boot, lease_ms: i64, renew_ms: u64) -> io::Result<usize> {
+    pub async fn adopt_boot_tuned(
+        &self,
+        boot: Boot,
+        leases: Leases,
+        report: impl Fn(&str) + Send + Sync + 'static,
+    ) -> io::Result<usize> {
         let seeded = self.seed_registry(&boot.registry.snapshot()).await;
         let policy = boot.registry.policy();
         let home = home_epoch(&*self.shared.store.lock().await, &boot.node_id);
         let served = BTreeMap::from([(HOME.to_string(), home)]);
         let state = DirState {
             node_id: boot.node_id.clone(),
-            lease_ms,
+            leases,
+            report: Box::new(report),
             inner: Mutex::new(DirAuthority { boot, served }),
         };
         self.shared
@@ -180,7 +202,7 @@ impl Server {
         let shared = self.shared.clone();
         self.shared.tasks.spawn(Site::Renewal, async move {
             loop {
-                tokio::time::sleep(Duration::from_millis(renew_ms)).await;
+                tokio::time::sleep(Duration::from_millis(leases.renew_ms)).await;
                 renew_leases(&shared).await;
             }
         });
@@ -231,7 +253,7 @@ pub(crate) async fn serve_workspace_on(shared: &Arc<Shared>, share: &str, name: 
     let claim = ServeClaim {
         node: node.clone(),
         share: share.into(),
-        lease_expiry_ms: now_ms() + state.lease_ms,
+        lease_expiry_ms: now_ms() + state.leases.lease_ms,
         epoch,
     };
     // Entry and claim are accepted together, after the last await before the
@@ -314,34 +336,36 @@ fn knows_principal(store: &Store, principal: &str) -> bool {
 
 /// Renew every served share's lease: same epoch, fresh absolute expiry — an
 /// ordinary ServeClaim append (a renewal is data, never a heartbeat protocol).
+/// Once enough of the node's claims are superseded, the tick also folds its
+/// claims chain into a checkpoint (plan Step 4.5c, `checkpoint::tick`), and
+/// says so through the root's reporter.
 async fn renew_leases(shared: &Arc<Shared>) {
     let Some(state) = shared.dir.get() else { return };
-    let node = state.node_id.clone();
-    let lease_ms = state.lease_ms;
+    let (node, leases) = (state.node_id.clone(), state.leases);
     let mut dir = state.inner.lock().await;
     if dir.served.is_empty() {
         return;
     }
-    let served: Vec<(String, i64)> = dir.served.iter().map(|(s, e)| (s.clone(), *e)).collect();
-    // One acceptance for the tick's renewals: if the save fails, none is
-    // folded or published, and the next tick retries.
-    let renewed = dir.accept(|registry| {
-        let mut ops = Vec::new();
-        for (share, epoch) in served {
-            let claim = ServeClaim {
-                node: node.clone(),
-                share,
-                lease_expiry_ms: now_ms() + lease_ms,
-                epoch,
-            };
-            match append(registry, Record::Serve(claim), &node) {
-                Ok(op) => ops.push(op),
-                Err(_) => break, // a rejected chain append: stop, next tick retries
-            }
-        }
-        Ok(ops)
+    let lease_expiry_ms = now_ms() + leases.lease_ms;
+    let renewals = dir.served.iter().map(|(share, epoch)| ServeClaim {
+        node: node.clone(),
+        share: share.clone(),
+        lease_expiry_ms,
+        epoch: *epoch,
     });
-    publish(shared, dir, renewed.unwrap_or_default()).await;
+    let renewals = renewals.collect();
+    // One acceptance for the tick, its checkpoint included: if an append is
+    // refused or the save fails, none is folded or published, and the next
+    // tick retries.
+    let tick = |registry: &mut Registry| {
+        let ticked = checkpoint::tick(registry, &node, renewals, leases.checkpoint_after);
+        ticked.map_err(|e| other(format!("registry append rejected: {e:?}")))
+    };
+    let (ops, folded) = dir.accept(tick).unwrap_or_default();
+    publish(shared, dir, ops).await;
+    if let Some(folded) = folded {
+        (state.report)(&folded.to_string());
+    }
 }
 
 /// Land freshly minted directory ops, then send them to peers. `dir` is the
@@ -370,7 +394,7 @@ pub(crate) async fn publish(shared: &Arc<Shared>, dir: MutexGuard<'_, DirAuthori
 /// that first epoch, if it holds none. Not a serve's [`max_claim_epoch`] + 1:
 /// every node serves `home` at once, so no claim on it is a stale one to
 /// fence out.
-fn home_epoch(store: &Store, node: &str) -> i64 {
+pub(crate) fn home_epoch(store: &Store, node: &str) -> i64 {
     let claims = store.scan(HOME, G_CLAIMS, &[], node, i64::MIN);
     let claims = claims
         .iter()
@@ -381,7 +405,7 @@ fn home_epoch(store: &Store, node: &str) -> i64 {
 
 /// Highest claim epoch the replica has seen for `share` — live or lapsed;
 /// fencing bumps over both.
-fn max_claim_epoch(store: &Store, share: &str) -> i64 {
+pub(crate) fn max_claim_epoch(store: &Store, share: &str) -> i64 {
     let mut max = 0;
     for (origin, _) in store.heads(HOME, G_CLAIMS, &[]) {
         for op in store.scan(HOME, G_CLAIMS, &[], &origin, i64::MIN) {
@@ -428,6 +452,11 @@ pub(crate) mod testing {
         super::publish(shared, dir, ops).await;
         Ok(generation)
     }
+
+    /// Renew the adopted node's leases once, as its loop does each tick.
+    pub(crate) async fn tick(shared: &Arc<Shared>) {
+        super::renew_leases(shared).await;
+    }
 }
 
 #[cfg(test)]
@@ -472,17 +501,45 @@ mod tests {
         max
     }
 
+    /// The leases a test renews by hand on: the default lease, the renewal
+    /// loop an hour off, and a checkpoint once `after` claims are superseded.
+    fn by_hand(after: usize) -> Leases {
+        let renew_ms = 3_600_000;
+        Leases {
+            renew_ms,
+            checkpoint_after: after,
+            ..Leases::default()
+        }
+    }
+
+    /// The lines a node's checkpoints report, as its root would print them.
+    type Lines = Arc<std::sync::Mutex<Vec<String>>>;
+
+    /// A reporter that keeps its lines, and the lines it keeps.
+    fn kept() -> (Lines, impl Fn(&str) + Send + Sync + 'static) {
+        let lines = Lines::default();
+        let keep = lines.clone();
+        let report = move |line: &str| keep.lock().unwrap().push(line.into());
+        (lines, report)
+    }
+
     /// A booted node with no mesh, adopted with the renewal loop an hour
     /// off, so a test renews by hand: its served state and its instance dir.
     async fn adopted(name: &str) -> (Arc<Shared>, PathBuf) {
+        let (shared, sys, _) = folding(name, CHECKPOINT_AFTER).await;
+        (shared, sys)
+    }
+
+    /// [`adopted`], its claims chain folded once `after` of its claims are
+    /// superseded (plan Step 4.5c): also the lines its checkpoints report.
+    async fn folding(name: &str, after: usize) -> (Arc<Shared>, PathBuf, Lines) {
         let sys = fresh(&format!("{name}-sys"));
         let boot = boot_at(sys.clone(), "gianni").unwrap();
         let server = Server::open(fresh(&format!("{name}-store"))).unwrap();
-        server
-            .adopt_boot_tuned(boot, LEASE_TTL_MS, 3_600_000)
-            .await
-            .unwrap();
-        (server.shared.clone(), sys)
+        let (lines, report) = kept();
+        let adopted = server.adopt_boot_tuned(boot, by_hand(after), report);
+        adopted.await.unwrap();
+        (server.shared.clone(), sys, lines)
     }
 
     /// Make every save of the instance at `sys` fail, or work again: a
@@ -719,7 +776,13 @@ mod tests {
         let (sys, node) = instance_holding_home("home-renewed", first);
         let boot = boot_at(sys.clone(), "gianni").unwrap();
         let server = Server::open(fresh("home-renewed-store")).unwrap();
-        server.adopt_boot_tuned(boot, LEASE, 100).await.unwrap();
+        let leases = Leases {
+            lease_ms: LEASE,
+            renew_ms: 100,
+            ..Leases::default()
+        };
+        let adopted = server.adopt_boot_tuned(boot, leases, |_: &str| {});
+        adopted.await.unwrap();
         let shared = server.shared.clone();
         let past = first + 3 * LEASE;
         let renewed = |st: &Store| max_lease(st, HOME, &node) > past;
@@ -750,7 +813,7 @@ mod tests {
         let boot = boot_at(sys, "gianni").unwrap();
         assert_eq!(boot.registry.who_serves(HOME, now_ms()), None, "lapsed");
         let server = Server::open(fresh("home-lapsed-store")).unwrap();
-        let adopted = server.adopt_boot_tuned(boot, LEASE_TTL_MS, 3_600_000);
+        let adopted = server.adopt_boot_tuned(boot, by_hand(CHECKPOINT_AFTER), |_: &str| {});
         adopted.await.unwrap();
         let shared = server.shared.clone();
         let st = shared.store.lock().await;
@@ -772,6 +835,7 @@ mod tests {
     fn the_default_lease_is_five_minutes_renewed_every_100_s() {
         let leases = Leases::default();
         assert_eq!((leases.lease_ms, leases.renew_ms), (300_000, 100_000));
+        assert_eq!(leases.checkpoint_after, 1_000, "plan Step 4.5c's threshold");
         let settings = crate::assembly::Settings::default();
         assert_eq!(settings.leases, leases, "the assembled root's settings");
     }
@@ -842,7 +906,7 @@ mod tests {
             ),
             "{aside}"
         );
-        let adopted = server.adopt_boot_tuned(boot, LEASE_TTL_MS, 3_600_000);
+        let adopted = server.adopt_boot_tuned(boot, by_hand(CHECKPOINT_AFTER), |_: &str| {});
         adopted.await.unwrap();
         let shared = server.shared.clone();
         assert!(serve_workspace_on(&shared, "ws-x", "x").await.unwrap());
@@ -886,6 +950,125 @@ mod tests {
         assert!(kept, "the old journal is kept beside the new one");
     }
 
+    // ---- signed checkpoints (plan Step 4.5c's part 3) ----------------------
+
+    /// How many of `node`'s claims `ops` holds, and how many of its
+    /// checkpoints.
+    fn folded_chain(ops: &[Op], node: &str) -> (usize, usize) {
+        use crate::registry::G_CHECKPOINTS;
+        let ours = |glade_id: &str| {
+            let ours = |op: &&Op| op.glade_id == glade_id && op.origin == node;
+            ops.iter().filter(ours).count()
+        };
+        (ours(G_CLAIMS), ours(G_CHECKPOINTS))
+    }
+
+    /// The line a checkpoint at `base` reports, having dropped `dropped`
+    /// claims and carried none.
+    fn folded_at(base: i64, dropped: usize) -> String {
+        let dropped = format!("{dropped} superseded claim(s) dropped");
+        format!("checkpoint: dir.claims folded at seq {base}, {dropped}, 0 carried")
+    }
+
+    /// Plan Step 4.5c: a node that serves `home` and `ws-a`, adopted with a
+    /// threshold of 4, renews by hand. Its third tick folds its claims chain,
+    /// and its sixth again, each saying so. From the first fold on,
+    /// records.json holds one checkpoint and at most 4 + 2 of the node's
+    /// claims, and so does the served store's journal of the node; after
+    /// every tick, the registry and the served store name the node as
+    /// serving `home`.
+    #[tokio::test]
+    async fn a_node_folds_its_claims_once_n_are_superseded() {
+        use crate::store::testing::journal_of;
+        let (shared, sys, lines) = folding("folds", 4).await;
+        let root = std::env::temp_dir().join("glade-claims-folds-store");
+        let node = shared.dir.get().unwrap().node_id.clone();
+        assert!(serve_workspace_on(&shared, "ws-a", "a").await.unwrap());
+        for tick in 1..=7 {
+            renew_leases(&shared).await;
+            if tick >= 3 {
+                let (claims, checkpoints) = folded_chain(&saved(&sys), &node);
+                let said = format!("tick {tick}: records.json holds {claims} of the node's claims");
+                assert!(claims <= 4 + 2, "{said}");
+                assert_eq!(checkpoints, 1, "tick {tick}: records.json");
+                let journal = journal_of(&root, HOME, &node);
+                let (claims, checkpoints) = folded_chain(&journal, &node);
+                let said = format!("tick {tick}: the journal holds {claims} of the node's claims");
+                assert!(claims <= 4 + 2, "{said}");
+                assert_eq!(checkpoints, 1, "tick {tick}: the journal");
+            }
+            let now = now_ms();
+            let dir = shared.dir.get().unwrap().inner.lock().await;
+            let serves = dir.boot.registry.who_serves(HOME, now);
+            assert_eq!(serves, Some(node.clone()), "tick {tick}: the registry");
+            drop(dir);
+            let serves = who_serves(&*shared.store.lock().await, HOME, now);
+            assert_eq!(serves, Some(node.clone()), "tick {tick}: the served store");
+        }
+        assert_eq!(*lines.lock().unwrap(), [folded_at(6, 7), folded_at(12, 6)]);
+    }
+
+    /// Plan Step 4.5c (section 4): a tick that folds publishes its ops in the
+    /// order it appended them: the claims it carries, then its renewals, then
+    /// its checkpoint, so no reader takes the checkpoint before the claims
+    /// that keep every fold's answers. The push sends the same ops, in one
+    /// frame, in that order. A node whose records.json also holds a claim on
+    /// `ws-gone`, a share it no longer serves, is adopted with a threshold of
+    /// 2 and renews twice. A session subscribed to its claims and its
+    /// checkpoints receives `home`'s renewal, then `ws-gone`'s claim carried,
+    /// `home`'s next renewal and the checkpoint, and the line counts the one
+    /// claim carried.
+    #[tokio::test]
+    async fn the_tick_publishes_its_carried_claims_and_renewals_before_its_checkpoint() {
+        use crate::frame::Frame;
+        use crate::registry::{StoreApi, G_CHECKPOINTS};
+        let (sys, node) = instance_holding_home("carried", now_ms() + LEASE_TTL_MS);
+        let mut boot = boot_at(sys, "gianni").unwrap();
+        let gone = ServeClaim {
+            node: node.clone(),
+            share: "ws-gone".into(),
+            lease_expiry_ms: now_ms() - 1,
+            epoch: 1,
+        };
+        boot.registry.append(Record::Serve(gone), &node).unwrap();
+        boot.store.save(&boot.registry.snapshot()).unwrap();
+        let server = Server::open(fresh("carried-store")).unwrap();
+        let (lines, report) = kept();
+        let adopted = server.adopt_boot_tuned(boot, by_hand(2), report);
+        adopted.await.unwrap();
+        let shared = server.shared.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let session = shared.next.fetch_add(1, Ordering::SeqCst);
+        shared.out.lock().await.insert(session, tx);
+        {
+            let mut router = shared.router.lock().await;
+            router.subscribe(session, HOME, G_CLAIMS, &[]);
+            router.subscribe(session, HOME, G_CHECKPOINTS, &[]);
+        }
+        renew_leases(&shared).await;
+        renew_leases(&shared).await;
+        let mut landed = Vec::new();
+        while let Ok(bytes) = rx.try_recv() {
+            let Ok(Frame::Ops(ops)) = Frame::from_bytes(&bytes) else {
+                panic!("expected the tick's ops");
+            };
+            for op in ops.ops {
+                let share = match op.glade_id == G_CLAIMS {
+                    true => envelope::record(&op, ServeClaim::from_cbor).unwrap().share,
+                    false => String::new(),
+                };
+                landed.push((op.glade_id, op.seq, share));
+            }
+        }
+        let at = |stream: &str, seq: i64, share: &str| (stream.to_string(), seq, share.to_string());
+        let (renewed, carried) = (at(G_CLAIMS, 3, HOME), at(G_CLAIMS, 4, "ws-gone"));
+        let (again, folded) = (at(G_CLAIMS, 5, HOME), at(G_CHECKPOINTS, 0, ""));
+        assert_eq!(landed, [renewed, carried, again, folded]);
+        let dropped = "3 superseded claim(s) dropped, 1 carried";
+        let line = format!("checkpoint: dir.claims folded at seq 3, {dropped}");
+        assert_eq!(*lines.lock().unwrap(), [line]);
+    }
+
     /// F1 live, two booted nodes over real iroh: B starts serving a workspace
     /// AFTER the link is up — the minted WorkspaceEntry + ServeClaim reach A's
     /// replica by PUSH (not connect-time anti-entropy), A's local fold routes
@@ -903,7 +1086,13 @@ mod tests {
         let id_b = boot_b.identity().unwrap();
         a.adopt_boot(boot_a).await.unwrap();
         // B renews fast so the test OBSERVES renewal (lease 1.5s, renew 300ms).
-        b.adopt_boot_tuned(boot_b, 1_500, 300).await.unwrap();
+        let leases = Leases {
+            lease_ms: 1_500,
+            renew_ms: 300,
+            ..Leases::default()
+        };
+        let adopted = b.adopt_boot_tuned(boot_b, leases, |_: &str| {});
+        adopted.await.unwrap();
 
         meshed(&a, id_a).await;
         let at_b = meshed(&b, id_b).await;

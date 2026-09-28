@@ -305,11 +305,11 @@ impl Storage {
         if let Some(boot) = instance.take() {
             // Adoption renews the `home` claim, which the line then reads, at
             // the point the hand-written root prints it. The leases are the
-            // settings' (F1).
-            let leases = start.settings.leases;
-            server
-                .adopt_boot_tuned(boot, leases.lease_ms, leases.renew_ms)
-                .await?;
+            // settings' (F1), and each checkpoint's line goes to the console
+            // (plan Step 4.5c).
+            let (leases, console) = (start.settings.leases, start.console.clone());
+            let report = move |line: &str| console.out(line);
+            server.adopt_boot_tuned(boot, leases, report).await?;
             let serves_home = server.serves(HOME).await.is_some();
             start
                 .console

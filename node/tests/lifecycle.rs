@@ -357,6 +357,7 @@ async fn the_assembled_root_leases_and_renews_as_its_settings_say() {
     start.settings.leases = Leases {
         lease_ms: LEASE,
         renew_ms: RENEW,
+        ..Leases::default()
     };
     let text = "glade-app v1\napp x\n\
                 binding x.one value share commons latest\n\

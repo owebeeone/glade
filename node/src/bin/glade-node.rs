@@ -205,7 +205,8 @@ fn program_path() -> Option<PathBuf> {
 /// Run the recovery command, or start the node from the composition root the
 /// environment chooses. The process's arguments are read here, once, and
 /// handed to whichever runs, with the node's leases (F1): the defaults, a
-/// five-minute lease renewed every 100 s, which no flag changes.
+/// five-minute lease renewed every 100 s and a checkpoint once 1,000 claims
+/// are superseded (plan Step 4.5c), which no flag changes.
 async fn start() -> std::io::Result<ExitCode> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().is_some_and(|arg| arg == "recovery") {
@@ -374,8 +375,8 @@ async fn run(args: Vec<String>, program: Option<PathBuf>, leases: Leases) -> std
     // and renew while serving (audit F1).
     if let Some((node, workspaces, network)) = booted {
         let (identity, key) = (node.identity()?, node.endpoint_key());
-        let (lease_ms, renew_ms) = (leases.lease_ms, leases.renew_ms);
-        server.adopt_boot_tuned(node, lease_ms, renew_ms).await?;
+        // Each checkpoint's line goes to stdout (plan Step 4.5c).
+        server.adopt_boot_tuned(node, leases, noted).await?;
         let serves_home = server.serves(HOME).await.is_some();
         println!("registry ready (home served: {serves_home})");
         let configured = network.peers.iter().map(|entry| entry.key);

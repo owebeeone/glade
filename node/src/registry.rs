@@ -637,6 +637,13 @@ impl Registry {
         v
     }
 
+    /// The ops `origin`'s chain on `glade_id` holds, in seq order: from its
+    /// floor, once a checkpoint gave it one (plan Step 4.5c).
+    pub(crate) fn chain(&self, glade_id: &str, origin: &str) -> Vec<&Op> {
+        let ops = self.fold_iter(glade_id).into_iter();
+        ops.filter(|op| op.origin == origin).collect()
+    }
+
     /// Append `rec` under `origin`'s chain and hand back the built op — the
     /// runtime directory-write path (`claims.rs`) seeds/fans/pushes the SAME
     /// bytes it persisted; `RegistryApi::append` delegates here. A sealed

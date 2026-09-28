@@ -649,6 +649,53 @@ at 272, and the desk replay printed `3ee97a4`'s lines.
 | `tests/assembled_path`: `both_roots_fold_a_long_claims_chain_at_adoption_and_say_so` | on each root: an instance whose records.json holds 2,000 renewals, written under its key by a test helper, prints the line before `registry ready`, and records.json then holds a bounded count; a second start prints no such line | no check at adoption's renewal |
 | `peer` (and `iroh_carrier` while the mesh is on `PeerEndpoint`): `a_protocol_3_node_fails_at_connect` | an older node fails at HELLO, and at the ALPN | `PROTOCOL` at 3 |
 
+**Part 3, as built** (2026-09-28, on `78a9ee5`). 210 production `.rs` lines added and 61 removed,
+against 130-200, so 10 over: `checkpoint.rs` +118 −3 (`superseded`, the rule, over a frontier of the
+later claims nothing supersedes; `tick`, the tick's appends to the staged registry, the carried
+claims, the renewals, then the checkpoint; `due`, which decodes a chain only once it holds `after`
+claims; `Folded`, whose `Display` is the line); `claims.rs` +69 −45 (`Leases.checkpoint_after` and
+`CHECKPOINT_AFTER`, 1,000; `adopt_boot_tuned(boot, leases, report)`, the reporter kept in
+`DirState`; `renew_leases` through `checkpoint::tick` in its one acceptance, reporting after
+`publish`; `home_epoch` and `max_claim_epoch` crate-visible for the rule's test); `registry.rs` +7
+(`chain`, one chain's held ops in seq order); `peer.rs` +7 −5 (`PROTOCOL` 4, its comment no longer
+naming the ALPN, which stays `glade/carrier/1` by the owner's ruling); the roots +9 −8 (`noted`,
+stdout, on the hand-written root, the console on the assembled one). Tests: 524 lines added and 20
+removed, the seven above, each first shown red in a copy of `78a9ee5` holding them, the names they
+call answering as today (`tick` appending the renewals alone), but (1) against the latest claim kept
+per share, and (3) and (6) in a copy of part 3 with that one thing switched off: (1)
+`who_serves(home) at 1700, the registry's`, left `None`, right `Some(<node>)`; (2) `tick 3:
+records.json holds 9 of the node's claims`; (3) the checkpoint published first, `[(dir.claims, 3,
+home), (dir.checkpoints, 0), (dir.claims, 4, ws-gone), (dir.claims, 5, home)]`; (4) `records.json
+holds C + 12098 records where at most C + 1,003 were expected`, the node's first two claims beside
+the 12,096 renewals; (5) `tick 3: B's copy holds 9 of A's claims`; (6) each root's lines `instance
+node registry peer listening`, no `checkpoint:`; (7) `a HELLO of protocol 3 taken`. The `peer` test
+replaces 4.5b's `a_hello_of_another_protocol_is_refused_on_a_link`, which presented protocol 4, so
+444 tests run on each path (438 + 7 − 1).
+
+As built, and where it differs: the trigger counts the superseded claims the chain holds before the
+tick, and the carry counts the tick's renewals too, which bounds a chain at N + S claims once it has
+folded (N + 2S − 1 before its first fold, while its length can be odd); a tick whose append is
+refused now takes nothing, where today's kept the renewals before the refused one, since no
+checkpoint may land without the renewals its carry counted; the claims tests and the mesh test tick
+by hand, the loop an hour off, not on short leases; the simulated week calls `tick` on the boot's
+registry directly, not through `accept` and an in-memory engine, whose snapshot per tick would
+dominate it, and also asserts that no checkpoint covered more than 1,002 claims, since its end state
+(12 checkpoints; C = 3, then 74 claims) depends on where the week stops, and its boot checked 78
+records in 4.7 ms; the order test reads a subscribed local session, and the push sends the same ops
+in one frame. At the desk's first restart the line reads `1 carried`, not section 10's `0 carried`:
+adoption's renewal renews `home` alone, so `ws-razel`'s last claim of the run before is superseded
+by nothing yet; the serve after it mints a higher epoch, and the next fold drops it. The gate passed
+9/9, 444 tests on each path, rustfmt at 270 (its baseline of 272 can be lowered), clippy at 11 and
+7, process-globals with nothing new, the contracts' 94 tests unchanged. The desk replay, laid out as
+grazel lays it out under a scratch `GLADE_HOME`: (1) today's binary's first boot, 27 records in
+8,041 bytes, `listening` after 1.03 s; (2) a week of renewals written by the test helper, 12,123
+records in 3,636,296 bytes; (3) today's binary, 2.10 s, 12,125 records; (4) part 3's binary,
+`checkpoint: dir.claims folded at seq 12100, 12100 superseded claim(s) dropped, 1 carried` before
+`registry ready`, 2.90 s, 28 records in 8,526 bytes and the served store's journal 7,353 bytes; (5)
+again, no line, 0.06 s, 30 records; (6) today's binary, exit 1, 4.1b's message naming
+`dir.checkpoints of node <id> at seq 0`, records.json untouched; (7) part 3's binary, as at (5),
+0.05 s, 32 records. Every other line was as today's.
+
 **What they do not prove:** Windows and Linux, which the lane owner runs on dabeest and the Pi; a
 year, only extrapolated from the week; a crash inside the journal's rewrite, only its two end
 states; a clock step on a live node, only in the pure rule; an older peer beyond the protocol's

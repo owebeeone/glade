@@ -30,8 +30,10 @@ mod node;
 #[path = "../journeys/restart.rs"]
 mod restart;
 
-// This binary's engine, the adapter tests on it, and the port's suite.
+// This binary's engine, the adapter tests on it, the port's suite, and plan
+// Step 4.5c's simulated week.
 mod adapter;
+mod checkpoints;
 mod disk;
 mod snapshots;
 
