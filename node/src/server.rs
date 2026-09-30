@@ -1,10 +1,11 @@
 //! The glade node server (P1) — ties the store, router, and echo provider over
 //! the websocket carrier. One connection per session; frames dispatched:
-//! `Subscribe` registers interest and ships the resume gap, `Ops` appends +
-//! fans out (minus origin) and answers each op with its status (refusing a
-//! client's op on `home`, and a `stream` op, which has no op path), and the directed
-//! exchange/channel frames hit the echo provider. The resume/convergence and
-//! verification logic all live in the carrier-free modules; this is the glue.
+//! `Subscribe` registers interest and ships the resume gap, `Ops` goes to the
+//! acceptance path (`accept.rs`), which appends + fans out (minus origin) and
+//! answers each op with its status (refusing a client's op on `home`, and a
+//! `stream` op, which has no op path), and the directed exchange/channel
+//! frames hit the echo provider. The resume/convergence and verification
+//! logic all live in the carrier-free modules; this is the glue.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -14,10 +15,11 @@ use std::sync::{Arc, OnceLock};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
 
-use glade_wire::generated::{ErrorCode, Op, Ops, Shape, Welcome};
+use glade_wire::generated::{ErrorCode, Ops, Welcome};
 
 use glade_grant_api::{GrantPort, Holder};
 
+use crate::accept::{accept_ops, SessionHeads};
 use crate::echo::Echo;
 use crate::envelope;
 use crate::exchange::Pending;
@@ -26,7 +28,7 @@ use crate::grants::{names_a_node, no_principal, refusal, Policy, PolicyView, REA
 use crate::mesh::Mesh;
 use crate::registry::HOME;
 use crate::router::{Router, SessionId, Zone};
-use crate::session::{ack, error_frame, missing_for, op_status, refusal_frame, refused_subscribe};
+use crate::session::{ack, missing_for, refusal_frame, refused_subscribe};
 use crate::store::{Append, Store, StoreError};
 use crate::sysdata::SystemSnapshot;
 use crate::tasks::{Owners, Site, Tasks};
@@ -257,23 +259,6 @@ async fn client_check(shared: &Arc<Shared>, sid: SessionId, share: &str) -> Resu
     checked.map_err(|denial| refusal(&holder, READ_SUBSCRIBE, share, denial))
 }
 
-/// The answer to a client's op on the home share (ruling H-R3, plan Step 4.3):
-/// the node's answer to any refused op, the op's status (R1), here under the
-/// wire's `Unauthorized` code.
-fn home_refused(op: &Op) -> Frame {
-    let message = format!("refused: only the node writes the {HOME} share (H-R3)");
-    op_status(op, ErrorCode::Unauthorized, message)
-}
-
-/// The answer to a client's `stream` op (F3, question 13; the owner's ruling
-/// of 2026-09-27): its status (R1), under the wire's `Protocol` code. A
-/// stream is a live channel, never stored, so it has no op path
-/// (`GladeShapeDispatch.md`), and neither client sends or folds one.
-fn stream_refused(op: &Op) -> Frame {
-    let message = "refused: stream has no op path; a stream is a live channel, never stored";
-    op_status(op, ErrorCode::Protocol, message.into())
-}
-
 async fn handle(shared: Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
     let (mut reader, writer) = ws::accept(stream).await?;
     let sid = shared.next.fetch_add(1, Ordering::SeqCst);
@@ -292,7 +277,7 @@ async fn handle(shared: Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
     let mut echo = Echo::new();
     // resume vectors the client has announced, or sent and the node holds
     // (R3), per zone-surface (share, glade_id, key) -> origin -> seq.
-    let mut client_heads: BTreeMap<(String, String, Vec<u8>), BTreeMap<String, i64>> = BTreeMap::new();
+    let mut client_heads = SessionHeads::new();
 
     loop {
         let bytes = match reader.read().await {
@@ -427,69 +412,9 @@ async fn handle(shared: Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
                 }
             }
             Frame::Ops(ops) => {
-                // Each op gets one status, in order (R1): `Ok` once the node
-                // holds it, and for an appended op only once its fan-out is
-                // queued (R2); otherwise the refusal. Only an op the node
-                // holds joins the session's heads (R3). Client-writes plan
-                // Step 2.1; GladeSubstrateV1 §6, "Session answers".
-                for op in ops.ops {
-                    // H-R3: a client submits intent, and appends no record with
-                    // a privileged effect. Every home record kind has one, and
-                    // the node writes its own (`claims::publish`), so a
-                    // client's op on home is refused before any of it is kept
-                    // (plan Step 4.3, part 1). The frame's other ops go on.
-                    if op.share == HOME {
-                        send(&shared, sid, &home_refused(&op)).await;
-                        continue;
-                    }
-                    // F3 (question 13): a `stream` op has no op path, so a
-                    // client's is refused before any of it is kept, whatever
-                    // the store holds. The frame's other ops go on.
-                    if op.shape == Shape::Stream {
-                        send(&shared, sid, &stream_refused(&op)).await;
-                        continue;
-                    }
-                    // R4: the cut is held from the append until the fan-out
-                    // is queued (plan Step 2.2).
-                    let cut = shared.cut.lock().await;
-                    let res = shared.store.lock().await.append(op.clone());
-                    let status = match res {
-                        Ok(Append::Appended) => {
-                            hold(&mut client_heads, &op);
-                            let status = op_status(&op, ErrorCode::Ok, "appended".into());
-                            let targets = shared.router.lock().await.route(
-                                sid,
-                                &op.share,
-                                &op.glade_id,
-                                &op.key,
-                            );
-                            let frame = Frame::Ops(Ops {
-                                ops: vec![op],
-                                pri: None,
-                            });
-                            for t in targets {
-                                send(&shared, t, &frame).await;
-                            }
-                            status
-                        }
-                        Ok(Append::Duplicate) => {
-                            hold(&mut client_heads, &op);
-                            op_status(&op, ErrorCode::Ok, "already held".into())
-                        }
-                        // Taken as seen, not held (R2): the session's heads
-                        // stay, and every op of its chain is above it.
-                        Ok(Append::BelowRetained) => {
-                            let message = format!(
-                                "({},{}) is below the first seq its chain holds",
-                                op.origin, op.seq
-                            );
-                            op_status(&op, ErrorCode::Retention, message)
-                        }
-                        Err(e) => error_frame(&e, &op),
-                    };
-                    drop(cut);
-                    send(&shared, sid, &status).await;
-                }
+                // One status per op, in order, on this session (R1-R3), from
+                // the one acceptance path (cross-node writes plan X2.1).
+                accept_ops(&shared, sid, &mut client_heads, ops.ops).await;
             }
             _ => {}
         }
@@ -508,16 +433,9 @@ async fn handle(shared: Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
     Ok(())
 }
 
-/// R3: the session's heads take the seq of an op the node holds, and never
-/// fall, so a repeat of a lower seq leaves them where they are.
-fn hold(heads: &mut BTreeMap<(String, String, Vec<u8>), BTreeMap<String, i64>>, op: &Op) {
-    let zone = (op.share.clone(), op.glade_id.clone(), op.key.clone());
-    raise(heads.entry(zone).or_default(), &op.origin, op.seq);
-}
-
 /// A session's head for `origin` in one zone rises to `seq` and never falls,
-/// whether a held op (R3) or a `Hello` (R4) names it.
-fn raise(heads: &mut BTreeMap<String, i64>, origin: &str, seq: i64) {
+/// whether a held op (R3, `accept.rs`) or a `Hello` (R4) names it.
+pub(crate) fn raise(heads: &mut BTreeMap<String, i64>, origin: &str, seq: i64) {
     let head = heads.entry(origin.into()).or_insert(seq);
     *head = (*head).max(seq);
 }
