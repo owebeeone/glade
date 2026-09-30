@@ -18,16 +18,19 @@
 //!      refusal stopped subscribes its surface again by itself (F7).
 //!   7. a zone refused after its ack is reported, and no longer live (F13):
 //!      two linked nodes, the claim holder refusing a forwarded read (F5).
+//!   8. the route probe (plan Step 4.6 part 4), `examples/route_probe.rs`,
+//!      driven a line at a time against a node that enforces client grants.
 //!
-//! Requires the node binary; the harness builds it once if absent.
+//! Requires the node binary; the harness builds it once if absent. The route
+//! probe is built into this suite's own target each time it runs.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::{Child, Command};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 use glade_client::hash::op_hash;
 use glade_client::supplier::{Supplier, SupplierConfig, SupplierSurface};
@@ -698,4 +701,140 @@ async fn a_zone_refused_after_its_ack_is_reported_and_no_longer_live() {
     client.close().await;
     a.kill().await.ok();
     b.kill().await.ok();
+}
+
+// ---- 8. the route probe (plan Step 4.6 part 4) ------------------------------
+
+/// The route probe, `examples/route_probe.rs`, built into this suite's own
+/// target: a run of this suite alone builds no example, and a fresh one is
+/// not built again.
+fn probe_built() -> PathBuf {
+    let target = Path::new(env!("CARGO_TARGET_TMPDIR")).parent().unwrap();
+    let built = std::process::Command::new(env!("CARGO"))
+        .args(["build", "--offline", "--example", "route_probe"])
+        .arg("--manifest-path")
+        .arg(manifest().join("Cargo.toml"))
+        .arg("--target-dir")
+        .arg(target)
+        .output()
+        .expect("run cargo build");
+    let stderr = String::from_utf8_lossy(&built.stderr);
+    assert!(built.status.success(), "the probe's build: {stderr}");
+    target.join("debug/examples/route_probe")
+}
+
+/// A route probe's process: its commands in, its lines out, and the events it
+/// printed before each answer.
+struct Probe {
+    child: Child,
+    stdin: ChildStdin,
+    lines: Lines<BufReader<ChildStdout>>,
+    events: Vec<String>,
+}
+
+impl Probe {
+    /// `principal`'s probe on the node at `port`, once it prints its welcome.
+    async fn start(bin: &Path, port: u16, principal: &str) -> Probe {
+        let mut child = Command::new(bin)
+            .arg(format!("ws://127.0.0.1:{port}"))
+            .arg(principal)
+            .env_clear()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn the route probe");
+        let stdin = child.stdin.take().unwrap();
+        let lines = BufReader::new(child.stdout.take().unwrap()).lines();
+        let mut probe = Probe {
+            child,
+            stdin,
+            lines,
+            events: vec![],
+        };
+        assert_eq!(probe.line().await, format!("welcome {principal}"));
+        probe
+    }
+
+    /// The next line it prints, within 5 s.
+    async fn line(&mut self) -> String {
+        let line = within(self.lines.next_line()).await.unwrap();
+        line.expect("the probe printed no more")
+    }
+
+    /// Send `command`, and return its answer; the events printed first are kept.
+    async fn ask(&mut self, command: &str) -> String {
+        let command = format!("{command}\n");
+        self.stdin.write_all(command.as_bytes()).await.unwrap();
+        loop {
+            let line = self.line().await;
+            let event = line.starts_with("op ") || line.starts_with("zone-refused ");
+            if !event && line != "dropped" {
+                return line;
+            }
+            self.events.push(line);
+        }
+    }
+}
+
+/// The route probe (plan Step 4.6 part 4), driven a line at a time as the route
+/// journey drives it, against a node that enforces client grants and whose app
+/// file seeds one: `alice` may read ws-route. The writer's appends and its
+/// `resend-last` are `ok`; alice's subscribe is acked at the writer's head, its
+/// replay arrives as events, each once, and her `log` holds it in order. Her
+/// subscribe to a share she holds no grant on is refused, as is `mallory`'s,
+/// who holds none, and no op reaches him. A command that cannot run is `error`,
+/// and `quit` is `bye`, after which each probe exits 0.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_route_probe_answers_each_command_on_a_line() {
+    let bin = probe_built();
+    let tmp = Tmp::new("route-probe");
+    let app = tmp.path().join("route.glade");
+    let text = "glade-app v1\napp route\nbinding route.notes log share commons from-cursor\n\
+                seed alice ws-route read.subscribe\nworkspace ws-route notes\n";
+    std::fs::write(&app, text).unwrap();
+    let args = ["--app", app.to_str().unwrap(), "--enforce-client-grants"];
+    let (mut node, _, port) = boot_as(&tmp, "route", &args).await;
+
+    let mut writer = Probe::start(&bin, port, "writer").await;
+    let e1 = writer.ask("append ws-route/route.notes log e1").await;
+    assert_eq!(e1, "ok ws-route/route.notes writer:0 e1");
+    let e2 = writer.ask("append ws-route/route.notes log e2").await;
+    assert_eq!(e2, "ok ws-route/route.notes writer:1 e2");
+    assert_eq!(writer.ask("resend-last").await, e2, "held byte for byte");
+
+    let mut alice = Probe::start(&bin, port, "alice").await;
+    let acked = alice.ask("subscribe ws-route/route.notes").await;
+    assert_eq!(acked, "acked ws-route/route.notes [writer:1]");
+    let log = alice.ask("log ws-route/route.notes").await;
+    assert_eq!(log, "log ws-route/route.notes [e1 e2]");
+    let arrived = [
+        "op ws-route/route.notes writer:0 e1",
+        "op ws-route/route.notes writer:1 e2",
+    ];
+    assert_eq!(alice.events, arrived, "each op of the replay, once");
+
+    let refused = |who: &str, share: &str| {
+        format!(
+            "refused {share}/route.notes Unauthorized: unauthorized: \
+             principal {who} holds no grant of read.subscribe on {share}"
+        )
+    };
+    let other = alice.ask("subscribe ws-other/route.notes").await;
+    assert_eq!(other, refused("alice", "ws-other"));
+    let mut mallory = Probe::start(&bin, port, "mallory").await;
+    let theirs = mallory.ask("subscribe ws-route/route.notes").await;
+    assert_eq!(theirs, refused("mallory", "ws-route"));
+    let none = mallory.ask("log ws-route/route.notes").await;
+    assert_eq!(none, "log ws-route/route.notes []");
+    assert!(mallory.events.is_empty(), "{:?}", mallory.events);
+    let bad = mallory.ask("subscribe ws-route").await;
+    assert_eq!(bad, "error subscribe: a zone is <share>/<glade_id>");
+
+    for mut probe in [writer, alice, mallory] {
+        assert_eq!(probe.ask("quit").await, "bye");
+        let status = within(probe.child.wait()).await.unwrap();
+        assert!(status.success(), "{status}");
+    }
+    node.kill().await.ok();
 }
