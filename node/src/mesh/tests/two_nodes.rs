@@ -2,6 +2,7 @@ use super::support::{fresh, wait_store};
 use crate::frame::Frame;
 use crate::mesh::hex_id;
 use crate::mesh::testing::{endpoint_key, on_carrier};
+use crate::netconf::PeerEntry;
 use crate::registry::{Record, RegistryApi};
 use crate::server::{Server, Shared};
 use crate::store::Store;
@@ -56,6 +57,8 @@ pub(super) struct TwoNodes {
     pub(super) a_id: String,
     pub(super) b_id: String,
     pub(super) port_a: u16,
+    /// B's address on the peer carrier, which A dialed.
+    pub(super) at_b: PeerEntry,
     /// B's provider session, which writes the workspace content, and the
     /// two ops it wrote.
     pub(super) provider: (crate::ws::WsReader, crate::ws::WsWriter),
@@ -113,7 +116,7 @@ pub(super) async fn two_nodes_limited(name: &str, grant: Option<&[&str]>, max: u
 
     on_carrier(&a, id_a, endpoint_key(), None, max).await;
     let at_b = on_carrier(&b, id_b, endpoint_key(), None, max).await;
-    a.connect_peer(at_b).await.unwrap();
+    a.connect_peer(at_b.clone()).await.unwrap();
 
     let (a_shared, b_shared) = (a.shared.clone(), b.shared.clone());
     let lis_a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -136,6 +139,7 @@ pub(super) async fn two_nodes_limited(name: &str, grant: Option<&[&str]>, max: u
         a_id,
         b_id,
         port_a,
+        at_b,
         provider,
         tree: [o0, o1],
     }
@@ -206,6 +210,24 @@ pub(super) async fn forward_lapses(a: &Arc<Shared>) {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("A's forward of the tree zone did not lapse");
+}
+
+/// Wait, bounded, until no session of the node holds the tree zone.
+pub(super) async fn tree_unrouted(shared: &Arc<Shared>) {
+    for _ in 0..500 {
+        if !tree_routed(shared).await {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("a session still holds the tree zone");
+}
+
+/// A dials B again, as a dialer does when it restarts, and holds the link.
+pub(super) async fn relinked(t: &TwoNodes) {
+    let shared = t.a.clone();
+    let a = Server { shared };
+    assert_eq!(a.connect_peer(t.at_b.clone()).await.unwrap(), t.b_id);
 }
 
 /// Subscribe the tree zone on a fresh conversation of A's link to B, as

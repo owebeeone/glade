@@ -2,7 +2,7 @@ use std::io;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use glade_wire::generated::{Error, Head, Subscribe};
+use glade_wire::generated::{Error, ErrorCode, Head, Subscribe};
 
 use crate::conversation::Linked;
 use crate::envelope;
@@ -65,8 +65,8 @@ pub(crate) async fn route_subscribe(shared: &Arc<Shared>, share: &str) -> Route 
 /// subscribers are then fed by the ordinary fan-out (replica serves reads,
 /// trace C5→C6). Deduped per zone: one conversation carries any number of
 /// local subscribers. The forward lapses with the conversation; a later
-/// subscribe retries. A refusal the claim holder sends on it reaches the
-/// local subscribers ([`lapse`]).
+/// subscribe retries. Its end, and a refusal the claim holder sends on it,
+/// reach the local subscribers ([`lapse`]).
 pub(crate) async fn forward_interest(shared: &Arc<Shared>, peer: String, share: String, glade_id: String, key: Vec<u8>) {
     let Some(mesh) = shared.mesh.get().cloned() else { return };
     let zone = (share.clone(), glade_id.clone(), key.clone());
@@ -84,27 +84,36 @@ pub(crate) async fn forward_interest(shared: &Arc<Shared>, peer: String, share: 
     });
 }
 
-/// A forward's end (F5, question 25; the owner's ruling of 2026-09-27). The
-/// zone leaves the forwarded set under the cut, so a subscribe registered
-/// after this forwards again, and one registered before is among those told.
-/// When the claim holder `peer` refused the read, at the subscribe (its ack
-/// named no zone) or later (its re-check pass), each local subscriber of the
-/// zone is told with a lone `Error`, the claim holder's code and its reason
-/// prefixed with who refused, and leaves the zone
-/// ([`crate::server::refuse_subscription`]). Nothing re-checks the refusal
-/// here: a subscribe made later forwards the interest again.
+/// A forward's end (F5, question 25; the owner's ruling of 2026-09-27; plan
+/// Step 4.6, part 3, ruled 2026-09-30). The zone leaves the forwarded set
+/// under the cut, so a subscribe registered after this forwards again, and
+/// one registered before is among those told. Each local subscriber of the
+/// zone is told with a lone `Error` and leaves the zone
+/// ([`crate::server::refuse_subscription`]). When the claim holder `peer`
+/// refused the read, at the subscribe (its ack named no zone) or later (its
+/// re-check pass), the `Error` holds its code and its reason prefixed with
+/// who refused; when the forward ended with no refusal (the claim holder
+/// ended it, or the link closed), `UnknownShare`, an absent route's code,
+/// and that the forward from `peer` ended. Nothing re-checks here: a
+/// subscribe made later routes afresh.
 async fn lapse(shared: &Arc<Shared>, mesh: &Mesh, peer: &str, zone: Zone, refused: Option<Error>) {
     let _cut = shared.cut.lock().await;
     mesh.forwarded.lock().await.remove(&zone);
-    let Some(refused) = refused else {
-        return;
+    let (code, why) = match refused {
+        Some(refused) => {
+            let (share, reason) = (&zone.0, &refused.message);
+            let why = format!("refused by node {peer}, which serves {share}: {reason}");
+            (refused.code, why)
+        }
+        None => {
+            let why = format!("forward from node {peer} ended");
+            (ErrorCode::UnknownShare, why)
+        }
     };
     let entries = shared.router.lock().await.entries();
     let subscribers = entries.into_iter().filter(|(_, at)| *at == zone);
-    let (share, reason) = (&zone.0, &refused.message);
-    let why = format!("refused by node {peer}, which serves {share}: {reason}");
     for (sid, _) in subscribers {
-        refuse_subscription(shared, sid, &zone, refused.code, why.clone()).await;
+        refuse_subscription(shared, sid, &zone, code, why.clone()).await;
     }
 }
 

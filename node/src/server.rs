@@ -226,7 +226,7 @@ async fn recheck(shared: &Arc<Shared>) {
 /// leaves the admission table and the session table, where its writer then
 /// finishes the stream. The caller holds the cut. The re-check pass refuses
 /// so, and so does a forwarding node relaying its claim holder's refusal
-/// (F5, `mesh.rs`).
+/// (F5) or telling that its forward ended (plan Step 4.6), in `mesh/route.rs`.
 pub(crate) async fn refuse_subscription(
     shared: &Arc<Shared>,
     sid: SessionId,

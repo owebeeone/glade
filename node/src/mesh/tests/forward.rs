@@ -1,12 +1,13 @@
 use super::support::wait_store;
 use super::two_nodes::{
-    a_client, admitted, forward_lapses, next_frame, ops_frame, payloads, refused_on_the_link, sub,
-    tree_len, tree_op, tree_payloads, tree_routed, tree_zone, two_nodes, two_nodes_limited,
+    a_client, admitted, forward_lapses, next_frame, ops_frame, payloads, refused_on_the_link,
+    relinked, sub, tree_len, tree_op, tree_payloads, tree_routed, tree_unrouted, tree_zone,
+    two_nodes, two_nodes_limited,
 };
 use crate::claims::testing;
 use crate::envelope;
 use crate::frame::Frame;
-use crate::mesh::forward_interest;
+use crate::mesh::{forward_interest, release_links};
 use crate::registry::{Record, HOME};
 use crate::sysdata::{CapabilityGrant, CapabilityRevocation};
 use glade_wire::cbor;
@@ -333,4 +334,66 @@ async fn a_forwarded_gap_crosses_in_chunks_under_the_frame_limit() {
     wait_store(&t.a, |st| tree_len(st) == 22, "the whole gap at A").await;
     let sent: Vec<Vec<u8>> = ops().map(|op| op.payload.clone()).collect();
     assert_eq!(tree_payloads(&t.a).await, sent);
+}
+
+// ---- a forward's end, told (plan Step 4.6, part 3) ---------------------
+
+/// Plan Step 4.6, part 3 (question 5, ruled 2026-09-30): B, the claim
+/// holder, releases its links, so A's forward of the zone ends with no
+/// refusal. A's subscriber, which has had the zone's ops, is told once, with
+/// a lone `Error`, `UnknownShare` (an absent route's code), that the forward
+/// from B ended, and leaves A's router for the zone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forwards_end_without_a_refusal_reaches_the_forwarding_nodes_subscribers() {
+    let t = two_nodes("ended", Some(&["read.*"])).await;
+    let (mut rc, wc) = a_client(&t).await;
+    assert_eq!(payloads(&mut rc, 2, "routed tree ops").await.len(), 2);
+
+    assert_eq!(release_links(&t.b).await, 1);
+    let why = format!("forward from node {} ended", t.b_id);
+    assert_eq!(told(&mut rc).await, (ErrorCode::UnknownShare, why));
+    assert!(!tree_routed(&t.a).await, "A routes the zone to no one");
+    let next = bound(&mut rc, &wc).await;
+    assert!(matches!(next, Frame::Heads(_)), "told twice: {next:?}");
+}
+
+/// A forward's end is told to the zone's subscribers at that end alone:
+/// once the last of them has left, B's release ends the forward and no one
+/// is told, nor is a client of A that holds another zone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forwards_end_tells_no_one_once_its_last_subscriber_has_left() {
+    let t = two_nodes("ended-unheard", Some(&["read.*"])).await;
+    let (mut other, other_w) = crate::ws::connect("127.0.0.1", t.port_a).await.unwrap();
+    assert!(matches!(bound(&mut other, &other_w).await, Frame::Heads(_)));
+    let (mut rc, wc) = a_client(&t).await;
+    assert_eq!(payloads(&mut rc, 2, "routed tree ops").await.len(), 2);
+    drop((rc, wc));
+    tree_unrouted(&t.a).await;
+
+    release_links(&t.b).await;
+    forward_lapses(&t.a).await;
+    let next = bound(&mut other, &other_w).await;
+    assert!(matches!(next, Frame::Heads(_)), "told: {next:?}");
+}
+
+/// After the end, A's subscriber subscribes again, once A is linked to B
+/// again, and the subscribe forwards afresh: the zone from A's replica,
+/// then B's next op, which only a new forward carries.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_subscribe_after_a_forwards_end_forwards_again_once_linked() {
+    let t = two_nodes("ended-again", Some(&["read.*"])).await;
+    let (mut rc, wc) = a_client(&t).await;
+    assert_eq!(payloads(&mut rc, 2, "routed tree ops").await.len(), 2);
+    release_links(&t.b).await;
+    forward_lapses(&t.a).await;
+
+    relinked(&t).await;
+    wc.send_binary(&sub("ws-razel", "ws.tree")).await.unwrap();
+    let replica = payloads(&mut rc, 2, "the tree from A's replica").await;
+    assert_eq!(replica, [b"tree-v0".to_vec(), b"tree-v1".to_vec()]);
+    let prev = crate::chain::op_hash(&t.tree[1]).to_vec();
+    let written = ops_frame(vec![tree_op(2, Some(prev), b"tree-v2")]);
+    t.provider.1.send_binary(&written).await.unwrap();
+    let fed = payloads(&mut rc, 1, "v2 through a new forward").await;
+    assert_eq!(fed, [b"tree-v2".to_vec()]);
 }
