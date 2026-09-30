@@ -866,11 +866,11 @@ impl RegistryApi for Registry {
 /// Where a binding-family record stands in the fold's order: the documented
 /// `value` rule, highest `(lamport, origin)` wins (glade-gyld README), made
 /// total by the stream — a retraction outranks a declaration it ties — and
-/// then the chain seq. Within one registry this order is "newest", because
-/// one clock numbers the family there (`next_binding_lamport`). Records from
-/// several nodes carry several clocks, so across them it is an order and not
-/// a newest: which one a store holding several nodes' records should use is
-/// open at plan Step 4.6.
+/// then the chain seq. Within one origin this order is "newest", because one
+/// clock numbers the family on each node (`next_binding_lamport`). Records
+/// from several nodes carry several clocks, so across origins it is an order
+/// and not a newest, and it only chooses between live declarations: a
+/// retraction is scoped to its own origin (STA-P3-1).
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Stamp {
     lamport: i64,
@@ -879,35 +879,39 @@ struct Stamp {
     seq: i64,
 }
 
-/// The newest record for one `(app, glade_id)`: a declaration, with its
-/// record's bytes as stored, or `None` for a retraction.
+/// One origin's newest record for one `(app, glade_id)`: a declaration, with
+/// its record's bytes as stored, or `None` for a retraction.
 #[derive(Clone, Debug)]
 struct Newest {
     stamp: Stamp,
     decl: Option<(BindingDecl, Vec<u8>)>,
 }
 
+/// One `(app, glade_id)`'s newest record from each origin that wrote one.
+type Origins = BTreeMap<String, Newest>;
+
 /// The `dir.bindings` fold (R9(a)), a pure function of an op-set, never of
-/// arrival order. Per `(app, glade_id)` the newest binding-family record
-/// wins, and a retraction that is newest takes that app's declaration down;
-/// per glade id, the newest declaration still live across apps is the
-/// surface. A retraction therefore retracts only its own app's declaration.
-/// The same fold serves the registry, `register`'s diff, and the served
-/// store (`exchange::declared_exchange`), but the rules above hold as stated
-/// within one registry, which holds one node's records only. The served
-/// store also holds peers' records, each numbered on its own node's clock,
-/// and a retraction, keyed `(app, glade_id)` with no origin, takes down every
-/// node's declaration of its surface: open at plan Step 4.6.
+/// arrival order. Per `(app, glade_id, origin)`, the origin being the op's,
+/// which its seal proves, the newest binding-family record wins, and a
+/// retraction that is newest takes down that origin's declaration and no
+/// other (STA-P3-1). Per `(app, glade_id)`, the highest declaration still
+/// live across origins stands; per glade id, the highest standing across
+/// apps is the surface. A retraction therefore retracts only its own app's
+/// declaration, as its own node made it. The same fold serves the registry,
+/// `register`'s diff, and the served store (`exchange::declared_exchange`).
+/// A registry holds one node's records, so each pair there has one origin;
+/// the served store also holds peers' records, each numbered on its own
+/// node's clock, and no node's retraction takes down another's declaration.
 #[derive(Clone, Debug, Default)]
 pub struct BindingFold {
-    newest: BTreeMap<(String, String), Newest>,
+    newest: BTreeMap<(String, String), Origins>,
 }
 
 impl BindingFold {
     /// Fold the binding family out of `ops`; ops on any other stream are
     /// ignored.
     pub fn over<'a>(ops: impl IntoIterator<Item = &'a Op>) -> BindingFold {
-        let mut newest: BTreeMap<(String, String), Newest> = BTreeMap::new();
+        let mut newest: BTreeMap<(String, String), Origins> = BTreeMap::new();
         for op in ops {
             let (app, glade_id, decl) = match op.glade_id.as_str() {
                 G_BINDINGS => {
@@ -928,7 +932,8 @@ impl BindingFold {
             let stamp =
                 Stamp { lamport: op.lamport, origin: op.origin.clone(), retraction: decl.is_none(), seq: op.seq };
             let candidate = Newest { stamp, decl };
-            match newest.entry((app, glade_id)) {
+            let origins = newest.entry((app, glade_id)).or_default();
+            match origins.entry(op.origin.clone()) {
                 Entry::Vacant(slot) => {
                     slot.insert(candidate);
                 }
@@ -942,38 +947,49 @@ impl BindingFold {
         BindingFold { newest }
     }
 
-    /// The live bindings: per glade id, the newest live declaration across
-    /// apps, in glade-id order.
+    /// The live bindings: per glade id, the highest declaration standing
+    /// across apps, in glade-id order.
     pub fn live(&self) -> Vec<BindingDecl> {
         let mut by_id: BTreeMap<&str, (&Stamp, &BindingDecl)> = BTreeMap::new();
-        for ((_, glade_id), newest) in &self.newest {
-            let Some((decl, _)) = &newest.decl else {
+        for ((_, glade_id), origins) in &self.newest {
+            let Some((stamp, (decl, _))) = standing(origins) else {
                 continue;
             };
-            let newer = by_id.get(glade_id.as_str()).map_or(true, |(stamp, _)| newest.stamp > **stamp);
-            if newer {
-                by_id.insert(glade_id.as_str(), (&newest.stamp, decl));
+            let best = by_id.get(glade_id.as_str());
+            if best.is_none_or(|(best, _)| stamp > *best) {
+                by_id.insert(glade_id.as_str(), (stamp, decl));
             }
         }
         by_id.into_values().map(|(_, decl)| decl.clone()).collect()
     }
 
-    /// The declarations live for `app`, by glade id, with the record's bytes
-    /// stored for each: what `register` diffs that app's file against.
+    /// The declarations standing for `app`, by glade id, with the record's
+    /// bytes stored for each: what `register` diffs that app's file against.
     pub fn declared_by(&self, app: &str) -> BTreeMap<String, Vec<u8>> {
         self.newest
             .iter()
             .filter(|((a, _), _)| a == app)
-            .filter_map(|((_, glade_id), newest)| {
-                newest.decl.as_ref().map(|(_, bytes)| (glade_id.clone(), bytes.clone()))
+            .filter_map(|((_, glade_id), origins)| {
+                standing(origins).map(|(_, (_, bytes))| (glade_id.clone(), bytes.clone()))
             })
             .collect()
     }
 
-    /// The `(app, glade_id)` pairs whose newest record is a retraction.
+    /// The `(app, glade_id)` pairs every origin has retracted: each origin's
+    /// newest record for the pair is a retraction.
     pub fn retracted(&self) -> Vec<(String, String)> {
-        self.newest.iter().filter(|(_, newest)| newest.decl.is_none()).map(|(key, _)| key.clone()).collect()
+        let pairs = self.newest.iter();
+        let retracted = pairs.filter(|(_, origins)| standing(origins).is_none());
+        retracted.map(|(key, _)| key.clone()).collect()
     }
+}
+
+/// The declaration standing for one `(app, glade_id)`: the highest of those
+/// its origins' newest records make, or `None` once each has retracted it.
+fn standing(origins: &Origins) -> Option<(&Stamp, &(BindingDecl, Vec<u8>))> {
+    let newest = origins.values();
+    let live = newest.filter_map(|n| Some((&n.stamp, n.decl.as_ref()?)));
+    live.max_by_key(|(stamp, _)| *stamp)
 }
 
 #[cfg(test)]
@@ -1474,15 +1490,23 @@ mod tests {
         live.into_keys().collect()
     }
 
-    /// Today's outcome across two origins (STA-P3-1), pinned, not endorsed.
-    /// Each registry numbers the binding family on its own clock and never
-    /// ingests another node's records. So where two nodes' records are folded
-    /// together, as the served store does, they rank by lamport, not by when
-    /// each was appended; and a retraction, keyed `(app, glade_id)` with no
-    /// origin, takes both nodes' declarations of its surface down. What such
-    /// a store should do is open at plan Step 4.6.
+    /// `app`'s live bindings as rows, in one fold of every record `regs` hold.
+    fn rows_together(regs: &[&Registry], app: &str) -> Vec<(String, String, String)> {
+        let ops: Vec<Op> = regs.iter().copied().flat_map(ops_of).collect();
+        let live = BindingFold::over(&ops).live();
+        let ours = live.into_iter().filter(|b| b.app == app);
+        ours.map(|b| (b.app, b.glade_id, b.shape)).collect()
+    }
+
+    /// STA-P3-1: a retraction is scoped to its op's origin. Each registry
+    /// numbers the binding family on its own clock and never ingests another
+    /// node's records, so where two nodes' records are folded together, as
+    /// the served store does, one node's retraction can outrank the other's
+    /// declaration. It still takes down only its own node's: each origin's
+    /// declaration stands or falls by that origin's records, and across
+    /// origins the stamp only chooses between live declarations.
     #[test]
-    fn across_two_origins_one_nodes_retraction_outranks_the_others_later_declaration() {
+    fn across_two_origins_a_retraction_takes_down_only_its_own_origins_declaration() {
         let (mut a, mut b) = (Registry::new(), Registry::new());
         // A's clock runs ahead of B's: six binding records of another app.
         for i in 0..6 {
@@ -1495,19 +1519,35 @@ mod tests {
         }
         let retraction = a.append_returning(retract("grazel", "g"), "A").unwrap();
         assert_eq!(retraction.lamport, 8);
-        // Folded together, A's retraction takes B's `g` down as well, while
-        // B's own registry has it live.
-        assert_eq!(live_together(&[&a, &b], "grazel"), ["h"]);
-        assert_eq!(live_together(&[&b], "grazel"), ["g", "h"]);
+        // A's retraction takes A's `g` down; folded together, B's stands.
+        assert_eq!(live_together(&[&a], "grazel"), ["h"]);
+        assert_eq!(live_together(&[&a, &b], "grazel"), ["g", "h"]);
         // B changes `g` after A's retraction. On B's clock that declaration
-        // is lamport 2, below the retraction's 8, so it stays down together.
+        // is lamport 2, below the retraction's 8 and A's own `g` at 6, and it
+        // is the live `g` together, as it is in B's registry, the basis of
+        // B's next `register` diff.
         let later = b.append_returning(decl("grazel", "g", "log"), "B").unwrap();
         assert_eq!(later.lamport, 2);
-        assert_eq!(live_together(&[&a, &b], "grazel"), ["h"]);
-        // B's registry, the basis of its next `register` diff, has the
-        // change live, so nothing on B declares `g` again.
         let want = vec![row("grazel", "g", "log"), row("grazel", "h", "value")];
+        assert_eq!(rows_together(&[&a, &b], "grazel"), want);
         assert_eq!(live(&b), want);
+    }
+
+    /// A retraction from an origin that never declared its `(app, glade_id)`
+    /// retracts nothing, however far that origin's clock runs ahead.
+    #[test]
+    fn a_retraction_from_an_origin_that_never_declared_it_retracts_nothing() {
+        let (mut a, mut b) = (Registry::new(), Registry::new());
+        b.append(decl("grazel", "g", "value"), "B").unwrap();
+        a.append(decl("other", "o", "value"), "A").unwrap();
+        let retraction = a.append_returning(retract("grazel", "g"), "A").unwrap();
+        assert_eq!(retraction.lamport, 1, "above B's declaration, at 0");
+        assert_eq!(live_together(&[&a, &b], "grazel"), ["g"]);
+        let want = [row("grazel", "g", "value")];
+        assert_eq!(rows_together(&[&a, &b], "grazel"), want);
+        let ops: Vec<Op> = [&a, &b].into_iter().flat_map(ops_of).collect();
+        let retracted = BindingFold::over(&ops).retracted();
+        assert!(retracted.is_empty(), "nothing is retracted: {retracted:?}");
     }
 
     /// The fold is a pure function of the op-set: any arrival order, and a

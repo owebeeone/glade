@@ -72,6 +72,8 @@ fn timed_out(corr: &str) -> Frame {
 /// declarations in the local replica — base glade reads records, not apps.
 /// `dir.bindings` is read through the binding fold, so only a LIVE
 /// declaration counts: a superseded or retracted one keeps nothing routable.
+/// The replica holds every node's records, and a retraction takes down only
+/// the declaration its own node made (STA-P3-1).
 pub fn declared_exchange(store: &Store, glade_id: &str) -> bool {
     for (origin, _) in store.heads(HOME, G_SERVICES, &[]) {
         for op in store.scan(HOME, G_SERVICES, &[], &origin, i64::MIN) {
@@ -600,16 +602,28 @@ mod tests {
     /// A registry sealed as a test node, and the node's id, its origin, so
     /// the served store takes what it appends (plan Step 4.1b).
     fn sealed() -> (Registry, String) {
-        let identity = crate::peer::NodeIdentity::from_key([41; 32]);
+        sealed_as(41)
+    }
+
+    /// A registry sealed as the test node whose key is `seed` repeated.
+    fn sealed_as(seed: u8) -> (Registry, String) {
+        let identity = crate::peer::NodeIdentity::from_key([seed; 32]);
         let origin = crate::transport::hex(&identity.node_id);
         (Registry::sealed(identity), origin)
     }
 
     /// The served store holding a registry's records, as `seed_registry` lands them.
     fn store_of(reg: &Registry, name: &str) -> Store {
+        store_of_each(&[reg], name)
+    }
+
+    /// The served store holding several nodes' registries' records.
+    fn store_of_each(regs: &[&Registry], name: &str) -> Store {
         let mut st = Store::open(fresh(name)).unwrap();
-        for bytes in &reg.snapshot().records {
-            st.append(Op::decode(bytes).unwrap()).unwrap();
+        for reg in regs {
+            for bytes in &reg.snapshot().records {
+                st.append(Op::decode(bytes).unwrap()).unwrap();
+            }
         }
         st
     }
@@ -641,6 +655,27 @@ mod tests {
         let retract = BindingRetraction { app: "demo".into(), glade_id: "d.x".into() };
         reg.append(Record::Retract(retract), &n1).unwrap();
         assert!(!declared_exchange(&store_of(&reg, "fold-4"), "d.x"), "a newest retraction takes it down");
+    }
+
+    /// STA-P3-1: the served store holds several nodes' records, and a
+    /// retraction takes down only its own node's declaration. B declares
+    /// `d.x` an exchange, through `Registry` since no v1 file can write one;
+    /// A declared it too, then retracted it, above B's declaration.
+    #[test]
+    fn a_retraction_leaves_another_nodes_exchange_declaration_routable() {
+        let ((mut a, na), (mut b, nb)) = (sealed_as(41), sealed_as(42));
+        b.append(binding("demo", "d.x", "exchange"), &nb).unwrap();
+        a.append(binding("demo", "d.x", "exchange"), &na).unwrap();
+        let retract = BindingRetraction {
+            app: "demo".into(),
+            glade_id: "d.x".into(),
+        };
+        let retraction = a.append_returning(Record::Retract(retract), &na).unwrap();
+        assert_eq!(retraction.lamport, 1, "above B's declaration, at 0");
+        let alone = store_of(&a, "origins-a");
+        assert!(!declared_exchange(&alone, "d.x"), "A's own is down");
+        let both = store_of_each(&[&a, &b], "origins-ab");
+        assert!(declared_exchange(&both, "d.x"), "B's stands");
     }
 
     fn tree_op(seq: i64, prev: Option<Vec<u8>>, payload: &[u8]) -> Op {
