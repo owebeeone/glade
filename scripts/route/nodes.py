@@ -175,9 +175,19 @@ class Host:
         return path
 
     def command_line(self, pid: int) -> str:
-        """The command line of `pid` there, read afresh; '' if there is no such process."""
+        """The command line of `pid` there, read afresh; '' if there is no such process. On msys
+        a native program's reads as Windows holds it, its paths spelled as `spellings` gives."""
         ps = f'tr "\\0" " " < /proc/{pid}/cmdline' if self.msys else f'ps -ww -o command= -p {pid}'
         return self.run(ps, check=False).strip()
+
+    def spellings(self, path: str) -> list[str]:
+        """`path` as a command line there may spell it: as given, and on msys as MSYS hands it
+        to a native program, the program in Windows form (`cygpath -w`), an argument in mixed
+        form (`cygpath -m`)."""
+        if not self.msys:
+            return [path]
+        q = shlex.quote(path)
+        return [path, *filter(None, self.run(f'cygpath -w {q} && cygpath -m {q}', check=False).splitlines())]
 
 
 @dataclass(frozen=True)
@@ -357,11 +367,13 @@ class Nodes:
 
     def signal(self, proc: Proc, sig: signals.Signals) -> None:
         """Send `sig`, SIGTERM or SIGKILL, to a process the harness started, once its command
-        line names the binary it started; on Windows either is a forced end (named gap 12)."""
+        line names the binary it started, as the host spells it; on Windows either is a forced
+        end (named gap 12)."""
         host, pid = proc.host, proc.pid
         ended = not host.ssh and proc.popen.returncode is not None  # reaped: the PID is free
         command = '' if ended else host.command_line(pid)
-        if not may_signal((host.ssh, pid), self.started, command, proc.binary):
+        if not any(may_signal((host.ssh, pid), self.started, command, binary)
+                   for binary in host.spellings(proc.binary)):
             self.log.line(proc.name, f'not signalled: pid {pid} is not {proc.binary}, started here')
             raise Refused(f'{proc.name}: pid {pid} is not a process the harness started on {proc.binary}')
         self.log.line(proc.name, f'{sig.name} to pid {pid}')

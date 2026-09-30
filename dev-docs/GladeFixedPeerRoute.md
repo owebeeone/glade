@@ -320,6 +320,193 @@ Parts 2 and 3 turn those green, and after part 6 the local run exits 0.
 - **Part 7, the runs.** The local placement on the Mac, then the crossing, each log kept, recorded here as
   4.5's crossings were recorded ("The route, <date>").
 
+### The route, 2026-09-30
+
+Run by an agent for the lane owner, on glade `ad0855c` (parts 1-6), as section 1 and "Part 7, the runs" lay out:
+the local placement on the Mac, then the crossing, A and C on the Pi and B on dabeest with `relay n0`. Times are
+the script's stamps, seconds since the run began, on the Mac's clock. `<A>` and `<B>` stand for A's and B's node
+ids, and `<C's tag>` for C's endpoint tag, which the logs carry in full. The logs stay in the Mac's scratchpad:
+`route-local.log`, `route-crossing.log` and `route-local-changed.log`, with the build logs `build-local.log`,
+`build-crossing.log`, `build-local-changed.log`, `build-pi.log` and `build-dabeest.log`.
+
+**The machines**
+
+| | the Mac | the Pi | dabeest |
+| --- | --- | --- | --- |
+| system | macOS (Darwin 25.6), Rust 1.96.0 | Raspberry Pi 5, Debian 13 aarch64, 4 cores, Rust 1.96.0 | Windows 11, MSYS bash (runtime 3.6.9), 24 cores, Rust 1.98.1 (MSVC) |
+| glade | `ad0855c`: clean for the local run; for the crossing and the local re-run, with the harness change below (4 paths) | `8bed929` to `ad0855c` by `pull --ff-only`; clean | `8bed929` to `ad0855c` by `pull --ff-only`; clean |
+| runs | local: A, B and C, the script, its clients and 3.4's suite; crossing: the script, its clients and the suite, no node | the crossing's A and C | the crossing's B |
+| build, empty target | `glade-node` 33 s, then the probe 4 s, into one target; for the crossing, the probe alone, 6 s; for the re-run, both, 38 s | `--offline --locked`: 191.3 s | `--offline --locked`: 56.7 s |
+| before | the desk running, untouched; 3.8 GiB free | load 0.00 before the build, 0.04 before the run; no `glade-node`; UDP 4545 and 4546 free; `wlan0` read; 4.5 GB free before the build | 7% CPU, no build or other heavy job (the idle ollama service aside); no `glade-node.exe`; UDP 4545 and 4546 free; Wi-Fi read by `ipconfig` |
+
+- **Binaries,** SHA-256 to 12 digits: the local run's `glade-node` `55d28448a167` and probe `4c8aa471bd94`; the
+  crossing's probe `edf1c96a6350`, the Pi's `glade-node` `d97010676976` and dabeest's `13b4ef13ef6e`.
+- **Builds.** Each went to a scratch target outside the checkout, the Pi's outside `~/git`, with the temporary
+  directory inside that scratch. The Pi's and dabeest's targets (2.1 and 2.6 GB) were deleted once the binary was
+  copied out, and the copies after the run. The Mac's targets also took the fast loop's build, and each was
+  deleted with its copies in the command that ran its placement (2.1 GB locally, 1.8 GB for the crossing). The
+  Pi's non-interactive shell has no `cargo` on its `PATH` (4.5's adaptation 1): the first attempt stopped at
+  `cargo: command not found`, and the build ran with `PATH=$HOME/.cargo/bin:$PATH`. `--offline --locked` held on
+  both hosts.
+- **ssh to dabeest.** The owner's configuration gives dabeest, by name and by address, LocalForwards on 11434 and
+  1919, which another session holds, and `ClearAllForwardings=yes` would also drop the harness's `-L`. The
+  crossing used `ssh -F /dev/null -o BatchMode=yes -o LogLevel=ERROR -o ConnectTimeout=10` with the user and host
+  that `ssh -G dabeest` resolves. With `-o HostKeyAlias=dabeest` host-key verification failed, since `known_hosts`
+  holds dabeest's keys under its address; without it, a test connection bound its own `-L` port and nothing else,
+  and 11434 and 1919 stayed with the other session. The Pi's was `ssh -o BatchMode=yes -o ConnectTimeout=10`.
+
+**The harness change, for Windows.** Part 5 left three Windows details untested. Before the crossing, a preflight
+on dabeest started a native program the harness's way (`echo pid $$`, then `exec env -i SYSTEMROOT="$SYSTEMROOT"
+…`), read its command line and ended it, then did the same with the scratch `glade-node.exe`, loopback only:
+
+- `SYSTEMROOT` under `env -i` suffices: the node started and listened.
+- `taskkill //F //PID "$(cat /proc/<pid>/winpid)"` ends it, and its ssh exits 1.
+- `/proc/<pid>/cmdline` of a native program reads as Windows holds it: the program as `cygpath -w` spells it
+  (`E:\…\bin\glade-node.exe`) and each path argument as `cygpath -m` does (`E:/…`). So `may_signal` refused,
+  the binary the harness started being `/e/…/bin/glade-node.exe`: teardown could not have stopped B, and T1
+  would have failed with B left running. Teardown's scan, which looks for `/e/…`, could not see a native node
+  holding the scratch.
+
+The change is in the Mac's working tree, uncommitted. `Host.spellings(path)` in `nodes.py` gives the path as given
+and, on msys, its `cygpath -w` and `-m` forms; `Nodes.signal` signals once the command line names any spelling of
+the binary it started, and `teardown` in `route.py` looks for any spelling of the scratch. Off msys there is one
+spelling and no call. Two tests came first, red before the change and green after:
+`test_on_msys_a_node_is_known_by_its_command_line_as_windows_spells_the_binary` in `test_nodes.py` and
+`test_teardown_finds_a_native_process_holding_the_scratch_as_windows_spells_it` in `test_route.py`, with `cygpath`
+and `taskkill` faked on the local shell's `PATH`. `test_nodes.py` passes 8 of 8 and `test_route.py` 7 of 7. A second
+preflight, the node started by `Nodes.spawn` and stopped by `Nodes.stop`, ended it (`exit 1`) and left nothing. No
+check, budget, node or client code changed, and every node ran `ad0855c`.
+
+**The local placement**, 23:23, on the committed tree (`route-local.log`, 1,124 lines): all three nodes on
+loopback, relays off. A's first life lasted 1.59 s, R1 to U3 taking under a second of it; B saw the crash
+33.8 s after the SIGKILL, and the run ended at 68.0 s. The suite's untimed build took 8.9 s, the node's build
+having made its dependencies.
+
+```
+CHECK R1 PASS a real registration is discoverable: alice's log at B [e1 e2] +0.438 s after A's workspace ws-route serving, 1 subscribe(s)
+CHECK U1 PASS unauthorized: a principal without a grant: mallory at B: refused ws-route/route.notes Unauthorized: unauthorized: principal mallory holds no grant of read.subscribe on ws-route
+CHECK U2 PASS unauthorized: a node without a grant: alice's subscribe of ws-closed at B: acked ws-closed/route.notes []; zone-refused ws-closed/route.notes Unauthorized: refused by node <A>, which serves ws-closed: unauthorized: node <B> holds no grant of read.subscribe on ws-closed
+CHECK U3 PASS unauthorized: an unbound key: A refused C's endpoint <C's tag> +0.041 s after C's start; 0 link line(s) between A and C; alice at B: acked ws-rogue/route.notes []
+CHECK H1 PASS honest stop: A exit 0 +0.015 s after SIGTERM; B's link to A closed +0.011 s, alice told +0.012 s, a subscribe refused as unreachable +0.012 s (each within 2 s)
+CHECK H2 PASS honest restart, exact retry: A: app route registered (+1 record(s), 5 unchanged), re-linked +0.039 s after its start; resend: ok ws-route/route.notes writer:1 e2; alice's log at B [e1 e2 e3] +0.009 s after A's workspace ws-route serving, 1 subscribe(s)
+CHECK E1 PASS expired entries excluded, route up: ws-lapse lapsed +10.588 s (window +8.000-12.500 s) after SIGTERM, A re-linked +0.091 s; ws-route did not lapse before SIGKILL
+CHECK H3 PASS honest loss: B's link to A closed +33.822 s after SIGKILL (budget 45 s), alice told +0.001 s after it; 134 of 134 subscribes at B answered within 2 s
+CHECK E2 PASS expired entries excluded, holder gone: ws-route lapsed +9.548 s (window +8.000-12.500 s) after SIGKILL
+CHECK H4 PASS honest restart after a crash, retry: A: app route registered (+0 record(s), 5 unchanged), re-linked +0.041 s after its start; resend: ok ws-route/route.notes writer:2 e3; alice's log at B [e1 e2 e3 e4] +0.011 s after A's workspace ws-route serving, 1 subscribe(s)
+CHECK F1 PASS the fast path, warm: 5 of 5 warm runs passed, 43 tests; the fastest 0.148 s (cpu 0.154 s), budget 1.0 s
+CHECK F2 PASS the fast path, one file touched: 3 of 3 touched runs passed, 43 tests; the fastest 1.687 s (cpu 1.784 s), budget 3.0 s
+CHECK T1 PASS the run's own hygiene: 5 node processes, each ended after the script signalled it; no process holds the scratch, its ports are free, it is deleted, and no endpoint id is in the log
+ROUTE: PASS -- all 13 checks passed
+```
+
+The same placement on the changed harness, after the crossing (`route-local-changed.log`, 1,128 lines): `ROUTE:
+PASS -- all 13 checks passed`, with R1 +0.433 s, H1's exit +0.014 s, E1 +10.584 s, H3 +33.835 s, E2 +9.551 s, F1
+0.168 s and F2 2.111 s.
+
+**The crossing**, 23:37 (`route-crossing.log`, 1,385 lines). The clocks, each read from the Mac over a new ssh
+connection: the Pi +0.110 s (±0.105) and dabeest +0.063 s (±0.135) before the run, +0.123 s (±0.118) and +0.061 s
+(±0.135) after. E1's and E2's windows were widened by the larger skew, 0.315 s, to +7.685-12.815 s. Every start
+took the same n0 relay, B's 3.63 s in and each of A's three 3.09 s in.
+
+| s | the Pi | dabeest | the clients, on the Mac |
+| --- | --- | --- | --- |
+| 5.18 | | B starts, hand-written root, client grants enforced | |
+| 8.80 | | `relay …` | |
+| 9.48 | A starts, assembled root, and dials B at that relay URL | | |
+| 10.79 | | `link <A> via relay …, rtt 348 ms` | |
+| 10.99 | `link <B> via direct …, rtt 22 ms`, 1.42 s after A's `peer` line | | |
+| 11.00-11.05 | home round, 11 records in 15 ms; ws-route, ws-lapse and ws-closed served | home round, 11 records in 207 ms; `via direct`, rtt 5 ms; two gaps in A's `dir.claims` healed | |
+| 11.54-11.59 | | | the writer appends `e1` and `e2` at A; alice reads `[e1 e2]` at B (R1); mallory is refused (U1); alice's ws-closed is acked, then refused (U2) |
+| 12.28-12.37 | C starts, relays off, and dials A: A prints `peer refused: endpoint <C's tag>: unknown endpoint key`, C `the link ended before a WELCOME` | | alice's ws-rogue is acked `[]` (U3) |
+| 13.61 | SIGTERM to A | | |
+| 13.83-13.85 | | `link <A> closed` | the writer's session `dropped`; alice told; `poll` refused, `claim holder <A> unreachable` |
+| 14.20 | A `exit 0` | | |
+| 14.85-16.35 | A starts on `route-a2.glade` (`+1 record(s), 5 unchanged`) and re-links, `via direct` | `via relay`, then `via direct` | |
+| 16.39-16.43 | | | the writer reconnects, resends `e2` (`ok … writer:1 e2`) and appends `e3`; alice reads `[e1 e2 e3]` |
+| 25.99 | | | `poll`: ws-lapse `no live ServeClaim` (acked at 25.49) |
+| 26.23 | SIGKILL to A; its ssh `exit 255` at 26.45 | | the writer's session `dropped` |
+| 35.13 | | | `poll`: ws-route `no live ServeClaim` (acked at 34.61) |
+| 44.54 | | `link <A> via relay …, rtt 315 ms` | |
+| 59.28 | | `link <A> closed` | alice told, 1 ms later |
+| 59.96-61.53 | A starts again on `route-a2.glade` (`+0 record(s), 5 unchanged`), re-links `via direct`, and pulls 9 of B's `dir.claims` records after a gap | `via relay`, then `via direct`; one gap of A's healed | |
+| 61.51-61.55 | | | the writer reconnects, resends `e3` (`ok … writer:2 e3`) and appends `e4`; alice reads `[e1 e2 e3 e4]` |
+| 61.6-102.9 | | | 3.4's suite: its build 33.7 s, untimed, then five warm runs and three touched |
+| 103.56 | | SIGTERM, a forced end: `exit 1` 0.38 s later | |
+| 104.17-112.61 | C: SIGTERM, `exit 255` 0.21 s later. A: SIGTERM at 104.63, `exit 0` 7.98 s later | | |
+
+```
+CHECK R1 PASS a real registration is discoverable: alice's log at B [e1 e2] +0.549 s after A's workspace ws-route serving, 1 subscribe(s)
+CHECK U1 PASS unauthorized: a principal without a grant: mallory at B: refused ws-route/route.notes Unauthorized: unauthorized: principal mallory holds no grant of read.subscribe on ws-route
+CHECK U2 PASS unauthorized: a node without a grant: alice's subscribe of ws-closed at B: acked ws-closed/route.notes []; zone-refused ws-closed/route.notes Unauthorized: refused by node <A>, which serves ws-closed: unauthorized: node <B> holds no grant of read.subscribe on ws-closed
+CHECK U3 PASS unauthorized: an unbound key: A refused C's endpoint <C's tag> +0.084 s after C's start; 0 link line(s) between A and C; alice at B: acked ws-rogue/route.notes []
+CHECK H1 PASS honest stop: A exit 0 +0.586 s after SIGTERM; B's link to A closed +0.228 s, alice told +0.229 s, a subscribe refused as unreachable +0.239 s (each within 2 s)
+CHECK H2 PASS honest restart, exact retry: A: app route registered (+1 record(s), 5 unchanged), re-linked +1.509 s after its start; resend: ok ws-route/route.notes writer:1 e2; alice's log at B [e1 e2 e3] +0.058 s after A's workspace ws-route serving, 1 subscribe(s)
+CHECK E1 PASS expired entries excluded, route up: ws-lapse lapsed +12.380 s (window +7.685-12.815 s) after SIGTERM, A re-linked +2.742 s; ws-route did not lapse before SIGKILL
+CHECK H3 PASS honest loss: B's link to A closed +33.056 s after SIGKILL (budget 45 s), alice told +0.001 s after it; 130 of 130 subscribes at B answered within 2 s
+CHECK E2 PASS expired entries excluded, holder gone: ws-route lapsed +8.901 s (window +7.685-12.815 s) after SIGKILL
+CHECK H4 PASS honest restart after a crash, retry: A: app route registered (+0 record(s), 5 unchanged), re-linked +1.497 s after its start; resend: ok ws-route/route.notes writer:2 e3; alice's log at B [e1 e2 e3 e4] +0.052 s after A's workspace ws-route serving, 1 subscribe(s)
+CHECK F1 PASS the fast path, warm: 5 of 5 warm runs passed, 43 tests; the fastest 0.149 s (cpu 0.156 s), budget 1.0 s
+CHECK F2 PASS the fast path, one file touched: 3 of 3 touched runs passed, 43 tests; the fastest 1.744 s (cpu 1.741 s), budget 3.0 s
+CHECK T1 PASS the run's own hygiene: 5 node processes, each ended after the script signalled it; no process holds the scratch, its ports are free, it is deleted, and no endpoint id is in the log
+ROUTE: PASS -- all 13 checks passed
+```
+
+**The timings that matter**
+
+| | local | crossing | bound |
+| --- | --- | --- | --- |
+| R1: alice's `[e1 e2]` at B after A's `workspace ws-route serving` | +0.438 s | +0.549 s | 5 s |
+| H1: A's `exit 0` after its SIGTERM | +0.015 s | +0.586 s | 10 s |
+| H1: B's `link <A> closed`, alice told, a subscribe refused as unreachable | +0.011, 0.012, 0.012 s | +0.228, 0.229, 0.239 s | 2 s each |
+| H2 and H4: A re-linked after its start | +0.039 and 0.041 s | +1.509 and 1.497 s | none (the script waits 60 s) |
+| E1: ws-lapse's first `no live ServeClaim` after the SIGTERM | +10.588 s | +12.380 s | +8.000-12.500 s; crossing +7.685-12.815 s |
+| H3: B's `link <A> closed` after the SIGKILL; subscribes at B answered within 2 s | +33.822 s; 134 of 134 | +33.056 s; 130 of 130 | 45 s; every one |
+| E2: ws-route's first `no live ServeClaim` after the SIGKILL | +9.548 s | +8.901 s | as E1 |
+| F1: the fastest of five warm runs, 43 tests | 0.148 s (cpu 0.154) | 0.149 s (cpu 0.156) | 1.0 s |
+| F2: the fastest of three touched runs | 1.687 s (cpu 1.784) | 1.744 s (cpu 1.741) | 3.0 s |
+
+**Teardown.** T1 passed in both placements, in the crossing with the change above, so that dabeest was also
+scanned for the scratch as Windows spells it. Then, by hand:
+
+- **The Pi:** no process under its scratch (an anchored `pgrep`), no `glade-node`, UDP 4545 and 4546 and TCP 4555
+  and 4556 free, and the run's `glade-route-*` directory gone.
+- **dabeest:** `tasklist` found no `glade-node.exe`; UDP 4545 and 4546 and TCP 4555 free; the run's directory gone.
+- Each build log was copied to the Mac, identical by `md5`; then `rm -rf` of each host's scratch, 255 MB on the Pi
+  and 31 MB on dabeest, a binary and a build log each. Nothing of the run's is left in either machine's temporary
+  directory. Both checkouts are clean at `ad0855c`, and dabeest's `scratch/` holds what it held before.
+- **The Mac:** no `glade-node` or `route_probe` from a scratch path, the desk's node untouched, 3.8 GiB free again.
+- **No endpoint id in any log:** T1 for each route log; by hand, the only 64-digit hex strings in each are its
+  three node ids, and the build logs hold none.
+
+**Seen, and no check covers it**
+
+- **A's last stop was slow:** 7.98 s at the crossing's teardown and 3.11 s at the local one, against H1's 0.586 and
+  0.015 s. Teardown stops the processes in the order they started, so B has gone (by force on dabeest, by the
+  signal locally) and A drains toward a peer that no longer answers. That is within `STOP_WITHIN`, but nothing
+  times it: past 10 s `stop` would send SIGKILL, and T1 would still pass.
+- **Gaps healed on `dir.claims`.** At the crossing's first link B refused two of A's claim records that arrived
+  ahead of an earlier one (`a gap: expected seq 2, got 4`, then `got 3`), then pulled 2 records 5 ms later and
+  reported the gaps healed. After the crash A's store held B's records to seq 6; B's live 15 came first (`expected
+  seq 7, got 15`), and A pulled 9 within 17 ms; B then healed one gap of A's. The local run shows the first heal
+  too, of one record. Each healed at once, and no check reads these lines.
+- **Paths.** A dialled B at B's relay URL, yet at each of its three starts A's first `link` line read `via direct`
+  (rtt 22, 5 and 6 ms), 1.50-1.51 s after it began, while B's read `via relay` (rtt 345-357 ms), then `via direct`
+  0.26 s later, the shape of the 2026-09-28 crossing's run 2. After the SIGKILL, B's path fell back to the relay
+  18.3 s in, and the link closed 33.1 s in (4.5's relay-path closes took 33.6 and 35.3 s).
+- **E1 near its window's top.** The crossing's +12.380 s is 0.435 s inside +12.815 s. The polls either side,
+  +11.873 s (acked) and +12.380 s (refused), put A's last renewal of ws-lapse within about 0.13 s of the SIGTERM,
+  the case the window's top allows for: the 12 s lease, the poll's 0.5 s and the skew. E2's +8.901 s fits a
+  renewal 3.4 s before the kill.
+- **The clocks' reads.** Each offset was read over a new ssh connection, so half its round trip, 0.105-0.135 s,
+  is most of the 0.315 s widening; 4.5's reads over one held session were good to 5-10 ms.
+- **The first warm run** took 1.70-1.91 s in all three runs and the other four 0.148-0.195 s; F1 judges the
+  fastest, as designed.
+- **dabeest's lines** still mix separators in the `instance` line (`E:/…/route-b/glade\sys\route-b`) and quote the
+  program as `'E:\…\glade-node.exe'` in the recovery warning, as the 2026-09-28 crossing recorded.
+- **Exit codes over ssh are ssh's:** A's clean stops `exit 0`, its SIGKILL `exit 255`, C's SIGTERM `exit 255` (the
+  hand-written root dies by the signal) and B's forced end `exit 1`; locally 0, -9, -15 and -15. T1 needs only
+  that each ended after a signal.
+
 ## 8. Size and the split
 
 | Part | What | Files | Production | Tests |

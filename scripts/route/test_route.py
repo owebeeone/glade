@@ -20,6 +20,9 @@ DENIED = ('refused ws-route/route.notes Unauthorized: unauthorized: principal ma
           'read.subscribe on ws-route')
 CLOSED = ('zone-refused ws-closed/route.notes Unauthorized: refused by node aaaa, which serves ws-closed: '
           'unauthorized: node bbbb holds no grant of read.subscribe on ws-closed')
+# a fake cygpath's body, after `rest=` strips the test's scratch: the path as MSYS spells E:
+CYGPATH = r'''case "$1" in -w) printf 'E:%s\n' "$rest" | tr / '\\' ;; -m) printf 'E:%s\n' "$rest" ;; esac
+'''
 
 
 def runs(label, walls):
@@ -229,6 +232,31 @@ class RouteTest(unittest.TestCase):
         self.assertEqual(route.teardown(journey), [])
         self.assertFalse(os.path.exists(scratch))
         self.assertEqual((given / 'kept').read_text(), 'not the run\'s\n')
+
+    def test_teardown_finds_a_native_process_holding_the_scratch_as_windows_spells_it(self):
+        """On dabeest /proc/<pid>/cmdline spells a native node's path arguments as `cygpath -m`
+        does (seen there 2026-09-30), so teardown looks for the scratch so spelled too. This
+        machine's sh stands in, `cygpath` faked on its PATH and dabeest's processes listed."""
+        fakes, listed = self.tmp / 'fakes', []
+        fakes.mkdir()
+        (fakes / 'cygpath').write_text(f'#!/bin/sh\nrest=${{2#"{self.tmp}"}}\n' + CYGPATH)
+        (fakes / 'cygpath').chmod(0o700)
+
+        class Dabeest(nodes.Host):
+            def run(self, command, stdin=None, check=True):  # what only dabeest's /proc can list
+                return '\n'.join(listed) if command == route.PROCESSES else super().run(command, stdin, check)
+
+        home, env = str(self.tmp / 'home'), {'PATH': f'{fakes}:{nodes.LOCAL_PATH["PATH"]}'}
+        pi = nodes.Host('/bin/sleep', str(self.tmp / 'pi' / 'glade-route-1'), home, ssh=('sh', '-c'))
+        dabeest = Dabeest('/bin/sleep', str(self.tmp / 'dab' / 'glade-route-1'), home, ssh=('sh', '-c'),
+                          msys=True, env=env)
+        journey = route.Journey(self.log, nodes.crossing(pi, dabeest), '')
+        for host in (pi, dabeest):
+            route.make_scratch(journey, host)
+        native = 'E:\\bin\\glade-node.exe --name route-b --app E:/dab/glade-route-1/apps/route-b.glade 4555'
+        listed.extend(['C:\\Windows\\System32\\svchost.exe -k netsvcs', native])
+        self.assertEqual(route.teardown(journey), [f'left running: {native}'])
+        self.assertFalse(os.path.exists(dabeest.scratch))
 
 
 if __name__ == '__main__':

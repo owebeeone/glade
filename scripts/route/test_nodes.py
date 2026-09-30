@@ -18,6 +18,9 @@ import nodes
 
 A, B = 'a' * 64, 'b' * 64
 PORTS = [40001, 40002, 40003, 40011, 40012, 40013]
+# a fake cygpath's body, after `rest=` strips the test's scratch: the path as MSYS spells E:
+CYGPATH = r'''case "$1" in -w) printf 'E:%s\n' "$rest" | tr / '\\' ;; -m) printf 'E:%s\n' "$rest" ;; esac
+'''
 
 
 class NodesTest(unittest.TestCase):
@@ -111,6 +114,36 @@ class NodesTest(unittest.TestCase):
         self.assertEqual(run.wait(ours, 5), -signal.SIGTERM)
         reused = dataclasses.replace(ours, pid=spare.pid)  # an ended process's PID, taken again
         self.assertRaises(nodes.Refused, run.signal, reused, signal.SIGTERM)
+
+    def test_on_msys_a_node_is_known_by_its_command_line_as_windows_spells_the_binary(self):
+        """On dabeest a node is a native program: /proc/<pid>/cmdline spells the program as
+        `cygpath -w` does and a path argument as `cygpath -m` does (seen there 2026-09-30). This
+        machine's sh stands in, with `cygpath` and `taskkill` faked on its PATH."""
+        fakes, calls, shown = self.tmp / 'fakes', self.tmp / 'calls', {}
+        fakes.mkdir()
+        (fakes / 'cygpath').write_text(f'#!/bin/sh\nrest=${{2#"{self.tmp}"}}\n' + CYGPATH)
+        (fakes / 'taskkill').write_text('#!/bin/sh\necho "taskkill $*" >> "$CALLS"\n')
+        for fake in fakes.iterdir():
+            fake.chmod(0o700)
+
+        class Dabeest(nodes.Host):
+            def command_line(self, pid):  # what only dabeest's /proc can show
+                return shown.get(pid, '')
+
+        env = {'PATH': f'{fakes}:{nodes.LOCAL_PATH["PATH"]}', 'CALLS': str(calls)}
+        host = Dabeest(self.bin, self.run_dir, self.home, ssh=('sh', '-c'), msys=True, env=env)
+        self.assertEqual(host.spellings(self.bin), [self.bin, 'E:\\bin\\sleep', 'E:/bin/sleep'])
+        self.assertEqual(nodes.Host(self.bin, self.run_dir, self.home).spellings(self.bin), [self.bin])
+        run = self.make({})
+        ours, stranger = (nodes.Proc('route-b', host, self.bin, pid, None) for pid in (41, 42))
+        run.started.update({(host.ssh, 41), (host.ssh, 42)})
+        shown.update({41: 'E:\\bin\\sleep --name route-b --app E:/run/apps/route-b.glade 4555',
+                      42: 'E:\\bin\\sleep2 --name route-b --app E:/run/apps/route-b.glade 4555'})
+        self.assertRaises(nodes.Refused, run.signal, stranger, signal.SIGTERM)
+        self.assertFalse(calls.exists())
+        run.signal(ours, signal.SIGTERM)
+        self.assertEqual(calls.read_text().split(), ['taskkill', '//F', '//PID'])
+        self.assertTrue(self.log.wait_for('route-b', '^SIGTERM to pid 41$', 0))
 
     def test_the_harness_builds_nothing_and_a_node_starts_in_its_scratch_with_the_route_flags(self):
         fake = self.tmp / 'target' / 'glade-node'

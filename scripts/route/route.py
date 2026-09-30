@@ -614,7 +614,8 @@ def teardown(journey: Journey) -> list[str]:
     here = here.splitlines()
     for host in hosts:
         listed = here + (host.run(PROCESSES, check=False).splitlines() if host.ssh else [])
-        problems += [f'left running: {line.strip()}' for line in listed if host.scratch in line]
+        held = host.spellings(host.scratch)  # on dabeest, a native node's arguments are E:/…
+        problems += [f'left running: {line.strip()}' for line in listed if any(path in line for path in held)]
     ports = [place.forward for place in places if place.forward] or [
         port for place in places for port in (place.peer_port, place.client_port)]
     problems += [f'port {port} still bound' for port in ports if bound(port)]
