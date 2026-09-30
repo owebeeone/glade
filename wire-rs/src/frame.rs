@@ -1,23 +1,16 @@
 //! A frame's size limit, for every carrier that reads frames: the node's
 //! websocket and peer stream, and client-rs's websocket (CD-G3 item 3,
-//! CD-G4). A frame is its `FrameType` tag byte, then one frame message; the
-//! limit is taken from the schema's file-level `max_encoded_len`
-//! (`taut/ir/glade.taut.py`), so the node and its clients cannot drift apart.
-//! A carrier checks a frame's claimed length with [`frame_len`] before it
+//! CD-G4). A frame is its `FrameType` tag byte, then one frame message. The
+//! limit is this one constant, so the node and its clients cannot drift apart;
+//! glade's schema declares no `max_encoded_len`, since taut stays at its
+//! v0.10.0 release (the owner, 2026-10-01). A carrier checks a frame's claimed length with [`frame_len`] before it
 //! allocates anything for it (F15).
 
 use std::io;
 
-use crate::generated::MAX_ENCODED_LEN;
-
-/// The most bytes a frame may hold, its tag byte included: the tag, then a
-/// frame message of at most the schema's `max_encoded_len`, 16 MiB less one.
-/// So 16 MiB, the frame limit the owner ruled for the carrier port (plan
-/// Step 4.5b, question 6).
-pub const MAX_FRAME_BYTES: usize = match MAX_ENCODED_LEN {
-    Some(message) => 1 + message,
-    None => panic!("glade's schema declares no max_encoded_len"),
-};
+/// The most bytes a frame may hold, its tag byte included: 16 MiB, the frame
+/// limit the owner ruled for the carrier port (plan Step 4.5b, question 6).
+pub const MAX_FRAME_BYTES: usize = 16 << 20;
 
 /// The length a frame's header claims, if it is at most [`MAX_FRAME_BYTES`],
 /// checked before anything is allocated for it. A longer one is refused as
@@ -39,15 +32,14 @@ mod tests {
     use super::*;
     use crate::generated::{self, FrameType};
 
-    /// CD-G3 item 3: the frame limit is the tag byte plus the schema's
-    /// `max_encoded_len`, which glade's schema declares at file level so that
-    /// the limit stays 16 MiB. Every frame message resolves to that bound and
-    /// to the default depth, so one raw decode serves every frame type
-    /// (CD-G4).
+    /// CD-G3 item 3: the frame limit is 16 MiB, this crate's constant.
+    /// glade's schema declares no bound, so every frame message resolves to
+    /// the default depth and no length bound, and one raw decode serves every
+    /// frame type (CD-G4).
     #[test]
-    fn the_frame_limit_is_the_tag_byte_and_the_schemas_bound() {
+    fn the_frame_limit_is_16_mib_and_every_frame_message_takes_the_default_bounds() {
         assert_eq!(MAX_FRAME_BYTES, 16 << 20);
-        assert_eq!(MAX_ENCODED_LEN, Some(MAX_FRAME_BYTES - 1));
+        assert_eq!(generated::MAX_ENCODED_LEN, None);
         assert_eq!(generated::MAX_DEPTH, crate::cbor::DEFAULT_MAX_DEPTH);
         let bounds = [
             (
@@ -110,7 +102,10 @@ mod tests {
         ];
         assert_eq!(bounds.len(), FrameType::NodeWelcome.wire() as usize + 1);
         for (depth, len) in bounds {
-            assert_eq!((depth, len), (generated::MAX_DEPTH, MAX_ENCODED_LEN));
+            assert_eq!(
+                (depth, len),
+                (generated::MAX_DEPTH, generated::MAX_ENCODED_LEN)
+            );
         }
     }
 

@@ -24,9 +24,9 @@ pub(crate) enum Inbound {
 impl Inbound {
     /// `bytes`, a whole frame, `[FrameType tag][CBOR of its message]`,
     /// decoded, or the codec's refusal; an empty frame is `Truncated`.
-    /// glade's schema declares no `max_depth` and only a file-level
-    /// `max_encoded_len`, which the websocket applied before it read the
-    /// frame, so every frame type resolves to the same bounds, and one raw
+    /// glade's schema declares neither `max_depth` nor `max_encoded_len`,
+    /// and the websocket applied the frame limit before it read the frame,
+    /// so every frame type resolves to the same bounds, and one raw
     /// `try_decode`, at the default depth, serves every arm (CD-B3).
     pub(crate) fn decode(bytes: &[u8]) -> Result<Inbound, DecodeError> {
         let (&tag, body) = bytes.split_first().ok_or(DecodeError::Truncated)?;

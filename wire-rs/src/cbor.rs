@@ -1,5 +1,3 @@
-// taut v0.10.0 wrote this file: `PYTHONPATH=src python3 -m taut.corpus.glade_build`,
-// run in the taut checkout, regenerates it. Do not edit it by hand.
 //! Minimal deterministic CBOR — the **fail-closed** Rust binding of the frozen
 //! wire substrate, and taut's only Rust runtime (vendored as `cbor.rs` by
 //! `tautc gen -l rust --with-runtime`).
