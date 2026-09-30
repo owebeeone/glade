@@ -4,7 +4,8 @@ Plan, 2026-09-24, for the owner. It answers the item added on 2026-09-24: a
 client's write to a share another node serves stays on the node the client
 reached (`glade/dev-docs/GladeSubstrateV1.md:332-334`, `:346-348`;
 `dev-docs/GladeFirstSlicePlan.md:938`; `dev-docs/GladeProgramStatus.md:37`).
-Step X1.1 is done (glade `55e636c`); nothing else is built. The code was read
+Step X1.1 is done (glade `55e636c`), X3.3a and X3.3b were built with CW 3.1 and 3.3, and X2.1 is
+done (glade `efcce3f`); nothing else is built. The code was read
 in the working trees on 2026-09-24 with no git command, so no revision is
 named; another agent was editing `glade/node/` and
 `glade/dev-docs/GladeNodeAssembly.md` (slice Step 4.1a), so line numbers there
@@ -362,6 +363,14 @@ with `Absent` answered. No op crosses yet.
 - **Proves:** one path decides every client op. **Not:** anything about peers.
 - **Gate:** the node gate. **Size:** ~60 production, ~100 test lines.
 - **Depends on:** CW 2.1; nothing in the slice.
+- **Done, 2026-10-01,** glade `efcce3f`: `node/src/accept.rs`, `accept_ops(shared, origin, &mut heads, ops)`,
+  the arm's per-op body moved unchanged, the stream refusal (F3, ruled after this plan) included.
+  Each op's status is sent on `origin` as soon as it is decided, as the arm did, rather than returned:
+  returning them would hold a batch's statuses until its last op. X3.1's peer stream is a session in
+  the session table, so its statuses reach it the same way. The new pure test answers a batch of
+  five, `Ok`, `Ok`, `Equivocation`, `Protocol` and `Unauthorized`, each with its hash, and the
+  fan-out skips the subscribed origin. Gate 9/9, 465 tests on each path, rustfmt 255 (baseline
+  lowered); the six downstream suites at their counts; glial's tests start no node, so not run.
 
 **X2.2 — The peer ack is a cut**
 
