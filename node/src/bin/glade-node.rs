@@ -15,8 +15,8 @@
 //!
 //! **Booted profile form** (opt-in): `glade-node --profile local|peer|server
 //! [--name NAME] [--operator OP] [--app FILE.glade]... [--config PATH]
-//! [--peer ID[@IP:PORT|@RELAY-URL]]... [--enforce-client-grants] [PORT]
-//! [STORE_DIR]` —
+//! [--peer ID[@IP:PORT|@RELAY-URL]]... [--enforce-client-grants]
+//! [--lease-ms N] [PORT] [STORE_DIR]` —
 //! reads every `--app` file, then the network (plan Step 4.5: the `--config`
 //! file, an absolute path no one else may read, and the `--peer` flags; a
 //! file that cannot be read, a bad line or a bad flag refuses the start
@@ -110,9 +110,15 @@
 //! The program reads its arguments, `GLADE_HOME` and `HOME`, and its own path
 //! once, at its entry point, and passes them down: nothing below reads the
 //! environment (the owner's rule of no process globals, glade's `AGENTS.md`).
-//! The entry point also hands each root the node's leases (F1, the owner's
-//! ruling of 2026-09-27): each claim lives five minutes and is renewed every
-//! 100 s. No flag changes them.
+//! The node's leases (F1, the owner's ruling of 2026-09-27) are by default a
+//! five-minute claim renewed every 100 s. `--lease-ms N` (plan Step 4.6, the
+//! owner's ruling of 2026-09-30) sets them on the booted form: each claim
+//! lives N ms, from 3,000 to 3,600,000, and is renewed every N/3 ms, and the
+//! node prints `leases N ms, renewed every N/3 ms` after `node`. Any other
+//! value refuses the start before anything is written; the legacy form
+//! ignores the flag, as it ignores `--config` and `--peer`. The entry point
+//! takes the flag out of the arguments, since each root reads a word it does
+//! not know as positional, and hands its value to the root that runs.
 //!
 //! Either form binds 127.0.0.1:<port> (0 = OS-assigned) and prints
 //! `listening <port>` so a parent process can read the actual port.
@@ -172,7 +178,7 @@ const USAGE: &str = "usage: glade-node <port> <store_dir> (the legacy form requi
     store directory), or glade-node --profile local|peer|server [--name NAME] \
     [--operator OP] [--app FILE.glade]... [--config PATH] \
     [--peer ID[@IP:PORT|@RELAY-URL]]... [--enforce-client-grants] [--recovery-out PATH] \
-    [port] [store_dir], or glade-node recovery --name NAME --out PATH, or \
+    [--lease-ms N] [port] [store_dir], or glade-node recovery --name NAME --out PATH, or \
     glade-node endpoint-id --name NAME";
 
 /// The refusal of a legacy start with no store directory: the usage line on
@@ -216,9 +222,11 @@ fn program_path() -> Option<PathBuf> {
 
 /// Run the recovery command, or start the node from the composition root the
 /// environment chooses. The process's arguments are read here, once, and
-/// handed to whichever runs, with the node's leases (F1): the defaults, a
-/// five-minute lease renewed every 100 s and a checkpoint once 1,000 claims
-/// are superseded (plan Step 4.5c), which no flag changes.
+/// handed to whichever runs, with `--lease-ms` taken out of them and handed
+/// on alone (plan Step 4.6). A booted root takes the node's leases (F1) from
+/// it, else the defaults, a five-minute lease renewed every 100 s; either
+/// way a checkpoint comes once 1,000 claims are superseded (plan Step 4.5c),
+/// which no flag changes.
 async fn start() -> std::io::Result<ExitCode> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().is_some_and(|arg| arg == "recovery") {
@@ -244,11 +252,40 @@ async fn start() -> std::io::Result<ExitCode> {
         });
     }
     let program = program_path();
-    let leases = Leases::default();
+    let (args, lease_flag) = take_lease_ms(args);
     if assembled(std::env::var_os(ASSEMBLED))? {
-        return run_assembled(args, program, leases).await;
+        return run_assembled(args, program, lease_flag).await;
     }
-    run(args, program, leases).await.map(|()| ExitCode::SUCCESS)
+    run(args, program, lease_flag).await?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `--lease-ms` taken out of the arguments (plan Step 4.6): the rest, which a
+/// root reads, and the flag's value, the last one given. Left in, the flag
+/// and its value would be positional words to either root, the value its
+/// port or its store directory. The flag with no word after it has the empty
+/// value, which a booted start refuses.
+fn take_lease_ms(args: Vec<String>) -> (Vec<String>, Option<String>) {
+    let (mut rest, mut value) = (Vec::new(), None);
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        if arg == "--lease-ms" {
+            value = Some(args.next().unwrap_or_default());
+        } else {
+            rest.push(arg);
+        }
+    }
+    (rest, value)
+}
+
+/// A booted start's leases: `--lease-ms`'s when it is given (plan Step 4.6),
+/// else the defaults (F1). Each root calls it before the instance boots, so a
+/// value `Leases::from_flag` refuses stops the start with nothing written.
+fn leases_from(lease_ms: Option<&str>) -> std::io::Result<Leases> {
+    match lease_ms {
+        Some(value) => Leases::from_flag(value),
+        None => Ok(Leases::default()),
+    }
 }
 
 /// A status line of the mesh's (plan Step 4.5), on stdout. The notes come
@@ -274,7 +311,11 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run(args: Vec<String>, program: Option<PathBuf>, leases: Leases) -> std::io::Result<()> {
+async fn run(
+    args: Vec<String>,
+    program: Option<PathBuf>,
+    lease_flag: Option<String>,
+) -> std::io::Result<()> {
     let mut profile: Option<Profile> = None;
     let mut name: Option<String> = None;
     let mut operator: Option<String> = None;
@@ -313,12 +354,18 @@ async fn run(args: Vec<String>, program: Option<PathBuf>, leases: Leases) -> std
         // The network (plan Step 4.5): the file, then the flags, each checked
         // before the instance boots.
         let network = netconf::load(config.as_deref(), &peers)?;
+        // Then the leases (plan Step 4.6), `--lease-ms`'s or the defaults.
+        let leases = leases_from(lease_flag.as_deref())?;
         let profile = profile.unwrap_or(Profile::Local);
         let recovery_out = recovery_out.as_deref().map(Path::new);
         let (name, operator, lease_ms) = (name.as_deref(), operator.as_deref(), leases.lease_ms);
         let mut node = boot(&root, profile, name, operator, recovery_out, lease_ms)?;
         println!("instance {}", node.dir.display());
         println!("node {}", node.node_id);
+        // `--lease-ms`, given, is said right after `node`.
+        if lease_flag.is_some() {
+            println!("{leases}");
+        }
         if let Some(committed) = &node.recovery {
             println!("{committed}");
         }
@@ -359,7 +406,7 @@ async fn run(args: Vec<String>, program: Option<PathBuf>, leases: Leases) -> std
             println!("app {} registered (+{} record(s), {} unchanged)", decl.app, reg.appended, reg.unchanged);
             workspaces.extend(decl.workspaces.iter().map(|w| (w.share.clone(), w.name.clone())));
         }
-        Some((node, workspaces, network))
+        Some((node, workspaces, network, leases))
     } else {
         None
     };
@@ -395,7 +442,7 @@ async fn run(args: Vec<String>, program: Option<PathBuf>, leases: Leases) -> std
     // with the DIRECTORY identity, converge with each `--peer` target, then
     // start SERVING the declared workspaces: mint WorkspaceEntry + ServeClaim
     // and renew while serving (audit F1).
-    if let Some((node, workspaces, network)) = booted {
+    if let Some((node, workspaces, network, leases)) = booted {
         let (identity, key) = (node.identity()?, node.endpoint_key());
         // Each checkpoint's line goes to stdout (plan Step 4.5c).
         server.adopt_boot_tuned(node, leases, noted).await?;
@@ -438,20 +485,20 @@ async fn run(args: Vec<String>, program: Option<PathBuf>, leases: Leases) -> std
 /// The assembled composition root (plan Steps 3.2 and 3.3): `run`'s start,
 /// step for step, as the sdax plan `glade_node::lifecycle::node_plan`, which
 /// owns every acquisition and every task. The root parses the arguments
-/// `start` read, puts the instance root, the program's path and the leases
-/// into the settings, and loads every `--app` file, then waits on the plan
-/// where `run` waits on `server.run`. A stop signal
+/// `start` read, puts the instance root, the program's path and `--lease-ms`
+/// into the settings, and loads every `--app` file, the network and the
+/// leases, then waits on the plan where `run` waits on `server.run`. A stop signal
 /// asks the plan to shut down; the report decides the exit status.
 async fn run_assembled(
     args: Vec<String>,
     program: Option<PathBuf>,
-    leases: Leases,
+    lease_flag: Option<String>,
 ) -> std::io::Result<ExitCode> {
     eprintln!("{ASSEMBLED_ROOT_LINE}");
     let mut settings = Settings {
         instance_root: Some(instance_root_from_env()),
         program,
-        leases,
+        lease_ms: lease_flag,
         ..Settings::from_args(args)
     };
     // The legacy form requires its store directory: refused, as `run`
@@ -460,11 +507,12 @@ async fn run_assembled(
         return Err(usage());
     }
     // Every `--app` file is loaded, and two naming one app are refused, then
-    // the network (plan Step 4.5), before the plan boots the instance
-    // (L1-14): a refused start writes nothing.
+    // the network (plan Step 4.5) and the leases (plan Step 4.6), before the
+    // plan boots the instance (L1-14): a refused start writes nothing.
     let decls = if settings.booted() {
         let decls = glade_node::appdecl::load_all(&settings.apps)?;
         settings.network = netconf::load(settings.config.as_deref(), &settings.peers)?;
+        settings.leases = leases_from(settings.lease_ms.as_deref())?;
         decls
     } else {
         Vec::new()

@@ -32,9 +32,15 @@ pub struct Settings {
     /// Step 4.1c), read once by the composition root, as the instance root
     /// is. `None` names `glade-node`.
     pub program: Option<PathBuf>,
-    /// How long the node's claims live and how often it renews them (F1),
-    /// from the entry point: by default five minutes, renewed every 100 s.
+    /// How long the node's claims live and how often it renews them (F1):
+    /// by default five minutes, renewed every 100 s; a booted start's root
+    /// sets them from `lease_ms` when it is given.
     pub leases: Leases,
+    /// `--lease-ms <n>` (plan Step 4.6), which the entry point takes out of
+    /// the arguments before either root reads them. A booted start takes its
+    /// leases from it, or is refused, and prints them after `node`. The
+    /// legacy form ignores it, as it ignores `--config` and `--peer`.
+    pub lease_ms: Option<String>,
     /// `--config PATH` (plan Step 4.5): the node's network file, which must
     /// be an absolute path. The legacy form ignores it, as it ignores
     /// `--peer`.
@@ -50,8 +56,8 @@ impl Settings {
     /// root does: an unknown `--profile` is no profile, a flag given no value
     /// reads as absent, and anything that is not a flag is positional. The
     /// instance root, the program's path and the leases are not arguments,
-    /// and the network is loaded from the file and the flags: the
-    /// composition root sets them.
+    /// `--lease-ms` is taken out before this reads them, and the network is
+    /// loaded from the file and the flags: the composition root sets them.
     pub fn from_args(args: impl IntoIterator<Item = String>) -> Settings {
         let mut settings = Settings::default();
         let mut args = args.into_iter();

@@ -33,6 +33,7 @@
 //! served share".
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::io;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -84,6 +85,44 @@ impl Default for Leases {
             renew_ms: RENEW_EVERY_MS,
             checkpoint_after: CHECKPOINT_AFTER,
         }
+    }
+}
+
+/// The shortest lease `--lease-ms` sets (plan Step 4.6, question 2, the
+/// owner's ruling of 2026-09-30): three seconds.
+pub const MIN_LEASE_MS: u32 = 3_000;
+/// The longest lease `--lease-ms` sets: an hour.
+pub const MAX_LEASE_MS: u32 = 3_600_000;
+
+impl Leases {
+    /// The leases `--lease-ms <value>` sets (plan Step 4.6): each claim lives
+    /// `value` ms and is renewed every `value / 3` ms, the default's rule, and
+    /// the checkpoint threshold stays the default's, a setting with no flag.
+    /// Any value but a whole number from [`MIN_LEASE_MS`] to [`MAX_LEASE_MS`]
+    /// is refused, and the refusal names the range.
+    pub fn from_flag(value: &str) -> io::Result<Leases> {
+        let range = MIN_LEASE_MS..=MAX_LEASE_MS;
+        let Some(ms) = value.parse::<u32>().ok().filter(|ms| range.contains(ms)) else {
+            let why = format!(
+                "--lease-ms {value:?}: expected a whole number of milliseconds \
+                 from {MIN_LEASE_MS} to {MAX_LEASE_MS}"
+            );
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, why));
+        };
+        Ok(Leases {
+            lease_ms: i64::from(ms),
+            renew_ms: u64::from(ms / 3),
+            ..Leases::default()
+        })
+    }
+}
+
+/// The line a booted root prints after `node` when `--lease-ms` set the
+/// leases (plan Step 4.6): `leases <n> ms, renewed every <n/3> ms`.
+impl fmt::Display for Leases {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (lease, renew) = (self.lease_ms, self.renew_ms);
+        write!(f, "leases {lease} ms, renewed every {renew} ms")
     }
 }
 
@@ -837,6 +876,39 @@ mod tests {
         assert_eq!(leases.checkpoint_after, 1_000, "plan Step 4.5c's threshold");
         let settings = crate::assembly::Settings::default();
         assert_eq!(settings.leases, leases, "the assembled root's settings");
+    }
+
+    /// Plan Step 4.6 (question 2, the owner's ruling of 2026-09-30):
+    /// `--lease-ms <n>` sets the lease to n ms, renewed at a third of it as
+    /// the default is, and leaves the checkpoint threshold, a setting with no
+    /// flag, at the default's. Both ends of 3,000 to 3,600,000 ms are taken,
+    /// and the leases read as the line a root prints after `node`.
+    #[test]
+    fn the_lease_flag_sets_the_lease_renewed_at_a_third() {
+        let leases = Leases::from_flag("12000").unwrap();
+        let set = (leases.lease_ms, leases.renew_ms, leases.checkpoint_after);
+        assert_eq!(set, (12_000, 4_000, 1_000));
+        let line = leases.to_string();
+        assert_eq!(line, "leases 12000 ms, renewed every 4000 ms");
+        let ends = [("3000", 3_000, 1_000), ("3600000", 3_600_000, 1_200_000)];
+        for (value, lease_ms, renew_ms) in ends {
+            let leases = Leases::from_flag(value).unwrap();
+            let set = (leases.lease_ms, leases.renew_ms);
+            assert_eq!(set, (lease_ms, renew_ms), "{value}");
+        }
+    }
+
+    /// Plan Step 4.6: any other value, out of range or not a whole number of
+    /// milliseconds, is refused, and the refusal names the flag and the range.
+    #[test]
+    fn the_lease_flag_refuses_any_other_value_naming_the_range() {
+        for value in ["2999", "3600001", "12s", "-1", ""] {
+            let refusal = Leases::from_flag(value).unwrap_err();
+            assert_eq!(refusal.kind(), io::ErrorKind::InvalidInput, "{value:?}");
+            let said = refusal.to_string();
+            assert!(said.starts_with("--lease-ms "), "{value:?}: {said}");
+            assert!(said.contains("from 3000 to 3600000"), "{value:?}: {said}");
+        }
     }
 
     /// Plan Step 4.1b (D8): an instance whose records.json and served store

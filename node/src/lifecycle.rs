@@ -233,6 +233,10 @@ impl Instance {
             .console
             .out(&format!("instance {}", boot.dir.display()));
         start.console.out(&format!("node {}", boot.node_id));
+        // `--lease-ms` (plan Step 4.6), given, is said right after `node`.
+        if start.settings.lease_ms.is_some() {
+            start.console.out(&start.settings.leases.to_string());
+        }
         if let Some(committed) = &boot.recovery {
             start.console.out(&committed.to_string());
         }
