@@ -43,11 +43,11 @@ fn wrap(bytes: Vec<u8>) -> Vec<u8> {
 
 /// The one record of `snapshot`, at its revision.
 fn unwrap(snapshot: Snapshot) -> Snapshot {
-    let map = cbor::decode(&snapshot.bytes);
-    let [record] = map.get(1).array() else {
+    let map = cbor::try_decode(&snapshot.bytes).unwrap();
+    let [record] = map.try_get(1).unwrap().try_array().unwrap() else {
         panic!("not one record: {map:?}");
     };
-    let bytes = record.bytes();
+    let bytes = record.try_bytes().unwrap();
     let revision = snapshot.revision;
     Snapshot { revision, bytes }
 }

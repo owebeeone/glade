@@ -528,7 +528,7 @@ async fn a_raw_stream_op_is_refused_and_its_zone_stays_empty() {
     let Ok(Msg::Binary(answer)) = within(raw_in.read()).await else {
         panic!("no status for the raw op");
     };
-    let status = generated::Error::from_cbor(&cbor::decode(&answer[1..]));
+    let status = generated::Error::from_cbor(&cbor::try_decode(&answer[1..]).unwrap()).unwrap();
     assert_eq!(status.code, ErrorCode::Protocol, "the node refuses the raw stream op: {status:?}");
 
     let reader = GladeClient::new("reader");

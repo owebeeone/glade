@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use glade_wire::frame::frame_len;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::Mutex;
@@ -68,23 +69,27 @@ pub async fn connect(host: &str, port: u16) -> std::io::Result<(WsReader, WsWrit
 }
 
 impl WsReader {
-    /// Read one data message (binary/text payload), skipping ping/pong.
+    /// Read one data message (binary/text payload), skipping ping/pong. A
+    /// frame whose header claims more than glade-wire's `MAX_FRAME_BYTES` is
+    /// refused before its payload, as `InvalidData`, as the node refuses one
+    /// (F15, TautCheckedDecode.md CD-G3 item 3).
     pub async fn read(&mut self) -> std::io::Result<Msg> {
         loop {
             let mut h = [0u8; 2];
             self.inner.read_exact(&mut h).await?;
             let opcode = h[0] & 0x0f;
             let masked = h[1] & 0x80 != 0;
-            let mut len = (h[1] & 0x7f) as usize;
+            let mut len = u64::from(h[1] & 0x7f);
             if len == 126 {
                 let mut e = [0u8; 2];
                 self.inner.read_exact(&mut e).await?;
-                len = u16::from_be_bytes(e) as usize;
+                len = u16::from_be_bytes(e).into();
             } else if len == 127 {
                 let mut e = [0u8; 8];
                 self.inner.read_exact(&mut e).await?;
-                len = u64::from_be_bytes(e) as usize;
+                len = u64::from_be_bytes(e);
             }
+            let len = frame_len(len)?;
             let mut mask = [0u8; 4];
             if masked {
                 self.inner.read_exact(&mut mask).await?;
@@ -125,5 +130,69 @@ impl WsWriter {
             frame.push(b ^ key[i % 4]);
         }
         self.inner.lock().await.write_all(&frame).await
+    }
+}
+
+// A braced module, so the condition encloses the whole section.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use glade_wire::frame::MAX_FRAME_BYTES;
+    use std::io;
+    use std::time::Duration;
+    use tokio::net::TcpListener;
+
+    /// A node on loopback that answers the upgrade, writes `bytes` and holds
+    /// the socket open until the client goes.
+    async fn serving(bytes: Vec<u8>) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                head.push(socket.read_u8().await.unwrap());
+            }
+            socket
+                .write_all(b"HTTP/1.1 101 Switching Protocols\r\n\r\n")
+                .await
+                .unwrap();
+            let _ = socket.write_all(&bytes).await;
+            let _ = socket.read(&mut [0; 1]).await;
+        });
+        port
+    }
+
+    /// An unmasked binary frame's header, as the node writes it, claiming
+    /// `len` bytes.
+    fn header(len: u64) -> Vec<u8> {
+        [&[0x82, 127][..], &len.to_be_bytes()].concat()
+    }
+
+    /// F15 in client-rs (TautCheckedDecode.md CD-G3 item 3): a header that
+    /// claims more than `MAX_FRAME_BYTES`, by one or up to all of `u64`, is
+    /// refused as `InvalidData` before its payload, where the reader
+    /// allocated what it claimed and waited for it. A frame of exactly the
+    /// limit is read whole.
+    #[tokio::test]
+    async fn a_header_over_the_frame_limit_is_refused_before_its_payload() {
+        for claimed in [MAX_FRAME_BYTES as u64 + 1, u64::MAX] {
+            let port = serving(header(claimed)).await;
+            let (mut reader, _writer) = connect("127.0.0.1", port).await.unwrap();
+            let read = tokio::time::timeout(Duration::from_secs(5), reader.read()).await;
+            let Ok(Err(refused)) = read else {
+                panic!("a header claiming {claimed} bytes was not refused before its payload");
+            };
+            assert_eq!(refused.kind(), io::ErrorKind::InvalidData, "{claimed}");
+            let said = format!("bad frame: {claimed} bytes, over the limit of {MAX_FRAME_BYTES}");
+            assert_eq!(refused.to_string(), said);
+        }
+        let at_limit = [header(MAX_FRAME_BYTES as u64), vec![7; MAX_FRAME_BYTES]].concat();
+        let port = serving(at_limit).await;
+        let (mut reader, _writer) = connect("127.0.0.1", port).await.unwrap();
+        let Msg::Binary(frame) = reader.read().await.unwrap() else {
+            panic!("the frame at the limit was not read");
+        };
+        assert_eq!(frame.len(), MAX_FRAME_BYTES);
     }
 }

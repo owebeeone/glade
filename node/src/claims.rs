@@ -463,7 +463,6 @@ pub(crate) mod testing {
 mod tests {
     use super::*;
     use crate::mesh::testing::meshed;
-    use glade_wire::cbor;
     use crate::mesh::who_serves;
     use crate::sysdir::boot_at;
     use std::future::Future;
@@ -568,8 +567,8 @@ mod tests {
 
     /// The entries and the claims for `share` that the served store holds.
     fn published_serve(store: &Store, share: &str) -> (usize, usize) {
-        let entry = |p: &[u8]| WorkspaceEntry::from_cbor(&cbor::decode(p)).workspace == share;
-        let claim = |p: &[u8]| ServeClaim::from_cbor(&cbor::decode(p)).share == share;
+        let entry = |p: &[u8]| WorkspaceEntry::decode(p).unwrap().workspace == share;
+        let claim = |p: &[u8]| ServeClaim::decode(p).unwrap().share == share;
         let entries = published(store, crate::registry::G_WORKSPACES, entry);
         (entries, published(store, G_CLAIMS, claim))
     }
@@ -580,7 +579,7 @@ mod tests {
         let snap = crate::registry::BlobStore::new(sys).load().unwrap();
         snap.records
             .iter()
-            .map(|bytes| Op::from_cbor(&cbor::decode(bytes)))
+            .map(|bytes| Op::decode(bytes).unwrap())
             .collect()
     }
 
@@ -606,7 +605,7 @@ mod tests {
             "the retry mints"
         );
         assert_eq!(published_serve(&*shared.store.lock().await, "ws-a"), (1, 1));
-        let claim = |p: &[u8]| ServeClaim::from_cbor(&cbor::decode(p)).share == "ws-a";
+        let claim = |p: &[u8]| ServeClaim::decode(p).unwrap().share == "ws-a";
         assert_eq!(count(&saved(&sys), G_CLAIMS, claim), 1, "and saved");
     }
 
@@ -628,7 +627,7 @@ mod tests {
         refuse_saves(&sys, false);
         renew_leases(&shared).await;
         assert_eq!(claims(&*shared.store.lock().await), 2, "the next one lands");
-        let claim = |p: &[u8]| ServeClaim::from_cbor(&cbor::decode(p)).share == "ws-a";
+        let claim = |p: &[u8]| ServeClaim::decode(p).unwrap().share == "ws-a";
         assert_eq!(count(&saved(&sys), G_CLAIMS, claim), 2, "and is saved");
     }
 
@@ -646,7 +645,7 @@ mod tests {
         refuse_saves(&sys, false);
         note_principal(&shared, "alice").await;
         assert!(knows_principal(&*shared.store.lock().await, "alice"));
-        let alice = |p: &[u8]| PrincipalRecord::from_cbor(&cbor::decode(p)).principal == "alice";
+        let alice = |p: &[u8]| PrincipalRecord::decode(p).unwrap().principal == "alice";
         assert_eq!(count(&saved(&sys), G_PRINCIPALS, alice), 1, "and saved");
     }
 
@@ -795,7 +794,7 @@ mod tests {
         assert!(epochs.len() > 3 && kept, "{epochs:?}");
         drop(st);
         let live = |p: &[u8]| {
-            let claim = ServeClaim::from_cbor(&cbor::decode(p));
+            let claim = ServeClaim::decode(p).unwrap();
             claim.share == HOME && claim.lease_expiry_ms > past
         };
         assert!(count(&saved(&sys), G_CLAIMS, live) > 0, "and saved");
@@ -882,7 +881,7 @@ mod tests {
             .save(&before.snapshot())
             .unwrap();
         for bytes in &before.snapshot().records {
-            crate::store::testing::journal(&at, &Op::from_cbor(&cbor::decode(bytes)));
+            crate::store::testing::journal(&at, &Op::decode(bytes).unwrap());
         }
         let note = Op {
             share: "ws-x".into(),

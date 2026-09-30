@@ -24,9 +24,8 @@ use std::io;
 use std::path::Path;
 use std::sync::{Mutex, PoisonError};
 
-use glade_wire::cbor;
+use glade_wire::cbor::{self, DecodeError};
 use glade_wire::generated::{Head, Op, Shape, StreamHeads};
-use glade_wire::wellformed::{self, Malformed};
 
 use crate::chain::op_hash;
 use crate::checkpoint::{self, Against, Checkpoint, Floor, Placement};
@@ -154,7 +153,7 @@ impl Record {
 /// `Unverified` is an op a sealed registry was handed that does not verify
 /// (plan Step 4.1b), and `NotOurs` an append a sealed registry was asked to
 /// make under another node's origin. `Malformed` is an op an unsealed
-/// registry was handed whose record `wellformed::decode` refuses (F15b).
+/// registry was handed whose record `cbor::try_decode` refuses (F15b).
 /// `Rewrite` is a checkpoint whose base moves back from the one held, or
 /// names another hash there (plan Step 4.5c).
 #[derive(Debug, PartialEq)]
@@ -164,7 +163,7 @@ pub enum RegistryError {
     Equivocation { origin: String, seq: i64 },
     Unverified { origin: String, why: Refused },
     NotOurs { origin: String },
-    Malformed { origin: String, why: Malformed },
+    Malformed { origin: String, why: DecodeError },
     Rewrite { origin: String, seq: i64 },
 }
 
@@ -512,7 +511,7 @@ impl Registry {
                 let origin = op.origin;
                 return Err(RegistryError::Unverified { origin, why });
             }
-        } else if let Err(why) = wellformed::decode(&envelope::record_bytes(&op.payload)) {
+        } else if let Err(why) = cbor::try_decode(&envelope::record_bytes(&op.payload)) {
             // An unsealed registry does not verify, so no kind check reads
             // the record: it refuses one its folds could not read (F15b).
             let origin = op.origin;
@@ -1016,7 +1015,7 @@ mod tests {
         // every persisted record carries its appending origin (blob-land, still
         // attributed) — the migration-to-per-origin-logs invariant.
         for bytes in &snap.records {
-            let op = Op::from_cbor(&cbor::decode(bytes));
+            let op = Op::decode(bytes).unwrap();
             assert!(!op.origin.is_empty(), "record missing origin attribution");
         }
         assert!(!snap.heads.is_empty(), "snapshot carries heads (cached fold + heads)");
@@ -1085,10 +1084,10 @@ mod tests {
         // tamper: corrupt one claim record's payload -> its op-hash changes, so
         // the NEXT op's prev no longer matches -> chain break -> suffix dropped.
         let target = snap.records.iter().position(|b| {
-            let op = Op::from_cbor(&cbor::decode(b));
+            let op = Op::decode(b).unwrap();
             op.origin == "peerX" && op.seq == 0
         }).unwrap();
-        let mut op = Op::from_cbor(&cbor::decode(&snap.records[target]));
+        let mut op = Op::decode(&snap.records[target]).unwrap();
         op.payload.push(0xff); // malicious edit — indistinguishable from a bad sync chunk
         snap.records[target] = cbor::encode(&op.to_cbor());
         let (reg, rejected) = Registry::from_snapshot(&snap);
@@ -1133,7 +1132,7 @@ mod tests {
         let without = |glade_id: &str| {
             let mut snap = r.snapshot();
             snap.records.retain(|bytes| {
-                let op = Op::from_cbor(&cbor::decode(bytes));
+                let op = Op::decode(bytes).unwrap();
                 !(op.glade_id == glade_id && op.seq == 0)
             });
             Registry::from_snapshot(&snap)
@@ -1399,7 +1398,7 @@ mod tests {
         (app.into(), glade_id.into(), shape.into())
     }
     fn ops_of(r: &Registry) -> Vec<Op> {
-        r.snapshot().records.iter().map(|b| Op::from_cbor(&cbor::decode(b))).collect()
+        r.snapshot().records.iter().map(|b| Op::decode(b).unwrap()).collect()
     }
 
     /// R9(a): `dir.bindings` folds by glade id and the newest declaration is
@@ -1552,12 +1551,12 @@ mod tests {
             zone: "commons".into(),
             retention: "from_cursor".into(),
         };
-        assert_eq!(BindingDecl::from_cbor(&cbor::decode(&payload)), b);
+        assert_eq!(BindingDecl::decode(&payload).unwrap(), b);
         assert_eq!(Record::Binding(b.clone()).encode(), payload);
         let mut r = Registry::new();
         r.append(Record::Binding(b), "n1").unwrap();
         let snap = r.snapshot();
-        let op = Op::from_cbor(&cbor::decode(&snap.records[0]));
+        let op = Op::decode(&snap.records[0]).unwrap();
         assert_eq!((op.payload.as_slice(), op.seq, op.lamport), (payload.as_slice(), 0, 0));
         let (back, rejected) = Registry::from_snapshot(&snap);
         assert_eq!(rejected, 0);

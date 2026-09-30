@@ -10,7 +10,6 @@ use std::collections::BTreeMap;
 
 use glade_node::appdecl::parse;
 use glade_node::assembly::HostError;
-use glade_node::cbor;
 use glade_node::chain::op_hash;
 use glade_node::claims::{LEASE_TTL_MS, RENEW_EVERY_MS};
 use glade_node::registry::Record;
@@ -29,7 +28,7 @@ type Heads = BTreeMap<(String, String), (i64, Vec<u8>)>;
 fn stored_heads(node: &TestNode) -> Heads {
     let mut heads = Heads::new();
     for bytes in node.store.snapshot().heads {
-        let stream = StreamHeads::from_cbor(&cbor::decode(&bytes));
+        let stream = StreamHeads::decode(&bytes).unwrap();
         for head in stream.heads {
             let hash = head.hash.expect("a stored head carries its hash");
             heads.insert((stream.glade_id.clone(), head.origin), (head.seq, hash));

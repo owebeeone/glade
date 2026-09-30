@@ -1451,6 +1451,35 @@ mod tests {
         refused_and_served(port, &tagged, "a Hello holding a CBOR tag").await;
     }
 
+    /// TautCheckedDecode.md CD-G3: a frame whose message is well-formed CBOR
+    /// of another shape, a field missing or of another type, or no map,
+    /// panicked its session's task in the generated decode, which left its
+    /// connection open and unread. Each is refused like any bad frame, as is
+    /// an int the strict codec refuses, and the session goes on; a new client
+    /// is served.
+    #[tokio::test]
+    async fn a_frame_of_another_shape_is_refused_and_its_session_goes_on() {
+        let (_, port) = serving("glade-server-cdg3-shape").await;
+        let hello = hello();
+        let tag = &hello[..1];
+        let session_an_int = cbor::Cbor::Map(vec![(1, cbor::Cbor::Int(1))]);
+        let cases = [
+            ([tag, &[0xa0]].concat(), "a Hello with no fields"),
+            (
+                [tag, &cbor::encode(&session_an_int)].concat(),
+                "a Hello whose session is an int",
+            ),
+            ([tag, &[0x03]].concat(), "a Hello that is not a map"),
+            (
+                [tag, &[0x18, 0x01]].concat(),
+                "a Hello that is a non-canonical int",
+            ),
+        ];
+        for (bytes, what) in cases {
+            refused_and_served(port, &bytes, what).await;
+        }
+    }
+
     /// A websocket to `port`, upgraded by hand, to write any bytes on.
     async fn upgraded(port: u16) -> TcpStream {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};

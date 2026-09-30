@@ -462,6 +462,13 @@ impl<S> Subscribes<S> {
         failed.into_iter().map(|(_, _, waiter)| waiter).collect()
     }
 
+    /// A frame the client could not take (CD-G4): it may have been any
+    /// waiting subscribe's ack, or carried its replay, so every waiting
+    /// subscribe is abandoned. The connection goes on, and what it saw stays.
+    pub fn not_taken(&mut self) -> Abandoned<S> {
+        self.abandon()
+    }
+
     /// The connection ended: every waiting subscribe is abandoned, and what
     /// the connection saw goes with it, its live zones too.
     pub fn ended(&mut self) -> Abandoned<S> {
@@ -985,6 +992,47 @@ mod tests {
         subs.acked(&ack(&other(), &[("a", 0)])).unwrap();
         assert_eq!(subs.failed(&[op_in(&zone(), "a", 0)]), vec![0], "the subscribe waiting on the frame's zone fails");
         assert_eq!(subs.received(&[op_in(&other(), "a", 0)]).len(), 1, "another zone's still completes");
+    }
+
+    /// CD-G4: a frame the client could not take may have been any waiting
+    /// subscribe's ack, or carried its replay, so each is abandoned, as at
+    /// the connection's end: those not yet acked and those catching up fail,
+    /// and one refused and waiting for its reason stays a refusal, the reason
+    /// unknown. The connection goes on, so what it saw stays: its live zones,
+    /// and the ops it has seen count toward a later subscribe's replay.
+    #[test]
+    fn a_frame_not_taken_abandons_every_waiting_subscribe_and_keeps_what_was_seen() {
+        let attic: Zone = ("ws-attic".into(), "g".into(), vec![]);
+        let mut subs = Subscribes::default();
+        subs.received(&[op_in(&zone(), "a", 5)]);
+        subs.sent(attic.clone(), 0);
+        subs.acked(&Heads { streams: vec![] }).unwrap();
+        subs.sent(zone(), 1);
+        subs.acked(&ack(&zone(), &[("b", 1)])).unwrap();
+        subs.sent(other(), 2);
+        let unknown = SubscribeOutcome::Refused {
+            code: None,
+            message: "its reason did not come".into(),
+        };
+        let refused = vec![Subscribed {
+            zone: attic,
+            outcome: unknown,
+            waiter: 0,
+        }];
+        assert_eq!(
+            subs.not_taken(),
+            Abandoned {
+                failed: vec![2, 1],
+                refused
+            }
+        );
+        assert!(subs.live(&zone()), "a zone its ack named stays live");
+        subs.sent(zone(), 3);
+        let done = subs
+            .acked(&ack(&zone(), &[("a", 5)]))
+            .unwrap()
+            .map(|done| done.waiter);
+        assert_eq!(done, Some(3), "the ops seen before still count");
     }
 
     #[test]

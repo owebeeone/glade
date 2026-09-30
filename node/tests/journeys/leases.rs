@@ -60,7 +60,7 @@ fn renewal() {
     clock.set(last);
     assert_eq!((a.serves(WS), b.serves(WS)), (None, None));
     for op in b.store.ops() {
-        let claim = ServeClaim::from_cbor(&glade_node::cbor::decode(&op.payload));
+        let claim = ServeClaim::decode(&op.payload).unwrap();
         assert_eq!(claim.epoch, 1, "a renewal keeps the epoch");
     }
 }

@@ -26,7 +26,7 @@ use std::sync::{Arc, Weak};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 
-use glade_wire::cbor::Cbor;
+use glade_wire::cbor::{Cbor, DecodeError};
 use glade_wire::generated::{
     ErrorCode, ExchangeReq, ExchangeRes, FrameType, Hello, Ops, Subscribe,
 };
@@ -36,6 +36,7 @@ use crate::answers::{
     zone_of, Abandoned, Answered, Answers, OpOutcome, OpStatus, RefusedAfterAck, SubscribeOutcome,
     Subscribed, Subscribes, Zone, ZoneRefusal, WAITING_BOUND,
 };
+use crate::inbound::Inbound;
 use crate::session::{require_op, shape_of, Session};
 use crate::ws::{self, Msg, WsWriter};
 
@@ -113,16 +114,32 @@ struct Inner {
 }
 
 impl Inner {
-    /// Decode + dispatch one inbound frame (the read loop's body).
+    /// Decode + dispatch one inbound frame (the read loop's body): the whole
+    /// frame is decoded before any state is touched, so a frame the codec
+    /// refuses changes nothing but the subscribes it may have answered
+    /// (TautCheckedDecode.md CD-G4).
     async fn dispatch(self: &Arc<Self>, bytes: &[u8]) {
-        if bytes.is_empty() {
-            return;
+        match Inbound::decode(bytes) {
+            Ok(inbound) => self.take(inbound).await,
+            Err(why) => self.not_taken(why).await,
         }
-        let ty = FrameType::from_wire(bytes[0] as i64);
-        let body = cbor::decode(&bytes[1..]);
-        match ty {
-            FrameType::Ops => {
-                let ops = Ops::from_cbor(&body).ops;
+    }
+
+    /// A frame the client could not take (CD-G4), as client-ts's `notTaken`:
+    /// it may have been a subscribe's ack, or carried its replay, so no
+    /// waiting subscribe can be matched to its answer any more, and each
+    /// fails with the codec's reason; one refused and waiting for its reason
+    /// stays a refusal. The read loop carries on.
+    async fn not_taken(&self, why: DecodeError) {
+        let why = format!("a frame the client could not take: {why}");
+        let abandoned = self.subscribes.lock().await.not_taken();
+        abandon(abandoned, io::ErrorKind::InvalidData, &why);
+    }
+
+    /// One inbound frame, decoded whole.
+    async fn take(self: &Arc<Self>, inbound: Inbound) {
+        match inbound {
+            Inbound::Ops(ops) => {
                 // The session folds every inbound op (so this client's own
                 // `fold_*` is live); listeners are an additive fan-out for a
                 // supplier serving several surfaces over one session.
@@ -139,11 +156,10 @@ impl Inner {
                 let done = self.subscribes.lock().await.received(&ops);
                 self.caught_up(done).await;
             }
-            FrameType::Heads => {
+            Inbound::Heads(ack) => {
                 // The ack of the oldest subscribe: it names the zone and the
                 // heads its replay must reach (R5), or no zone, for a refusal
                 // whose reason follows (R6).
-                let ack = generated::Heads::from_cbor(&body);
                 let acked = self.subscribes.lock().await.acked(&ack);
                 match acked {
                     Ok(done) => {
@@ -154,11 +170,10 @@ impl Inner {
                     }
                 }
             }
-            FrameType::Error => {
+            Inbound::Error(status) => {
                 // R1: a status names its op by hash. An `Error` with no `corr`
                 // is a refused subscribe's reason (R6), or else refuses zones
                 // after their ack (F13).
-                let status = generated::Error::from_cbor(&body);
                 let refused = self.subscribes.lock().await.reason(&status);
                 if let Some(refused) = refused {
                     let _ = refused.waiter.send(Ok(refused.outcome));
@@ -179,24 +194,22 @@ impl Inner {
                     self.caught_up(done).await;
                 }
             }
-            FrameType::Welcome => {
+            Inbound::Welcome(_) => {
                 if let Some(tx) = self.welcome_acks.lock().await.pop_front() {
                     let _ = tx.send(());
                 }
             }
-            FrameType::ExchangeReq => {
+            Inbound::ExchangeReq(req) => {
                 // This session is the attached provider (it Subscribed a declared
                 // exchange surface); surface the request to every provider loop.
-                let req = ExchangeReq::from_cbor(&body);
                 self.exreq_senders.lock().await.retain(|s| s.send(req.clone()).is_ok());
             }
-            FrameType::ExchangeRes => {
-                let res = ExchangeRes::from_cbor(&body);
+            Inbound::ExchangeRes(res) => {
                 if let Some(tx) = self.ex_waiters.lock().await.remove(&res.corr) {
                     let _ = tx.send(ExchangeOutcome { ok: res.ok, payload: res.payload, error: res.error });
                 }
             }
-            _ => {} // channel frames: ignored (echo/channel are P3)
+            Inbound::Ignored => {} // channel frames: ignored (echo/channel are P3)
         }
     }
 
@@ -661,4 +674,81 @@ fn parse_url(url: &str) -> io::Result<(String, u16)> {
         .parse()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "bad port"))?;
     Ok((host.to_string(), port))
+}
+
+// A braced module, so the condition encloses the whole section.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use glade_wire::generated::{Heads, StreamHeads};
+    use std::time::Duration;
+
+    fn zone(key: u8) -> Zone {
+        ("s".into(), "g".into(), vec![key])
+    }
+
+    /// TautCheckedDecode.md CD-G4: a frame the client cannot take may have
+    /// been a subscribe's ack, so each waiting subscribe fails with the
+    /// codec's reason, as client-ts's `notTaken` fails them: an unknown frame
+    /// type or a message of another shape, which panicked the read loop's
+    /// task, an empty frame, which it dropped silently, and bytes the strict
+    /// codec refuses. The client takes the next frame as before: a later
+    /// subscribe's ack answers it.
+    #[tokio::test]
+    async fn a_frame_the_client_cannot_take_fails_each_waiting_subscribe() {
+        let client = GladeClient::new("o");
+        let inner = &client.inner;
+        let refused = [
+            (vec![15, 0xa0], "unknown FrameType wire value 15"),
+            (
+                vec![FrameType::Heads.wire() as u8, 0xa0],
+                "missing map key 1",
+            ),
+            (vec![], "truncated CBOR input"),
+            (
+                vec![FrameType::Welcome.wire() as u8, 0x18, 0x01],
+                "non-canonical integer encoding of 1",
+            ),
+        ];
+        for (bytes, why) in refused {
+            let (first, second) = (oneshot::channel(), oneshot::channel());
+            {
+                let mut subscribes = inner.subscribes.lock().await;
+                subscribes.sent(zone(1), first.0);
+                subscribes.sent(zone(2), second.0);
+            }
+            inner.dispatch(&bytes).await;
+            for waiting in [first.1, second.1] {
+                let answered = tokio::time::timeout(Duration::from_secs(5), waiting).await;
+                let failed = answered.expect(why).unwrap().expect_err(why);
+                assert_eq!(failed.kind(), io::ErrorKind::InvalidData, "{why}");
+                assert_eq!(
+                    failed.to_string(),
+                    format!("a frame the client could not take: {why}")
+                );
+            }
+        }
+        let (tx, rx) = oneshot::channel();
+        inner.subscribes.lock().await.sent(zone(3), tx);
+        let named = StreamHeads {
+            share: "s".into(),
+            glade_id: "g".into(),
+            key: vec![3],
+            heads: vec![],
+        };
+        let ack = Heads {
+            streams: vec![named],
+        };
+        inner
+            .dispatch(&frame(FrameType::Heads, ack.to_cbor()))
+            .await;
+        let answered = tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            answered.unwrap(),
+            SubscribeOutcome::Accepted { heads: vec![] }
+        );
+    }
 }

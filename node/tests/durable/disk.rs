@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use glade_node::cbor;
 use glade_node::registry::{BlobStore, StoreApi};
 use glade_node::sysdata::SystemSnapshot;
 use glade_wire::generated::Op;
@@ -66,7 +65,7 @@ impl DiskStore {
         let records = self.snapshot().records;
         records
             .iter()
-            .map(|bytes| Op::from_cbor(&cbor::decode(bytes)))
+            .map(|bytes| Op::decode(bytes).unwrap())
             .collect()
     }
 

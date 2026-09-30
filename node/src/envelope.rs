@@ -14,9 +14,8 @@ use std::io;
 use std::path::Path;
 
 use glade_signer_api::{Purpose, SignatureStatus};
-use glade_wire::cbor::{self, Cbor};
+use glade_wire::cbor::{self, Cbor, DecodeError};
 use glade_wire::generated::{Op, Shape};
-use glade_wire::wellformed::{self, Malformed};
 
 use crate::checkpoint;
 use crate::peer::NodeIdentity;
@@ -150,17 +149,21 @@ pub fn record_bytes(payload: &[u8]) -> Vec<u8> {
 }
 
 /// The record `op` carries, decoded by `from`, a record kind's `from_cbor`,
-/// or why its bytes were refused: `wellformed::decode` reads them first, so
-/// none the wire codec's decode would panic on, or recurse too deep for,
-/// reaches it (F15b). A verified store's records are each their stream's
-/// kind, so none is refused, and none panics `from`.
-pub fn record<T>(op: &Op, from: impl FnOnce(&Cbor) -> T) -> Result<T, Malformed> {
-    wellformed::decode(&record_bytes(&op.payload)).map(|record| from(&record))
+/// or why it was refused: taut's fail-closed `cbor::try_decode` reads its
+/// bytes, bounded 32 deep, and `from` its fields, each refusing with a
+/// `DecodeError` what the legacy codec panicked on or recursed too deep for
+/// (F15b, TautCheckedDecode.md CD-G3). A verified store's records are each
+/// their stream's kind, so none is refused.
+pub fn record<T>(
+    op: &Op,
+    from: impl FnOnce(&Cbor) -> Result<T, DecodeError>,
+) -> Result<T, DecodeError> {
+    cbor::try_decode(&record_bytes(&op.payload)).and_then(|record| from(&record))
 }
 
 /// [`record`], for a fold: a record it refuses is skipped, and said on
 /// stderr in one line, [`skipped`].
-pub(crate) fn folded<T>(op: &Op, from: impl FnOnce(&Cbor) -> T) -> Option<T> {
+pub(crate) fn folded<T>(op: &Op, from: impl FnOnce(&Cbor) -> Result<T, DecodeError>) -> Option<T> {
     match record(op, from) {
         Ok(record) => Some(record),
         Err(why) => {
@@ -171,7 +174,7 @@ pub(crate) fn folded<T>(op: &Op, from: impl FnOnce(&Cbor) -> T) -> Option<T> {
 }
 
 /// The line a fold skips `op`'s record with: its zone and its seq, and why.
-fn skipped(op: &Op, why: Malformed) -> String {
+fn skipped(op: &Op, why: DecodeError) -> String {
     let (share, stream, seq) = (&op.share, &op.glade_id, op.seq);
     let hex: String = op.key.iter().map(|byte| format!("{byte:02x}")).collect();
     let key = match hex.is_empty() {
@@ -182,9 +185,9 @@ fn skipped(op: &Op, why: Malformed) -> String {
 }
 
 /// The op `bytes` hold, one a journal or a snapshot stored, or why they were
-/// refused: `wellformed::decode` reads them first (F15b).
-pub(crate) fn decode_op(bytes: &[u8]) -> Result<Op, Malformed> {
-    wellformed::decode(bytes).map(|op| Op::from_cbor(&op))
+/// refused: `cbor::try_decode` reads them, and `Op::from_cbor` the op (F15b).
+pub(crate) fn decode_op(bytes: &[u8]) -> Result<Op, DecodeError> {
+    cbor::try_decode(bytes).and_then(|op| Op::from_cbor(&op))
 }
 
 /// The ops a snapshot's `records` hold, each read by [`decode_op`]: one it
@@ -202,7 +205,7 @@ pub(crate) fn snapshot_ops(records: &[Vec<u8>]) -> Vec<Op> {
 
 /// The line an op a snapshot holds at `at` is `done` with, `skipped` or
 /// `quarantined`, when [`decode_op`] refuses it: its place, and why.
-pub(crate) fn unreadable_op(done: &str, at: usize, why: Malformed) -> String {
+pub(crate) fn unreadable_op(done: &str, at: usize, why: DecodeError) -> String {
     let n = at + 1;
     format!("{done} an op that cannot be read: record {n} of the snapshot ({why})")
 }
@@ -821,7 +824,7 @@ mod tests {
         }
     }
 
-    /// F15b: a record `wellformed::decode` refuses is refused by [`record`]
+    /// F15b: a record `cbor::try_decode` refuses is refused by [`record`]
     /// and skipped by [`folded`], whose line names its zone and seq; an op
     /// it refuses is skipped by [`snapshot_ops`], which keeps the ops around
     /// it.
@@ -836,23 +839,86 @@ mod tests {
             payload: nested.clone(),
             ..Op::default()
         };
-        let why = Malformed::TooDeep;
-        assert_eq!(record(&op, ServeClaim::from_cbor), Err(why));
+        let why = DecodeError::TooDeep { limit: 32 };
+        assert_eq!(record(&op, ServeClaim::from_cbor), Err(why.clone()));
         assert_eq!(folded(&op, ServeClaim::from_cbor), None);
         let line = "skipped a record that cannot be read: zone home/dir.claims, seq 3";
-        assert_eq!(skipped(&op, why), format!("{line} ({why})"));
+        let said = format!("{line} (CBOR nested deeper than 32)");
+        assert_eq!(skipped(&op, why), said);
         let held = cbor::encode(&op.to_cbor());
         let ops = snapshot_ops(&[held.clone(), nested, held]);
         assert_eq!(ops, [op.clone(), op]);
     }
 
-    /// F15b: no production code of this crate calls the wire codec's
-    /// `cbor::decode`, which recurses once for each level of nesting, with no
-    /// limit: bytes from a client, a peer or the store reach it only through
-    /// `wellformed::decode`, as [`record`] and [`decode_op`] read them. A
-    /// source check over `src/`: each file's code before its first
-    /// `#[cfg(test)]`, where this crate's test modules begin, with every
-    /// comment set aside. The node gate runs it with the other tests.
+    /// TautCheckedDecode.md CD-G3: a record of another shape than its
+    /// kind's, a field missing or of another type, panicked its kind's
+    /// `from_cbor` in every fold that read it. Taut's codec refuses it, as it
+    /// refuses bytes the legacy codec took and the codec does not (a
+    /// non-canonical int, a repeated key): [`record`] answers why, and
+    /// [`folded`] skips it. An op of another shape than an op is refused by
+    /// [`decode_op`], and skipped by [`snapshot_ops`].
+    #[test]
+    fn a_record_or_an_op_of_another_shape_is_refused_not_a_panic() {
+        let claim = |record: Cbor| Op {
+            share: HOME.into(),
+            glade_id: G_CLAIMS.into(),
+            payload: cbor::encode(&record),
+            ..Op::default()
+        };
+        let two_texts = Cbor::Map(vec![
+            (1, Cbor::Text("n".into())),
+            (2, Cbor::Text("s".into())),
+        ]);
+        let epoch_text = Cbor::Map(vec![
+            (1, Cbor::Text("n".into())),
+            (2, Cbor::Text("s".into())),
+            (3, Cbor::Int(1)),
+            (4, Cbor::Text("four".into())),
+        ]);
+        let refused = [
+            (claim(two_texts), DecodeError::MissingKey(3)),
+            (
+                claim(epoch_text),
+                DecodeError::WrongType { expected: "int" },
+            ),
+            (
+                claim(Cbor::Int(7)),
+                DecodeError::WrongType { expected: "map" },
+            ),
+        ];
+        for (op, why) in refused {
+            assert_eq!(record(&op, ServeClaim::from_cbor), Err(why));
+            assert_eq!(folded(&op, ServeClaim::from_cbor), None);
+        }
+        let non_canonical = Op {
+            payload: vec![0xa1, 0x18, 0x01, 0x00],
+            ..claim(Cbor::Null)
+        };
+        let why = DecodeError::NonCanonicalInt(1);
+        assert_eq!(record(&non_canonical, ServeClaim::from_cbor), Err(why));
+        let repeated = Op {
+            payload: vec![0xa2, 0x01, 0x00, 0x01, 0x00],
+            ..claim(Cbor::Null)
+        };
+        let why = DecodeError::DuplicateMapKey(glade_wire::cbor::MapKey::Int(1));
+        assert_eq!(record(&repeated, ServeClaim::from_cbor), Err(why));
+
+        let not_an_op = cbor::encode(&Cbor::Map(vec![(1, Cbor::Text("home".into()))]));
+        assert_eq!(decode_op(&not_an_op), Err(DecodeError::MissingKey(2)));
+        let held = cbor::encode(&Op::default().to_cbor());
+        let ops = snapshot_ops(&[held.clone(), not_an_op, held]);
+        assert_eq!(ops, [Op::default(), Op::default()]);
+    }
+
+    /// F15b: no production code of this crate calls `cbor::decode`, the
+    /// legacy codec's decode, which recursed once for each level of nesting,
+    /// with no limit, and panicked on bytes it could not read: bytes from a
+    /// client, a peer or the store are read by taut's fail-closed
+    /// `cbor::try_decode`, as [`record`] and [`decode_op`] read them
+    /// (TautCheckedDecode.md CD-G2). A source check over `src/`: each file's
+    /// code before its first `#[cfg(test)]`, where this crate's test modules
+    /// begin, with every comment set aside. The node gate runs it with the
+    /// other tests.
     #[test]
     fn no_production_code_calls_the_recursive_decode() {
         assert!(names_the_decode("x(cbor::decode(&b))") && names_the_decode("cbor::decode;"));

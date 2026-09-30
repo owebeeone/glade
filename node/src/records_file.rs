@@ -678,12 +678,12 @@ mod tests {
         file.compare_exchange(None, &encode(&snap)).unwrap();
         file.compare_exchange(Some(1), &encode(&snap)).unwrap();
         let older = |bytes: &[u8]| {
-            let c = cbor::decode(bytes);
+            let c = cbor::try_decode(bytes).unwrap();
             let list = |key| {
-                c.get(key)
-                    .array()
+                let items = c.try_get(key).unwrap().try_array().unwrap();
+                items
                     .iter()
-                    .map(|x| x.bytes())
+                    .map(|x| x.try_bytes().unwrap())
                     .collect::<Vec<_>>()
             };
             (list(1), list(2))

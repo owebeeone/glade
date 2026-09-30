@@ -21,8 +21,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use glade_grant_api::{GrantPort, Holder};
+use glade_wire::cbor;
 use glade_wire::generated::{ExchangeReq, ExchangeRes, Heads, StreamHeads};
-use glade_wire::wellformed;
 
 use crate::conversation::Conversation;
 use crate::echo::Echo;
@@ -332,15 +332,17 @@ async fn handle_create(shared: &Arc<Shared>, sid: SessionId, req: ExchangeReq) {
 }
 
 /// `req`'s `WorkspaceCreateReq`, or `None` once its requester is answered
-/// why not: bytes the wire codec's decode would panic on, or recurse too
-/// deep for, are refused as data, and the session goes on (F15b).
+/// why not: bytes `cbor::try_decode` refuses, which the legacy decode
+/// panicked on or recursed too deep for (F15b), and a map of another shape,
+/// which its `from_cbor` panicked on (TautCheckedDecode.md CD-G3), are
+/// refused as data, and the session goes on.
 async fn create_request(
     shared: &Arc<Shared>,
     sid: SessionId,
     req: &ExchangeReq,
 ) -> Option<WorkspaceCreateReq> {
-    match wellformed::decode(&req.payload) {
-        Ok(create) => Some(WorkspaceCreateReq::from_cbor(&create)),
+    match cbor::try_decode(&req.payload).and_then(|c| WorkspaceCreateReq::from_cbor(&c)) {
+        Ok(create) => Some(create),
         Err(why) => {
             let reason = format!("workspace.create refused its payload: {why}");
             send(shared, sid, &res_err(&req.corr, &reason)).await;
@@ -393,12 +395,12 @@ async fn try_forward(shared: &Arc<Shared>, peer: &str, req: ExchangeReq) -> io::
 /// The claim holder's answer to an exchange on `glade_id` forwarded to it
 /// (F15b). A `workspace.create` answer carries the node's own
 /// `WorkspaceCreateRes`, which the requester decodes, so one whose payload
-/// `wellformed::decode` refuses fails the exchange. Any other exchange's
+/// `cbor::try_decode` refuses fails the exchange. Any other exchange's
 /// payload is its app's, opaque to the node, and passes as it came.
 fn forwarded(glade_id: &str, res: ExchangeRes) -> io::Result<ExchangeRes> {
     let payload = res.payload.as_deref();
     let created = payload.filter(|_| glade_id == WORKSPACE_CREATE);
-    if let Some(Err(why)) = created.map(wellformed::decode) {
+    if let Some(Err(why)) = created.map(cbor::try_decode) {
         return Err(other(format!("its {WORKSPACE_CREATE} answer: {why}")));
     }
     Ok(res)
@@ -607,7 +609,7 @@ mod tests {
     fn store_of(reg: &Registry, name: &str) -> Store {
         let mut st = Store::open(fresh(name)).unwrap();
         for bytes in &reg.snapshot().records {
-            st.append(Op::from_cbor(&glade_wire::cbor::decode(bytes))).unwrap();
+            st.append(Op::decode(bytes).unwrap()).unwrap();
         }
         st
     }
@@ -750,7 +752,7 @@ mod tests {
             Frame::ExchangeRes(res) => {
                 assert!(res.ok, "create succeeded, corr intact: {:?}", res.error);
                 assert_eq!(res.corr, "cr-1");
-                let out = crate::sysdata::WorkspaceCreateRes::from_cbor(&glade_wire::cbor::decode(&res.payload.unwrap()));
+                let out = crate::sysdata::WorkspaceCreateRes::decode(&res.payload.unwrap()).unwrap();
                 assert_eq!((out.workspace.as_str(), out.node.as_str(), out.created), ("ws-new", b_id.as_str(), true), "the TARGET performed the creation under its own origin");
             }
             other => panic!("expected ExchangeRes, got {other:?}"),
@@ -795,7 +797,7 @@ mod tests {
         match next_frame(&mut rc, "re-create response").await {
             Frame::ExchangeRes(res) => {
                 assert!(res.ok);
-                let out = crate::sysdata::WorkspaceCreateRes::from_cbor(&glade_wire::cbor::decode(&res.payload.unwrap()));
+                let out = crate::sysdata::WorkspaceCreateRes::decode(&res.payload.unwrap()).unwrap();
                 assert!(!out.created, "already served: nothing new minted");
             }
             other => panic!("expected ExchangeRes, got {other:?}"),
@@ -826,7 +828,7 @@ mod tests {
             let res = next_exchange_res(&mut rc, "self-target create response").await;
             assert!(res.ok, "{:?}", res.error);
             assert_eq!(res.corr, "cr-4");
-            let out = crate::sysdata::WorkspaceCreateRes::from_cbor(&glade_wire::cbor::decode(&res.payload.unwrap()));
+            let out = crate::sysdata::WorkspaceCreateRes::decode(&res.payload.unwrap()).unwrap();
             assert_eq!((out.node.as_str(), out.created), (a_id.as_str(), true));
         }
         {
@@ -1117,8 +1119,10 @@ mod tests {
 
     /// F15b: a `workspace.create` whose payload nests 100,000 deep, which the
     /// wire codec's decode recursed on until the node's stack overflowed and
-    /// the process aborted, is answered `ok: false` with the reason, and the
-    /// node serves on: that session and another client are answered.
+    /// the process aborted, is answered `ok: false` with the reason; so is one
+    /// whose payload is a map of another shape, which the legacy `from_cbor`
+    /// panicked on, ending the session's task (TautCheckedDecode.md CD-G3).
+    /// The node serves on: that session and another client are answered.
     #[tokio::test]
     async fn a_nested_create_payload_is_refused_and_the_node_serves_on() {
         let server = Server::open(fresh("nested-create")).unwrap();
@@ -1129,12 +1133,20 @@ mod tests {
 
         let mut nested = vec![0x81; 100_000];
         nested.push(0);
-        let create = xreq(HOME, WORKSPACE_CREATE, "n-1", &nested);
-        wc.send_binary(&create).await.unwrap();
-        let res = next_exchange_res(&mut rc, "the nested create's answer").await;
-        assert_eq!((res.corr.as_str(), res.ok), ("n-1", false));
-        let why = res.error.unwrap_or_default();
-        assert!(why.contains("nested deeper than 32"), "{why}");
+        let workspace_only = cbor::Cbor::Map(vec![(1, cbor::Cbor::Text("ws".into()))]);
+        let misshapen = cbor::encode(&workspace_only);
+        let refused = [
+            ("n-1", nested, "nested deeper than 32"),
+            ("n-2", misshapen, "missing map key 2"),
+        ];
+        for (corr, payload, reason) in refused {
+            let create = xreq(HOME, WORKSPACE_CREATE, corr, &payload);
+            wc.send_binary(&create).await.unwrap();
+            let res = next_exchange_res(&mut rc, "the refused create's answer").await;
+            assert_eq!((res.corr.as_str(), res.ok), (corr, false));
+            let why = res.error.unwrap_or_default();
+            assert!(why.contains(reason), "{why}");
+        }
 
         let (mut other, wo) = ws::connect("127.0.0.1", port).await.unwrap();
         for (r, w, corr) in [(&mut rc, &wc, "e-1"), (&mut other, &wo, "e-2")] {
@@ -1148,7 +1160,8 @@ mod tests {
 
     /// F15b: a claim holder's answer to a forwarded `workspace.create`
     /// carries the node's own `WorkspaceCreateRes`, which the requester
-    /// decodes, so one whose payload `wellformed` refuses fails the exchange.
+    /// decodes, so one whose payload `cbor::try_decode` refuses fails the
+    /// exchange.
     /// A well-formed one passes as it came, and so does any other exchange's
     /// payload, which is its app's.
     #[test]

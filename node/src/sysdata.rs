@@ -1,7 +1,13 @@
-// DEPRECATED (--legacy-codec): fail-OPEN legacy codec (from_cbor -> Self, panics on malformed input). Fail-closed decode is the taut v0.8.0 default; this opt-out is removed at v0.10.0 — regenerate without --legacy-codec to migrate. See dev-docs/RustFailClosed.md.
+// taut v0.10.0 wrote this file: the command in glade/node/ir/sysdata.taut.py
+// regenerates it. Do not edit it by hand.
 // GENERATED native Rust types + codec — do not edit.
 #![allow(dead_code)]
-use crate::cbor::Cbor;
+use crate::cbor::{Cbor, DecodeError};
+
+// The file's bounds, for a decode rooted at a type that is not a message:
+// `cbor::try_decode_with(bytes, MAX_DEPTH, MAX_ENCODED_LEN)`.
+pub const MAX_DEPTH: usize = 32;
+pub const MAX_ENCODED_LEN: Option<usize> = None;
 
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct NodeRecord {
@@ -9,17 +15,22 @@ pub struct NodeRecord {
     pub operator: String,
 }
 impl NodeRecord {
+    pub const MAX_DEPTH: usize = 32;
+    pub const MAX_ENCODED_LEN: Option<usize> = None;
     pub fn to_cbor(&self) -> Cbor {
         Cbor::Map(vec![
             (1, Cbor::Text(self.node_id.clone())),
             (2, Cbor::Text(self.operator.clone())),
         ])
     }
-    pub fn from_cbor(c: &Cbor) -> Self {
-        Self {
-            node_id: c.get(1).text(),
-            operator: c.get(2).text(),
-        }
+    pub fn from_cbor(c: &Cbor) -> Result<Self, DecodeError> {
+        Ok(Self {
+            node_id: c.try_get(1)?.try_text()?,
+            operator: c.try_get(2)?.try_text()?,
+        })
+    }
+    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        Self::from_cbor(&crate::cbor::try_decode_with(bytes, Self::MAX_DEPTH, Self::MAX_ENCODED_LEN)?)
     }
 }
 
@@ -30,6 +41,8 @@ pub struct WorkspaceEntry {
     pub eligible_hosts: Vec<String>,
 }
 impl WorkspaceEntry {
+    pub const MAX_DEPTH: usize = 32;
+    pub const MAX_ENCODED_LEN: Option<usize> = None;
     pub fn to_cbor(&self) -> Cbor {
         Cbor::Map(vec![
             (1, Cbor::Text(self.workspace.clone())),
@@ -37,12 +50,15 @@ impl WorkspaceEntry {
             (3, Cbor::Array(self.eligible_hosts.iter().map(|x| Cbor::Text(x.clone())).collect())),
         ])
     }
-    pub fn from_cbor(c: &Cbor) -> Self {
-        Self {
-            workspace: c.get(1).text(),
-            name: c.get(2).text(),
-            eligible_hosts: c.get(3).array().iter().map(|x| x.text()).collect(),
-        }
+    pub fn from_cbor(c: &Cbor) -> Result<Self, DecodeError> {
+        Ok(Self {
+            workspace: c.try_get(1)?.try_text()?,
+            name: c.try_get(2)?.try_text()?,
+            eligible_hosts: c.try_get(3)?.try_array()?.iter().map(|x| Ok(x.try_text()?)).collect::<Result<Vec<_>, DecodeError>>()?,
+        })
+    }
+    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        Self::from_cbor(&crate::cbor::try_decode_with(bytes, Self::MAX_DEPTH, Self::MAX_ENCODED_LEN)?)
     }
 }
 
@@ -54,6 +70,8 @@ pub struct ServeClaim {
     pub epoch: i64,
 }
 impl ServeClaim {
+    pub const MAX_DEPTH: usize = 32;
+    pub const MAX_ENCODED_LEN: Option<usize> = None;
     pub fn to_cbor(&self) -> Cbor {
         Cbor::Map(vec![
             (1, Cbor::Text(self.node.clone())),
@@ -62,13 +80,16 @@ impl ServeClaim {
             (4, Cbor::Int(self.epoch)),
         ])
     }
-    pub fn from_cbor(c: &Cbor) -> Self {
-        Self {
-            node: c.get(1).text(),
-            share: c.get(2).text(),
-            lease_expiry_ms: c.get(3).int(),
-            epoch: c.get(4).int(),
-        }
+    pub fn from_cbor(c: &Cbor) -> Result<Self, DecodeError> {
+        Ok(Self {
+            node: c.try_get(1)?.try_text()?,
+            share: c.try_get(2)?.try_text()?,
+            lease_expiry_ms: c.try_get(3)?.try_int()?,
+            epoch: c.try_get(4)?.try_int()?,
+        })
+    }
+    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        Self::from_cbor(&crate::cbor::try_decode_with(bytes, Self::MAX_DEPTH, Self::MAX_ENCODED_LEN)?)
     }
 }
 
@@ -79,6 +100,8 @@ pub struct CapabilityGrant {
     pub verbs: Vec<String>,
 }
 impl CapabilityGrant {
+    pub const MAX_DEPTH: usize = 32;
+    pub const MAX_ENCODED_LEN: Option<usize> = None;
     pub fn to_cbor(&self) -> Cbor {
         Cbor::Map(vec![
             (1, Cbor::Text(self.principal.clone())),
@@ -86,12 +109,15 @@ impl CapabilityGrant {
             (3, Cbor::Array(self.verbs.iter().map(|x| Cbor::Text(x.clone())).collect())),
         ])
     }
-    pub fn from_cbor(c: &Cbor) -> Self {
-        Self {
-            principal: c.get(1).text(),
-            share: c.get(2).text(),
-            verbs: c.get(3).array().iter().map(|x| x.text()).collect(),
-        }
+    pub fn from_cbor(c: &Cbor) -> Result<Self, DecodeError> {
+        Ok(Self {
+            principal: c.try_get(1)?.try_text()?,
+            share: c.try_get(2)?.try_text()?,
+            verbs: c.try_get(3)?.try_array()?.iter().map(|x| Ok(x.try_text()?)).collect::<Result<Vec<_>, DecodeError>>()?,
+        })
+    }
+    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        Self::from_cbor(&crate::cbor::try_decode_with(bytes, Self::MAX_DEPTH, Self::MAX_ENCODED_LEN)?)
     }
 }
 
@@ -101,17 +127,22 @@ pub struct CapabilityRevocation {
     pub share: String,
 }
 impl CapabilityRevocation {
+    pub const MAX_DEPTH: usize = 32;
+    pub const MAX_ENCODED_LEN: Option<usize> = None;
     pub fn to_cbor(&self) -> Cbor {
         Cbor::Map(vec![
             (1, Cbor::Text(self.principal.clone())),
             (2, Cbor::Text(self.share.clone())),
         ])
     }
-    pub fn from_cbor(c: &Cbor) -> Self {
-        Self {
-            principal: c.get(1).text(),
-            share: c.get(2).text(),
-        }
+    pub fn from_cbor(c: &Cbor) -> Result<Self, DecodeError> {
+        Ok(Self {
+            principal: c.try_get(1)?.try_text()?,
+            share: c.try_get(2)?.try_text()?,
+        })
+    }
+    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        Self::from_cbor(&crate::cbor::try_decode_with(bytes, Self::MAX_DEPTH, Self::MAX_ENCODED_LEN)?)
     }
 }
 
@@ -125,6 +156,8 @@ pub struct BindingDecl {
     pub retention: String,
 }
 impl BindingDecl {
+    pub const MAX_DEPTH: usize = 32;
+    pub const MAX_ENCODED_LEN: Option<usize> = None;
     pub fn to_cbor(&self) -> Cbor {
         Cbor::Map(vec![
             (1, Cbor::Text(self.app.clone())),
@@ -135,15 +168,18 @@ impl BindingDecl {
             (6, Cbor::Text(self.retention.clone())),
         ])
     }
-    pub fn from_cbor(c: &Cbor) -> Self {
-        Self {
-            app: c.get(1).text(),
-            glade_id: c.get(2).text(),
-            shape: c.get(3).text(),
-            authority: c.get(4).text(),
-            zone: c.get(5).text(),
-            retention: c.get(6).text(),
-        }
+    pub fn from_cbor(c: &Cbor) -> Result<Self, DecodeError> {
+        Ok(Self {
+            app: c.try_get(1)?.try_text()?,
+            glade_id: c.try_get(2)?.try_text()?,
+            shape: c.try_get(3)?.try_text()?,
+            authority: c.try_get(4)?.try_text()?,
+            zone: c.try_get(5)?.try_text()?,
+            retention: c.try_get(6)?.try_text()?,
+        })
+    }
+    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        Self::from_cbor(&crate::cbor::try_decode_with(bytes, Self::MAX_DEPTH, Self::MAX_ENCODED_LEN)?)
     }
 }
 
@@ -153,17 +189,22 @@ pub struct BindingRetraction {
     pub glade_id: String,
 }
 impl BindingRetraction {
+    pub const MAX_DEPTH: usize = 32;
+    pub const MAX_ENCODED_LEN: Option<usize> = None;
     pub fn to_cbor(&self) -> Cbor {
         Cbor::Map(vec![
             (1, Cbor::Text(self.app.clone())),
             (2, Cbor::Text(self.glade_id.clone())),
         ])
     }
-    pub fn from_cbor(c: &Cbor) -> Self {
-        Self {
-            app: c.get(1).text(),
-            glade_id: c.get(2).text(),
-        }
+    pub fn from_cbor(c: &Cbor) -> Result<Self, DecodeError> {
+        Ok(Self {
+            app: c.try_get(1)?.try_text()?,
+            glade_id: c.try_get(2)?.try_text()?,
+        })
+    }
+    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        Self::from_cbor(&crate::cbor::try_decode_with(bytes, Self::MAX_DEPTH, Self::MAX_ENCODED_LEN)?)
     }
 }
 
@@ -174,6 +215,8 @@ pub struct ServiceDefinition {
     pub glade_id: String,
 }
 impl ServiceDefinition {
+    pub const MAX_DEPTH: usize = 32;
+    pub const MAX_ENCODED_LEN: Option<usize> = None;
     pub fn to_cbor(&self) -> Cbor {
         Cbor::Map(vec![
             (1, Cbor::Text(self.app.clone())),
@@ -181,12 +224,15 @@ impl ServiceDefinition {
             (3, Cbor::Text(self.glade_id.clone())),
         ])
     }
-    pub fn from_cbor(c: &Cbor) -> Self {
-        Self {
-            app: c.get(1).text(),
-            name: c.get(2).text(),
-            glade_id: c.get(3).text(),
-        }
+    pub fn from_cbor(c: &Cbor) -> Result<Self, DecodeError> {
+        Ok(Self {
+            app: c.try_get(1)?.try_text()?,
+            name: c.try_get(2)?.try_text()?,
+            glade_id: c.try_get(3)?.try_text()?,
+        })
+    }
+    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        Self::from_cbor(&crate::cbor::try_decode_with(bytes, Self::MAX_DEPTH, Self::MAX_ENCODED_LEN)?)
     }
 }
 
@@ -195,15 +241,20 @@ pub struct PrincipalRecord {
     pub principal: String,
 }
 impl PrincipalRecord {
+    pub const MAX_DEPTH: usize = 32;
+    pub const MAX_ENCODED_LEN: Option<usize> = None;
     pub fn to_cbor(&self) -> Cbor {
         Cbor::Map(vec![
             (1, Cbor::Text(self.principal.clone())),
         ])
     }
-    pub fn from_cbor(c: &Cbor) -> Self {
-        Self {
-            principal: c.get(1).text(),
-        }
+    pub fn from_cbor(c: &Cbor) -> Result<Self, DecodeError> {
+        Ok(Self {
+            principal: c.try_get(1)?.try_text()?,
+        })
+    }
+    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        Self::from_cbor(&crate::cbor::try_decode_with(bytes, Self::MAX_DEPTH, Self::MAX_ENCODED_LEN)?)
     }
 }
 
@@ -215,6 +266,8 @@ pub struct NodeTransportBinding {
     pub sig: Vec<u8>,
 }
 impl NodeTransportBinding {
+    pub const MAX_DEPTH: usize = 32;
+    pub const MAX_ENCODED_LEN: Option<usize> = None;
     pub fn to_cbor(&self) -> Cbor {
         Cbor::Map(vec![
             (1, Cbor::Text(self.node.clone())),
@@ -223,13 +276,16 @@ impl NodeTransportBinding {
             (4, Cbor::Bytes(self.sig.clone())),
         ])
     }
-    pub fn from_cbor(c: &Cbor) -> Self {
-        Self {
-            node: c.get(1).text(),
-            endpoint_id: c.get(2).text(),
-            valid_from: c.get(3).int(),
-            sig: c.get(4).bytes(),
-        }
+    pub fn from_cbor(c: &Cbor) -> Result<Self, DecodeError> {
+        Ok(Self {
+            node: c.try_get(1)?.try_text()?,
+            endpoint_id: c.try_get(2)?.try_text()?,
+            valid_from: c.try_get(3)?.try_int()?,
+            sig: c.try_get(4)?.try_bytes()?,
+        })
+    }
+    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        Self::from_cbor(&crate::cbor::try_decode_with(bytes, Self::MAX_DEPTH, Self::MAX_ENCODED_LEN)?)
     }
 }
 
@@ -240,6 +296,8 @@ pub struct NodeTransportRevocation {
     pub sig: Vec<u8>,
 }
 impl NodeTransportRevocation {
+    pub const MAX_DEPTH: usize = 32;
+    pub const MAX_ENCODED_LEN: Option<usize> = None;
     pub fn to_cbor(&self) -> Cbor {
         Cbor::Map(vec![
             (1, Cbor::Text(self.node.clone())),
@@ -247,12 +305,15 @@ impl NodeTransportRevocation {
             (3, Cbor::Bytes(self.sig.clone())),
         ])
     }
-    pub fn from_cbor(c: &Cbor) -> Self {
-        Self {
-            node: c.get(1).text(),
-            endpoint_id: c.get(2).text(),
-            sig: c.get(3).bytes(),
-        }
+    pub fn from_cbor(c: &Cbor) -> Result<Self, DecodeError> {
+        Ok(Self {
+            node: c.try_get(1)?.try_text()?,
+            endpoint_id: c.try_get(2)?.try_text()?,
+            sig: c.try_get(3)?.try_bytes()?,
+        })
+    }
+    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        Self::from_cbor(&crate::cbor::try_decode_with(bytes, Self::MAX_DEPTH, Self::MAX_ENCODED_LEN)?)
     }
 }
 
@@ -262,17 +323,22 @@ pub struct NodeRecoveryKey {
     pub recovery_key: String,
 }
 impl NodeRecoveryKey {
+    pub const MAX_DEPTH: usize = 32;
+    pub const MAX_ENCODED_LEN: Option<usize> = None;
     pub fn to_cbor(&self) -> Cbor {
         Cbor::Map(vec![
             (1, Cbor::Text(self.node.clone())),
             (2, Cbor::Text(self.recovery_key.clone())),
         ])
     }
-    pub fn from_cbor(c: &Cbor) -> Self {
-        Self {
-            node: c.get(1).text(),
-            recovery_key: c.get(2).text(),
-        }
+    pub fn from_cbor(c: &Cbor) -> Result<Self, DecodeError> {
+        Ok(Self {
+            node: c.try_get(1)?.try_text()?,
+            recovery_key: c.try_get(2)?.try_text()?,
+        })
+    }
+    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        Self::from_cbor(&crate::cbor::try_decode_with(bytes, Self::MAX_DEPTH, Self::MAX_ENCODED_LEN)?)
     }
 }
 
@@ -284,6 +350,8 @@ pub struct ChainCheckpoint {
     pub hash: Vec<u8>,
 }
 impl ChainCheckpoint {
+    pub const MAX_DEPTH: usize = 32;
+    pub const MAX_ENCODED_LEN: Option<usize> = None;
     pub fn to_cbor(&self) -> Cbor {
         Cbor::Map(vec![
             (1, Cbor::Text(self.node.clone())),
@@ -292,13 +360,16 @@ impl ChainCheckpoint {
             (4, Cbor::Bytes(self.hash.clone())),
         ])
     }
-    pub fn from_cbor(c: &Cbor) -> Self {
-        Self {
-            node: c.get(1).text(),
-            stream: c.get(2).text(),
-            seq: c.get(3).int(),
-            hash: c.get(4).bytes(),
-        }
+    pub fn from_cbor(c: &Cbor) -> Result<Self, DecodeError> {
+        Ok(Self {
+            node: c.try_get(1)?.try_text()?,
+            stream: c.try_get(2)?.try_text()?,
+            seq: c.try_get(3)?.try_int()?,
+            hash: c.try_get(4)?.try_bytes()?,
+        })
+    }
+    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        Self::from_cbor(&crate::cbor::try_decode_with(bytes, Self::MAX_DEPTH, Self::MAX_ENCODED_LEN)?)
     }
 }
 
@@ -308,17 +379,22 @@ pub struct SignedRecord {
     pub sig: Vec<u8>,
 }
 impl SignedRecord {
+    pub const MAX_DEPTH: usize = 32;
+    pub const MAX_ENCODED_LEN: Option<usize> = None;
     pub fn to_cbor(&self) -> Cbor {
         Cbor::Map(vec![
             (1, Cbor::Bytes(self.record.clone())),
             (2, Cbor::Bytes(self.sig.clone())),
         ])
     }
-    pub fn from_cbor(c: &Cbor) -> Self {
-        Self {
-            record: c.get(1).bytes(),
-            sig: c.get(2).bytes(),
-        }
+    pub fn from_cbor(c: &Cbor) -> Result<Self, DecodeError> {
+        Ok(Self {
+            record: c.try_get(1)?.try_bytes()?,
+            sig: c.try_get(2)?.try_bytes()?,
+        })
+    }
+    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        Self::from_cbor(&crate::cbor::try_decode_with(bytes, Self::MAX_DEPTH, Self::MAX_ENCODED_LEN)?)
     }
 }
 
@@ -329,6 +405,8 @@ pub struct WorkspaceCreateReq {
     pub target: String,
 }
 impl WorkspaceCreateReq {
+    pub const MAX_DEPTH: usize = 32;
+    pub const MAX_ENCODED_LEN: Option<usize> = None;
     pub fn to_cbor(&self) -> Cbor {
         Cbor::Map(vec![
             (1, Cbor::Text(self.workspace.clone())),
@@ -336,12 +414,15 @@ impl WorkspaceCreateReq {
             (3, Cbor::Text(self.target.clone())),
         ])
     }
-    pub fn from_cbor(c: &Cbor) -> Self {
-        Self {
-            workspace: c.get(1).text(),
-            name: c.get(2).text(),
-            target: c.get(3).text(),
-        }
+    pub fn from_cbor(c: &Cbor) -> Result<Self, DecodeError> {
+        Ok(Self {
+            workspace: c.try_get(1)?.try_text()?,
+            name: c.try_get(2)?.try_text()?,
+            target: c.try_get(3)?.try_text()?,
+        })
+    }
+    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        Self::from_cbor(&crate::cbor::try_decode_with(bytes, Self::MAX_DEPTH, Self::MAX_ENCODED_LEN)?)
     }
 }
 
@@ -352,6 +433,8 @@ pub struct WorkspaceCreateRes {
     pub created: bool,
 }
 impl WorkspaceCreateRes {
+    pub const MAX_DEPTH: usize = 32;
+    pub const MAX_ENCODED_LEN: Option<usize> = None;
     pub fn to_cbor(&self) -> Cbor {
         Cbor::Map(vec![
             (1, Cbor::Text(self.workspace.clone())),
@@ -359,12 +442,15 @@ impl WorkspaceCreateRes {
             (3, Cbor::Bool(self.created)),
         ])
     }
-    pub fn from_cbor(c: &Cbor) -> Self {
-        Self {
-            workspace: c.get(1).text(),
-            node: c.get(2).text(),
-            created: c.get(3).boolean(),
-        }
+    pub fn from_cbor(c: &Cbor) -> Result<Self, DecodeError> {
+        Ok(Self {
+            workspace: c.try_get(1)?.try_text()?,
+            node: c.try_get(2)?.try_text()?,
+            created: c.try_get(3)?.try_bool()?,
+        })
+    }
+    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        Self::from_cbor(&crate::cbor::try_decode_with(bytes, Self::MAX_DEPTH, Self::MAX_ENCODED_LEN)?)
     }
 }
 
@@ -375,6 +461,8 @@ pub struct SystemSnapshot {
     pub revision: Option<i64>,
 }
 impl SystemSnapshot {
+    pub const MAX_DEPTH: usize = 32;
+    pub const MAX_ENCODED_LEN: Option<usize> = None;
     pub fn to_cbor(&self) -> Cbor {
         Cbor::Map(vec![
             (1, Cbor::Array(self.records.iter().map(|x| Cbor::Bytes(x.clone())).collect())),
@@ -382,11 +470,14 @@ impl SystemSnapshot {
             (3, match &self.revision { Some(v) => Cbor::Int(*v), None => Cbor::Null }),
         ])
     }
-    pub fn from_cbor(c: &Cbor) -> Self {
-        Self {
-            records: c.get(1).array().iter().map(|x| x.bytes()).collect(),
-            heads: c.get(2).array().iter().map(|x| x.bytes()).collect(),
-            revision: { let v = c.get(3); if v.is_null() { None } else { Some(v.int()) } },
-        }
+    pub fn from_cbor(c: &Cbor) -> Result<Self, DecodeError> {
+        Ok(Self {
+            records: c.try_get(1)?.try_array()?.iter().map(|x| Ok(x.try_bytes()?)).collect::<Result<Vec<_>, DecodeError>>()?,
+            heads: c.try_get(2)?.try_array()?.iter().map(|x| Ok(x.try_bytes()?)).collect::<Result<Vec<_>, DecodeError>>()?,
+            revision: { let v = c.try_get(3)?; if v.is_null() { None } else { Some(v.try_int()?) } },
+        })
+    }
+    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        Self::from_cbor(&crate::cbor::try_decode_with(bytes, Self::MAX_DEPTH, Self::MAX_ENCODED_LEN)?)
     }
 }

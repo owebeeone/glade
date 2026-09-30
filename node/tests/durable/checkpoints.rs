@@ -6,7 +6,6 @@
 
 use std::time::Instant;
 
-use glade_node::cbor;
 use glade_node::checkpoint;
 use glade_node::claims::Leases;
 use glade_node::registry::{BlobStore, Record, Registry, RegistryApi, StoreApi, HOME};
@@ -71,7 +70,7 @@ async fn a_simulated_week_leaves_records_json_and_the_boot_bounded() {
     drop(boot);
 
     let saved = BlobStore::new(sys.path()).load().unwrap();
-    let read = |bytes: &Vec<u8>| Op::from_cbor(&cbor::decode(bytes));
+    let read = |bytes: &Vec<u8>| Op::decode(bytes).unwrap();
     let ops: Vec<Op> = saved.records.iter().map(read).collect();
     let on = |stream: &str| ops.iter().filter(|op| op.glade_id == stream).count();
     let (claims, checkpoints) = (on("dir.claims"), on("dir.checkpoints"));

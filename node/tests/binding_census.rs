@@ -17,7 +17,6 @@ use std::path::PathBuf;
 use glade_node::appdecl::{parse, register, AppDecl, AppFileVersion, Registered};
 use glade_node::registry::{BindingFold, Registry, RegistryApi, G_BINDING_RETRACTIONS};
 use glade_node::sysdata::BindingDecl;
-use glade_wire::cbor;
 use glade_wire::generated::Op;
 
 /// The registrant: every census file registers under one node's chain.
@@ -136,7 +135,7 @@ fn declared(decls: &[&AppDecl]) -> Vec<BindingDecl> {
 }
 
 fn ops_of(reg: &Registry) -> Vec<Op> {
-    reg.snapshot().records.iter().map(|b| Op::from_cbor(&cbor::decode(b))).collect()
+    reg.snapshot().records.iter().map(|b| Op::decode(b).unwrap()).collect()
 }
 
 fn retracted(reg: &Registry) -> Vec<(String, String)> {

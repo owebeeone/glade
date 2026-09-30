@@ -96,6 +96,17 @@
 //! check (plan Step 4.1c) is discarded to its fail-closed defaults, with a
 //! line on stderr, and the node starts.
 //!
+//! **The decode dry run** (TautCheckedDecode.md §7, CD-G3 item 2). `glade-node
+//! decode-dry-run DIR...` decodes every op and every `home` record under each
+//! DIR (each `records.json`, and each journal of a served store) with taut's
+//! fail-closed codec, as the node reads them, prints a line for each file,
+//! one for each op or record the codec refuses and a total, and exits 0 when
+//! it refused nothing and 1 otherwise. Run it on a node's data before the node
+//! is replaced by a build on that codec: strict-canonical decode may refuse
+//! bytes the legacy codec took. It reads nothing else, writes nothing and
+//! takes no lock, so it may run beside the node; it starts no node, so
+//! `GLADE_NODE_ASSEMBLED` does not apply to it.
+//!
 //! The program reads its arguments, `GLADE_HOME` and `HOME`, and its own path
 //! once, at its entry point, and passes them down: nothing below reads the
 //! environment (the owner's rule of no process globals, glade's `AGENTS.md`).
@@ -138,6 +149,7 @@ use std::sync::Arc;
 
 use glade_node::assembly::{Settings, ASSEMBLED_ROOT_LINE};
 use glade_node::claims::Leases;
+use glade_node::dry_run;
 use glade_node::endpoint_id;
 use glade_node::grants::{CLIENT_GRANTS_ENFORCED, GRANTS_UNAVAILABLE};
 use glade_node::iroh_carrier::{IrohCarrier, Lent, FIRST_WORD};
@@ -220,6 +232,16 @@ async fn start() -> std::io::Result<ExitCode> {
         let root = instance_root_from_env();
         println!("{}", endpoint_id::command(&root, args.into_iter().skip(1))?);
         return Ok(ExitCode::SUCCESS);
+    }
+    if args.first().is_some_and(|arg| arg == "decode-dry-run") {
+        let dry = dry_run::command(args.into_iter().skip(1))?;
+        for line in &dry.lines {
+            println!("{line}");
+        }
+        return Ok(match dry.refused {
+            0 => ExitCode::SUCCESS,
+            _ => ExitCode::FAILURE,
+        });
     }
     let program = program_path();
     let leases = Leases::default();

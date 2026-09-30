@@ -989,7 +989,7 @@ mod tests {
         assert_eq!(out, Registered { appended: 3, unchanged: 0 });
 
         let snap = reg.snapshot();
-        let ops: Vec<Op> = snap.records.iter().map(|b| Op::from_cbor(&cbor::decode(b))).collect();
+        let ops: Vec<Op> = snap.records.iter().map(|b| Op::decode(b).unwrap()).collect();
         assert_eq!(ops.len(), 3);
         for op in &ops {
             assert_eq!(op.share, HOME);
@@ -1248,7 +1248,7 @@ mod tests {
         (glade_id.into(), retention.into())
     }
     fn ops_of(reg: &Registry) -> Vec<Op> {
-        reg.snapshot().records.iter().map(|b| Op::from_cbor(&cbor::decode(b))).collect()
+        reg.snapshot().records.iter().map(|b| Op::decode(b).unwrap()).collect()
     }
 
     /// R9(a): `register` diffs a file's bindings against the FOLD, per
@@ -1844,10 +1844,7 @@ mod tests {
             principal: "alice".into(),
             share: "ws-a".into(),
         };
-        assert_eq!(
-            CapabilityRevocation::from_cbor(&cbor::decode(&op.payload)),
-            pair
-        );
+        assert_eq!(CapabilityRevocation::decode(&op.payload).unwrap(), pair);
         assert_eq!(
             counts(&revoked, &mut reg),
             (0, 3),

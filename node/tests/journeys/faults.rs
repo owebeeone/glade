@@ -16,7 +16,6 @@ use glade_carrier_api::{
 };
 use glade_grant_api::conformance::{self as grant, Record as GrantRecord};
 use glade_grant_api::{admits, Denial, GrantPort, Holder};
-use glade_node::cbor;
 use glade_node::registry::StoreApi;
 use glade_node::sysdata::SystemSnapshot;
 use glade_wire::generated::Op;
@@ -163,7 +162,7 @@ impl VolatileStore {
         let records = self.snapshot().records;
         records
             .iter()
-            .map(|bytes| Op::from_cbor(&cbor::decode(bytes)))
+            .map(|bytes| Op::decode(bytes).unwrap())
             .collect()
     }
 

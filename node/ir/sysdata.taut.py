@@ -18,11 +18,16 @@ Two layers:
 
 REGENERATE (never hand-edit the generated .rs):
     cd glade-wz/taut && PYTHONPATH=src python3 -m taut.cli gen \
-        ../glade/node/ir/sysdata.taut.py -o /tmp/sysdata-gen -l rust --api-only \
-        --legacy-codec
-    # then copy /tmp/sysdata-gen/rust/api.rs -> glade/node/src/sysdata.rs
-    # --legacy-codec matches glade-wire's frozen cbor runtime (fail-open);
-    # removed at taut v0.10 — see GladeGrazelAttachNotes.md ambiguity #1.
+        ../glade/node/ir/sysdata.taut.py -o /tmp/sysdata-gen -l rust --api-only
+    # then write glade/node/src/sysdata.rs: a header naming the taut tag, then
+    # the generated api.rs.
+    tag=$(git describe --tags --abbrev=0 --match 'v[0-9]*')
+    { echo "// taut $tag wrote this file: the command in glade/node/ir/sysdata.taut.py"
+      echo "// regenerates it. Do not edit it by hand."
+      cat /tmp/sysdata-gen/rust/api.rs; } > ../glade/node/src/sysdata.rs
+    # The codec is taut's fail-closed one, as glade-wire's runtime is: from_cbor
+    # returns a DecodeError, never panics (taut v0.10.0 removed --legacy-codec;
+    # TautCheckedDecode.md §7).
 """
 
 import sys

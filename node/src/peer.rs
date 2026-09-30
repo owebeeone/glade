@@ -600,7 +600,10 @@ mod hello_tests {
         let empty = cbor::encode(&Cbor::Map(vec![]));
         let hello = [&[15][..], &empty].concat();
         let shaped = [&[4][..], &cbor::encode(&ops)].concat();
-        let cases = [(hello, "frame type 15", true), (shaped, "shape 9", false)];
+        let cases = [
+            (hello, "FrameType wire value 15", true),
+            (shaped, "Shape wire value 9", false),
+        ];
         for (bytes, value, handshake) in cases {
             let refused = if handshake {
                 let [dialer, accepting] = on(&CHANNEL);
@@ -637,13 +640,18 @@ mod hello_tests {
         });
         let good = hello.to_bytes();
         let tag = &good[..1];
-        let tagged = "bad frame: CBOR the wire does not take (0xc0)";
         let cases = [
-            (good[..good.len() - 1].to_vec(), "bad frame: truncated"),
-            ([tag, &[0xc0, 0x00]].concat(), tagged),
+            (
+                good[..good.len() - 1].to_vec(),
+                "bad frame: truncated CBOR input",
+            ),
+            (
+                [tag, &[0xc0, 0x00]].concat(),
+                "bad frame: unsupported major type 6",
+            ),
             (
                 [tag, &[0x81].repeat(100_000), &[0x80]].concat(),
-                "bad frame: nested deeper than 32",
+                "bad frame: CBOR nested deeper than 32",
             ),
         ];
         for (bytes, said) in cases {

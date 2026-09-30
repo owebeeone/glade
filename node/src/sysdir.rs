@@ -749,7 +749,7 @@ mod tests {
             b"an older file",
             "not overwritten"
         );
-        let held = SystemSnapshot::from_cbor(&cbor::decode(&fs::read(&aside.file).unwrap()));
+        let held = SystemSnapshot::decode(&fs::read(&aside.file).unwrap()).unwrap();
         assert_eq!(held.records, written.records, "byte for byte");
         assert_eq!((boot.rejected, boot.rebound), (0, rebound(true, 0)));
         assert_eq!(boot.registry.nodes_of("gianni"), vec![node.clone()]);
@@ -761,7 +761,7 @@ mod tests {
             .unwrap()
             .records
             .iter()
-            .map(|bytes| Op::from_cbor(&cbor::decode(bytes)))
+            .map(|bytes| Op::decode(bytes).unwrap())
             .collect();
         assert!(saved.iter().all(|op| op.origin == node), "only the node");
         assert!(
@@ -803,7 +803,7 @@ mod tests {
         assert!(clean.registry.policy().is_some());
         drop(clean);
         let at = snap.records.len() - 1;
-        let mut op = Op::from_cbor(&cbor::decode(&snap.records[at]));
+        let mut op = Op::decode(&snap.records[at]).unwrap();
         let e = op.payload.iter().position(|b| *b == b'e').unwrap();
         op.payload[e] = b'm';
         snap.records[at] = cbor::encode(&op.to_cbor());
@@ -1065,7 +1065,7 @@ mod tests {
         let store = BlobStore::new(&dir);
         let mut snap = store.load().unwrap();
         let transport_record = |bytes: &Vec<u8>| {
-            let glade_id = Op::from_cbor(&cbor::decode(bytes)).glade_id;
+            let glade_id = Op::decode(bytes).unwrap().glade_id;
             glade_id.starts_with("dir.transport-")
         };
         snap.records.retain(|bytes| !transport_record(bytes));

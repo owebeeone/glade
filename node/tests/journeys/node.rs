@@ -188,7 +188,7 @@ impl TestNode {
         let link = run(carrier.accept()).unwrap().expect("a link");
         let mut answers = Vec::new();
         while let Some(frame) = run(link.recv()).expect("a frame or the end") {
-            answers.push(self.host().ingest(Op::from_cbor(&cbor::decode(&frame))));
+            answers.push(self.host().ingest(Op::decode(&frame).unwrap()));
         }
         answers
     }

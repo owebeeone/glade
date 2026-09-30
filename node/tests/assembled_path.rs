@@ -448,7 +448,7 @@ fn both_roots_report_home_served_on_a_start_after_the_claim_lapsed() {
 fn claims_held(instance: &Path) -> Vec<(String, i64)> {
     let saved = BlobStore::new(instance).load().unwrap();
     let ops = saved.records.iter();
-    let ops = ops.map(|bytes| Op::from_cbor(&cbor::decode(bytes)));
+    let ops = ops.map(|bytes| Op::decode(bytes).unwrap());
     let claims = ops.filter(|op| op.glade_id == "dir.claims");
     let claims = claims.map(|op| envelope::record(&op, ServeClaim::from_cbor).unwrap());
     let held = claims.map(|claim| (claim.share, claim.lease_expiry_ms));
@@ -541,7 +541,7 @@ fn both_roots_fold_a_long_claims_chain_at_adoption_and_say_so() {
         assert_eq!(lines[2], line, "{root:?}");
         let saved = BlobStore::new(&instance).load().unwrap();
         let ops = saved.records.iter();
-        let ops = ops.map(|bytes| Op::from_cbor(&cbor::decode(bytes)));
+        let ops = ops.map(|bytes| Op::decode(bytes).unwrap());
         let held = ["dir.checkpoints", "dir.claims"];
         let folded = |op: &Op| held.contains(&op.glade_id.as_str());
         let streams: Vec<String> = ops.filter(folded).map(|op| op.glade_id).collect();
@@ -813,7 +813,7 @@ fn both_roots_start_past_a_nested_op_in_the_store() {
         assert!(lines.contains(&quarantined), "{root:?}: {lines:?}");
         let said = stderr
             .lines()
-            .filter(|line| line.ends_with("(bad frame: nested deeper than 32)"));
+            .filter(|line| line.ends_with("(CBOR nested deeper than 32)"));
         assert_eq!(said.count(), 2, "{root:?}: {stderr}");
     }
     std::fs::remove_dir_all(&dir).unwrap();
@@ -1338,7 +1338,7 @@ fn both_roots_set_an_unsigned_instance_aside_and_serve_signed() {
         let ops: Vec<Op> = saved
             .records
             .iter()
-            .map(|bytes| Op::from_cbor(&cbor::decode(bytes)))
+            .map(|bytes| Op::decode(bytes).unwrap())
             .collect();
         assert!(ops.iter().all(|op| op.origin == node), "{root:?}");
         let signed = ops.iter().all(|op| envelope::verify(op).is_ok());

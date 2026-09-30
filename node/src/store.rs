@@ -711,9 +711,9 @@ fn read_log(path: &Path) -> Result<Vec<Op>, StoreError> {
 /// record is what an interrupted append leaves: it is skipped, as it always
 /// was, and now also cut from the file, so the next append starts on a record
 /// boundary instead of after the torn bytes (plan Step 4.4). A journal whose
-/// records are all complete is not written to. A record `wellformed::decode`
-/// refuses is `None`, and said on stderr in one line naming its place (F15b):
-/// the file keeps it.
+/// records are all complete is not written to. A record `cbor::try_decode`
+/// or `Op::from_cbor` refuses is `None`, and said on stderr in one line
+/// naming its place (F15b): the file keeps it.
 fn read_records(path: &Path) -> Result<Vec<Option<Op>>, StoreError> {
     let data = fs::read(path)?;
     let mut ops = Vec::new();

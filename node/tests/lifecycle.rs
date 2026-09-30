@@ -24,7 +24,6 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use glade_node::appdecl::parse;
 use glade_node::assembly::Settings;
-use glade_node::cbor;
 use glade_node::claims::Leases;
 use glade_node::envelope;
 use glade_node::lifecycle::{node_plan, Console, InstanceAt, NodeStart};
@@ -332,7 +331,7 @@ async fn a_dialer_its_peer_does_not_know_is_refused_and_reported() {
 fn claims_held(instance: &Path) -> Vec<(String, i64)> {
     let saved = BlobStore::new(instance).load().unwrap();
     let ops = saved.records.iter();
-    let ops = ops.map(|bytes| Op::from_cbor(&cbor::decode(bytes)));
+    let ops = ops.map(|bytes| Op::decode(bytes).unwrap());
     let claims = ops.filter(|op| op.glade_id == "dir.claims");
     let claims = claims.map(|op| envelope::record(&op, ServeClaim::from_cbor).unwrap());
     let held = claims.map(|claim| (claim.share, claim.lease_expiry_ms));
