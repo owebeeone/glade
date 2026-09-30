@@ -108,8 +108,8 @@ confinement_all_targets='node'
 # starts clean. A name here that is no longer in scope fails the component, as
 # a stale entry.
 style_dispositions='
-glade-node  gap:267  gap:11
-glade-wire  gap:43   gap:7
+glade-node  gap:259  gap:11
+glade-wire  gap:1    gap:7
 '
 
 results=$(mktemp -d "${TMPDIR:-/tmp}/glade-node-gate.XXXXXX") || exit 1
