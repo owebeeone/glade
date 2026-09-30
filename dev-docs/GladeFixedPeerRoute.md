@@ -403,3 +403,9 @@ Nothing else: no record, format, `PROTOCOL` or ALPN change, and the new files (`
 8. **The split** (section 8). Recommend six parts and the runs, in that order. Alternatives: merge parts 2
    and 3 (about 190-280 lines), or build the journey in Rust within the probe, dropping `nodes.py` but
    putting ssh control and log stamping in Rust.
+
+**Ruled, owner, 2026-09-30 ("all recommended"):** 1-8 as recommended. Both placements, `local` for
+every run and `crossing` at the done; `--lease-ms`, with the route at 12,000; the origin alone in a
+retraction's scope; no retract half in v1; a forward's end told to its subscribers in this step; the
+route outside the gate; A on the assembled root, B and C on the hand-written one; six parts, then the
+runs. The build starts in the node lane once glade's move onto taut v0.10.0 lands.
