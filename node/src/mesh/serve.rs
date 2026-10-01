@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use glade_grant_api::{GrantPort, Holder};
 use glade_wire::cbor;
-use glade_wire::generated::{ErrorCode, Head, Heads, Op, Ops, Priority, StreamHeads, Subscribe};
+use glade_wire::generated::{ErrorCode, Heads, Op, Ops, Priority, Subscribe};
 
 use crate::conversation::Conversation;
 use crate::frame::Frame;
@@ -13,7 +13,7 @@ use crate::grants::{refusal, READ_SUBSCRIBE};
 use crate::peer::OPS_PER_CHUNK;
 use crate::registry::HOME;
 use crate::server::Shared;
-use crate::session::{heads_map, missing_for, refused_subscribe, serve_order};
+use crate::session::{ack, missing_for, refused_subscribe, serve_order};
 use crate::tasks::Site;
 
 use super::{pull_on_gap, Mesh, Round};
@@ -77,6 +77,13 @@ pub(super) async fn serve_conversation(
 /// conversation joins the admission table, and the re-check pass ends it if
 /// a later fold refuses it (`server::refresh_policy`). Check and registration
 /// hold the cut, so no fold change falls between them unseen.
+///
+/// The ack is a cut (R4, R5; cross-node writes plan X2.2), as a client's is:
+/// the ack and the gap are read under one hold of the store lock and queued
+/// under the cut that registered the stream, which every fan-out holds from
+/// its append until its ops are queued, so each op of the zone reaches the
+/// peer once, after the ack. The ack names each origin's head by seq and
+/// hash.
 async fn serve_peer_subscribe(
     shared: Arc<Shared>,
     mesh: &Mesh,
@@ -109,19 +116,12 @@ async fn serve_peer_subscribe(
     // chunks under the link's frame limit (plan Step 4.5b).
     let their: crate::session::Heads =
         s.from.clone().unwrap_or_default().into_iter().map(|h| (h.origin, h.seq)).collect();
-    let (server_heads, gap) = {
+    let (acked, gap) = {
         let st = shared.store.lock().await;
-        (heads_map(&st, &s.share, &s.glade_id, &key), missing_for(&st, &s.share, &s.glade_id, &key, &their))
+        let gap = missing_for(&st, &s.share, &s.glade_id, &key, &their);
+        (ack(&st, &s.share, &s.glade_id, &key), gap)
     };
-    let ack = Frame::Heads(Heads {
-        streams: vec![StreamHeads {
-            share: s.share.clone(),
-            glade_id: s.glade_id.clone(),
-            key: key.clone(),
-            heads: server_heads.iter().map(|(o, sq)| Head { origin: o.clone(), seq: *sq, hash: None }).collect(),
-        }],
-    });
-    let _ = tx.send(ack.to_bytes());
+    let _ = tx.send(acked.to_bytes());
     for ops in chunked(gap, mesh.chunk_bytes()) {
         let pri = Some(Priority::Bulk);
         let _ = tx.send(Frame::Ops(Ops { ops, pri }).to_bytes());

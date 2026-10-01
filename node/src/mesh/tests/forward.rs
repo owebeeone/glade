@@ -1,17 +1,21 @@
 use super::support::wait_store;
 use super::two_nodes::{
     a_client, admitted, forward_lapses, next_frame, ops_frame, payloads, refused_on_the_link,
-    relinked, sub, tree_len, tree_op, tree_payloads, tree_routed, tree_unrouted, tree_zone,
-    two_nodes, two_nodes_limited,
+    relinked, sub, subscribed_on_the_link, tree_len, tree_op, tree_payloads, tree_routed,
+    tree_unrouted, tree_zone, two_nodes, two_nodes_limited, TwoNodes,
 };
+use crate::chain::op_hash;
 use crate::claims::testing;
+use crate::conversation::Conversation;
 use crate::envelope;
 use crate::frame::Frame;
 use crate::mesh::{forward_interest, release_links};
 use crate::registry::{Record, HOME};
+use crate::store::Store;
 use crate::sysdata::{CapabilityGrant, CapabilityRevocation};
 use glade_wire::cbor;
-use glade_wire::generated::{ErrorCode, Ops};
+use glade_wire::generated::{ErrorCode, Head, Heads, Op, Ops, StreamHeads};
+use std::time::Duration;
 
 // ---- the s-discovery golden path, end to end ---------------------------
 
@@ -396,4 +400,98 @@ async fn a_subscribe_after_a_forwards_end_forwards_again_once_linked() {
     t.provider.1.send_binary(&written).await.unwrap();
     let fed = payloads(&mut rc, 1, "v2 through a new forward").await;
     assert_eq!(fed, [b"tree-v2".to_vec()]);
+}
+
+// ---- the peer ack is a cut (cross-node writes plan X2.2) ---------------
+
+/// The next frame B sends on `conversation`, bounded: a hang is a failure.
+async fn from_b(conversation: &mut Conversation, what: &str) -> Frame {
+    let next = tokio::time::timeout(Duration::from_secs(5), conversation.recv());
+    let Ok(read) = next.await else {
+        panic!("timed out waiting for {what}");
+    };
+    read.unwrap_or_else(|e| panic!("reading {what}: {e}"))
+}
+
+/// B's provider writes `op`, a client op on B.
+async fn provider_writes(t: &TwoNodes, op: &Op) {
+    let frame = ops_frame(vec![op.clone()]);
+    t.provider.1.send_binary(&frame).await.unwrap();
+}
+
+/// R4 on the peer path (X2.2): no op of a zone reaches a forwarding node
+/// before the ack of its subscribe, and each op the claim holder holds
+/// reaches it once after the ack. B's store lock is held while a client op
+/// on B waits for it, and A's subscribe reaches B behind that op; then the
+/// lock is let go. The ack comes first, the op in the gap after it, and B's
+/// next op follows the gap: the op is not sent again. Green from the start:
+/// slice 4.3 part 2 put the stream's registration under the cut, which every
+/// fan-out holds from its append until its ops are queued. With the stream
+/// registered first, as before it, the op reached A ahead of the ack. As in
+/// the client's test (`server.rs`), the pauses only give each frame time to
+/// reach its lock, and any order of the two gives the same answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn no_op_of_a_zone_reaches_a_forwarding_node_before_its_ack() {
+    let t = two_nodes("peer-cut", Some(&["read.subscribe"])).await;
+    let pause = || tokio::time::sleep(Duration::from_millis(50));
+    let o2 = tree_op(2, Some(op_hash(&t.tree[1]).to_vec()), b"tree-v2");
+    let o3 = tree_op(3, Some(op_hash(&o2).to_vec()), b"tree-v3");
+
+    let store = t.b.store.lock().await;
+    provider_writes(&t, &o2).await;
+    pause().await; // the op takes the cut, then waits for the store
+    let mut conversation = subscribed_on_the_link(&t).await;
+    pause().await; // the subscribe reaches B and waits for a lock
+    drop(store);
+
+    let first = from_b(&mut conversation, "B's first frame").await;
+    assert!(
+        matches!(&first, Frame::Heads(h) if h.streams.len() == 1),
+        "an op reached A before its ack: {first:?}"
+    );
+    provider_writes(&t, &o3).await;
+    let mut ops = Vec::new();
+    while ops.last() != Some(&o3) {
+        match from_b(&mut conversation, "the zone's ops").await {
+            Frame::Ops(o) => ops.extend(o.ops),
+            other => panic!("expected the zone's ops, got {other:?}"),
+        }
+    }
+    let once = [t.tree[0].clone(), t.tree[1].clone(), o2, o3];
+    assert_eq!(ops, once, "each op once, in order, after the ack");
+}
+
+/// R5 on the peer path (X2.2): B's ack of A's forwarded subscribe names the
+/// zone and each origin's head there by seq and hash, the 32 bytes of the op
+/// at that seq, as a client's ack does (client-writes plan Step 2.2). Red
+/// before X2.2: the peer ack named each head with no hash.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_peer_ack_names_each_origin_head_with_its_hash() {
+    let t = two_nodes("peer-ack-hashes", Some(&["read.subscribe"])).await;
+    let other = Op {
+        origin: "prov-c".into(),
+        ..tree_op(0, None, b"c zero")
+    };
+    provider_writes(&t, &other).await;
+    let both = |st: &Store| st.heads("ws-razel", "ws.tree", &[]).len() == 2;
+    wait_store(&t.b, both, "B to hold the zone's two origins").await;
+
+    let mut conversation = subscribed_on_the_link(&t).await;
+    let head = |op: &Op| Head {
+        origin: op.origin.clone(),
+        seq: op.seq,
+        hash: Some(op_hash(op).to_vec()),
+    };
+    let (share, glade_id, key) = tree_zone();
+    let heads = vec![head(&t.tree[1]), head(&other)];
+    let zone = StreamHeads {
+        share,
+        glade_id,
+        key,
+        heads,
+    };
+    let ack = Frame::Heads(Heads {
+        streams: vec![zone],
+    });
+    assert_eq!(from_b(&mut conversation, "B's ack").await, ack);
 }

@@ -1,4 +1,5 @@
 use super::support::{fresh, wait_store};
+use crate::conversation::Conversation;
 use crate::frame::Frame;
 use crate::mesh::hex_id;
 use crate::mesh::testing::{endpoint_key, on_carrier};
@@ -230,12 +231,11 @@ pub(super) async fn relinked(t: &TwoNodes) {
     assert_eq!(a.connect_peer(t.at_b.clone()).await.unwrap(), t.b_id);
 }
 
-/// Subscribe the tree zone on a fresh conversation of A's link to B, as
-/// A's forward does, and return B's answer: a refusal's two frames (R6),
-/// and the reason, once B has ended the conversation.
-pub(super) async fn refused_on_the_link(t: &TwoNodes) -> glade_wire::generated::Error {
+/// A fresh conversation of A's link to B, on which A subscribes the tree
+/// zone from nothing, as A's forward does.
+pub(super) async fn subscribed_on_the_link(t: &TwoNodes) -> Conversation {
     let linked = t.a.mesh.get().unwrap().linked(&t.b_id).await.unwrap();
-    let mut conversation = linked.open();
+    let conversation = linked.open();
     let (share, glade_id, _) = tree_zone();
     let subscribe = Subscribe {
         share,
@@ -244,6 +244,14 @@ pub(super) async fn refused_on_the_link(t: &TwoNodes) -> glade_wire::generated::
         from: None,
     };
     conversation.send(&Frame::Subscribe(subscribe)).unwrap();
+    conversation
+}
+
+/// Subscribe the tree zone on a fresh conversation of A's link to B, as
+/// A's forward does, and return B's answer: a refusal's two frames (R6),
+/// and the reason, once B has ended the conversation.
+pub(super) async fn refused_on_the_link(t: &TwoNodes) -> glade_wire::generated::Error {
+    let mut conversation = subscribed_on_the_link(t).await;
     let mut frames = Vec::new();
     loop {
         let read = tokio::time::timeout(Duration::from_secs(5), conversation.recv());
