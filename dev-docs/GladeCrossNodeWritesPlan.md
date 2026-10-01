@@ -4,8 +4,8 @@ Plan, 2026-09-24, for the owner. It answers the item added on 2026-09-24: a
 client's write to a share another node serves stays on the node the client
 reached (`glade/dev-docs/GladeSubstrateV1.md:332-334`, `:346-348`;
 `dev-docs/GladeFirstSlicePlan.md:938`; `dev-docs/GladeProgramStatus.md:37`).
-Step X1.1 is done (glade `55e636c`), X3.3a and X3.3b were built with CW 3.1 and 3.3, and X2.1-X2.3
-are done (glade `efcce3f`, `4c0663b`, `0e95739`); nothing else is built. The code was read
+Step X1.1 is done (glade `55e636c`), X3.3a and X3.3b were built with CW 3.1 and 3.3, and X2.1-X3.2
+are done (glade `efcce3f`, `4c0663b`, `0e95739`, `6f45657`, `3b4963a`, `3f9d123`); nothing else is built. The code was read
 in the working trees on 2026-09-24 with no git command, so no revision is
 named; another agent was editing `glade/node/` and
 `glade/dev-docs/GladeNodeAssembly.md` (slice Step 4.1a), so line numbers there
@@ -446,6 +446,12 @@ linked node; c gets A's verdict; B holds only what A accepted.
 - **Gate:** the node gate. **Size:** ~70 production, ~260 test lines.
 - **Depends on:** X2.1, X2.2; nothing in the slice (4.1b never meets it, W8).
 
+- **Done, 2026-10-01,** glade `6f45657`: `serve_peer_subscribe`'s read loop hands `Ops` to `accept_ops` with the
+  stream as origin: its own zone only (else `Protocol`; `home` stays `Unauthorized`), and only while the
+  holder's fold names it (`who_serves`, not the route, which answers `Local` for a share the directory
+  never heard of; else `UnknownShare`); statuses go on the stream. The holder check reads
+  `sysdir::now_ms`, not the clock port Step R gave claims (tests only).
+
 **X3.2 — The forwarding node sends writes up and relays the answers**
 
 - **Goal:** W1's forward half, W3 and W5's node half. The `Ops` arm hands a
@@ -471,6 +477,21 @@ linked node; c gets A's verdict; B holds only what A accepted.
 - **Gate:** the node gate. **Size:** ~160 production, ~320 test lines; if over, it
   splits into the send half with its pending table, then landing and relay.
 - **Depends on:** X2.3, X3.1; nothing in the slice beyond 4.1a's HELLO, landed.
+
+- **Done, 2026-10-01,** in two commits, 242 production lines against ~160: glade `3b4963a` (the send half:
+  a `Forward` op is queued on its zone's forward, opened if none runs, sent up in order and held
+  pending; the forward's end, or 12 s unanswered (`FORWARD_TIMEOUT`), answers it `UnknownShare`) and
+  `3f9d123` (an answer settles the first pending write its `corr` names: `Ok` lands the op here, the
+  writer as origin, raising the writer's shared heads, then is relayed, or this node's own status if it
+  cannot land; a refusal is relayed and nothing kept). Beyond the plan: an op over the peer link's frame
+  limit is refused `Protocol` here and the forward goes on. Carried over, not observed: a forward that
+  ends removes its zone's entry unconditionally, so after a link release an old forward's end could
+  remove a newer one's handle.
+- **Step R, beside it, 2026-10-01,** glade `a4a023a` (owner: "yes, fix renewal first"): claims renew on the
+  wall clock. The loop wakes every 2 s (`RENEW_TICK_MS`, or `renew_ms` if shorter) and renews once the
+  wall clock says `renew_ms` has passed or it moved back, so claims lapsed across a machine sleep renew
+  within a tick; the cadence is unchanged. The paused-clock tests use tokio's `test-util` through iroh's
+  n0-future, undeclared.
 
 **X3.3a — client-rs keeps a write that was not placed**
 
