@@ -4,8 +4,8 @@ Plan, 2026-09-24, for the owner. It answers the item added on 2026-09-24: a
 client's write to a share another node serves stays on the node the client
 reached (`glade/dev-docs/GladeSubstrateV1.md:332-334`, `:346-348`;
 `dev-docs/GladeFirstSlicePlan.md:938`; `dev-docs/GladeProgramStatus.md:37`).
-Step X1.1 is done (glade `55e636c`), X3.3a and X3.3b were built with CW 3.1 and 3.3, and X2.1 is
-done (glade `efcce3f`); nothing else is built. The code was read
+Step X1.1 is done (glade `55e636c`), X3.3a and X3.3b were built with CW 3.1 and 3.3, and X2.1-X2.3
+are done (glade `efcce3f`, `4c0663b`, `0e95739`); nothing else is built. The code was read
 in the working trees on 2026-09-24 with no git command, so no revision is
 named; another agent was editing `glade/node/` and
 `glade/dev-docs/GladeNodeAssembly.md` (slice Step 4.1a), so line numbers there
@@ -389,6 +389,11 @@ with `Absent` answered. No op crosses yet.
 - **Gate:** the node gate. **Size:** ~30 production, ~150 test lines.
 - **Depends on:** CW 2.2. Slice 4.3 part 2 edits the same function: the later one
   rebases, and if 4.3 closed the race, this step keeps only its tests.
+- **Done, 2026-10-01,** glade `4c0663b`: the peer ack is `session::ack`, each origin's head with its hash,
+  read with the gap under one store hold. Slice 4.3 part 2 had closed R4's race (the stream registers
+  under the cut, and every fan-out holds the cut until its ops are queued), so
+  `no_op_of_a_zone_reaches_a_forwarding_node_before_its_ack` was green from the start; it stays as the
+  peer path's only guard of that order, and fails with the stream registered before the cut.
 
 **X2.3 — Writes follow the read route**
 
@@ -408,6 +413,17 @@ with `Absent` answered. No op crosses yet.
   change.
 - **Gate:** the node gate. **Size:** ~40 production, ~130 test lines.
 - **Depends on:** X2.1; nothing in the slice.
+- **Done, 2026-10-01,** glade `0e95739`: in `accept::accept_ops`, after the H-R3 and F3 refusals and
+  before the cut, `not_placed` asks `route_subscribe` once per share per frame; `Absent` answers
+  `UnknownShare` with the route's reason and keeps nothing. **Measured:** about 3 µs per claim record
+  per scan, a known share one scan and an unknown share two: 3.0 ms and 6.1 ms at 1,000 claims, with
+  the store lock held. Claims renew every 100 s now and a checkpoint folds the chain at 1,000
+  superseded, so a served share's chain cycles to about 1,000 over some 14 hours; a chatty writer then
+  pays up to ~3 ms a frame, which argues for the cached fold. **Seen:** the renewal loop sleeps on
+  tokio's monotonic clock, which stops while a Mac sleeps, but leases run on the wall clock: after a
+  sleep longer than a lease's remainder, a node's own share routes `Absent` until its next renewal, up
+  to 100 s, so its clients' writes get `UnknownShare` and are resent (a pre-existing gap that also
+  refuses subscribes in that window).
 
 ### Phase X3 — The write crosses
 
