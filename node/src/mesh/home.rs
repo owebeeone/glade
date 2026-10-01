@@ -16,7 +16,7 @@ use crate::server::{send, Shared};
 use crate::store::{Append, Store, StoreError};
 use crate::transport::key_of;
 
-use super::{hex_id, Mesh};
+use super::{forwards_return, hex_id, Mesh};
 
 /// Push freshly-minted home-share ops to every live peer link — the traces'
 /// B9 "directory ops replicate" step for records written AFTER connect-time
@@ -207,6 +207,11 @@ pub(super) async fn pull_on_gap(
     let peer = hex_id(&pusher);
     loop {
         let pulled = pull_from(shared, mesh, &peer, pusher).await;
+        // X4.2b: what the pull landed may route a local subscriber's zone
+        // to the pusher.
+        if pulled.as_ref().is_ok_and(|outcome| outcome.applied > 0) {
+            forwards_return(shared, &peer).await;
+        }
         let mut during = mesh.take_gaps(&pusher, false);
         let (line, again) = {
             let st = shared.store.lock().await;

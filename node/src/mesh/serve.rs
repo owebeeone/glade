@@ -17,7 +17,7 @@ use crate::server::Shared;
 use crate::session::{ack, missing_for, refused_subscribe, serve_order};
 use crate::tasks::Site;
 
-use super::{pull_on_gap, Mesh, Round};
+use super::{forwards_return, hex_id, pull_on_gap, Mesh, Round};
 
 /// Serve one conversation the peer opened, by its first frame: `Heads` = a
 /// home-scoped sync pull (serve the gap, END); `Subscribe` = a forwarded
@@ -27,8 +27,10 @@ use super::{pull_on_gap, Mesh, Round};
 /// exchange, `exchange.rs`); `Ops` = a peer's home-share PUSH (freshly-minted
 /// directory records, the B9 step) — scoped ingest, home ops only, one frame
 /// per conversation, one [`Round`]; a chain it leaves short as a gap starts a
-/// pull from the peer ([`pull_on_gap`]). `node` is the peer, as its HELLO
-/// proved it.
+/// pull from the peer ([`pull_on_gap`]), and a round that lands records may
+/// route a local subscriber's zone to the peer, so it brings back the
+/// forwards they call for ([`forwards_return`], cross-node writes plan
+/// X4.2b). `node` is the peer, as its HELLO proved it.
 pub(super) async fn serve_conversation(
     shared: Arc<Shared>,
     node: [u8; 32],
@@ -51,8 +53,11 @@ pub(super) async fn serve_conversation(
             // Noted before the round's lines, so a refusal once reported is a
             // gap some pull answers for; a new pull starts after the lines.
             let pull = mesh.note_gaps(node, std::mem::take(&mut round.gaps));
-            round.end();
+            let landed = round.end().applied;
             conversation.end();
+            if landed > 0 {
+                forwards_return(&shared, &hex_id(&node)).await;
+            }
             if let Some(gaps) = pull {
                 let pulling = shared.clone();
                 shared.tasks.spawn(Site::GapPull, async move {
