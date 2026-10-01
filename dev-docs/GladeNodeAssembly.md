@@ -1134,7 +1134,8 @@ session may claim a node's id.
   roots (the hand-written root's parser, and `Settings` for the assembled
   one). With it, `Server::enforce_client_grants` turns the check on before the
   node serves, and both roots print
-  `client grants enforced: a client session reads a share other than home only with a grant`
+  `client grants enforced: a client session reads or writes a share other than home only with a grant`
+  (writes since cross-node writes X4.1)
   after the `app` lines. grazel passes no such flag.
 - **The check**, when on (`server.rs`, the `Subscribe` arm). It comes after the
   provider-attach branch and the route's absence, under the cut, before

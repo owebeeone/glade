@@ -4,8 +4,8 @@ Plan, 2026-09-24, for the owner. It answers the item added on 2026-09-24: a
 client's write to a share another node serves stays on the node the client
 reached (`glade/dev-docs/GladeSubstrateV1.md:332-334`, `:346-348`;
 `dev-docs/GladeFirstSlicePlan.md:938`; `dev-docs/GladeProgramStatus.md:37`).
-Step X1.1 is done (glade `55e636c`), X3.3a and X3.3b were built with CW 3.1 and 3.3, and X2.1-X3.2
-are done (glade `efcce3f`, `4c0663b`, `0e95739`, `6f45657`, `3b4963a`, `3f9d123`); nothing else is built. The code was read
+Step X1.1 is done (glade `55e636c`), X3.3a and X3.3b were built with CW 3.1 and 3.3, and every node step,
+X2.1-X4.3, is done (glade `efcce3f` to `6108673`); X4.3's run on the two machines is not. The code was read
 in the working trees on 2026-09-24 with no git command, so no revision is
 named; another agent was editing `glade/node/` and
 `glade/dev-docs/GladeNodeAssembly.md` (slice Step 4.1a), so line numbers there
@@ -553,6 +553,14 @@ restart of the holder.
 - **Depends on:** X3.1, X3.2; slice 4.3 part 2 (the adapter, the peer id threaded
   to `handle_peer_stream`, the switch) and its `revoke` line; question 6.
 
+- **Done, 2026-10-02,** glade `822ab0f`: `write.append`, checked before routing, after the H-R3 and F3
+  refusals: at the holder on the forwarding node's id, on by default; at the client's node on its
+  principal behind `--enforce-client-grants` (every client write there, local or forwarded, as question
+  6 says). `Unauthorized` per op; a refused forward refuses its pending writes, prefixed with the
+  refusing node, and each later write opens a forward that is refused again until one is admitted.
+  client-rs's route-probe test gained one seed line (`seed writer ws-route write.append`), its
+  assertions unchanged. The desk passes no switch and has no link, so it sees nothing.
+
 **X4.2 — Forwards come back with the link**
 
 - **Goal:** on link-up, B reopens a forward for each zone with a local subscriber
@@ -566,6 +574,13 @@ restart of the holder.
   clients subscribe again anyway.
 - **Gate:** the node gate. **Size:** ~60 production, ~200 test lines.
 - **Depends on:** X3.2; nothing in the slice.
+
+- **Done, 2026-10-02,** glade `cdf3f92`, with 4.6 part 3's ruling kept: a forward's end tells its
+  subscribers and they leave, so X4.2 serves the subscriber left with no forward (part 3's open point, a
+  link lost between routing and the forward's start): once a link's home pull converges, each locally
+  subscribed zone that routes to that peer gets its forward. **X4.2b, added,** `834f0bd`: the same pass
+  runs when a peer's home records land after the link, since a holder that has just started publishes
+  its claim after its dials; without it X4.2 does nothing in a real two-node run.
 
 **X4.3 — Two nodes, writes from both sides**
 
@@ -584,6 +599,12 @@ restart of the holder.
 - **Gate:** the node gate. **Size:** ~400 test lines, no production code.
 - **Depends on:** X3.2, X3.3a, X4.1, X4.2; on two machines, slice 4.2 and 4.5.
   It can join 4.6's route script once 4.6 lands.
+- **Done over loopback, 2026-10-02,** glade `6108673`: `node/tests/cross_node_writes.rs`, 520 lines, 12
+  checks, each naming the step it pins and seen failing on a tree without it (X4.2b, X3.2b, X3.2, X4.1,
+  X2.3). Three booted nodes; the node's own websocket client in place of client-rs sessions (a
+  client-rs dev-dependency would widen the gate's scope and the lockfile), the keep-and-resend done by
+  hand; Unix only (the holder runs the assembled root, stopped by SIGTERM). The run on the two machines
+  waits on the owner.
 
 ## 6. Order and parallelism
 
