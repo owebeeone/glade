@@ -19,9 +19,10 @@
 //! Serving a workspace ([`Server::serve_workspace`]) mints the entry (diffed —
 //! re-serving appends nothing) + the first claim (epoch = fold max + 1, so a
 //! restarted or taking-over node fences out any stale claim), then RENEWS the
-//! lease on a cadence while serving. Lease expiry stays an absolute wall-clock
-//! stamp judged at each reader's clock — the write path uses the clock, the
-//! fold never does (WD §2).
+//! lease on a cadence while serving, kept by the wall clock the leases expire
+//! on, never by tokio's alone, which stops while the machine sleeps (Step R).
+//! Lease expiry stays an absolute wall-clock stamp judged at each reader's
+//! clock — the write path uses the clock, the fold never does (WD §2).
 //!
 //! The `home` share is served like any other (GDL-038; the lane owner's ruling
 //! of 2026-09-25): it joins the renewal set at adoption, at the epoch of the
@@ -41,15 +42,17 @@ use std::time::Duration;
 
 use tokio::sync::{Mutex, MutexGuard};
 
+use glade_clock_api::ClockPort;
 use glade_wire::generated::Op;
 
+use crate::assembly::SystemClock;
 use crate::checkpoint;
 use crate::envelope;
 use crate::registry::{Record, Registry, RegistryApi, G_CLAIMS, G_PRINCIPALS, HOME};
 use crate::server::{refresh_policy, Server, Shared};
 use crate::store::Store;
 use crate::sysdata::{PrincipalRecord, ServeClaim, WorkspaceCreateReq, WorkspaceCreateRes, WorkspaceEntry};
-use crate::sysdir::{now_ms, Boot};
+use crate::sysdir::Boot;
 use crate::tasks::Site;
 
 /// Default serve-lease TTL: five minutes (question 32 (a), the owner's ruling
@@ -59,6 +62,9 @@ pub const LEASE_TTL_MS: i64 = 300_000;
 /// Default renewal cadence: a third of the TTL, so one missed renewal never
 /// lapses a healthy holder. 100 s; it was 10 s.
 pub const RENEW_EVERY_MS: u64 = 100_000;
+/// The renewal loop's tick: the longest it sleeps between two looks at the
+/// wall clock, two seconds, or the renewal cadence where that is shorter.
+pub const RENEW_TICK_MS: u64 = 2_000;
 /// Default checkpoint threshold (plan Step 4.5c; the owner's ruling of
 /// 2026-09-27): a tick folds the node's claims chain once 1,000 of its claims
 /// are superseded, about 14 hours of renewals of two shares.
@@ -138,6 +144,9 @@ pub(crate) struct DirState {
     /// Our directory node id — the origin every mint is attributed to.
     pub(crate) node_id: String,
     leases: Leases,
+    /// The wall clock this node's claims are stamped with, and its renewal
+    /// loop reads: the system clock on both roots, a test's own in tests.
+    clock: Arc<dyn ClockPort>,
     /// Where the line each checkpoint prints goes: the reporter the
     /// composition root handed adoption (plan Step 4.5c).
     report: Box<dyn Fn(&str) + Send + Sync>,
@@ -222,6 +231,20 @@ impl Server {
         leases: Leases,
         report: impl Fn(&str) + Send + Sync + 'static,
     ) -> io::Result<usize> {
+        self.adopt_clocked(boot, leases, Arc::new(SystemClock), report)
+            .await
+    }
+
+    /// [`Server::adopt_boot_tuned`] on `clock`, the wall clock the node's
+    /// claims are stamped with and its renewal loop reads: there the system
+    /// clock, here a test's own.
+    async fn adopt_clocked(
+        &self,
+        boot: Boot,
+        leases: Leases,
+        clock: Arc<dyn ClockPort>,
+        report: impl Fn(&str) + Send + Sync + 'static,
+    ) -> io::Result<usize> {
         let seeded = self.seed_registry(&boot.registry.snapshot()).await;
         let policy = boot.registry.policy();
         let home = home_epoch(&*self.shared.store.lock().await, &boot.node_id);
@@ -229,6 +252,7 @@ impl Server {
         let state = DirState {
             node_id: boot.node_id.clone(),
             leases,
+            clock: clock.clone(),
             report: Box::new(report),
             inner: Mutex::new(DirAuthority { boot, served }),
         };
@@ -237,14 +261,10 @@ impl Server {
             .set(state)
             .map_err(|_| other("directory authority already adopted"))?;
         refresh_policy(&self.shared, policy).await;
+        let renewed = clock.now_ms();
         renew_leases(&self.shared).await;
-        let shared = self.shared.clone();
-        self.shared.tasks.spawn(Site::Renewal, async move {
-            loop {
-                tokio::time::sleep(Duration::from_millis(leases.renew_ms)).await;
-                renew_leases(&shared).await;
-            }
-        });
+        let renewing = renew_while_serving(self.shared.clone(), renewed);
+        self.shared.tasks.spawn(Site::Renewal, renewing);
         Ok(seeded)
     }
 
@@ -262,7 +282,7 @@ impl Server {
     pub async fn serves(&self, share: &str) -> Option<String> {
         let state = self.shared.dir.get()?;
         let dir = state.inner.lock().await;
-        dir.boot.registry.who_serves(share, now_ms())
+        dir.boot.registry.who_serves(share, state.clock.now_ms())
     }
 }
 
@@ -292,7 +312,7 @@ pub(crate) async fn serve_workspace_on(shared: &Arc<Shared>, share: &str, name: 
     let claim = ServeClaim {
         node: node.clone(),
         share: share.into(),
-        lease_expiry_ms: now_ms() + state.leases.lease_ms,
+        lease_expiry_ms: state.clock.now_ms() + state.leases.lease_ms,
         epoch,
     };
     // Entry and claim are accepted together, after the last await before the
@@ -373,6 +393,50 @@ fn knows_principal(store: &Store, principal: &str) -> bool {
     false
 }
 
+/// The lease-renewal loop, from adoption on, the last renewal made at `last`
+/// by the wall clock (Step R, the owner's ruling of 2026-10-01). Leases
+/// expire on the wall clock, but tokio's, which the loop sleeps on, stops
+/// while the machine sleeps. So the loop sleeps at most one tick
+/// ([`RENEW_TICK_MS`], or `renew_ms` where that is shorter) and renews
+/// whenever the wall clock says a renewal is due ([`renewal_due`]): a node
+/// woken past its leases renews within a tick of waking, where a sleep of
+/// `renew_ms` left its claims lapsed for what remained of it. In normal
+/// running each sleep ends when the next renewal is due, so renewals keep
+/// their `renew_ms` cadence.
+async fn renew_while_serving(shared: Arc<Shared>, mut last: i64) {
+    let Some(state) = shared.dir.get() else {
+        return;
+    };
+    loop {
+        let now = state.clock.now_ms();
+        if renewal_due(state.leases, last, now) {
+            renew_leases(&shared).await;
+            last = now;
+        }
+        let asleep = until_due(state.leases, last, state.clock.now_ms());
+        tokio::time::sleep(asleep).await;
+    }
+}
+
+/// Whether the wall clock says a renewal is due at `now`, the last made at
+/// `last`: `renew_ms` or more since it, or the clock moved backwards.
+fn renewal_due(leases: Leases, last: i64, now: i64) -> bool {
+    now < last || now.saturating_sub(last) >= renew_ms(leases)
+}
+
+/// How long the loop sleeps at `now`, the last renewal made at `last`: until
+/// the wall clock says the next is due, and never longer than one tick.
+fn until_due(leases: Leases, last: i64, now: i64) -> Duration {
+    let left = last.saturating_add(renew_ms(leases)).saturating_sub(now);
+    let tick = leases.renew_ms.min(RENEW_TICK_MS);
+    Duration::from_millis(u64::try_from(left).unwrap_or(0).min(tick))
+}
+
+/// The renewal cadence as a span of the wall clock.
+fn renew_ms(leases: Leases) -> i64 {
+    i64::try_from(leases.renew_ms).unwrap_or(i64::MAX)
+}
+
 /// Renew every served share's lease: same epoch, fresh absolute expiry — an
 /// ordinary ServeClaim append (a renewal is data, never a heartbeat protocol).
 /// Once enough of the node's claims are superseded, the tick also folds its
@@ -385,7 +449,7 @@ async fn renew_leases(shared: &Arc<Shared>) {
     if dir.served.is_empty() {
         return;
     }
-    let lease_expiry_ms = now_ms() + leases.lease_ms;
+    let lease_expiry_ms = state.clock.now_ms() + leases.lease_ms;
     let renewals = dir.served.iter().map(|(share, epoch)| ServeClaim {
         node: node.clone(),
         share: share.clone(),
@@ -492,7 +556,8 @@ pub(crate) mod testing {
         Ok(generation)
     }
 
-    /// Renew the adopted node's leases once, as its loop does each tick.
+    /// Renew the adopted node's leases once, as its loop does when a renewal
+    /// is due.
     pub(crate) async fn tick(shared: &Arc<Shared>) {
         super::renew_leases(shared).await;
     }
@@ -503,7 +568,7 @@ mod tests {
     use super::*;
     use crate::mesh::testing::meshed;
     use crate::mesh::who_serves;
-    use crate::sysdir::boot_at;
+    use crate::sysdir::{boot_at, now_ms};
     use std::future::Future;
     use std::path::PathBuf;
     use std::pin::{pin, Pin};
@@ -862,6 +927,123 @@ mod tests {
         let dir = shared.dir.get().unwrap().inner.lock().await;
         let serves = dir.boot.registry.who_serves(HOME, now_ms());
         assert_eq!(serves, Some(node), "in the adopted registry too");
+    }
+
+    /// A wall clock a test moves, read through the node's clock port: what a
+    /// machine's sleep moves while tokio's clock, which the renewal loop
+    /// sleeps on, stands still.
+    #[derive(Clone)]
+    struct Wall(Arc<std::sync::atomic::AtomicI64>);
+
+    impl Wall {
+        fn advance(&self, by: i64) {
+            self.0.fetch_add(by, Ordering::SeqCst);
+        }
+    }
+
+    impl ClockPort for Wall {
+        fn now_ms(&self) -> i64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    /// A booted node with no mesh, adopted on `leases` and a wall clock of
+    /// the test's own, which starts at the system clock's now, after the
+    /// boot: its served state, its node id and the wall clock.
+    async fn on_the_wall(name: &str, leases: Leases) -> (Arc<Shared>, String, Wall) {
+        let boot = boot_at(fresh(&format!("{name}-sys")), "gianni").unwrap();
+        let node = boot.node_id.clone();
+        let server = Server::open(fresh(&format!("{name}-store"))).unwrap();
+        let wall = Wall(Arc::new(now_ms().into()));
+        let clock = Arc::new(wall.clone());
+        let adopted = server.adopt_clocked(boot, leases, clock, |_: &str| {});
+        adopted.await.unwrap();
+        (server.shared.clone(), node, wall)
+    }
+
+    /// Let the node's tasks run while tokio's paused clock stays where it
+    /// stands: they are yielded to, never slept on, so the clock is never
+    /// moved on to their next timer.
+    async fn settle() {
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Whether `node`'s claim on `home` is live in the served store at `at`,
+    /// and how many claims on `home` the store holds from it.
+    async fn home_at(shared: &Arc<Shared>, node: &str, at: i64) -> (bool, usize) {
+        let st = shared.store.lock().await;
+        let live = who_serves(&st, HOME, at).as_deref() == Some(node);
+        (live, home_epochs(&st, node).len())
+    }
+
+    /// One tick of tokio's clock, the renewal loop's.
+    fn one_tick() -> Duration {
+        Duration::from_millis(RENEW_TICK_MS)
+    }
+
+    /// Claims renew on the wall clock (Step R, the owner's ruling of
+    /// 2026-10-01). Leases expire on the wall clock, but the renewal loop
+    /// sleeps on tokio's, which stops while the machine sleeps. Here the
+    /// wall clock moves eight hours while tokio's stands still, as across a
+    /// night's sleep, so the node's claim on `home` has lapsed; within one
+    /// tick of tokio's clock it is renewed, live again at the wall clock.
+    /// Red before: the loop slept `renew_ms`, 100 s of tokio's clock, and
+    /// the claim stayed lapsed until they had passed.
+    #[tokio::test(start_paused = true)]
+    async fn a_claim_lapsed_across_a_sleep_is_renewed_within_one_tick() {
+        let (shared, node, wall) = on_the_wall("slept", Leases::default()).await;
+        settle().await;
+        assert!(home_at(&shared, &node, wall.now_ms()).await.0, "live");
+        wall.advance(8 * 3_600_000);
+        let (live, held) = home_at(&shared, &node, wall.now_ms()).await;
+        assert!(!live, "lapsed across the sleep");
+        tokio::time::advance(one_tick()).await;
+        settle().await;
+        let renewed = home_at(&shared, &node, wall.now_ms()).await;
+        assert_eq!(renewed, (true, held + 1), "renewed within one tick");
+    }
+
+    /// Step R's second rule: a wall clock moved backwards, an hour here,
+    /// makes a renewal due at once, so the node renews within one tick.
+    /// Red before: nothing renewed until `renew_ms` of tokio's clock.
+    #[tokio::test(start_paused = true)]
+    async fn a_wall_clock_moved_backwards_renews_within_one_tick() {
+        let (shared, node, wall) = on_the_wall("backwards", Leases::default()).await;
+        settle().await;
+        wall.advance(-3_600_000);
+        let held = home_at(&shared, &node, wall.now_ms()).await.1;
+        tokio::time::advance(one_tick()).await;
+        settle().await;
+        let renewed = home_at(&shared, &node, wall.now_ms()).await;
+        assert_eq!(renewed, (true, held + 1), "renewed within one tick");
+    }
+
+    /// Step R's guard: in normal running the wall clock and tokio's move
+    /// together, and renewals keep their `renew_ms` cadence. On 12 s leases
+    /// renewed every 4 s (`--lease-ms 12000`, as the fixed-peer route's E1
+    /// and E2 run), moved a second at a time, the node renews at 4 s, 8 s
+    /// and 12 s, and at no tick between.
+    #[tokio::test(start_paused = true)]
+    async fn in_normal_running_renewals_keep_their_cadence() {
+        let leases = Leases::from_flag("12000").unwrap();
+        let (shared, node, wall) = on_the_wall("cadence", leases).await;
+        settle().await;
+        let mut held = home_at(&shared, &node, wall.now_ms()).await.1;
+        let mut renewed_at = Vec::new();
+        for second in 1..=12 {
+            wall.advance(1_000);
+            tokio::time::advance(Duration::from_secs(1)).await;
+            settle().await;
+            let (live, now_held) = home_at(&shared, &node, wall.now_ms()).await;
+            assert!(live, "live at {second} s");
+            if now_held > held {
+                renewed_at.push(second);
+            }
+            held = now_held;
+        }
+        assert_eq!(renewed_at, [4, 8, 12]);
     }
 
     /// F1 (question 32 (a), the owner's ruling of 2026-09-27): the node's
