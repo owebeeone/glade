@@ -6,19 +6,24 @@
 //! So the placement checks are made here, where every client op passes: a
 //! client's op by its share's route (W1, X2.3), which sends it up to the
 //! claim holder when the share is forwarded (X3.2), and a forwarded op by
-//! the holder's own fold (W2, X3.1). GladeSubstrateV1 §6, "Session
+//! the holder's own fold (W2, X3.1). So is the write grant (X4.1): a
+//! forwarded op's on the forwarding node's id, and, while client sessions
+//! are checked, a client's on its principal. GladeSubstrateV1 §6, "Session
 //! answers"; client-writes plan Step 2.1.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use glade_grant_api::{GrantPort, Holder};
 use glade_wire::generated::{ErrorCode, Op, Ops, Shape};
 
 use crate::frame::Frame;
+use crate::grants::{refusal, WRITE_APPEND};
 use crate::mesh::{route_subscribe, who_serves, write_up, Route, Write};
 use crate::registry::HOME;
 use crate::router::{SessionId, Zone};
-use crate::server::{raise, send, Shared};
+use crate::server::{client_check, raise, send, Shared};
 use crate::session::{error_frame, op_status, Heads};
 use crate::store::Append;
 use crate::sysdir::now_ms;
@@ -45,9 +50,11 @@ pub(crate) enum Source<'a> {
     /// would get (W1, X2.3, X3.2).
     Client,
     /// The forward of `zone` this node serves as the share's claim holder
-    /// (W2, X3.1): it carries the forwarding node's writes on that zone
-    /// alone, placed only while this node's fold names it the holder.
-    Forward(&'a Zone),
+    /// (W2, X3.1) to the node named, as its HELLO proved it: it carries
+    /// that node's writes on that zone alone, each granted `write.append`
+    /// on the node's id (X4.1), placed only while this node's fold names it
+    /// the holder.
+    Forward(&'a Zone, [u8; 32]),
 }
 
 /// Where an op is placed, asked once per share per frame.
@@ -69,8 +76,9 @@ enum Placement {
 /// One op's refusal never stops the batch. `source` says how an op is
 /// placed ([`Source`]): an op not placed is answered `UnknownShare` with the
 /// reason, and kept nowhere; an op sent up to its claim holder is answered
-/// once the holder has decided it. A forward's op on another zone is
-/// refused.
+/// once the holder has decided it. An op whose writer holds no grant to
+/// write is refused ([`write_granted`]), and so is a forward's op on another
+/// zone.
 pub(crate) async fn accept_ops(
     shared: &Arc<Shared>,
     origin: SessionId,
@@ -94,8 +102,14 @@ pub(crate) async fn accept_ops(
             send(shared, origin, &stream_refused(&op)).await;
             continue;
         }
+        // X4.1 (question 6): the writer's grant, before X3.1's path.
+        if let Err(why) = write_granted(shared, origin, source, &op.share).await {
+            let refused = op_status(&op, ErrorCode::Unauthorized, why);
+            send(shared, origin, &refused).await;
+            continue;
+        }
         // W2 (X3.1): a forward carries its own zone's ops alone.
-        if let Source::Forward(zone) = source {
+        if let Source::Forward(zone, _) = source {
             if !in_zone(&op, zone) {
                 send(shared, origin, &off_zone(&op, zone)).await;
                 continue;
@@ -188,7 +202,7 @@ async fn placement(
         return asked.clone();
     }
     let placed = match source {
-        Source::Forward(_) => match not_held(shared, share).await {
+        Source::Forward(..) => match not_held(shared, share).await {
             Some(reason) => Placement::Not(reason),
             None => Placement::Here,
         },
@@ -200,6 +214,31 @@ async fn placement(
     };
     routes.insert(share.into(), placed.clone());
     placed
+}
+
+/// Whether the writer `source` names may write on `share` (X4.1, question
+/// 6), `Err` the refusal's reason: at the claim holder, a forwarding node
+/// holds `write.append` on its node id, always (4.3's peer paths); at a
+/// client's node, while client sessions are checked (4.3's switch), the
+/// session's principal holds it, and a session that names none holds
+/// nothing. Unchecked, a client session writes as ever.
+async fn write_granted(
+    shared: &Arc<Shared>,
+    origin: SessionId,
+    source: Source<'_>,
+    share: &str,
+) -> Result<(), String> {
+    match source {
+        Source::Forward(_, node) => {
+            let holder = Holder::Node(node);
+            let checked = shared.policy.check(&holder, WRITE_APPEND, share);
+            checked.map_err(|denial| refusal(&holder, WRITE_APPEND, share, denial))
+        }
+        Source::Client if shared.client_grants.load(Ordering::SeqCst) => {
+            client_check(shared, origin, WRITE_APPEND, share).await
+        }
+        Source::Client => Ok(()),
+    }
 }
 
 /// Why this node takes no forwarded write on `share` (W2, X3.1), if it does

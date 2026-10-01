@@ -124,9 +124,10 @@
 //! `listening <port>` so a parent process can read the actual port.
 //!
 //! The grant check (plan Step 4.3): a peer reads a share this node serves only
-//! with a grant from this node's fold, always. A client session is checked
-//! too only with `--enforce-client-grants`, which is off by default; then the
-//! node prints `client grants enforced: …` before it serves.
+//! with a grant from this node's fold, always, and writes there only with a
+//! write grant too (cross-node writes plan X4.1). A client session's reads and
+//! writes are checked too only with `--enforce-client-grants`, which is off by
+//! default; then the node prints `client grants enforced: …` before it serves.
 //!
 //! **Two composition roots** (plan Step 3.2). The environment variable
 //! `GLADE_NODE_ASSEMBLED` chooses which one starts the node:

@@ -108,7 +108,7 @@ async fn held_at_b(t: &TwoNodes, share: &str, glade_id: &str) -> usize {
 /// loop discarded every frame A sent on the forward, so no status came.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_forwarded_op_lands_at_the_claim_holder_and_is_answered() {
-    let t = two_nodes("x31-lands", Some(&["read.subscribe"])).await;
+    let t = two_nodes("x31-lands", Some(&["read.subscribe", "write.append"])).await;
     let mut subscriber = b_subscriber(&t).await;
     let mut forward = forward_by_hand(&t).await;
 
@@ -134,7 +134,7 @@ async fn a_forwarded_op_lands_at_the_claim_holder_and_is_answered() {
 /// zone's own op lands after them. Red before X3.1: no status.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_forwarded_op_off_its_zone_or_on_home_is_refused_and_not_stored() {
-    let t = two_nodes("x31-off", Some(&["read.subscribe"])).await;
+    let t = two_nodes("x31-off", Some(&["read.subscribe", "write.append"])).await;
     let mut forward = forward_by_hand(&t).await;
 
     let off = Op {
@@ -176,7 +176,7 @@ async fn a_forwarded_op_off_its_zone_or_on_home_is_refused_and_not_stored() {
 /// before X3.1: no status.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_node_that_no_longer_holds_the_claim_takes_no_forwarded_write() {
-    let t = two_nodes("x31-moved", Some(&["read.subscribe"])).await;
+    let t = two_nodes("x31-moved", Some(&["read.subscribe", "write.append"])).await;
     let mut subscriber = b_subscriber(&t).await;
     let mut forward = forward_by_hand(&t).await;
     let taker = hex_id(&node_of(C_SEED));

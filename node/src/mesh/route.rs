@@ -153,17 +153,7 @@ async fn unplaced(shared: &Arc<Shared>, write: Write, why: String) {
 async fn lapse(shared: &Arc<Shared>, mesh: &Mesh, peer: &str, zone: Zone, refused: Option<Error>) {
     let _cut = shared.cut.lock().await;
     mesh.forwarded.lock().await.remove(&zone);
-    let (code, why) = match refused {
-        Some(refused) => {
-            let (share, reason) = (&zone.0, &refused.message);
-            let why = format!("refused by node {peer}, which serves {share}: {reason}");
-            (refused.code, why)
-        }
-        None => {
-            let why = format!("forward from node {peer} ended");
-            (ErrorCode::UnknownShare, why)
-        }
-    };
+    let (code, why) = ending(peer, &zone.0, refused.as_ref());
     let entries = shared.router.lock().await.entries();
     let subscribers = entries.into_iter().filter(|(_, at)| *at == zone);
     for (sid, _) in subscribers {
@@ -171,12 +161,32 @@ async fn lapse(shared: &Arc<Shared>, mesh: &Mesh, peer: &str, zone: Zone, refuse
     }
 }
 
+/// What a forward's end says to those it served (F5, plan Step 4.6 part 3,
+/// cross-node writes plan X4.1): when the claim holder `peer` refused it,
+/// the holder's code and its reason, prefixed with who refused; else
+/// `UnknownShare`, an absent route's code, and that the forward ended.
+fn ending(peer: &str, share: &str, refused: Option<&Error>) -> (ErrorCode, String) {
+    match refused {
+        Some(refused) => {
+            let reason = &refused.message;
+            let why = format!("refused by node {peer}, which serves {share}: {reason}");
+            (refused.code, why)
+        }
+        None => {
+            let why = format!("forward from node {peer} ended");
+            (ErrorCode::UnknownShare, why)
+        }
+    }
+}
+
 /// Run one forward until its conversation ends: `Some` refusal when the claim
 /// holder refused the read, which ends it (F5). The writes queued for it go
 /// up in order, each held pending ([`Pending`]) until the holder's answer,
 /// which is relayed to its writer ([`settle`]); one unanswered for
-/// [`FORWARD_TIMEOUT`] is answered `UnknownShare`, and so is each one
-/// pending or queued when the forward ends: it was not placed (W5).
+/// [`FORWARD_TIMEOUT`] is answered `UnknownShare`. So is each one pending or
+/// queued when the forward ends, as not placed (W5), unless the holder
+/// refused the forward: then each is refused as the forward was, its
+/// `Unauthorized` (X4.1), and a later write opens a forward again.
 async fn run_forward(
     shared: &Arc<Shared>,
     linked: &Arc<Linked>,
@@ -185,14 +195,16 @@ async fn run_forward(
     mut writes: mpsc::UnboundedReceiver<Write>,
 ) -> io::Result<Option<Error>> {
     let mut pending = Pending::default();
-    let ended = carry(shared, linked, peer, zone, &mut writes, &mut pending).await;
+    let carried = carry(shared, linked, peer, zone, &mut writes, &mut pending).await;
     writes.close();
-    let why = format!("forward from node {peer} ended");
+    let refused = carried.as_ref().ok().and_then(Option::as_ref);
+    let (code, why) = ending(peer, &zone.0, refused);
     let queued = std::iter::from_fn(|| writes.try_recv().ok());
     for write in pending.drain().chain(queued) {
-        unplaced(shared, write, why.clone()).await;
+        let status = op_status(&write.op, code, why.clone());
+        send(shared, write.writer, &status).await;
     }
-    ended
+    carried
 }
 
 /// [`run_forward`]'s conversation, from its subscribe to its end.

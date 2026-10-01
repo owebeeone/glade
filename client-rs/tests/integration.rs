@@ -779,8 +779,9 @@ impl Probe {
 
 /// The route probe (plan Step 4.6 part 4), driven a line at a time as the route
 /// journey drives it, against a node that enforces client grants and whose app
-/// file seeds one: `alice` may read ws-route. The writer's appends and its
-/// `resend-last` are `ok`; alice's subscribe is acked at the writer's head, its
+/// file seeds two: `alice` may read ws-route, and `writer` write there, which
+/// the node checks since cross-node writes plan X4.1. The writer's appends and
+/// its `resend-last` are `ok`; alice's subscribe is acked at the writer's head, its
 /// replay arrives as events, each once, and her `log` holds it in order. Her
 /// subscribe to a share she holds no grant on is refused, as is `mallory`'s,
 /// who holds none, and no op reaches him. A command that cannot run is `error`,
@@ -791,7 +792,8 @@ async fn the_route_probe_answers_each_command_on_a_line() {
     let tmp = Tmp::new("route-probe");
     let app = tmp.path().join("route.glade");
     let text = "glade-app v1\napp route\nbinding route.notes log share commons from-cursor\n\
-                seed alice ws-route read.subscribe\nworkspace ws-route notes\n";
+                seed alice ws-route read.subscribe\nseed writer ws-route write.append\n\
+                workspace ws-route notes\n";
     std::fs::write(&app, text).unwrap();
     let args = ["--app", app.to_str().unwrap(), "--enforce-client-grants"];
     let (mut node, _, port) = boot_as(&tmp, "route", &args).await;

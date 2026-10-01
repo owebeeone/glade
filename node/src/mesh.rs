@@ -341,6 +341,7 @@ mod tests {
     mod checkpoints;
     mod crossing;
     mod forward;
+    mod grants;
     mod holder;
     mod home;
     mod link;

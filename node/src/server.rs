@@ -119,9 +119,10 @@ impl Server {
     /// Check client sessions against the grant fold too (plan Step 4.3): the
     /// websocket path's switch, `--enforce-client-grants`, which is off by
     /// default. A client session then reads a share other than `home` only
-    /// if the principal its Hello names holds `read.subscribe` there; one
-    /// that names none holds nothing. Its writes and exchanges are not
-    /// checked. Call before serving.
+    /// if the principal its Hello names holds `read.subscribe` there, and
+    /// writes there only if it holds `write.append` (cross-node writes plan
+    /// X4.1, `accept.rs`); one that names none holds nothing. Its exchanges
+    /// are not checked. Call before serving.
     pub fn enforce_client_grants(&self) {
         self.shared.client_grants.store(true, Ordering::SeqCst);
     }
@@ -209,7 +210,7 @@ async fn recheck(shared: &Arc<Shared>) {
                 let checked = shared.policy.check(&holder, READ_SUBSCRIBE, &share);
                 checked.map_err(|denial| refusal(&holder, READ_SUBSCRIBE, &share, denial))
             }
-            None if clients => client_check(shared, sid, &share).await,
+            None if clients => client_check(shared, sid, READ_SUBSCRIBE, &share).await,
             None => Ok(()),
         };
         if let Err(why) = verdict {
@@ -247,16 +248,22 @@ pub(crate) async fn refuse_subscription(
 }
 
 /// The grant check for a client session (plan Step 4.3): the principal its
-/// Hello bound, as the client claimed it, asked for `read.subscribe` on
-/// `share`. A session that bound none holds nothing. `Err` is the refusal's
-/// reason.
-async fn client_check(shared: &Arc<Shared>, sid: SessionId, share: &str) -> Result<(), String> {
+/// Hello bound, as the client claimed it, asked for `verb` on `share`:
+/// `read.subscribe` for a read, and `write.append` for a write (cross-node
+/// writes plan X4.1). A session that bound none holds nothing. `Err` is the
+/// refusal's reason.
+pub(crate) async fn client_check(
+    shared: &Arc<Shared>,
+    sid: SessionId,
+    verb: &str,
+    share: &str,
+) -> Result<(), String> {
     let Some(principal) = shared.principals.lock().await.get(&sid).cloned() else {
-        return Err(no_principal(READ_SUBSCRIBE, share));
+        return Err(no_principal(verb, share));
     };
     let holder = Holder::Principal(principal);
-    let checked = shared.policy.check(&holder, READ_SUBSCRIBE, share);
-    checked.map_err(|denial| refusal(&holder, READ_SUBSCRIBE, share, denial))
+    let checked = shared.policy.check(&holder, verb, share);
+    checked.map_err(|denial| refusal(&holder, verb, share, denial))
 }
 
 async fn handle(shared: Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
@@ -383,7 +390,9 @@ async fn handle(shared: Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
                         // two frames (R6), and nothing is registered, served
                         // or forwarded. `home` is exempt.
                         if s.share != HOME && shared.client_grants.load(Ordering::SeqCst) {
-                            if let Err(why) = client_check(&shared, sid, &s.share).await {
+                            if let Err(why) =
+                                client_check(&shared, sid, READ_SUBSCRIBE, &s.share).await
+                            {
                                 drop(cut);
                                 let code = ErrorCode::Unauthorized;
                                 for frame in refused_subscribe(code, why, &s.share, &s.glade_id) {
@@ -1249,12 +1258,14 @@ mod tests {
 
     /// With client sessions checked, a session whose Hello claims a principal
     /// the fold grants `read.*` on `sh` is served, its ack and the ops that
-    /// follow; one claiming another principal is refused. The principal is
-    /// the client's claim: nothing proves it yet.
+    /// follow, which wanda, granted `write.*` there, writes (X4.1); one
+    /// claiming another principal is refused. The principal is the client's
+    /// claim: nothing proves it yet.
     #[tokio::test]
     async fn a_session_claiming_a_granted_principal_is_served() {
         let mut policy = Policy::default();
         policy.grant("alice", "sh", ["read.*".to_string()]);
+        policy.grant("wanda", "sh", ["write.*".to_string()]);
         let (_, port) = guarded("granted-principal", policy, true).await;
 
         let (mut rb, wb) = session(port, Some("bob")).await;
@@ -1267,7 +1278,7 @@ mod tests {
         let (mut ra, wa) = session(port, Some("alice")).await;
         let answer = subscribe_on(&mut ra, &wa, "sh").await;
         assert_eq!(answer.map_err(|e| e.message), Ok(1));
-        let (mut rw, ww) = session(port, None).await;
+        let (mut rw, ww) = session(port, Some("wanda")).await;
         let written = op("w", 0, b"for alice");
         ww.send_binary(&ops_frame(written.clone())).await.unwrap();
         match next(&mut rw, "the writer's status").await {
@@ -1282,12 +1293,14 @@ mod tests {
 
     /// The re-check pass reaches client sessions when they are checked: a
     /// revocation of alice on `sh` ends her live zone there, told by a lone
-    /// `Error{Unauthorized}`, and her zone on `sh2` goes on.
+    /// `Error{Unauthorized}`, and her zone on `sh2` goes on, where wanda,
+    /// granted `write.*`, writes (X4.1).
     #[tokio::test]
     async fn a_revocation_ends_a_client_zone_of_a_claimed_principal() {
         let mut policy = Policy::default();
         policy.grant("alice", "sh", ["read.*".to_string()]);
         policy.grant("alice", "sh2", ["read.*".to_string()]);
+        policy.grant("wanda", "sh2", ["write.*".to_string()]);
         let (shared, port) = guarded("client-revoke", policy.clone(), true).await;
         let (mut ra, wa) = session(port, Some("alice")).await;
         for share in ["sh", "sh2"] {
@@ -1310,7 +1323,7 @@ mod tests {
         let routed = shared.router.lock().await.route(0, "sh", "g", &[]);
         assert_eq!(routed, Vec::<SessionId>::new(), "her sh zone ended");
 
-        let (mut rw, ww) = session(port, None).await;
+        let (mut rw, ww) = session(port, Some("wanda")).await;
         let on_sh2 = Op {
             share: "sh2".into(),
             ..op("w", 0, b"sh2 goes on")
@@ -1321,6 +1334,80 @@ mod tests {
             Frame::Ops(ops) => assert_eq!(ops.ops[0].payload, b"sh2 goes on"),
             other => panic!("alice expected the sh2 op, got {other:?}"),
         }
+    }
+
+    /// Each of `writes` from a new session claiming its principal, if any:
+    /// the status its op is answered.
+    async fn written_by(port: u16, writes: &[(Option<&str>, &Op)]) -> Vec<Error> {
+        let mut statuses = Vec::new();
+        for (claimed, op) in writes {
+            let (mut r, w) = session(port, *claimed).await;
+            w.send_binary(&ops_frame((*op).clone())).await.unwrap();
+            match next(&mut r, "the writer's status").await {
+                Frame::Error(e) => statuses.push(e),
+                other => panic!("the writer expected its op's status, got {other:?}"),
+            }
+        }
+        statuses
+    }
+
+    /// X4.1 (cross-node writes plan, question 6): with client sessions
+    /// checked, a write on a share other than `home` needs `write.append` on
+    /// the principal the session's Hello claims. bob, whom the fold grants
+    /// `read.*` on `sh` and no write verb, and a session that names no
+    /// principal are each refused, per op, `Unauthorized`, naming the op;
+    /// neither op is stored, nor reaches alice, who reads `sh`. wanda,
+    /// granted `write.*`, writes: `Ok`, and alice gets her op first. Red
+    /// before X4.1: no write was checked.
+    #[tokio::test]
+    async fn a_session_write_without_a_grant_is_refused_when_the_switch_is_on() {
+        let mut policy = Policy::default();
+        policy.grant("alice", "sh", ["read.*".to_string()]);
+        policy.grant("bob", "sh", ["read.*".to_string()]);
+        policy.grant("wanda", "sh", ["write.*".to_string()]);
+        let (shared, port) = guarded("write-checked", policy, true).await;
+        let (mut ra, wa) = session(port, Some("alice")).await;
+        let answer = subscribe_on(&mut ra, &wa, "sh").await;
+        assert_eq!(answer.map_err(|e| e.message), Ok(1));
+
+        let (by_bob, by_no_one) = (op("bob", 0, b"bob's"), op("anon", 0, b"no one's"));
+        let refused = written_by(port, &[(Some("bob"), &by_bob), (None, &by_no_one)]).await;
+        let whys = [
+            "unauthorized: principal bob holds no grant of write.append on sh",
+            "unauthorized: a session that names no principal holds no grant of write.append on sh",
+        ];
+        for ((e, op), why) in refused.iter().zip([&by_bob, &by_no_one]).zip(whys) {
+            assert_eq!(said(e), status_for(op, ErrorCode::Unauthorized));
+            assert_eq!(e.message, why);
+        }
+        let held = shared.store.lock().await.heads("sh", "g", &[]);
+        assert!(held.is_empty(), "stored: {held:?}");
+
+        let by_wanda = op("wanda", 0, b"wanda's");
+        let taken = written_by(port, &[(Some("wanda"), &by_wanda)]).await;
+        assert_eq!(said(&taken[0]), status_for(&by_wanda, ErrorCode::Ok));
+        match next(&mut ra, "the first op alice gets").await {
+            Frame::Ops(ops) => assert_eq!(ops.ops, [by_wanda]),
+            other => panic!("alice expected wanda's op, got {other:?}"),
+        }
+    }
+
+    /// Its twin: unchecked, the default, a session's write needs no grant,
+    /// as ever: bob, whom the fold grants no write verb, and a session that
+    /// names no principal each write `Ok`, and both ops are stored.
+    #[tokio::test]
+    async fn a_session_write_without_a_grant_lands_when_the_switch_is_off() {
+        let mut policy = Policy::default();
+        policy.grant("bob", "sh", ["read.*".to_string()]);
+        let (shared, port) = guarded("write-unchecked", policy, false).await;
+
+        let (by_bob, by_no_one) = (op("bob", 0, b"bob's"), op("anon", 0, b"no one's"));
+        let taken = written_by(port, &[(Some("bob"), &by_bob), (None, &by_no_one)]).await;
+        for (e, op) in taken.iter().zip([&by_bob, &by_no_one]) {
+            assert_eq!(said(e), status_for(op, ErrorCode::Ok), "{}", e.message);
+        }
+        let held = shared.store.lock().await.heads("sh", "g", &[]);
+        assert_eq!(held.len(), 2, "both stored: {held:?}");
     }
 
     // ---- a frame the node cannot take (F15) -------------------------------

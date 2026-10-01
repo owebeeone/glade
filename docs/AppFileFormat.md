@@ -367,13 +367,18 @@ there.
   read `ws-razel` and use `gwz.ops` there. Without a grant it is refused, and
   what it asks for is not served. The `home` share, where grants are kept,
   needs no grant.
+- **Another node writing to a share this node serves**, for its own clients,
+  needs `write.append` too, and its writes ride its read, so
+  `seed <node-id> ws-razel read.*,write.*` lets it read and write there.
+  Without the write verb each of its writes is refused, and none is kept.
 - **A client** (a browser tab or a supplier on the node's websocket) is
   checked only when the node starts with `--enforce-client-grants`, which is
   off by default: by default everything a client reads is served, as before.
   With it, a client reads a share other than `home` only if the principal its
-  Hello names holds `read.subscribe` there, and the node says so when it
-  starts, with `client grants enforced: …`. A client's writes and exchanges
-  are not checked either way.
+  Hello names holds `read.subscribe` there, and writes there only if it holds
+  `write.append`; the node says so when it starts, with
+  `client grants enforced: …`. A client's exchanges are not checked either
+  way.
 - A node that cannot read its own grants refuses every check, and says so when
   it starts, with `grants unavailable: …`.
 
@@ -393,11 +398,12 @@ id, holds no grant.
 | What is asked | Verb |
 | --- | --- |
 | reading a surface | `read.subscribe` |
+| writing to a surface | `write.append` |
 | a request on an exchange | the exchange's glade id, such as `gwz.ops` |
 
 A verb `p.*`, where `p` is not empty, is a pattern: it allows every verb that
-begins with `p.`. So `read.*` allows `read.subscribe`, `gwz.*` allows
-`gwz.ops`, and `gyld.*` allows `gyld.ops`. Any other verb allows only itself.
+begins with `p.`. So `read.*` allows `read.subscribe`, `write.*` allows
+`write.append`, `gwz.*` allows `gwz.ops`, and `gyld.*` allows `gyld.ops`. Any other verb allows only itself.
 
 Two spellings are warned on their line, and the line still registers: a verb
 with a `*` anywhere but at the end of a pattern `p.*`, such as `*`, `.*`,

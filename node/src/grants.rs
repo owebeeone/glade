@@ -18,9 +18,10 @@
 //! Holders and verbs (ruled 2026-09-24). A grant names a node by its node id in
 //! lower-case hex, and a principal by its name. A principal written as 64
 //! lower-case hex digits would read as a node's grant, so it matches nothing:
-//! a `Node` never matches a `Principal`. A read asks [`READ_SUBSCRIBE`], an
-//! exchange its own glade id, and a granted `p.*` admits every verb that
-//! begins `p.` (`glade_grant_api::admits`).
+//! a `Node` never matches a `Principal`. A read asks [`READ_SUBSCRIBE`], a
+//! write [`WRITE_APPEND`] (cross-node writes plan X4.1), an exchange its own
+//! glade id, and a granted `p.*` admits every verb that begins `p.`
+//! (`glade_grant_api::admits`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{PoisonError, RwLock};
@@ -32,15 +33,21 @@ use crate::mesh::hex_id;
 /// The verb a read asks for: a subscribe, whether a peer's or a client's.
 pub const READ_SUBSCRIBE: &str = "read.subscribe";
 
+/// The verb a write asks for (cross-node writes plan X4.1, question 6): a
+/// forwarding node's, at the claim holder, or a client's, at its node while
+/// client sessions are checked.
+pub const WRITE_APPEND: &str = "write.append";
+
 /// What a start prints when the fold it loaded cannot be read (plan Step 4.3):
 /// a grant or a revocation was quarantined, so every grant check refuses.
 pub const GRANTS_UNAVAILABLE: &str =
     "grants unavailable: a grant or revocation record was quarantined at load, so every grant check refuses";
 
 /// What a start prints when it checks client sessions too, as switched on by
-/// `--enforce-client-grants` (plan Step 4.3; off by default).
+/// `--enforce-client-grants` (plan Step 4.3; off by default), their writes
+/// included since cross-node writes plan X4.1.
 pub const CLIENT_GRANTS_ENFORCED: &str =
-    "client grants enforced: a client session reads a share other than home only with a grant";
+    "client grants enforced: a client session reads or writes a share other than home only with a grant";
 
 /// Whether `name` is written as a node's id: 64 lower-case hex digits.
 pub fn names_a_node(name: &str) -> bool {

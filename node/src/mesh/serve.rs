@@ -90,7 +90,8 @@ pub(super) async fn serve_conversation(
 /// plan X3.1): an `Ops` frame on the stream goes through the acceptance path
 /// with the stream's session as origin ([`Source::Forward`]), so the
 /// fan-out skips the stream, and each op's status is queued on it behind
-/// the fan-out before it.
+/// the fan-out before it. Each op needs `write.append` on `node` there
+/// (X4.1), and is refused `Unauthorized` without it.
 async fn serve_peer_subscribe(
     shared: Arc<Shared>,
     mesh: &Mesh,
@@ -162,7 +163,7 @@ async fn serve_peer_subscribe(
             read = conversation.recv() => {
                 match read {
                     Ok(Frame::Ops(ops)) => {
-                        let source = Source::Forward(&zone);
+                        let source = Source::Forward(&zone, node);
                         accept_ops(&shared, sid, &heads, ops.ops, source).await;
                     }
                     Ok(_) => {}

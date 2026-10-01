@@ -38,7 +38,7 @@ use crate::ws::{WsReader, WsWriter};
 
 /// c, a client of A, writes `payload` on the tree zone at `seq`, after
 /// `prev`.
-fn c_writes(seq: i64, prev: Option<&Op>, payload: &[u8]) -> Op {
+pub(super) fn c_writes(seq: i64, prev: Option<&Op>, payload: &[u8]) -> Op {
     Op {
         share: "ws-razel".into(),
         glade_id: "ws.tree".into(),
@@ -63,7 +63,7 @@ async fn taken(r: &mut WsReader, w: &WsWriter) {
 
 /// The status `r` next reads for `op` (R1), passing over anything else: its
 /// code and its message.
-async fn status_of(r: &mut WsReader, op: &Op) -> (ErrorCode, String) {
+pub(super) async fn status_of(r: &mut WsReader, op: &Op) -> (ErrorCode, String) {
     let corr = Some(hex_id(&op_hash(op)));
     loop {
         if let Frame::Error(e) = next_frame(r, "the op's status").await {
@@ -75,7 +75,7 @@ async fn status_of(r: &mut WsReader, op: &Op) -> (ErrorCode, String) {
 }
 
 /// c's ops on `glade_id` of `ws-razel` that `node` holds.
-async fn held_from_c(node: &Arc<Shared>, glade_id: &str) -> Vec<Op> {
+pub(super) async fn held_from_c(node: &Arc<Shared>, glade_id: &str) -> Vec<Op> {
     let store = node.store.lock().await;
     store.scan("ws-razel", glade_id, &[], "c-on-a", i64::MIN)
 }
@@ -91,7 +91,7 @@ async fn held_from_c(node: &Arc<Shared>, glade_id: &str) -> Vec<Op> {
 /// `Ok`; before X3.2b, the resend went unanswered.
 #[tokio::test(flavor = "multi_thread")]
 async fn writes_pending_when_the_forward_ends_are_answered_unknown_share() {
-    let t = two_nodes("x32-pending", Some(&["read.*"])).await;
+    let t = two_nodes("x32-pending", Some(&["read.*", "write.*"])).await;
     let (mut rc, wc) = a_client(&t).await;
     assert_eq!(payloads(&mut rc, 2, "routed tree ops").await.len(), 2);
 
@@ -185,7 +185,7 @@ async fn subscribed_to(port: u16, zones: &[&str]) -> (WsReader, WsWriter) {
 
 /// A session of `node` subscribed by hand to each of `zones` of
 /// `ws-razel`, which forwards nothing: its queue.
-async fn listening(node: &Arc<Shared>, zones: &[&str]) -> UnboundedReceiver<Vec<u8>> {
+pub(super) async fn listening(node: &Arc<Shared>, zones: &[&str]) -> UnboundedReceiver<Vec<u8>> {
     let (tx, rx) = mpsc::unbounded_channel();
     let sid = node.next.fetch_add(1, Ordering::SeqCst);
     node.out.lock().await.insert(sid, tx);
@@ -197,7 +197,7 @@ async fn listening(node: &Arc<Shared>, zones: &[&str]) -> UnboundedReceiver<Vec<
 }
 
 /// c's ops among the frames `rx` holds now, in order.
-fn from_c(rx: &mut UnboundedReceiver<Vec<u8>>) -> Vec<Op> {
+pub(super) fn from_c(rx: &mut UnboundedReceiver<Vec<u8>>) -> Vec<Op> {
     let mut ops = Vec::new();
     while let Ok(bytes) = rx.try_recv() {
         if let Ok(Frame::Ops(frame)) = Frame::from_bytes(&bytes) {
@@ -244,7 +244,7 @@ fn named(op: &Op) -> String {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_write_on_a_reaches_b_and_every_subscriber() {
     const ZONES: [&str; 3] = ["ws.tree", "ws.log", "ws.crdt"];
-    let t = two_nodes("x32-reach", Some(&["read.*"])).await;
+    let t = two_nodes("x32-reach", Some(&["read.*", "write.*"])).await;
     let (c_node, port_c) = third_node(&t, "x32-reach").await;
     let (mut rc, wc) = subscribed_to(t.port_a, &ZONES).await;
     let (mut rd, _wd) = subscribed_to(port_c, &ZONES).await;
@@ -308,7 +308,7 @@ async fn a_write_on_a_reaches_b_and_every_subscriber() {
 /// the one it accepted.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_write_the_holder_accepted_that_a_cannot_hold_gets_as_status() {
-    let t = two_nodes("x32-fork", Some(&["read.*"])).await;
+    let t = two_nodes("x32-fork", Some(&["read.*", "write.*"])).await;
     let held_at_a = c_writes(0, None, b"held at A");
     t.a.store.lock().await.append(held_at_a.clone()).unwrap();
     let (mut rc, wc) = crate::ws::connect("127.0.0.1", t.port_a).await.unwrap();
@@ -334,7 +334,7 @@ async fn a_write_the_holder_accepted_that_a_cannot_hold_gets_as_status() {
 /// refusals went unrelayed.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_write_the_holder_refuses_is_refused_at_a_and_kept_nowhere() {
-    let t = two_nodes("x32-refused", Some(&["read.*"])).await;
+    let t = two_nodes("x32-refused", Some(&["read.*", "write.*"])).await;
     let swmr = |origin: &str, body: &[u8]| Op {
         glade_id: "ws.swmr".into(),
         origin: origin.into(),
