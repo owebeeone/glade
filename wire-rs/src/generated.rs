@@ -1,3 +1,5 @@
+// taut v0.10.0 wrote this file: `PYTHONPATH=src python3 -m taut.corpus.glade_build`,
+// run in the taut checkout, regenerates it. Do not edit it by hand.
 // GENERATED from taut/ir + corpus by taut/src/taut/gen/rust.py — do not edit.
 #![allow(dead_code)]
 use crate::cbor::{Cbor, DecodeError};
@@ -5,7 +7,7 @@ use crate::cbor::{Cbor, DecodeError};
 // The file's bounds, for a decode rooted at a type that is not a message:
 // `cbor::try_decode_with(bytes, MAX_DEPTH, MAX_ENCODED_LEN)`.
 pub const MAX_DEPTH: usize = 32;
-pub const MAX_ENCODED_LEN: Option<usize> = None;
+pub const MAX_ENCODED_LEN: Option<usize> = Some(16777215);
 
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub enum FrameType {
@@ -149,7 +151,7 @@ pub struct Head {
 }
 impl Head {
     pub const MAX_DEPTH: usize = 32;
-    pub const MAX_ENCODED_LEN: Option<usize> = None;
+    pub const MAX_ENCODED_LEN: Option<usize> = Some(16777215);
     pub fn to_cbor(&self) -> Cbor {
         Cbor::Map(vec![
             (1, Cbor::Text(self.origin.clone())),
@@ -178,7 +180,7 @@ pub struct StreamHeads {
 }
 impl StreamHeads {
     pub const MAX_DEPTH: usize = 32;
-    pub const MAX_ENCODED_LEN: Option<usize> = None;
+    pub const MAX_ENCODED_LEN: Option<usize> = Some(16777215);
     pub fn to_cbor(&self) -> Cbor {
         Cbor::Map(vec![
             (1, Cbor::Text(self.share.clone())),
@@ -215,7 +217,7 @@ pub struct Op {
 }
 impl Op {
     pub const MAX_DEPTH: usize = 32;
-    pub const MAX_ENCODED_LEN: Option<usize> = None;
+    pub const MAX_ENCODED_LEN: Option<usize> = Some(16777215);
     pub fn to_cbor(&self) -> Cbor {
         Cbor::Map(vec![
             (1, Cbor::Text(self.share.clone())),
@@ -259,7 +261,7 @@ pub struct Hello {
 }
 impl Hello {
     pub const MAX_DEPTH: usize = 32;
-    pub const MAX_ENCODED_LEN: Option<usize> = None;
+    pub const MAX_ENCODED_LEN: Option<usize> = Some(16777215);
     pub fn to_cbor(&self) -> Cbor {
         Cbor::Map(vec![
             (1, Cbor::Text(self.session.clone())),
@@ -291,7 +293,7 @@ pub struct Welcome {
 }
 impl Welcome {
     pub const MAX_DEPTH: usize = 32;
-    pub const MAX_ENCODED_LEN: Option<usize> = None;
+    pub const MAX_ENCODED_LEN: Option<usize> = Some(16777215);
     pub fn to_cbor(&self) -> Cbor {
         Cbor::Map(vec![
             (1, Cbor::Text(self.session.clone())),
@@ -319,7 +321,7 @@ pub struct NodeHello {
 }
 impl NodeHello {
     pub const MAX_DEPTH: usize = 32;
-    pub const MAX_ENCODED_LEN: Option<usize> = None;
+    pub const MAX_ENCODED_LEN: Option<usize> = Some(16777215);
     pub fn to_cbor(&self) -> Cbor {
         Cbor::Map(vec![
             (1, Cbor::Bytes(self.node_id.clone())),
@@ -347,7 +349,7 @@ pub struct NodeWelcome {
 }
 impl NodeWelcome {
     pub const MAX_DEPTH: usize = 32;
-    pub const MAX_ENCODED_LEN: Option<usize> = None;
+    pub const MAX_ENCODED_LEN: Option<usize> = Some(16777215);
     pub fn to_cbor(&self) -> Cbor {
         Cbor::Map(vec![
             (1, Cbor::Bytes(self.node_id.clone())),
@@ -376,7 +378,7 @@ pub struct Subscribe {
 }
 impl Subscribe {
     pub const MAX_DEPTH: usize = 32;
-    pub const MAX_ENCODED_LEN: Option<usize> = None;
+    pub const MAX_ENCODED_LEN: Option<usize> = Some(16777215);
     pub fn to_cbor(&self) -> Cbor {
         Cbor::Map(vec![
             (1, Cbor::Text(self.share.clone())),
@@ -406,7 +408,7 @@ pub struct Unsubscribe {
 }
 impl Unsubscribe {
     pub const MAX_DEPTH: usize = 32;
-    pub const MAX_ENCODED_LEN: Option<usize> = None;
+    pub const MAX_ENCODED_LEN: Option<usize> = Some(16777215);
     pub fn to_cbor(&self) -> Cbor {
         Cbor::Map(vec![
             (1, Cbor::Text(self.share.clone())),
@@ -433,7 +435,7 @@ pub struct Ops {
 }
 impl Ops {
     pub const MAX_DEPTH: usize = 32;
-    pub const MAX_ENCODED_LEN: Option<usize> = None;
+    pub const MAX_ENCODED_LEN: Option<usize> = Some(16777215);
     pub fn to_cbor(&self) -> Cbor {
         Cbor::Map(vec![
             (1, Cbor::Array(self.ops.iter().map(|x| x.to_cbor()).collect())),
@@ -457,7 +459,7 @@ pub struct Heads {
 }
 impl Heads {
     pub const MAX_DEPTH: usize = 32;
-    pub const MAX_ENCODED_LEN: Option<usize> = None;
+    pub const MAX_ENCODED_LEN: Option<usize> = Some(16777215);
     pub fn to_cbor(&self) -> Cbor {
         Cbor::Map(vec![
             (1, Cbor::Array(self.streams.iter().map(|x| x.to_cbor()).collect())),
@@ -482,7 +484,7 @@ pub struct ExchangeReq {
 }
 impl ExchangeReq {
     pub const MAX_DEPTH: usize = 32;
-    pub const MAX_ENCODED_LEN: Option<usize> = None;
+    pub const MAX_ENCODED_LEN: Option<usize> = Some(16777215);
     pub fn to_cbor(&self) -> Cbor {
         Cbor::Map(vec![
             (1, Cbor::Text(self.share.clone())),
@@ -513,7 +515,7 @@ pub struct ExchangeRes {
 }
 impl ExchangeRes {
     pub const MAX_DEPTH: usize = 32;
-    pub const MAX_ENCODED_LEN: Option<usize> = None;
+    pub const MAX_ENCODED_LEN: Option<usize> = Some(16777215);
     pub fn to_cbor(&self) -> Cbor {
         Cbor::Map(vec![
             (1, Cbor::Text(self.corr.clone())),
@@ -544,7 +546,7 @@ pub struct ChannelOpen {
 }
 impl ChannelOpen {
     pub const MAX_DEPTH: usize = 32;
-    pub const MAX_ENCODED_LEN: Option<usize> = None;
+    pub const MAX_ENCODED_LEN: Option<usize> = Some(16777215);
     pub fn to_cbor(&self) -> Cbor {
         Cbor::Map(vec![
             (1, Cbor::Text(self.share.clone())),
@@ -573,7 +575,7 @@ pub struct ChannelData {
 }
 impl ChannelData {
     pub const MAX_DEPTH: usize = 32;
-    pub const MAX_ENCODED_LEN: Option<usize> = None;
+    pub const MAX_ENCODED_LEN: Option<usize> = Some(16777215);
     pub fn to_cbor(&self) -> Cbor {
         Cbor::Map(vec![
             (1, Cbor::Text(self.channel.clone())),
@@ -598,7 +600,7 @@ pub struct ChannelClose {
 }
 impl ChannelClose {
     pub const MAX_DEPTH: usize = 32;
-    pub const MAX_ENCODED_LEN: Option<usize> = None;
+    pub const MAX_ENCODED_LEN: Option<usize> = Some(16777215);
     pub fn to_cbor(&self) -> Cbor {
         Cbor::Map(vec![
             (1, Cbor::Text(self.channel.clone())),
@@ -625,7 +627,7 @@ pub struct Chunk {
 }
 impl Chunk {
     pub const MAX_DEPTH: usize = 32;
-    pub const MAX_ENCODED_LEN: Option<usize> = None;
+    pub const MAX_ENCODED_LEN: Option<usize> = Some(16777215);
     pub fn to_cbor(&self) -> Cbor {
         Cbor::Map(vec![
             (1, Cbor::Text(self.corr.clone())),
@@ -657,7 +659,7 @@ pub struct Error {
 }
 impl Error {
     pub const MAX_DEPTH: usize = 32;
-    pub const MAX_ENCODED_LEN: Option<usize> = None;
+    pub const MAX_ENCODED_LEN: Option<usize> = Some(16777215);
     pub fn to_cbor(&self) -> Cbor {
         Cbor::Map(vec![
             (1, Cbor::Int(self.code.wire())),

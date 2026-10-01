@@ -1,9 +1,12 @@
 //! A frame's size limit, for every carrier that reads frames: the node's
 //! websocket and peer stream, and client-rs's websocket (CD-G3 item 3,
 //! CD-G4). A frame is its `FrameType` tag byte, then one frame message. The
-//! limit is this one constant, so the node and its clients cannot drift apart;
-//! glade's schema declares no `max_encoded_len`, since taut stays at its
-//! v0.10.0 release (the owner, 2026-10-01). A carrier checks a frame's claimed length with [`frame_len`] before it
+//! limit is this one constant, so the node and its clients cannot drift apart.
+//! glade's schema (`taut/ir/glade.taut.py`) also declares `max_encoded_len`,
+//! 16 MiB less the tag byte, which the tests below keep in step with it; no
+//! language takes its limit from that bound (the owner, 2026-10-01: all
+//! languages or none, taut-dev's `dev-docs/TautGeneratedBounds.md`). A
+//! carrier checks a frame's claimed length with [`frame_len`] before it
 //! allocates anything for it (F15).
 
 use std::io;
@@ -32,14 +35,15 @@ mod tests {
     use super::*;
     use crate::generated::{self, FrameType};
 
-    /// CD-G3 item 3: the frame limit is 16 MiB, this crate's constant.
-    /// glade's schema declares no bound, so every frame message resolves to
-    /// the default depth and no length bound, and one raw decode serves every
-    /// frame type (CD-G4).
+    /// CD-G3 item 3: the frame limit is 16 MiB, this crate's constant, and
+    /// glade's schema declares the same bound for a frame message at file
+    /// level: the limit less the tag byte. Every frame message resolves to
+    /// that bound and the default depth, so one raw decode serves every frame
+    /// type (CD-G4).
     #[test]
-    fn the_frame_limit_is_16_mib_and_every_frame_message_takes_the_default_bounds() {
+    fn the_frame_limit_is_16_mib_and_the_schemas_bound_agrees() {
         assert_eq!(MAX_FRAME_BYTES, 16 << 20);
-        assert_eq!(generated::MAX_ENCODED_LEN, None);
+        assert_eq!(generated::MAX_ENCODED_LEN, Some(MAX_FRAME_BYTES - 1));
         assert_eq!(generated::MAX_DEPTH, crate::cbor::DEFAULT_MAX_DEPTH);
         let bounds = [
             (
