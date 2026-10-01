@@ -19,7 +19,7 @@ use glade_wire::generated::{ErrorCode, Ops, Welcome};
 
 use glade_grant_api::{GrantPort, Holder};
 
-use crate::accept::{accept_ops, SessionHeads};
+use crate::accept::{accept_ops, SessionHeads, Source};
 use crate::echo::Echo;
 use crate::envelope;
 use crate::exchange::Pending;
@@ -414,7 +414,7 @@ async fn handle(shared: Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
             Frame::Ops(ops) => {
                 // One status per op, in order, on this session (R1-R3), from
                 // the one acceptance path (cross-node writes plan X2.1).
-                accept_ops(&shared, sid, &mut client_heads, ops.ops).await;
+                accept_ops(&shared, sid, &mut client_heads, ops.ops, Source::Client).await;
             }
             _ => {}
         }

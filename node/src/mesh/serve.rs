@@ -7,6 +7,7 @@ use glade_grant_api::{GrantPort, Holder};
 use glade_wire::cbor;
 use glade_wire::generated::{ErrorCode, Heads, Op, Ops, Priority, Subscribe};
 
+use crate::accept::{accept_ops, SessionHeads, Source};
 use crate::conversation::Conversation;
 use crate::frame::Frame;
 use crate::grants::{refusal, READ_SUBSCRIBE};
@@ -84,6 +85,12 @@ pub(super) async fn serve_conversation(
 /// its append until its ops are queued, so each op of the zone reaches the
 /// peer once, after the ack. The ack names each origin's head by seq and
 /// hash.
+///
+/// The holder decides the forwarding node's writes (W2, cross-node writes
+/// plan X3.1): an `Ops` frame on the stream goes through the acceptance path
+/// with the stream's session as origin ([`Source::Forward`]), so the
+/// fan-out skips the stream, and each op's status is queued on it behind
+/// the fan-out before it.
 async fn serve_peer_subscribe(
     shared: Arc<Shared>,
     mesh: &Mesh,
@@ -136,6 +143,9 @@ async fn serve_peer_subscribe(
     // re-check pass refused it), when it sends END. A frame over the link's
     // limit is an op over it alone: the loop ends there, with a line, and the
     // forward lapses. It holds no lock across a receive (`conversation.rs`).
+    // What it reads is the forwarding node's writes, decided as they come.
+    let zone = (s.share.clone(), s.glade_id.clone(), key);
+    let mut heads = SessionHeads::new();
     let finished = loop {
         tokio::select! {
             queued = rx.recv() => {
@@ -150,8 +160,13 @@ async fn serve_peer_subscribe(
                 }
             }
             read = conversation.recv() => {
-                if read.is_err() {
-                    break false;
+                match read {
+                    Ok(Frame::Ops(ops)) => {
+                        let source = Source::Forward(&zone);
+                        accept_ops(&shared, sid, &mut heads, ops.ops, source).await;
+                    }
+                    Ok(_) => {}
+                    Err(_) => break false,
                 }
             }
         }

@@ -336,6 +336,7 @@ pub(crate) mod testing {
 mod tests {
     mod checkpoints;
     mod forward;
+    mod holder;
     mod home;
     mod link;
     mod support;
