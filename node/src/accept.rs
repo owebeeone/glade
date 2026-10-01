@@ -4,9 +4,10 @@
 //! websocket `Ops` arm (`server.rs`), and at a claim holder the writes a
 //! forwarding node sends on the forward it serves (X3.1, `mesh/serve.rs`).
 //! So the placement checks are made here, where every client op passes: a
-//! client's op by its share's route (W1, X2.3), a forwarded op by the
-//! holder's own fold (W2, X3.1). GladeSubstrateV1 §6, "Session answers";
-//! client-writes plan Step 2.1.
+//! client's op by its share's route (W1, X2.3), which sends it up to the
+//! claim holder when the share is forwarded (X3.2), and a forwarded op by
+//! the holder's own fold (W2, X3.1). GladeSubstrateV1 §6, "Session
+//! answers"; client-writes plan Step 2.1.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -14,7 +15,7 @@ use std::sync::Arc;
 use glade_wire::generated::{ErrorCode, Op, Ops, Shape};
 
 use crate::frame::Frame;
-use crate::mesh::{route_subscribe, who_serves, Route};
+use crate::mesh::{route_subscribe, who_serves, write_up, Route, Write};
 use crate::registry::HOME;
 use crate::router::{SessionId, Zone};
 use crate::server::{raise, send, Shared};
@@ -30,12 +31,23 @@ pub(crate) type SessionHeads = BTreeMap<Zone, Heads>;
 #[derive(Clone, Copy)]
 pub(crate) enum Source<'a> {
     /// A client's session: each op is placed by the route its subscribe
-    /// would get (W1, X2.3).
+    /// would get (W1, X2.3, X3.2).
     Client,
     /// The forward of `zone` this node serves as the share's claim holder
     /// (W2, X3.1): it carries the forwarding node's writes on that zone
     /// alone, placed only while this node's fold names it the holder.
     Forward(&'a Zone),
+}
+
+/// Where an op is placed, asked once per share per frame.
+#[derive(Clone)]
+enum Placement {
+    /// In this node's store.
+    Here,
+    /// Up its zone's forward to the claim holder, the node named (X3.2).
+    Up(String),
+    /// Nowhere: answered `UnknownShare`, for the reason given.
+    Not(String),
 }
 
 /// Decide each op of `ops`, a batch from session `origin`, in order, and
@@ -45,7 +57,9 @@ pub(crate) enum Source<'a> {
 /// (R2); otherwise the refusal. Only an op the node holds joins `heads` (R3).
 /// One op's refusal never stops the batch. `source` says how an op is
 /// placed ([`Source`]): an op not placed is answered `UnknownShare` with the
-/// reason, and kept nowhere. A forward's op on another zone is refused.
+/// reason, and kept nowhere; an op sent up to its claim holder is answered
+/// once the holder has decided it. A forward's op on another zone is
+/// refused.
 pub(crate) async fn accept_ops(
     shared: &Arc<Shared>,
     origin: SessionId,
@@ -76,13 +90,21 @@ pub(crate) async fn accept_ops(
                 continue;
             }
         }
-        // W1 (X2.3) and W2 (X3.1), after the refusals: an op every node
-        // refuses is refused, never answered `UnknownShare`, which its
+        // W1 (X2.3, X3.2) and W2 (X3.1), after the refusals: an op every
+        // node refuses is refused, never answered `UnknownShare`, which its
         // client would keep and send again (W5).
-        if let Some(reason) = not_placed(shared, source, &mut routes, &op.share).await {
-            let status = op_status(&op, ErrorCode::UnknownShare, reason);
-            send(shared, origin, &status).await;
-            continue;
+        match placement(shared, source, &mut routes, &op.share).await {
+            Placement::Here => {}
+            Placement::Up(holder) => {
+                let write = Write { op, writer: origin };
+                write_up(shared, holder, write).await;
+                continue;
+            }
+            Placement::Not(reason) => {
+                let status = op_status(&op, ErrorCode::UnknownShare, reason);
+                send(shared, origin, &status).await;
+                continue;
+            }
         }
         // R4: the cut is held from the append until the fan-out is queued
         // (plan Step 2.2).
@@ -124,30 +146,34 @@ pub(crate) async fn accept_ops(
     }
 }
 
-/// Why an op on `share` is not placed, if it is not, asked once per share
-/// per frame, `routes` holding the frame's answers so far. A client's op is
-/// placed by the C2 decision a subscribe of `share` would get (W1, X2.3):
-/// `Absent` is not placed; `Local` places the op here, and so, until X3.2
-/// sends it to the claim holder, does `Forward`. A forwarded op is placed
-/// only while this node holds the share ([`not_held`]).
-async fn not_placed(
+/// Where an op on `share` is placed, asked once per share per frame,
+/// `routes` holding the frame's answers so far. A client's op is placed by
+/// the C2 decision a subscribe of `share` would get (W1): `Local` here,
+/// `Forward` up to the claim holder (X3.2), `Absent` nowhere (X2.3). A
+/// forwarded op is placed here only while this node holds the share
+/// ([`not_held`]).
+async fn placement(
     shared: &Arc<Shared>,
     source: Source<'_>,
-    routes: &mut BTreeMap<String, Option<String>>,
+    routes: &mut BTreeMap<String, Placement>,
     share: &str,
-) -> Option<String> {
+) -> Placement {
     if let Some(asked) = routes.get(share) {
         return asked.clone();
     }
-    let absent = match source {
-        Source::Forward(_) => not_held(shared, share).await,
+    let placed = match source {
+        Source::Forward(_) => match not_held(shared, share).await {
+            Some(reason) => Placement::Not(reason),
+            None => Placement::Here,
+        },
         Source::Client => match route_subscribe(shared, share).await {
-            Route::Absent(reason) => Some(reason),
-            Route::Local | Route::Forward(_) => None,
+            Route::Local => Placement::Here,
+            Route::Forward(holder) => Placement::Up(holder),
+            Route::Absent(reason) => Placement::Not(reason),
         },
     };
-    routes.insert(share.into(), absent.clone());
-    absent
+    routes.insert(share.into(), placed.clone());
+    placed
 }
 
 /// Why this node takes no forwarded write on `share` (W2, X3.1), if it does

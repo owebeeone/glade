@@ -27,7 +27,7 @@
 //! them. A node with no link and no relay notes nothing.
 
 use std::collections::btree_map::Entry;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::io;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, PoisonError};
@@ -40,6 +40,7 @@ use crate::conversation::Linked;
 use crate::frame::MAX_FRAME_BYTES;
 use crate::iroh_carrier::IrohCarrier;
 use crate::peer::NodeIdentity;
+use crate::router::Zone;
 use crate::signing::NodeSigner;
 use crate::transport::{Door, EndpointKey};
 
@@ -52,9 +53,10 @@ pub use route::{directory_knows, who_serves};
 
 pub(crate) use home::{ingest_and_fanout, push_home};
 pub(crate) use link::release_links;
-pub(crate) use route::{forward_interest, route_subscribe, Route};
+pub(crate) use route::{forward_interest, route_subscribe, write_up, Route, Write};
 
 use home::{pull_home, pull_on_gap, Gaps, Round};
+use route::Upward;
 use serve::serve_conversation;
 
 fn other<E: Into<Box<dyn std::error::Error + Send + Sync>>>(e: E) -> io::Error {
@@ -91,9 +93,11 @@ pub struct Mesh {
     pub(crate) links: Mutex<BTreeMap<String, Peer>>,
     /// The number the next link takes ([`Peer`]).
     numbered: AtomicU64,
-    /// Zones whose interest is already forwarded to a claim holder — a second
-    /// local subscriber joins the flow, it never opens a second conversation.
-    pub(crate) forwarded: Mutex<BTreeSet<(String, String, Vec<u8>)>>,
+    /// The forwards to claim holders, by zone, each the handle its writes
+    /// are queued on (cross-node writes plan X3.2): a second local
+    /// subscriber, or a write, joins the running flow; it never opens a
+    /// second conversation.
+    pub(crate) forwarded: Mutex<BTreeMap<Zone, Upward>>,
     /// The door the port was lent (plan Steps 4.2b and 4.5b), if any: loaded
     /// from the served store before the first accept, then fed each transport
     /// record that lands there.
@@ -335,6 +339,7 @@ pub(crate) mod testing {
 #[cfg(test)]
 mod tests {
     mod checkpoints;
+    mod crossing;
     mod forward;
     mod holder;
     mod home;

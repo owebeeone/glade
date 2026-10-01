@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::future::poll_fn;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -47,7 +47,7 @@ impl Server {
             self_id: hex_id(&identity.node_id),
             links: Mutex::new(BTreeMap::new()),
             numbered: AtomicU64::new(0),
-            forwarded: Mutex::new(BTreeSet::new()),
+            forwarded: Mutex::new(BTreeMap::new()),
             door,
             signer: NodeSigner::new(Some(identity)),
             gap_pulls: std::sync::Mutex::new(BTreeMap::new()),

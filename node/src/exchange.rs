@@ -46,7 +46,8 @@ pub const WORKSPACE_CREATE: &str = "workspace.create";
 const PROVIDER_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long the requesting node waits on the claim holder — longer than
 /// [`PROVIDER_TIMEOUT`] so the holder's own timeout answer arrives as data.
-const FORWARD_TIMEOUT: Duration = Duration::from_secs(12);
+/// A forwarded write waits as long (cross-node writes plan X3.2, W5).
+pub(crate) const FORWARD_TIMEOUT: Duration = Duration::from_secs(12);
 
 fn other<E: Into<Box<dyn std::error::Error + Send + Sync>>>(e: E) -> io::Error {
     io::Error::new(io::ErrorKind::Other, e)
@@ -1140,7 +1141,7 @@ mod tests {
         let mesh = t.a.mesh.get().unwrap();
         let mut lapsed = false;
         for _ in 0..500 {
-            if !mesh.forwarded.lock().await.contains(&zone) {
+            if !mesh.forwarded.lock().await.contains_key(&zone) {
                 lapsed = true;
                 break;
             }

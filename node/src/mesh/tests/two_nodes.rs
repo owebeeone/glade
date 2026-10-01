@@ -205,7 +205,7 @@ pub(super) async fn a_client(t: &TwoNodes) -> (crate::ws::WsReader, crate::ws::W
 pub(super) async fn forward_lapses(a: &Arc<Shared>) {
     let mesh = a.mesh.get().unwrap();
     for _ in 0..500 {
-        if !mesh.forwarded.lock().await.contains(&tree_zone()) {
+        if !mesh.forwarded.lock().await.contains_key(&tree_zone()) {
             return;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
