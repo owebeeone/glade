@@ -1,9 +1,10 @@
 //! One acceptance path for client ops (cross-node writes plan, step X2.1).
 //!
 //! A session's ops are decided here, one by one, whatever carried them: the
-//! websocket `Ops` arm (`server.rs`) today, and the route check (X2.3) and a
-//! claim holder's forwarded writes (X3.1) when they land. GladeSubstrateV1 §6,
-//! "Session answers"; client-writes plan Step 2.1.
+//! websocket `Ops` arm (`server.rs`) today, and a claim holder's forwarded
+//! writes (X3.1) when they land. So the route check (W1, X2.3) is made here,
+//! where every client op passes. GladeSubstrateV1 §6, "Session answers";
+//! client-writes plan Step 2.1.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -11,6 +12,7 @@ use std::sync::Arc;
 use glade_wire::generated::{ErrorCode, Op, Ops, Shape};
 
 use crate::frame::Frame;
+use crate::mesh::{route_subscribe, Route};
 use crate::registry::HOME;
 use crate::router::{SessionId, Zone};
 use crate::server::{raise, send, Shared};
@@ -26,13 +28,16 @@ pub(crate) type SessionHeads = BTreeMap<Zone, Heads>;
 /// `corr` is the op's hash, `Ok` once the node holds the op, and for an
 /// appended op only once its fan-out to the zone's other sessions is queued
 /// (R2); otherwise the refusal. Only an op the node holds joins `heads` (R3).
-/// One op's refusal never stops the batch.
+/// One op's refusal never stops the batch. An op is placed by the route its
+/// subscribe would get (W1): on a share that routes `Absent`, it is answered
+/// `UnknownShare` with the route's reason, and kept nowhere.
 pub(crate) async fn accept_ops(
     shared: &Arc<Shared>,
     origin: SessionId,
     heads: &mut SessionHeads,
     ops: Vec<Op>,
 ) {
+    let mut routes = BTreeMap::new();
     for op in ops {
         // H-R3: a client submits intent, and appends no record with a
         // privileged effect. Every home record kind has one, and the node
@@ -46,6 +51,14 @@ pub(crate) async fn accept_ops(
         // refused before any of it is kept, whatever the store holds.
         if op.shape == Shape::Stream {
             send(shared, origin, &stream_refused(&op)).await;
+            continue;
+        }
+        // W1 (X2.3), after the refusals: an op every node refuses is
+        // refused, never answered `UnknownShare`, which its client would
+        // keep and send again (W5).
+        if let Some(reason) = not_placed(shared, &mut routes, &op.share).await {
+            let status = op_status(&op, ErrorCode::UnknownShare, reason);
+            send(shared, origin, &status).await;
             continue;
         }
         // R4: the cut is held from the append until the fan-out is queued
@@ -86,6 +99,27 @@ pub(crate) async fn accept_ops(
         drop(cut);
         send(shared, origin, &status).await;
     }
+}
+
+/// Why an op on `share` is not placed, if its route is `Absent` (W1, X2.3):
+/// the C2 decision a subscribe of `share` would get, asked once per share
+/// per frame, `routes` holding the frame's answers so far. `Local` places
+/// the op here, and so, until X3.2 sends it to the claim holder, does
+/// `Forward`.
+async fn not_placed(
+    shared: &Arc<Shared>,
+    routes: &mut BTreeMap<String, Option<String>>,
+    share: &str,
+) -> Option<String> {
+    if let Some(asked) = routes.get(share) {
+        return asked.clone();
+    }
+    let absent = match route_subscribe(shared, share).await {
+        Route::Absent(reason) => Some(reason),
+        Route::Local | Route::Forward(_) => None,
+    };
+    routes.insert(share.into(), absent.clone());
+    absent
 }
 
 /// The answer to a client's op on the home share (ruling H-R3, plan Step 4.3):

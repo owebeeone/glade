@@ -340,4 +340,5 @@ mod tests {
     mod link;
     mod support;
     mod two_nodes;
+    mod writes;
 }
