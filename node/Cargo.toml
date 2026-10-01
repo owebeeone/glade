@@ -67,6 +67,10 @@ glade-persistence-api = { path = "../contracts/persistence-api", features = ["co
 # The scripted driver and plan invariants tests/release_order.rs runs over the
 # node's plan. publish = false upstream, so it can only come from Git.
 sdax-testkit = { git = "https://github.com/owebeeone/sdax-rs", package = "sdax-testkit", rev = "ccf06e76a90e22a454471a71f0cf6f5cb878baac" }
+# The paused clock of src/claims.rs's renewal tests (`start_paused`,
+# `time::advance`, Step R). Until Step T only iroh's n0-future turned test-util
+# on. It adds no crate: the same tokio as above, `"1"` a range as there.
+tokio = { version = "1", features = ["test-util"] }
 
 # Every `home` record's signature is checked as it is taken in, and each start
 # checks every record held (plan Step 4.1b). Unoptimised, a check costs about

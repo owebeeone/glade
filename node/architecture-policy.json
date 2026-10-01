@@ -24,7 +24,8 @@
         "dev:glade-grant-api",
         "dev:glade-persistence-api",
         "dev:glade-signer-api",
-        "dev:sdax-testkit"
+        "dev:sdax-testkit",
+        "dev:tokio"
       ],
       "conformance_tests": ["assembly", "binding_census", "shipped_app_files"]
     }
