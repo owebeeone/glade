@@ -19,7 +19,7 @@ use glade_wire::generated::{ErrorCode, Ops, Welcome};
 
 use glade_grant_api::{GrantPort, Holder};
 
-use crate::accept::{accept_ops, SessionHeads, Source};
+use crate::accept::{accept_ops, heads_of, SharedHeads, Source};
 use crate::echo::Echo;
 use crate::envelope;
 use crate::exchange::Pending;
@@ -276,8 +276,9 @@ async fn handle(shared: Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
 
     let mut echo = Echo::new();
     // resume vectors the client has announced, or sent and the node holds
-    // (R3), per zone-surface (share, glade_id, key) -> origin -> seq.
-    let mut client_heads = SessionHeads::new();
+    // (R3), per zone-surface (share, glade_id, key) -> origin -> seq; shared
+    // with the forwards that land its writes (cross-node writes plan X3.2).
+    let client_heads = SharedHeads::default();
 
     loop {
         let bytes = match reader.read().await {
@@ -315,7 +316,8 @@ async fn handle(shared: Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
                 // a held op's seq does (R3), they only raise the session's.
                 for sh in &h.heads {
                     let zone = (sh.share.clone(), sh.glade_id.clone(), sh.key.clone());
-                    let m = client_heads.entry(zone).or_default();
+                    let mut heads = heads_of(&client_heads);
+                    let m = heads.entry(zone).or_default();
                     for hd in &sh.heads {
                         raise(m, &hd.origin, hd.seq);
                     }
@@ -373,7 +375,8 @@ async fn handle(shared: Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
                         // its append until its ops are queued, so each op of
                         // the zone reaches this session once, after the ack.
                         let zone = (s.share.clone(), s.glade_id.clone(), key.clone());
-                        let their = client_heads.get(&zone).cloned().unwrap_or_default();
+                        let their = heads_of(&client_heads).get(&zone).cloned();
+                        let their = their.unwrap_or_default();
                         let cut = shared.cut.lock().await;
                         // The grant check, when client sessions are checked
                         // (plan Step 4.3): refused, the refused subscribe's
@@ -414,7 +417,7 @@ async fn handle(shared: Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
             Frame::Ops(ops) => {
                 // One status per op, in order, on this session (R1-R3), from
                 // the one acceptance path (cross-node writes plan X2.1).
-                accept_ops(&shared, sid, &mut client_heads, ops.ops, Source::Client).await;
+                accept_ops(&shared, sid, &client_heads, ops.ops, Source::Client).await;
             }
             _ => {}
         }

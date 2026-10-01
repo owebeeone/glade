@@ -10,7 +10,7 @@
 //! answers"; client-writes plan Step 2.1.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use glade_wire::generated::{ErrorCode, Op, Ops, Shape};
 
@@ -26,6 +26,17 @@ use crate::sysdir::now_ms;
 /// A session's heads, per zone-surface: each origin's highest seq that the
 /// session announced (R4), or sent and the node holds (R3).
 pub(crate) type SessionHeads = BTreeMap<Zone, Heads>;
+
+/// A session's heads, shared with the forwards that land its writes, which
+/// raise them for an op the claim holder accepted (R3; cross-node writes
+/// plan X3.2).
+pub(crate) type SharedHeads = Arc<Mutex<SessionHeads>>;
+
+/// The heads behind `heads`, for one read or raise, never held across an
+/// await.
+pub(crate) fn heads_of(heads: &SharedHeads) -> MutexGuard<'_, SessionHeads> {
+    heads.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// What carried a batch of ops, which says how each is placed.
 #[derive(Clone, Copy)]
@@ -63,7 +74,7 @@ enum Placement {
 pub(crate) async fn accept_ops(
     shared: &Arc<Shared>,
     origin: SessionId,
-    heads: &mut SessionHeads,
+    heads: &SharedHeads,
     ops: Vec<Op>,
     source: Source<'_>,
 ) {
@@ -93,57 +104,72 @@ pub(crate) async fn accept_ops(
         // W1 (X2.3, X3.2) and W2 (X3.1), after the refusals: an op every
         // node refuses is refused, never answered `UnknownShare`, which its
         // client would keep and send again (W5).
-        match placement(shared, source, &mut routes, &op.share).await {
-            Placement::Here => {}
+        let status = match placement(shared, source, &mut routes, &op.share).await {
+            Placement::Here => place(shared, origin, heads, op).await,
             Placement::Up(holder) => {
-                let write = Write { op, writer: origin };
+                let heads = heads.clone();
+                let write = Write {
+                    op,
+                    writer: origin,
+                    heads,
+                };
                 write_up(shared, holder, write).await;
                 continue;
             }
-            Placement::Not(reason) => {
-                let status = op_status(&op, ErrorCode::UnknownShare, reason);
-                send(shared, origin, &status).await;
-                continue;
-            }
-        }
-        // R4: the cut is held from the append until the fan-out is queued
-        // (plan Step 2.2).
-        let cut = shared.cut.lock().await;
-        let res = shared.store.lock().await.append(op.clone());
-        let status = match res {
-            Ok(Append::Appended) => {
-                hold(heads, &op);
-                let status = op_status(&op, ErrorCode::Ok, "appended".into());
-                let router = shared.router.lock().await;
-                let targets = router.route(origin, &op.share, &op.glade_id, &op.key);
-                drop(router);
-                let frame = Frame::Ops(Ops {
-                    ops: vec![op],
-                    pri: None,
-                });
-                for t in targets {
-                    send(shared, t, &frame).await;
-                }
-                status
-            }
-            Ok(Append::Duplicate) => {
-                hold(heads, &op);
-                op_status(&op, ErrorCode::Ok, "already held".into())
-            }
-            // Taken as seen, not held (R2): the session's heads stay, and
-            // every op of its chain is above it.
-            Ok(Append::BelowRetained) => {
-                let message = format!(
-                    "({},{}) is below the first seq its chain holds",
-                    op.origin, op.seq
-                );
-                op_status(&op, ErrorCode::Retention, message)
-            }
-            Err(e) => error_frame(&e, &op),
+            Placement::Not(reason) => op_status(&op, ErrorCode::UnknownShare, reason),
         };
-        drop(cut);
         send(shared, origin, &status).await;
     }
+}
+
+/// Append `op`, from session `origin`, to this node's store, and its status
+/// (R1): `Ok` once the node holds it, and for an appended op only once its
+/// fan-out to the zone's other sessions is queued (R2); otherwise the
+/// refusal. A held op's seq joins `heads` (R3). A forwarding node lands an
+/// op its claim holder accepted so too, its writer as origin (W3, X3.2).
+pub(crate) async fn place(
+    shared: &Arc<Shared>,
+    origin: SessionId,
+    heads: &SharedHeads,
+    op: Op,
+) -> Frame {
+    // R4: the cut is held from the append until the fan-out is queued
+    // (plan Step 2.2).
+    let cut = shared.cut.lock().await;
+    let res = shared.store.lock().await.append(op.clone());
+    let status = match res {
+        Ok(Append::Appended) => {
+            hold(heads, &op);
+            let status = op_status(&op, ErrorCode::Ok, "appended".into());
+            let router = shared.router.lock().await;
+            let targets = router.route(origin, &op.share, &op.glade_id, &op.key);
+            drop(router);
+            let frame = Frame::Ops(Ops {
+                ops: vec![op],
+                pri: None,
+            });
+            for t in targets {
+                send(shared, t, &frame).await;
+            }
+            status
+        }
+        Ok(Append::Duplicate) => {
+            hold(heads, &op);
+            op_status(&op, ErrorCode::Ok, "already held".into())
+        }
+        // Taken as seen, not held (R2): the session's heads stay, and
+        // every op of its chain is above it.
+        Ok(Append::BelowRetained) => {
+            let message = format!(
+                "({},{}) is below the first seq its chain holds",
+                op.origin, op.seq
+            );
+            op_status(&op, ErrorCode::Retention, message)
+        }
+        Err(e) => error_frame(&e, &op),
+    };
+    drop(cut);
+    status
 }
 
 /// Where an op on `share` is placed, asked once per share per frame,
@@ -220,9 +246,9 @@ fn stream_refused(op: &Op) -> Frame {
 
 /// R3: the session's heads take the seq of an op the node holds, and never
 /// fall, so a repeat of a lower seq leaves them where they are.
-fn hold(heads: &mut SessionHeads, op: &Op) {
+fn hold(heads: &SharedHeads, op: &Op) {
     let zone = (op.share.clone(), op.glade_id.clone(), op.key.clone());
-    raise(heads.entry(zone).or_default(), &op.origin, op.seq);
+    raise(heads_of(heads).entry(zone).or_default(), &op.origin, op.seq);
 }
 
 #[cfg(test)]
@@ -318,14 +344,8 @@ mod tests {
             past_gap.clone(),
             on_home.clone(),
         ];
-        let mut heads = SessionHeads::new();
-        run(accept_ops(
-            &shared,
-            origin,
-            &mut heads,
-            batch,
-            Source::Client,
-        ));
+        let heads = SharedHeads::default();
+        run(accept_ops(&shared, origin, &heads, batch, Source::Client));
 
         let answers: Vec<(ErrorCode, Option<String>)> = queued(&mut queues[0])
             .into_iter()
@@ -350,6 +370,7 @@ mod tests {
         assert_eq!(fanned, once, "the other subscriber gets the new op, once");
         let zone = ("sh".to_string(), "g".to_string(), vec![]);
         let held = SessionHeads::from([(zone, Heads::from([("w".to_string(), 0)]))]);
+        let heads = heads_of(&heads).clone();
         assert_eq!(heads, held, "only the held op's seq joins the heads");
     }
 }

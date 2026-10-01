@@ -7,7 +7,7 @@ use glade_grant_api::{GrantPort, Holder};
 use glade_wire::cbor;
 use glade_wire::generated::{ErrorCode, Heads, Op, Ops, Priority, Subscribe};
 
-use crate::accept::{accept_ops, SessionHeads, Source};
+use crate::accept::{accept_ops, SharedHeads, Source};
 use crate::conversation::Conversation;
 use crate::frame::Frame;
 use crate::grants::{refusal, READ_SUBSCRIBE};
@@ -145,7 +145,7 @@ async fn serve_peer_subscribe(
     // forward lapses. It holds no lock across a receive (`conversation.rs`).
     // What it reads is the forwarding node's writes, decided as they come.
     let zone = (s.share.clone(), s.glade_id.clone(), key);
-    let mut heads = SessionHeads::new();
+    let heads = SharedHeads::default();
     let finished = loop {
         tokio::select! {
             queued = rx.recv() => {
@@ -163,7 +163,7 @@ async fn serve_peer_subscribe(
                 match read {
                     Ok(Frame::Ops(ops)) => {
                         let source = Source::Forward(&zone);
-                        accept_ops(&shared, sid, &mut heads, ops.ops, source).await;
+                        accept_ops(&shared, sid, &heads, ops.ops, source).await;
                     }
                     Ok(_) => {}
                     Err(_) => break false,

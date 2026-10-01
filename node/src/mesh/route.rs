@@ -8,6 +8,8 @@ use glade_wire::generated::{Error, ErrorCode, Head, Op, Ops, Subscribe};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
+use crate::accept::{place, SharedHeads};
+use crate::chain::op_hash;
 use crate::conversation::{Conversation, Linked};
 use crate::envelope;
 use crate::exchange::FORWARD_TIMEOUT;
@@ -20,7 +22,7 @@ use crate::store::Store;
 use crate::sysdir::now_ms;
 use crate::tasks::Site;
 
-use super::{ingest_and_fanout, Mesh};
+use super::{hex_id, ingest_and_fanout, Mesh};
 
 /// Where a subscribe is served (the C2 decision). Decided per subscribe, at
 /// the reader's clock — a lapsed lease at read time IS the absence case.
@@ -66,11 +68,12 @@ pub(crate) async fn route_subscribe(shared: &Arc<Shared>, share: &str) -> Route 
 }
 
 /// A client's write on a share another node holds (W1, cross-node writes
-/// plan X3.2): the op, and the session that wrote it, which the answer goes
-/// to.
+/// plan X3.2): the op, the session that wrote it, which the answer goes to,
+/// and that session's heads, which an op the holder accepted raises (R3).
 pub(crate) struct Write {
     pub(crate) op: Op,
     pub(crate) writer: SessionId,
+    pub(crate) heads: SharedHeads,
 }
 
 /// A forward's handle: where writes are queued for it to send up, in the
@@ -170,7 +173,8 @@ async fn lapse(shared: &Arc<Shared>, mesh: &Mesh, peer: &str, zone: Zone, refuse
 
 /// Run one forward until its conversation ends: `Some` refusal when the claim
 /// holder refused the read, which ends it (F5). The writes queued for it go
-/// up in order, each held pending ([`Pending`]); one unanswered for
+/// up in order, each held pending ([`Pending`]) until the holder's answer,
+/// which is relayed to its writer ([`settle`]); one unanswered for
 /// [`FORWARD_TIMEOUT`] is answered `UnknownShare`, and so is each one
 /// pending or queued when the forward ends: it was not placed (W5).
 async fn run_forward(
@@ -234,8 +238,13 @@ async fn carry(
                         }
                     }
                 }
-                // An op's status (R1) names its op: it ends nothing.
-                Ok(Frame::Error(answer)) if answer.corr.is_some() => {}
+                // An op's status (R1) names its op: its write's answer, which
+                // ends nothing.
+                Ok(Frame::Error(answer)) if answer.corr.is_some() => {
+                    if let Some(write) = pending.answered(&answer) {
+                        settle(shared, write, answer).await;
+                    }
+                }
                 // The claim holder's refusal (plan Step 4.3), after an ack that
                 // names no zone or, from its re-check pass, alone; it then
                 // ends the conversation.
@@ -253,6 +262,23 @@ async fn carry(
     }
     conversation.end();
     Ok(None)
+}
+
+/// Relay the claim holder's `answer` to `write`'s writer (W3). On `Ok` the
+/// op lands here first, through the verify path with the writer as origin,
+/// so the fan-out skips the writer and the op counts as the writer's (R3);
+/// should it not land, the writer gets this node's status for it. Any other
+/// answer is relayed as it came, and nothing is kept.
+async fn settle(shared: &Arc<Shared>, write: Write, answer: Error) {
+    let Write { op, writer, heads } = write;
+    let status = match answer.code {
+        ErrorCode::Ok => match place(shared, writer, &heads, op).await {
+            Frame::Error(held) if held.code == ErrorCode::Ok => Frame::Error(answer),
+            refused => refused,
+        },
+        _ => Frame::Error(answer),
+    };
+    send(shared, writer, &status).await;
 }
 
 /// Send `write` up the forward, held pending at the claim holder (W1, W6).
@@ -288,6 +314,18 @@ impl Pending {
     /// Hold `write`, sent at `sent`: due an answer [`FORWARD_TIMEOUT`] later.
     pub(super) fn hold(&mut self, write: Write, sent: Instant) {
         self.0.push_back((write, sent + FORWARD_TIMEOUT));
+    }
+
+    /// The first write held whose op `answer` names by its hash (R1): the
+    /// holder answers in the order sent, so an op sent twice takes its
+    /// answers in turn.
+    pub(super) fn answered(&mut self, answer: &Error) -> Option<Write> {
+        let names = |(write, _): &(Write, Instant)| {
+            let hash = hex_id(&op_hash(&write.op));
+            answer.corr.as_deref() == Some(hash.as_str())
+        };
+        let at = self.0.iter().position(names)?;
+        self.0.remove(at).map(|(write, _)| write)
     }
 
     /// When the first write held is due its answer by, if one is held.
