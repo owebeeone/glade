@@ -56,7 +56,7 @@ pub(crate) use link::release_links;
 pub(crate) use route::{forward_interest, route_subscribe, write_up, Route, Write};
 
 use home::{pull_home, pull_on_gap, Gaps, Round};
-use route::Upward;
+use route::{forwards_return, Upward};
 use serve::serve_conversation;
 
 fn other<E: Into<Box<dyn std::error::Error + Send + Sync>>>(e: E) -> io::Error {
@@ -345,6 +345,7 @@ mod tests {
     mod holder;
     mod home;
     mod link;
+    mod returning;
     mod support;
     mod two_nodes;
     mod writes;

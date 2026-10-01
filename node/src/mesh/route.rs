@@ -1,5 +1,5 @@
 use std::collections::btree_map::Entry;
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::io;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -64,6 +64,31 @@ pub(crate) async fn route_subscribe(shared: &Arc<Shared>, share: &str) -> Route 
         }
         None if known => Route::Absent(format!("no live ServeClaim for {share}")),
         None => Route::Local,
+    }
+}
+
+/// The forwards a link brings back (cross-node writes plan X4.2): once this
+/// node's home pull from `peer` has converged, each zone a local session
+/// subscribes, the peer streams this node serves aside, whose share now
+/// routes to `peer`, gets its forward, or joins the one that runs. So a
+/// subscriber left with no forward gets the holder's ops again without
+/// subscribing again: one whose link was lost between its route and its
+/// forward's start, or one acked from this replica before the directory
+/// named `peer` the share's holder. A forward that ended has told its own
+/// subscribers, and they have left (plan Step 4.6, part 3).
+pub(super) async fn forwards_return(shared: &Arc<Shared>, peer: &str) {
+    let streams = shared.admitted.lock().await.clone();
+    let entries = shared.router.lock().await.entries();
+    let local = entries
+        .into_iter()
+        .filter(|(sid, _)| !streams.contains_key(sid));
+    let zones: BTreeSet<Zone> = local.map(|(_, zone)| zone).collect();
+    for (share, glade_id, key) in zones {
+        if let Route::Forward(holder) = route_subscribe(shared, &share).await {
+            if holder == peer {
+                forward_interest(shared, holder, share, glade_id, key).await;
+            }
+        }
     }
 }
 

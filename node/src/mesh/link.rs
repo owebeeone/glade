@@ -19,7 +19,7 @@ use crate::server::{Server, Shared};
 use crate::signing::NodeSigner;
 use crate::tasks::Site;
 
-use super::{hex_id, other, pull_home, serve_conversation, Mesh, Peer, PeerPort};
+use super::{forwards_return, hex_id, other, pull_home, serve_conversation, Mesh, Peer, PeerPort};
 
 impl Server {
     /// Wire the peer fabric onto this node over `peer`, a bound port (plan
@@ -122,8 +122,10 @@ async fn accepted(
 }
 
 /// Drive one link after its HELLO, which proved `node`, dialer or acceptor
-/// side: register it, start its conversations, and run OUR home-share pull.
-/// Returns once our own pull has completed (the link itself lives on).
+/// side: register it, start its conversations, and run OUR home-share pull;
+/// once it has converged, bring back the forwards the link carries
+/// ([`forwards_return`], cross-node writes plan X4.2). Returns once our own
+/// pull has completed (the link itself lives on).
 async fn run_link(
     shared: Arc<Shared>,
     mesh: Arc<Mesh>,
@@ -172,6 +174,7 @@ async fn run_link(
         let (n, ms) = (round.applied, began.elapsed().as_millis());
         let line = format!("home round with node {peer}: {n} record(s) in {ms} ms");
         mesh.status(&line);
+        forwards_return(&shared, &peer).await;
     }
     pulled.map(drop)
 }
