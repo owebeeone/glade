@@ -31,11 +31,12 @@ const GYLD: &str = "../../grazel/apps/gyld-app.glade";
 /// post-amendment boot must do to the store its pre-amendment parse filled:
 /// append one record per `from-cursor` line (b2 rewrites the stored token to
 /// `from_cursor`) and one for the `windowed` line Step 2.4 moved, and leave
-/// every other record unchanged.
+/// every other record unchanged. The later session-desk declaration adds one
+/// fresh binding to Gyld; the pre-amendment reconstruction excludes it.
 const CENSUS: [(&str, Registered); 5] = [
     (GRAZEL, Registered { appended: 5, unchanged: 7 }),
     ("../apps/grazel-app.glade", Registered { appended: 5, unchanged: 7 }),
-    (GYLD, Registered { appended: 2, unchanged: 10 }),
+    (GYLD, Registered { appended: 3, unchanged: 10 }),
     ("../../glade-gyld/tests/fixtures/gyld-test-app.glade", Registered { appended: 2, unchanged: 7 }),
     ("../../glade-gwz/tests/fixtures/gwz-test-app.glade", Registered { appended: 1, unchanged: 3 }),
 ];
@@ -68,12 +69,14 @@ fn records(decl: &AppDecl) -> usize {
 /// Undo plan Step 2.4's one token edit (grazel 05553b4, glade 7bd5f9d):
 /// `term.log`'s retention back from `from-cursor` to `windowed`. Returns the
 /// text and the number of lines changed; no other census line moved in 2.4.
+/// The later `gyld.desk` line is removed to keep the historical input honest.
 /// It also puts back `glade-app v0`, the header the text had then, which Step
 /// 2.7 moved to `v1`; that line is not counted, being no census line.
 fn before_step_2_4(text: &str) -> (String, usize) {
     let mut changed = 0;
     let lines: Vec<String> = text
         .lines()
+        .filter(|line| !line.split_whitespace().take(2).eq(["binding", "gyld.desk"]))
         .map(|line| {
             let toks: Vec<&str> = line.split_whitespace().collect();
             if toks == ["binding", "term.log", "log", "share", "commons", "from-cursor"] {
@@ -146,8 +149,8 @@ fn retracted(reg: &Registry) -> Vec<(String, String)> {
 ///
 /// UNITS (SAF-P3-13): the asserted numbers count binding lines of the census,
 /// with ONE REGISTRY PER FILE — each file is its own store's share of the
-/// tree-wide migration cost — and the 15 is their SUM over the five files.
-/// No single store appends 15: grazel-app.glade is counted once in each of
+/// tree-wide migration cost — and the 16 is their SUM over the five files.
+/// No single store appends 16: grazel-app.glade is counted once in each of
 /// its two byte-identical homes, and the two fixtures are test files. The
 /// owner's store is the next test.
 ///
@@ -155,7 +158,7 @@ fn retracted(reg: &Registry) -> Vec<(String, String)> {
 /// as a pre-amendment node left it (tokens raw, `term.log` `windowed`); the
 /// file as it is now is then registered on the next boot.
 #[test]
-fn row9_the_first_boot_appends_15_over_the_census() {
+fn row9_the_first_boot_appends_16_over_the_census() {
     let texts = read_all(CENSUS.map(|(rel, _)| rel));
     let mut total = 0;
     for ((rel, want), text) in CENSUS.iter().zip(&texts) {
@@ -174,14 +177,14 @@ fn row9_the_first_boot_appends_15_over_the_census() {
         assert_eq!(retracted(&reg), vec![], "{rel}: no line was deleted");
         total += out.appended;
     }
-    assert_eq!(total, 15, "binding lines appended, summed over one registry per census file");
+    assert_eq!(total, 16, "binding lines appended, summed over one registry per census file");
 }
 
 /// §4.7 row 9 in the owner's store: grazel's boot with its gyld leg on
 /// registers grazel-app.glade then gyld-app.glade into ONE registry, so the
-/// unit here is one store, and its share of the migration is 5 + 2 = 7.
+/// unit here is one store, and its share of the migration is 5 + 3 = 8.
 #[test]
-fn row9_the_owners_two_file_store_appends_7() {
+fn row9_the_owners_two_file_store_appends_8() {
     let [grazel, gyld] = read_all([GRAZEL, GYLD]);
     let (pre_grazel, pre_gyld) =
         (pre_amendment(&before_step_2_4(&grazel).0), pre_amendment(&before_step_2_4(&gyld).0));
@@ -195,9 +198,9 @@ fn row9_the_owners_two_file_store_appends_7() {
     let (post_grazel, post_gyld) = (parse(&grazel).unwrap(), parse(&gyld).unwrap());
     let a = register(&post_grazel, &mut reg, ORIGIN).unwrap();
     let b = register(&post_gyld, &mut reg, ORIGIN).unwrap();
-    assert_eq!((a, b), (Registered { appended: 5, unchanged: 7 }, Registered { appended: 2, unchanged: 10 }));
+    assert_eq!((a, b), (Registered { appended: 5, unchanged: 7 }, Registered { appended: 3, unchanged: 10 }));
     assert_eq!(reg.bindings_of(), declared(&[&post_grazel, &post_gyld]));
-    assert_eq!(reg.bindings_of().len(), 15);
+    assert_eq!(reg.bindings_of().len(), 16);
     assert_eq!(retracted(&reg), vec![]);
 }
 
@@ -206,26 +209,26 @@ fn row9_the_owners_two_file_store_appends_7() {
 fn both_registered(grazel: &AppDecl, gyld: &AppDecl) -> Registry {
     let mut reg = Registry::new();
     assert_eq!(register(grazel, &mut reg, ORIGIN).unwrap(), Registered { appended: 12, unchanged: 0 });
-    assert_eq!(register(gyld, &mut reg, ORIGIN).unwrap(), Registered { appended: 10, unchanged: 2 });
+    assert_eq!(register(gyld, &mut reg, ORIGIN).unwrap(), Registered { appended: 11, unchanged: 2 });
     reg
 }
 
 /// §4.7 row 10, first test: grazel-app.glade then gyld-app.glade into ONE
 /// registry. Registering the second file is diffed only against its own app
-/// (`gyld`), so grazel's seven are not retracted: all 15 are live.
+/// (`gyld`), so grazel's seven are not retracted: all 16 are live.
 #[test]
 fn row10_two_app_files_in_one_registry_are_all_live() {
     let [grazel, gyld] = read_all([GRAZEL, GYLD]);
     let (grazel, gyld) = (parse(&grazel).unwrap(), parse(&gyld).unwrap());
     let reg = both_registered(&grazel, &gyld);
     assert_eq!(reg.bindings_of(), declared(&[&grazel, &gyld]));
-    assert_eq!(reg.bindings_of().len(), 15);
+    assert_eq!(reg.bindings_of().len(), 16);
     assert_eq!(retracted(&reg), vec![]);
     assert!(ops_of(&reg).iter().all(|o| o.glade_id != G_BINDING_RETRACTIONS), "no retraction record");
 }
 
 /// §4.7 row 10, second test: the next boot loads grazel-app.glade alone
-/// (the gyld leg switched off). A file not loaded retracts nothing: gyld's 8
+/// (the gyld leg switched off). A file not loaded retracts nothing: gyld's 9
 /// stay live and the store does not change.
 #[test]
 fn row10_a_file_not_loaded_retracts_nothing() {
@@ -236,8 +239,8 @@ fn row10_a_file_not_loaded_retracts_nothing() {
     assert_eq!(register(&grazel, &mut reg, ORIGIN).unwrap(), Registered { appended: 0, unchanged: 12 });
     assert_eq!(reg.snapshot(), before, "nothing appended");
     let gyld_live: Vec<BindingDecl> = reg.bindings_of().into_iter().filter(|b| b.app == "gyld").collect();
-    assert_eq!(gyld_live, declared(&[&gyld]), "gyld's 8 untouched");
-    assert_eq!(gyld_live.len(), 8);
+    assert_eq!(gyld_live, declared(&[&gyld]), "gyld's 9 untouched");
+    assert_eq!(gyld_live.len(), 9);
     assert_eq!(retracted(&reg), vec![]);
 }
 
@@ -259,12 +262,33 @@ fn row10_a_deleted_line_retracts_exactly_its_surface() {
 
     let mut reg = reboot(&reg);
     assert_eq!(register(&grazel_decl, &mut reg, ORIGIN).unwrap(), Registered { appended: 0, unchanged: 12 });
-    // the retraction is gyld's one append; its 7 bindings, service, 2 seeds
+    // the retraction is gyld's one append; its 8 bindings, service, 2 seeds
     // and workspace are unchanged
-    assert_eq!(register(&edited, &mut reg, ORIGIN).unwrap(), Registered { appended: 1, unchanged: 11 });
+    assert_eq!(register(&edited, &mut reg, ORIGIN).unwrap(), Registered { appended: 1, unchanged: 12 });
     assert_eq!(retracted(&reg), vec![("gyld".to_string(), "gyld.file".to_string())]);
     assert_eq!(reg.bindings_of(), declared(&[&grazel_decl, &edited]));
-    assert_eq!(reg.bindings_of().len(), 14);
+    assert_eq!(reg.bindings_of().len(), 15);
     let retractions = ops_of(&reg).iter().filter(|o| o.glade_id == G_BINDING_RETRACTIONS).count();
     assert_eq!(retractions, 1);
+}
+
+/// SS-03: the session desk is a private whole-value surface, distinct from appearance.
+#[test]
+fn session_desk_is_declared_private_value() {
+    let [gyld] = read_all([GYLD]);
+    let decl = parse(&gyld).unwrap();
+    let desk = decl
+        .bindings
+        .iter()
+        .find(|b| b.glade_id == "gyld.desk")
+        .expect("SS-03: gyld.desk binding");
+    assert_eq!(
+        (
+            &desk.shape[..],
+            &desk.authority[..],
+            &desk.zone[..],
+            &desk.retention[..]
+        ),
+        ("value", "share", "private", "latest")
+    );
 }
