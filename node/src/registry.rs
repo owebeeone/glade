@@ -340,8 +340,9 @@ pub trait RegistryApi {
     fn append(&mut self, rec: Record, origin: &str) -> Result<(), RegistryError>;
 
     /// Which node currently serves `workspace`, at the reader's clock `now_ms`.
-    /// Lease expiry is evaluated at read time, never inside the fold; highest
-    /// live epoch wins.
+    /// Lease expiry is evaluated at read time, never inside the fold; the
+    /// highest live epoch wins, and at an equal epoch the lower node id
+    /// ([`rank_claims`]).
     fn who_serves(&self, workspace: &str, now_ms: i64) -> Option<String>;
 
     /// Eligible replica nodes for `share` (WorkspaceEntry.eligible_hosts, LWW).
@@ -750,6 +751,16 @@ impl Registry {
     }
 }
 
+/// How two live claims on one share rank: `Greater` when `a` holds the share
+/// over `b`. The higher epoch holds, and at an equal epoch the lower node id.
+/// Two nodes that each claim a share before either has the other's claim mint
+/// the same epoch, so every fold that names a share's holder ranks by this,
+/// never by the order it reads the claims in: [`RegistryApi::who_serves`] and
+/// the served store's `mesh::who_serves`.
+pub(crate) fn rank_claims(a: &ServeClaim, b: &ServeClaim) -> std::cmp::Ordering {
+    a.epoch.cmp(&b.epoch).then_with(|| b.node.cmp(&a.node))
+}
+
 impl RegistryApi for Registry {
     fn append(&mut self, rec: Record, origin: &str) -> Result<(), RegistryError> {
         self.append_returning(rec, origin).map(|_| ())
@@ -760,7 +771,7 @@ impl RegistryApi for Registry {
             .into_iter()
             .filter_map(|o| envelope::folded(o, ServeClaim::from_cbor))
             .filter(|c| c.share == workspace && c.lease_expiry_ms > now_ms) // read-time expiry
-            .max_by_key(|c| c.epoch) // highest live epoch wins
+            .max_by(rank_claims) // highest live epoch, then the lower node id
             .map(|c| c.node)
     }
 
@@ -1055,6 +1066,51 @@ mod tests {
         // same op-set, different reader clock -> different answer, fold unchanged.
         assert_eq!(r.who_serves("ws-razel", 0), Some("peer2".into()));
         assert_eq!(r.who_serves("ws-razel", 40_000), None); // all leases expired
+    }
+
+    /// Two nodes that each claim a share before either has the other's claim
+    /// mint the same epoch. Every fold that names its holder then names the
+    /// lower node id, in whichever order the claims arrive: the registry's
+    /// and the served store's. A higher epoch still holds over a lower id.
+    #[test]
+    fn an_equal_epoch_is_held_by_the_lower_node_id_in_every_fold() {
+        use crate::mesh::who_serves;
+        use crate::store::Store;
+
+        let node = |key: u8| NodeIdentity::from_key([key; 32]);
+        let ids = [1, 2].map(|key| transport::hex(&node(key).node_id));
+        let (lower, higher) = if ids[0] < ids[1] { (0, 1) } else { (1, 0) };
+        let mut writers = [Registry::sealed(node(1)), Registry::sealed(node(2))];
+        let mut claim_at = |at: usize, epoch: i64| {
+            let rec = claim(&ids[at], "ws-tie", 30_000, epoch);
+            writers[at].append_returning(rec, &ids[at]).unwrap()
+        };
+        let tied = [claim_at(0, 1), claim_at(1, 1)];
+        let over = claim_at(higher, 2);
+        // The holder each fold names: the registry's, then the served store's.
+        let folds = |registry: &Registry, store: &Store| {
+            let ours = registry.who_serves("ws-tie", 0);
+            (ours, who_serves(store, "ws-tie", 0))
+        };
+        for (run, order) in [[0, 1], [1, 0]].into_iter().enumerate() {
+            let mut registry = Registry::sealed(node(3));
+            let root = std::env::temp_dir().join(format!("glade-reg-tie-{run}"));
+            let _ = fs::remove_dir_all(&root);
+            let mut store = Store::open(&root).unwrap();
+            for at in order {
+                registry.ingest(tied[at].clone()).unwrap();
+                store.append(tied[at].clone()).unwrap();
+            }
+            let held = Some(ids[lower].clone());
+            let said = format!("claims in order {order:?}");
+            assert_eq!(folds(&registry, &store), (held.clone(), held), "{said}");
+            registry.ingest(over.clone()).unwrap();
+            store.append(over.clone()).unwrap();
+            let held = Some(ids[higher].clone());
+            let said = format!("{said}, then epoch 2");
+            assert_eq!(folds(&registry, &store), (held.clone(), held), "{said}");
+            fs::remove_dir_all(&root).unwrap();
+        }
     }
 
     /// The seam's central requirement (#6): the blob engine and a DIFFERENT

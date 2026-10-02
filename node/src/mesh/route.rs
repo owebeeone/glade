@@ -14,7 +14,7 @@ use crate::conversation::{Conversation, Linked};
 use crate::envelope;
 use crate::exchange::FORWARD_TIMEOUT;
 use crate::frame::Frame;
-use crate::registry::HOME;
+use crate::registry::{rank_claims, HOME};
 use crate::router::{SessionId, Zone};
 use crate::server::{refuse_subscription, send, Shared};
 use crate::session::op_status;
@@ -388,7 +388,9 @@ impl Pending {
 
 /// Fold the local replica's home share for the current claim holder of
 /// `share`, judged at the READER's clock `now_ms` (lease expiry never enters
-/// the fold — WD §2); highest live epoch wins. `None` = no live claim.
+/// the fold — WD §2); the highest live epoch wins, and at an equal epoch the
+/// lower node id, as in the registry's fold ([`rank_claims`]). `None` = no
+/// live claim.
 pub fn who_serves(store: &Store, share: &str, now_ms: i64) -> Option<String> {
     let mut best: Option<crate::sysdata::ServeClaim> = None;
     for (origin, _) in store.heads(HOME, crate::registry::G_CLAIMS, &[]) {
@@ -396,7 +398,8 @@ pub fn who_serves(store: &Store, share: &str, now_ms: i64) -> Option<String> {
             let Some(c) = envelope::folded(&op, crate::sysdata::ServeClaim::from_cbor) else {
                 continue;
             };
-            if c.share == share && c.lease_expiry_ms > now_ms && best.as_ref().map_or(true, |b| c.epoch > b.epoch) {
+            let live = c.share == share && c.lease_expiry_ms > now_ms;
+            if live && best.as_ref().is_none_or(|b| rank_claims(&c, b).is_gt()) {
                 best = Some(c);
             }
         }
