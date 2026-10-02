@@ -5774,6 +5774,18 @@ under the root the entry point read.
 - A first argument `endpoint-id` no longer starts a node. The legacy form's
   first positional is a port, so nothing that ran before is lost.
 
+**Node grant identity (2026-10-03).** `glade-node node-id --name <name>` MUST
+print exactly one line of 64 lowercase hex digits: the signing identity used
+by `seed` and grant declarations, distinct from the endpoint's transport
+identity. It MUST use the same instance-name, key-mode and missing-key lock
+validation as `endpoint-id`. It MUST read or mint only `node.key`, start no
+node and create no registry records or endpoint key. An existing key MUST be
+readable while the node holds its instance lock. A malformed key, invalid name
+or locked instance with a missing key MUST fail rather than substitute an
+identity. The paired Gyld launcher uses both public commands before first boot;
+it never reads secret key bytes. Coverage: `endpoint_id` unit tests and
+`node/tests/endpoint_id.rs`'s node identity CLI test (PS-02 in the paired plan).
+
 **How the Pi and dabeest exchange ids before their first start.** Each machine
 mints its key with the command, then the lane owner pipes each id from one
 machine into a file on the other, through the Mac. The names are section 10's,

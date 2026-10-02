@@ -180,7 +180,7 @@ const USAGE: &str = "usage: glade-node <port> <store_dir> (the legacy form requi
     [--operator OP] [--app FILE.glade]... [--config PATH] \
     [--peer ID[@IP:PORT|@RELAY-URL]]... [--enforce-client-grants] [--recovery-out PATH] \
     [--lease-ms N] [port] [store_dir], or glade-node recovery --name NAME --out PATH, or \
-    glade-node endpoint-id --name NAME";
+    glade-node endpoint-id --name NAME, or glade-node node-id --name NAME";
 
 /// The refusal of a legacy start with no store directory: the usage line on
 /// stderr, and exit 1, as every refused start.
@@ -240,6 +240,14 @@ async fn start() -> std::io::Result<ExitCode> {
     if args.first().is_some_and(|arg| arg == "endpoint-id") {
         let root = instance_root_from_env();
         println!("{}", endpoint_id::command(&root, args.into_iter().skip(1))?);
+        return Ok(ExitCode::SUCCESS);
+    }
+    if args.first().is_some_and(|arg| arg == "node-id") {
+        let root = instance_root_from_env();
+        println!(
+            "{}",
+            endpoint_id::node_command(&root, args.into_iter().skip(1))?
+        );
         return Ok(ExitCode::SUCCESS);
     }
     if args.first().is_some_and(|arg| arg == "decode-dry-run") {

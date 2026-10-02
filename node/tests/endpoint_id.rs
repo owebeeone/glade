@@ -48,10 +48,10 @@ impl Drop for Spawned {
 /// the bound: its exit status, its stdout lines and its stderr. A process
 /// still running at the bound is killed, and the test fails with what it
 /// printed.
-fn endpoint_id(home: &Path, name: &str) -> (ExitStatus, Vec<String>, String) {
+fn identity_id(home: &Path, name: &str, kind: &str) -> (ExitStatus, Vec<String>, String) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_glade-node"));
     command
-        .args(["endpoint-id", "--name", name])
+        .args([kind, "--name", name])
         .env("GLADE_HOME", home)
         .env("HOME", home)
         .stdin(Stdio::null())
@@ -85,6 +85,40 @@ fn endpoint_id(home: &Path, name: &str) -> (ExitStatus, Vec<String>, String) {
         .read_to_string(&mut stderr)
         .unwrap();
     (status, stdout.lines().map(str::to_owned).collect(), stderr)
+}
+
+fn endpoint_id(home: &Path, name: &str) -> (ExitStatus, Vec<String>, String) {
+    identity_id(home, name, "endpoint-id")
+}
+
+#[test]
+fn node_id_command_is_stable_key_only_and_matches_a_booted_identity() {
+    let dir = scratch("node-id-command");
+    let home = dir.join("glade-home");
+    let (status, lines, error) = identity_id(&home, "n", "node-id");
+    assert!(status.success(), "{error}");
+    assert_eq!(lines.len(), 1);
+    let first = lines[0].clone();
+    assert_eq!(first.len(), 64);
+    let instance = home.join("sys/n");
+    assert!(instance.join("node.key").is_file());
+    assert!(!instance.join("endpoint.key").exists());
+    assert!(!instance.join("records.json").exists());
+    assert!(!instance.join("instance.lock").exists());
+    let before = files(&home);
+    let (status, again, error) = identity_id(&home, "n", "node-id");
+    assert!(status.success(), "{error}");
+    assert_eq!(again, lines);
+    assert_eq!(files(&home), before);
+    let boot = boot_at(instance, "owner").unwrap();
+    assert_eq!(boot.node_id, first);
+    let (status, running, error) = identity_id(&home, "n", "node-id");
+    assert!(status.success(), "{error}");
+    assert_eq!(running, lines);
+    drop(boot);
+    let (status, _, _) = identity_id(&home, "../escape", "node-id");
+    assert!(!status.success());
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 /// Every file under `dir`, with its length and when it was last written.
