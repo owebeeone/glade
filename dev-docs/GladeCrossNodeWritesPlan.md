@@ -5,7 +5,8 @@ client's write to a share another node serves stays on the node the client
 reached (`glade/dev-docs/GladeSubstrateV1.md:332-334`, `:346-348`;
 `dev-docs/GladeFirstSlicePlan.md:938`; `dev-docs/GladeProgramStatus.md:37`).
 Step X1.1 is done (glade `55e636c`), X3.3a and X3.3b were built with CW 3.1 and 3.3, and every node step,
-X2.1-X4.3, is done (glade `efcce3f` to `6108673`); X4.3's run on the two machines is not. The code was read
+X2.1-X4.3, is done (glade `efcce3f` to `6108673`); X4.3's run on the two machines is a later integration
+test (owner, 2026-10-02), and equal-epoch claims rank alike in every fold since `c1a6764`. The code was read
 in the working trees on 2026-09-24 with no git command, so no revision is
 named; another agent was editing `glade/node/` and
 `glade/dev-docs/GladeNodeAssembly.md` (slice Step 4.1a), so line numbers there
@@ -603,8 +604,16 @@ restart of the holder.
   checks, each naming the step it pins and seen failing on a tree without it (X4.2b, X3.2b, X3.2, X4.1,
   X2.3). Three booted nodes; the node's own websocket client in place of client-rs sessions (a
   client-rs dev-dependency would widen the gate's scope and the lockfile), the keep-and-resend done by
-  hand; Unix only (the holder runs the assembled root, stopped by SIGTERM). The run on the two machines
-  waits on the owner.
+  hand; Unix only (the holder runs the assembled root, stopped by SIGTERM). **Ruled, owner,
+  2026-10-02:** the run on the two machines is a later integration test. A second node on one machine
+  covers glade's part, since NAT and firewall traversal is iroh's (ruled 2026-09-24).
+- **Fixed after X4.3, 2026-10-02,** glade `c1a6764`: two nodes that each serve S before either has the
+  other's claim both mint epoch 1, and the node's two claim folds broke that tie apart. The routing fold
+  (`mesh::who_serves`) kept the first claim in origin order; the registry's, which `Server::serves` and
+  the assembly's host port read, kept the last. Both now rank by `registry::rank_claims`: the higher
+  epoch, then the lower node id. One registry test pins both folds in both arrival orders, red first.
+  Found reviewing the settings demo (gryth-wz `dev-docs/GrythGripScopes.md`, question 8), where every
+  gyld-ui node serves `ws-razel`.
 
 ## 6. Order and parallelism
 
