@@ -308,6 +308,7 @@ pub fn staged_plan(d: &Descriptor, c: Candidate) -> CommitPlan {
         batch: Bytes::new(b"exact-test-batch".to_vec()),
         kind: CommitKind::AcceptedBatch,
         records: vec![c.clone()],
+        qualified_forks: vec![],
         acceptances: vec![StagedAcceptance {
             candidate: c,
             facts: verified,

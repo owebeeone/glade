@@ -62,7 +62,7 @@ fn main() {
             }
             state = drive(state, Event::OfferReplica(Box::new(op.clone())), verified).state;
         }
-        traces.push(json!({"scenario":"AB", "reverse":reverse, "result":projection_trace(&state,&d.instance)}));
+        traces.push(json!({"scenario":"AB-buffer", "reverse":reverse, "result":projection_trace(&state,&d.instance)}));
         let dependent = candidate(
             &d,
             "dependent",
@@ -156,7 +156,86 @@ fn main() {
             facts(&second),
         )
         .state;
-        traces.push(json!({"scenario":"A", "reverse":reverse, "result":projection_trace(&state,&d.instance)}));
+        let before_recovery = projection_trace(&state, &d.instance);
+        traces.push(json!({"scenario":"A", "reverse":reverse, "result":before_recovery}));
+        let old = state.instances[&d.instance].accepted.clone();
+        let qualified_fork = state.instances[&d.instance]
+            .qualified_forks
+            .iter()
+            .any(|pair| {
+                pair.first.operation.inner().origin == "writer-e0"
+                    && pair.second.operation.inner().origin == "writer-e0"
+                    && pair.first.operation.inner().seq == 1
+                    && pair.second.operation.inner().seq == 1
+                    && pair.first.operation.canonical().digest()
+                        != pair.second.operation.canonical().digest()
+                    && [
+                        pair.first.operation.canonical().digest(),
+                        pair.second.operation.canonical().digest(),
+                    ]
+                    .iter()
+                    .all(|digest| {
+                        old.iter().any(|record| {
+                            record.candidate.operation.canonical().digest() == *digest
+                        })
+                    })
+            });
+        let fresh = candidate(
+            &d,
+            "writer-e1",
+            0,
+            None,
+            vec![Head {
+                origin: "writer-e0".into(),
+                seq: 0,
+                hash: Some(a.operation.canonical().digest().to_vec()),
+            }],
+            insert("fresh-atom-b", Some("atom-a"), "B"),
+        );
+        let recovered = drive(
+            state,
+            Event::SubmitLocal(Box::new(fresh.clone())),
+            facts(&fresh),
+        );
+        let fresh_local_receipt = recovered
+            .effects
+            .iter()
+            .any(|e| matches!(e, Effect::Report(Outcome::AcceptedLocal(_))));
+        let old_receipts_preserved = old.iter().all(|record| {
+            recovered.state.instances[&d.instance]
+                .accepted
+                .contains(record)
+        });
+        let old_retries_exact = old.iter().all(|record| {
+            step(
+                &recovered.state,
+                Event::SubmitLocal(Box::new(record.candidate.clone())),
+            )
+            .effects
+            .contains(&Effect::Report(Outcome::ExactRetry(record.receipt.clone())))
+        });
+        let mut reused = candidate(
+            &d,
+            "writer-e0",
+            0,
+            None,
+            vec![],
+            insert("illegal-atom", None, "Q"),
+        );
+        reused.evidence.certificate = Bytes::new(b"reused-origin-epoch-1".to_vec());
+        let mut invalid = facts(&reused);
+        invalid.certificate.epoch = "epoch-1".into();
+        invalid.issuance_unique = false;
+        let refused = drive(
+            recovered.state,
+            Event::SubmitLocal(Box::new(reused)),
+            invalid,
+        );
+        let reused_origin_rejected = refused.effects.contains(&Effect::Report(Outcome::Invalid));
+        traces.push(json!({"scenario":"AB", "reverse":reverse, "before_recovery":before_recovery,
+            "qualified_fork":qualified_fork, "old_receipts_preserved":old_receipts_preserved,
+            "old_retries_exact":old_retries_exact, "reused_origin_rejected":reused_origin_rejected,
+            "fresh_local_receipt":fresh_local_receipt, "result":projection_trace(&refused.state,&d.instance)}));
     }
     let y = descriptor("y");
     let mut isolated = initial(d.clone());

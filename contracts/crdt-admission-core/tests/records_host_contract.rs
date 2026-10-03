@@ -315,6 +315,7 @@ fn icd010_unknown_commit_retains_reservation_and_foreign_callback_cannot_accept(
     let mut state = initial(d.clone());
     let plan = staged_plan(&d, c.clone());
     state.commits.insert(7, plan.clone());
+    state.next_effect_id = 8;
     let unknown = step(
         &state,
         Event::CommitResolved(CommitReply {
@@ -650,6 +651,7 @@ fn icd010_commit_callbacks_bind_batch_revision_and_have_three_distinct_outcomes(
     let plan = staged_plan(&d, c.clone());
     let mut state = initial(d.clone());
     state.commits.insert(plan.id, plan.clone());
+    state.next_effect_id = 8;
     for (id, digest, revision) in [
         (8, plan.batch.digest(), 1),
         (7, [9; 32], 1),
@@ -719,27 +721,34 @@ fn icd010_lookup_recovery_binds_request_and_restores_original_receipt() {
     let c = candidate(&d, "a", 0, None, vec![], insert("a", None, "A"));
     let plan = staged_plan(&d, c.clone());
     let request = LookupRequest {
+        lookup_id: 40,
         plan_id: 7,
         expected_revision: 0,
         instance: d.instance.clone(),
-        operation: c.operation.canonical().digest(),
+        operation: Some(c.operation.canonical().digest()),
         batch_digest: plan.batch.digest(),
     };
     let mut state = initial(d.clone());
     state.unknown_commits.insert(7, plan.clone());
-    state.lookups.insert(7, request.clone());
+    state.lookups.insert(40, request.clone());
+    state.next_effect_id = 41;
     let receipt = plan.acceptances[0].receipt.clone();
     let foreign = step(
         &state,
         Event::LookupResolved(LookupReply {
+            lookup_id: 40,
             plan_id: 7,
             expected_revision: 0,
             instance: d.instance.clone(),
-            operation: [9; 32],
+            operation: Some([9; 32]),
             batch_digest: request.batch_digest,
             result: LookupResult::Committed {
-                receipt: receipt.clone(),
-                revision: 1,
+                batch: BatchCommitted {
+                    batch_digest: plan.batch.digest(),
+                    receipts: vec![receipt.clone()],
+                    revision: 1,
+                    storage: StorageClass::VolatileTest,
+                },
             },
         }),
     );
@@ -753,14 +762,19 @@ fn icd010_lookup_recovery_binds_request_and_restores_original_receipt() {
     let found = step(
         &state,
         Event::LookupResolved(LookupReply {
+            lookup_id: 40,
             plan_id: 7,
             expected_revision: 0,
             instance: d.instance.clone(),
             operation: request.operation,
             batch_digest: request.batch_digest,
             result: LookupResult::Committed {
-                receipt: receipt.clone(),
-                revision: 1,
+                batch: BatchCommitted {
+                    batch_digest: plan.batch.digest(),
+                    receipts: vec![receipt.clone()],
+                    revision: 1,
+                    storage: StorageClass::VolatileTest,
+                },
             },
         }),
     );
@@ -795,6 +809,7 @@ fn icd006_stale_verification_after_policy_change_cannot_seal_or_commit() {
             verified_query: None,
         },
     );
+    state.next_effect_id = 8;
     let changed = step(
         &state,
         Event::ObservePolicy {
@@ -835,6 +850,7 @@ fn icd006_delayed_prior_cut_committed_callback_retains_historical_admission() {
     state.commits.insert(7, plan.clone());
     // Trusted host began under the plan's valid cut, physically committed, then
     // observed revocation before delivering the delayed barrier reply.
+    state.next_effect_id = 8;
     let changed = step(
         &state,
         Event::ObservePolicy {
@@ -869,27 +885,34 @@ fn icd006_delayed_prior_cut_committed_callback_retains_historical_admission() {
     let mut unknown = changed.state;
     unknown.commits.remove(&7);
     unknown.unknown_commits.insert(7, plan.clone());
+    unknown.next_effect_id = 41;
     unknown.lookups.insert(
-        7,
+        40,
         LookupRequest {
+            lookup_id: 40,
             plan_id: 7,
             expected_revision: 0,
             instance: d.instance.clone(),
-            operation: plan.acceptances[0].receipt.operation,
+            operation: Some(plan.acceptances[0].receipt.operation),
             batch_digest: plan.batch.digest(),
         },
     );
     let recovered = step(
         &unknown,
         Event::LookupResolved(LookupReply {
+            lookup_id: 40,
             plan_id: 7,
             expected_revision: 0,
             instance: d.instance.clone(),
-            operation: plan.acceptances[0].receipt.operation,
+            operation: Some(plan.acceptances[0].receipt.operation),
             batch_digest: plan.batch.digest(),
             result: LookupResult::Committed {
-                receipt: plan.acceptances[0].receipt.clone(),
-                revision: 1,
+                batch: BatchCommitted {
+                    batch_digest: plan.batch.digest(),
+                    receipts: vec![plan.acceptances[0].receipt.clone()],
+                    revision: 1,
+                    storage: StorageClass::VolatileTest,
+                },
             },
         }),
     );

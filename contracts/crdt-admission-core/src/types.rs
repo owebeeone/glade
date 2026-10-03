@@ -235,6 +235,8 @@ pub struct CommitPlan {
     pub kind: CommitKind,
     pub records: Vec<Candidate>,
     pub acceptances: Vec<StagedAcceptance>,
+    /// Explicit retained conviction; each rival must independently qualify.
+    pub qualified_forks: Vec<ForkEvidence>,
     pub charges: Charges,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -253,26 +255,38 @@ pub struct CommitReply {
     pub batch_digest: Digest,
     pub result: CommitResult,
 }
+/// Storage attests the whole original atomic batch, including retention-only work.
+/// Receipts are exactly the staged admissions; no synthetic retention receipt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BatchCommitted {
+    pub batch_digest: Digest,
+    pub revision: u64,
+    pub storage: StorageClass,
+    pub receipts: Vec<Receipt>,
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LookupResult {
-    Committed { receipt: Receipt, revision: u64 },
+    Committed { batch: BatchCommitted },
     KnownAbsent,
     Unknown,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LookupRequest {
+    /// Fresh checked invocation identity, distinct from the immutable plan ID.
+    pub lookup_id: u64,
     pub plan_id: u64,
     pub expected_revision: u64,
     pub instance: Instance,
-    pub operation: Digest,
+    pub operation: Option<Digest>,
     pub batch_digest: Digest,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LookupReply {
+    pub lookup_id: u64,
     pub plan_id: u64,
     pub expected_revision: u64,
     pub instance: Instance,
-    pub operation: Digest,
+    pub operation: Option<Digest>,
     pub batch_digest: Digest,
     pub result: LookupResult,
 }
@@ -296,6 +310,15 @@ pub struct ReadCut {
 pub enum Outcome {
     AcceptedLocal(Receipt),
     ExactRetry(Receipt),
+    /// Batch custody only; this outcome is never application admission.
+    BatchRetained {
+        instance: Instance,
+        kind: CommitKind,
+        batch_digest: Digest,
+        revision: u64,
+        storage: StorageClass,
+    },
+    /// Immutable batch identity; no application receipt is implied.
     OutcomeUnknown(Digest),
     MissingHistory(Vec<Slot>),
     PolicyPending,
@@ -363,6 +386,7 @@ pub struct State {
     pub queries: BTreeMap<u64, PendingVerification>,
     pub commits: BTreeMap<u64, CommitPlan>,
     pub unknown_commits: BTreeMap<u64, CommitPlan>,
+    /// Keyed by lookup_id; Unknown retires invocation, not reserved plan.
     pub lookups: BTreeMap<u64, LookupRequest>,
     pub next_effect_id: u64,
 }
