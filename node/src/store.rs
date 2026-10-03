@@ -200,6 +200,7 @@ impl Store {
     /// taken without them and rewritten.
     pub fn open(root: impl Into<PathBuf>) -> Result<Store, StoreError> {
         let root = root.into();
+        let _guard = legacy_seal::unsealed(&root)?;
         let mut logs: BTreeMap<ChainId, Vec<Op>> = BTreeMap::new();
         let (mut register, mut covered) = (Register::new(), Vec::new());
         let mut aside = SetAside {
@@ -276,11 +277,6 @@ impl Store {
         legacy_seal::seal_with(&self.root, |_| Ok(())).map_err(StoreError::Io)
     }
 
-    #[allow(dead_code)]
-    fn append_with(&mut self, _op: Op, _after_check: impl FnOnce()) -> Result<Append, StoreError> {
-        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "Q4-A lock consumer scaffold").into())
-    }
-
     /// The `home` journals `open` set aside, if any.
     pub fn set_aside(&self) -> Option<&SetAside> {
         self.aside.as_ref()
@@ -302,6 +298,18 @@ impl Store {
     /// checkpoint placed moves its chain's floor and rewrites its origin's
     /// journal. A byte-identical repeat was checked when it first landed.
     pub fn append(&mut self, op: Op) -> Result<Append, StoreError> {
+        self.append_with(op, || {})
+    }
+
+    // Production supplies an immediate callback. Tests can pause here to attack
+    // the actual OS lock and prove a seal cannot overtake the journal mutation.
+    fn append_with(
+        &mut self,
+        op: Op,
+        after_check: impl FnOnce(),
+    ) -> Result<Append, StoreError> {
+        let _guard = legacy_seal::unsealed(&self.root)?;
+        after_check();
         self.validate_surface_contract(&op)?;
         let chain = chain_of(&op);
         // Classify against the current tail without holding a borrow of `logs`

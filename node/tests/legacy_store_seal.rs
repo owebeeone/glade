@@ -141,7 +141,6 @@ mod unix_profile {
     use super::common::*;
     use glade_node::server::Server;
     use glade_node::store::{Append, Store};
-    use std::fs;
     #[test]
     fn ls002_success_seals_both_existing_handles_and_shared_server_reopen() {
         let f = Fixture::new("seal-success");

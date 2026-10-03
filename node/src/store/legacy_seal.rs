@@ -1,7 +1,7 @@
 //! Q4-A local Store retirement. This is not a protected-resource enrollment.
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::io;
+use std::path::Path;
 
 const LOCK: &str = "legacy-store.lock";
 const MARKER: &str = "legacy-store.sealed";
@@ -14,18 +14,108 @@ pub(super) enum Cut {
     AfterDirectorySync,
 }
 
-pub(super) fn seal_with(_root: &Path, _at: impl FnMut(Cut) -> io::Result<()>) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "Q4-A publication scaffold",
-    ))
+fn locked(root: &Path) -> io::Result<File> {
+    fs::create_dir_all(root)?;
+    let path = root.join(LOCK);
+    match fs::symlink_metadata(&path) {
+        Ok(meta) if !meta.file_type().is_file() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "legacy Store lock is not a regular file",
+            ));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(e);
+        }
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    file.lock()?;
+    Ok(file)
+}
+
+/// Returned guard remains alive through the caller's complete mutation/replay.
+pub(super) fn unsealed(root: &Path) -> io::Result<File> {
+    let guard = locked(root)?;
+    match fs::symlink_metadata(root.join(MARKER)) {
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "legacy Store {} is sealed for migration; legacy writes and replay are disabled",
+                root.display()
+            ),
+        )),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(guard),
+        Err(e) => Err(e),
+    }
+}
+
+pub(super) fn seal_with(root: &Path, at: impl FnMut(Cut) -> io::Result<()>) -> io::Result<()> {
+    platform::seal(root, at)
+}
+
+// The complete platform branches have explicit enclosing modules. Publication
+// never substitutes a successful no-op for an unqualified directory sync.
+#[cfg(unix)]
+mod platform {
+    use super::*;
+
+    pub(super) fn seal(root: &Path, mut at: impl FnMut(Cut) -> io::Result<()>) -> io::Result<()> {
+        let _guard = locked(root)?;
+        at(Cut::BeforeCreate)?;
+        let marker = root.join(MARKER);
+        let file = match fs::symlink_metadata(&marker) {
+            Ok(meta) if meta.file_type().is_file() => {
+                OpenOptions::new().read(true).write(true).open(&marker)?
+            }
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "legacy Store seal is not a regular file; admission remains closed",
+                ));
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&marker)?,
+            Err(e) => {
+                return Err(e);
+            }
+        };
+        at(Cut::AfterCreate)?;
+        file.sync_all()?;
+        at(Cut::AfterFileSync)?;
+        File::open(root)?.sync_all()?;
+        at(Cut::AfterDirectorySync)?;
+        Ok(())
+    }
+}
+
+#[cfg(not(unix))]
+mod platform {
+    use super::{io, Cut, Path};
+
+    pub(super) fn seal(_root: &Path, _at: impl FnMut(Cut) -> io::Result<()>) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "legacy Store seal publication is not qualified on this platform",
+        ))
+    }
 }
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::store::{Append, Store, StoreError};
     use glade_wire::generated::{Op, Shape};
-    use std::io::{BufRead, Read};
+    use std::io::{BufRead, Read, Write};
+    use std::path::PathBuf;
     use std::process::{Command, Stdio};
     use std::sync::mpsc;
     use std::time::Duration;
@@ -222,8 +312,8 @@ mod tests {
             let reader = std::thread::spawn(move || {
                 for line in io::BufReader::new(stdout).lines() {
                     let line = line.unwrap();
-                    if line.starts_with("seal-cut:") {
-                        tx.send(line).unwrap();
+                    if let Some(start) = line.find("seal-cut:") {
+                        tx.send(line[start..].to_owned()).unwrap();
                         break;
                     }
                 }
@@ -236,6 +326,7 @@ mod tests {
             assert_eq!(observed.unwrap(), format!("seal-cut:{cut:?}"));
             use std::os::unix::process::ExitStatusExt;
             assert_eq!(output.status.signal(), Some(9), "actual SIGKILL required");
+            println!("LS-006 actual SIGKILL at {cut:?}");
             assert_eq!(f.journal(), before);
             if cut == Cut::BeforeCreate {
                 assert!(!f.0.join(MARKER).exists());
