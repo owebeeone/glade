@@ -471,3 +471,127 @@ fn trusted_observation_injection_has_finite_instance_and_name_bounds() {
         Err(Fault::Capacity)
     );
 }
+
+#[test]
+fn sparse_invocation_restore_preserves_actual_remaining_capacity() {
+    let mut h = MemoryHost::new();
+    let mut s = h.open(open_request()).unwrap();
+    let a = prepared(s.prepare(prepare_request(binding("x", CommitKind::Candidate, 1), 128)));
+    let RecoveryResult::Validated(r) = s.recover() else {
+        panic!("authentic recovery")
+    };
+    let mut restored = MemoryHost::restore(*r).unwrap();
+    let mut open = open_request();
+    open.owner.generation = 2;
+    let mut r = restored.open(open.clone()).unwrap();
+    let mut stale = resolution(a.clone(), 128, OperationKind::Inspect);
+    stale.owner = open.owner.clone();
+    assert_eq!(
+        r.inspect(stale).result,
+        ResolveResult::Refused(Fault::CallbackMismatch)
+    );
+    let mut q = resolution(a.clone(), 129, OperationKind::Inspect);
+    q.owner = open.owner.clone();
+    assert_eq!(r.inspect(q).result, ResolveResult::Pending);
+    assert_eq!(
+        s.inspect(resolution(a.clone(), 129, OperationKind::Inspect))
+            .result,
+        ResolveResult::Pending
+    );
+    let live_terminal = s
+        .request_fence(resolution(a.clone(), 130, OperationKind::Fence))
+        .result;
+    let mut q = resolution(a.clone(), 130, OperationKind::Fence);
+    q.owner = open.owner.clone();
+    assert_eq!(r.request_fence(q).result, live_terminal);
+    assert!(
+        matches!(live_terminal,ResolveResult::Terminal(ref t) if matches!(t.outcome,TerminalOutcome::NonCommit{..}))
+    );
+    for n in 131..256 {
+        let live = s.inspect(resolution(a.clone(), n, OperationKind::Inspect));
+        let mut q = resolution(a.clone(), n, OperationKind::Inspect);
+        q.owner = open.owner.clone();
+        let recovered = r.inspect(q);
+        assert_eq!(live.result, recovered.result);
+        assert_eq!(recovered.result, live_terminal);
+    }
+    let mut q = resolution(a.clone(), 256, OperationKind::Fence);
+    q.owner = open.owner;
+    assert_eq!(
+        r.request_fence(q).result,
+        ResolveResult::Refused(Fault::Capacity)
+    );
+    assert_eq!(
+        s.request_fence(resolution(a, 256, OperationKind::Fence))
+            .result,
+        ResolveResult::Refused(Fault::Capacity)
+    );
+}
+
+#[test]
+fn restoration_rejects_corrupt_cardinality_floor_and_history_limit() {
+    let mut h = MemoryHost::new();
+    let mut s = h.open(open_request()).unwrap();
+    prepared(s.prepare(prepare_request(binding("x", CommitKind::Candidate, 1), 128)));
+    let RecoveryResult::Validated(r) = s.recover() else {
+        panic!("authentic recovery")
+    };
+    assert_eq!(r.invocation_count, 1);
+    assert_eq!(r.invocation_high_water, 128);
+    for mutation in 0..5 {
+        let mut bad = (*r).clone();
+        match mutation {
+            0 => bad.invocation_count = 0,
+            1 => bad.invocation_count = 129,
+            2 => bad.invocation_high_water = 0,
+            3 => bad.limits.invocation_history = 0,
+            _ => bad.next_attempt = 1,
+        }
+        assert!(
+            MemoryHost::restore(bad).is_err(),
+            "corrupt restored history must refuse"
+        );
+    }
+}
+
+#[test]
+fn restored_capacity_and_binding_phase_consistency_are_validated() {
+    let mut h = MemoryHost::new();
+    let mut s = h.open(open_request()).unwrap();
+    prepared(s.prepare(prepare_request(
+        binding("x", CommitKind::AcceptedBatch, 1),
+        128,
+    )));
+    let RecoveryResult::Validated(r) = s.recover() else {
+        panic!("authentic recovery")
+    };
+    for mutation in 0..8 {
+        let mut bad = (*r).clone();
+        match mutation {
+            0 => bad.limits.max_batch_bytes = 1,
+            1 => bad.limits.max_receipts = 0,
+            2 => bad.limits.max_windows = 0,
+            3 => bad.limits.max_name_bytes = 0,
+            4 => bad.revisions.clear(),
+            5 => bad.attempts[0].attempt.id.instance.incarnation = "foreign".into(),
+            6 => {
+                bad.attempts[0].phase = AttemptPhase::Terminal(TerminalOutcome::NonCommit {
+                    revision: 1,
+                    storage: StorageClass::VolatileTest,
+                })
+            }
+            _ => {
+                bad.attempts[0].phase = AttemptPhase::Started {
+                    cut: Some(LocalPrecondition {
+                        policy: [9; 32],
+                        time: cut().time,
+                    }),
+                }
+            }
+        }
+        assert!(
+            MemoryHost::restore(bad).is_err(),
+            "mutation {mutation} cannot be validated recovery"
+        );
+    }
+}

@@ -173,9 +173,8 @@ pub fn seed(state: &mut State, c: Candidate) {
 /// Compiled downstream host executes the public effects, never private kernel helpers.
 /// Test evidence is intentionally trusted; commit replies attest VOLATILE test retention.
 pub fn drive(state: State, first: Event, supplied: Facts) -> Transition {
-    let mut records_host = storage_host::MemoryHost::new();
-    let mut host = records_host.open(storage_host::open_request()).unwrap();
-    drive_with_port(state, first, supplied, &mut host)
+    let mut fixture = FixtureReplica::new(state).expect("explicit consistent trusted fixture seed");
+    fixture.advance(first, supplied)
 }
 /// Caller owns the session and retains it across event/effect continuations.
 pub fn drive_with_port<S: StorageAttemptSession>(
@@ -443,10 +442,33 @@ pub fn register_attempt(state: &mut State, plan: &CommitPlan) {
             phase: AttemptPhase::Reserved,
         },
     );
+    let prepare = PrepareRequest {
+        owner: state.storage_owner.clone().unwrap(),
+        invocation: InvocationId {
+            namespace: state.invocation_namespace,
+            number: 7,
+        },
+        binding: binding_for(plan),
+    };
+    let id = prepare.invocation.clone();
+    let previous = state
+        .retired_storage_invocations
+        .insert(id, StorageInvocation::Prepare(prepare.clone()));
+    assert!(previous.is_none_or(|old| old == StorageInvocation::Prepare(prepare)));
     let q = resolve_request(plan, 8, OperationKind::Begin);
-    state
+    let old = state
         .storage_invocations
-        .insert(q.invocation.clone(), StorageInvocation::Resolve(q));
+        .insert(q.invocation.clone(), StorageInvocation::Resolve(q.clone()));
+    assert!(old.is_none_or(|old| old == StorageInvocation::Resolve(q)));
+    assert!(
+        state
+            .storage_invocations
+            .len()
+            .checked_add(state.retired_storage_invocations.len())
+            .unwrap()
+            <= state.storage_limits.as_ref().unwrap().invocation_history
+    );
+    state.next_effect_id = state.next_effect_id.max(9);
 }
 
 pub fn terminal_result(
@@ -469,4 +491,301 @@ pub fn terminal_result(
             start_cut: plan.local_precondition.clone(),
         },
     }))
+}
+
+/// Explicit trusted, bounded development assembly. No physical import/encoding claim.
+pub struct FixtureReplica {
+    pub state: State,
+    pub session: storage_host::MemorySession,
+}
+impl FixtureReplica {
+    pub fn new(state: State) -> Result<Self, Fault> {
+        let seed = owned_fixture_seed(&state)?;
+        let mut session = storage_host::MemoryHost::from_owned_fixture(seed)?;
+        for (instance, value) in &state.instances {
+            session.observe_policy(
+                instance.clone(),
+                LocalPrecondition {
+                    policy: value.policy.digest(),
+                    time: value.policy_time.clone(),
+                },
+            )?;
+        }
+        Ok(Self { state, session })
+    }
+    pub fn observe_policy(
+        &mut self,
+        instance: Instance,
+        cut: LocalPrecondition,
+    ) -> Result<(), Fault> {
+        // Provider input is independent of a later Begin caller expectation.
+        self.session.observe_policy(instance, cut)
+    }
+    pub fn advance(&mut self, event: Event, supplied: Facts) -> Transition {
+        if let Event::ObservePolicy {
+            instance,
+            policy,
+            time,
+        } = &event
+        {
+            self.observe_policy(
+                instance.clone(),
+                LocalPrecondition {
+                    policy: policy.digest(),
+                    time: time.clone(),
+                },
+            )
+            .unwrap();
+        }
+        let result = drive_with_port(self.state.clone(), event, supplied, &mut self.session);
+        self.state = result.state.clone();
+        result
+    }
+}
+fn request_identity(request: &StorageInvocation) -> (&Owner, &InvocationId) {
+    match request {
+        StorageInvocation::Prepare(q) | StorageInvocation::RecoverPlan(q) => {
+            (&q.owner, &q.invocation)
+        }
+        StorageInvocation::Resolve(q) => (&q.owner, &q.invocation),
+    }
+}
+fn owned_fixture_seed(state: &State) -> Result<storage_host::OwnedFixtureSeed, Fault> {
+    let owner = state.storage_owner.clone().ok_or(Fault::Ownership)?;
+    let limits = state.storage_limits.clone().ok_or(Fault::Capacity)?;
+    if state.instances.len() > limits.instances || state.attempts.len() > limits.attempts {
+        return Err(Fault::Capacity);
+    }
+    let count = state
+        .storage_invocations
+        .len()
+        .checked_add(state.retired_storage_invocations.len())
+        .ok_or(Fault::Capacity)?;
+    if count > limits.invocation_history {
+        return Err(Fault::Capacity);
+    }
+    let mut high = state.next_effect_id.saturating_sub(1);
+    for (id, request) in state
+        .storage_invocations
+        .iter()
+        .chain(state.retired_storage_invocations.iter())
+    {
+        let (issued_owner, issued_id) = request_identity(request);
+        if issued_id != id
+            || issued_owner != &owner
+            || id.namespace != state.invocation_namespace
+            || id.number == u64::MAX
+            || id.number >= state.next_effect_id
+        {
+            return Err(Fault::Integrity);
+        }
+        if state.storage_invocations.contains_key(id)
+            && state.retired_storage_invocations.contains_key(id)
+        {
+            return Err(Fault::Integrity);
+        }
+        high = high.max(id.number);
+        match request {
+            StorageInvocation::Resolve(q) => {
+                if state
+                    .attempts
+                    .get(&q.attempt.binding.plan)
+                    .is_none_or(|a| a.attempt != q.attempt)
+                {
+                    return Err(Fault::Integrity);
+                }
+            }
+            StorageInvocation::Prepare(q) | StorageInvocation::RecoverPlan(q) => {
+                if state
+                    .attempts
+                    .get(&q.binding.plan)
+                    .is_none_or(|a| a.attempt.binding != q.binding)
+                    && state
+                        .preparing
+                        .get(&q.binding.plan)
+                        .is_none_or(|p| p.binding != q.binding)
+                {
+                    return Err(Fault::Integrity);
+                }
+            }
+        }
+    }
+    for (number, q) in &state.lookups {
+        if *number != q.invocation.number
+            || q.operation != OperationKind::Inspect
+            || state.storage_invocations.get(&q.invocation)
+                != Some(&StorageInvocation::Resolve(q.clone()))
+        {
+            return Err(Fault::Integrity);
+        }
+    }
+    let mut attempts = Vec::new();
+    let mut next_attempt = 1;
+    for (plan, a) in &state.attempts {
+        if plan != &a.attempt.binding.plan
+            || a.attempt.id.store != owner.store
+            || a.attempt.id.instance != plan.instance
+        {
+            return Err(Fault::Integrity);
+        }
+        next_attempt = next_attempt.max(a.attempt.id.number.checked_add(1).ok_or(Fault::Capacity)?);
+        if let Some(t) = state.terminal_results.get(&a.attempt.id) {
+            if t.attempt != a.attempt || a.phase != AttemptPhase::Terminal(t.outcome.clone()) {
+                return Err(Fault::Integrity);
+            }
+        } else if matches!(a.phase, AttemptPhase::Terminal(_)) {
+            return Err(Fault::Integrity);
+        }
+        attempts.push(RetainedAttempt {
+            attempt: a.attempt.clone(),
+            phase: a.phase.clone(),
+        });
+    }
+    for (id, t) in &state.terminal_results {
+        if &t.attempt.id != id
+            || state
+                .attempts
+                .get(&t.attempt.binding.plan)
+                .is_none_or(|a| a.attempt != t.attempt)
+        {
+            return Err(Fault::Integrity);
+        }
+    }
+    for p in state.commits.values().chain(state.unknown_commits.values()) {
+        let b = binding_for(p);
+        if state
+            .attempts
+            .get(&b.plan)
+            .is_none_or(|a| a.attempt.binding != b)
+            && state.preparing.get(&b.plan).is_none_or(|q| q.binding != b)
+        {
+            return Err(Fault::Integrity);
+        }
+    }
+    let mut revisions = BTreeMap::new();
+    let mut genesis_custody = BTreeMap::new();
+    for (instance, value) in &state.instances {
+        let latest = state
+            .terminal_results
+            .values()
+            .filter(|t| &t.attempt.id.instance == instance)
+            .filter_map(|t| {
+                if let TerminalOutcome::Committed { revision, .. } = &t.outcome {
+                    Some(*revision)
+                } else {
+                    None
+                }
+            })
+            .max()
+            .unwrap_or(0);
+        if latest != value.revision {
+            return Err(Fault::Integrity);
+        }
+        let mut charged = Charges {
+            edit: 0,
+            recovery: 0,
+            evidence: 0,
+            pending: 0,
+        };
+        for t in state
+            .terminal_results
+            .values()
+            .filter(|t| &t.attempt.id.instance == instance)
+        {
+            if let TerminalOutcome::Committed { receipts, .. } = &t.outcome {
+                if receipts
+                    .iter()
+                    .any(|receipt| !value.accepted.iter().any(|a| &a.receipt == receipt))
+                {
+                    return Err(Fault::Integrity);
+                }
+                let c = &t.attempt.binding.charges;
+                charged.edit = charged.edit.checked_add(c.edit).ok_or(Fault::Capacity)?;
+                charged.recovery = charged
+                    .recovery
+                    .checked_add(c.recovery)
+                    .ok_or(Fault::Capacity)?;
+                charged.evidence = charged
+                    .evidence
+                    .checked_add(c.evidence)
+                    .ok_or(Fault::Capacity)?;
+                charged.pending = charged
+                    .pending
+                    .checked_add(c.pending)
+                    .ok_or(Fault::Capacity)?;
+            }
+        }
+        if value.used.edit < charged.edit
+            || value.used.recovery < charged.recovery
+            || value.used.evidence < charged.evidence
+            || value.used.pending < charged.pending
+        {
+            return Err(Fault::Integrity);
+        }
+        revisions.insert(instance.clone(), value.revision);
+        // An explicit immutable development snapshot of all semantic custody,
+        // receipts, derived state and reservations at the seed cut. Not a wire encoder.
+        genesis_custody.insert(
+            instance.clone(),
+            Bytes::new(format!("{value:?}").into_bytes()),
+        );
+    }
+    Ok(storage_host::OwnedFixtureSeed {
+        recovery: Recovery {
+            owner,
+            invocation_namespace: state.invocation_namespace,
+            limits,
+            preparing: state
+                .preparing
+                .values()
+                .map(|q| q.binding.clone())
+                .collect(),
+            revisions,
+            attempts,
+            next_attempt,
+            invocation_high_water: high,
+            invocation_count: count,
+        },
+        genesis_custody,
+    })
+}
+pub fn register_lookup(state: &mut State, request: ResolveRequest) -> Result<(), Fault> {
+    if request.owner != state.storage_owner.clone().ok_or(Fault::Ownership)?
+        || request.invocation.namespace != state.invocation_namespace
+        || request.operation != OperationKind::Inspect
+        || state
+            .attempts
+            .get(&request.attempt.binding.plan)
+            .is_none_or(|a| a.attempt != request.attempt)
+        || state.storage_invocations.contains_key(&request.invocation)
+        || state
+            .retired_storage_invocations
+            .contains_key(&request.invocation)
+        || request.invocation.number < state.next_effect_id
+    {
+        return Err(Fault::CallbackMismatch);
+    }
+    let limits = state.storage_limits.as_ref().ok_or(Fault::Capacity)?;
+    if state
+        .storage_invocations
+        .len()
+        .checked_add(state.retired_storage_invocations.len())
+        .is_none_or(|n| n >= limits.invocation_history)
+    {
+        return Err(Fault::Capacity);
+    }
+    let next = request
+        .invocation
+        .number
+        .checked_add(1)
+        .ok_or(Fault::Capacity)?;
+    state.next_effect_id = next;
+    state
+        .lookups
+        .insert(request.invocation.number, request.clone());
+    state.storage_invocations.insert(
+        request.invocation.clone(),
+        StorageInvocation::Resolve(request),
+    );
+    Ok(())
 }

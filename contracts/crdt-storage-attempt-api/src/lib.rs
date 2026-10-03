@@ -226,6 +226,8 @@ pub struct Recovery {
     pub attempts: Vec<RetainedAttempt>,
     pub next_attempt: u64,
     pub invocation_high_water: u64,
+    /// Actual retained request cardinality, independent of sparse identity floor.
+    pub invocation_count: usize,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RecoveryResult {

@@ -39,6 +39,7 @@ fn main() {
     let mut traces = Vec::new();
     for reverse in [false, true] {
         let mut state = initial(d.clone());
+        let mut buffer_replica = FixtureReplica::new(state.clone()).unwrap();
         let b = candidate(
             &d,
             "writer-e1",
@@ -60,7 +61,13 @@ fn main() {
             if op.operation.inner().origin == "writer-e1" {
                 verified.certificate.epoch = "epoch-1".into();
             }
-            state = drive(state, Event::OfferReplica(Box::new(op.clone())), verified).state;
+            state = drive_with_port(
+                state,
+                Event::OfferReplica(Box::new(op.clone())),
+                verified,
+                &mut buffer_replica.session,
+            )
+            .state;
         }
         traces.push(json!({"scenario":"AB-buffer", "reverse":reverse, "result":projection_trace(&state,&d.instance)}));
         let dependent = candidate(
@@ -89,19 +96,33 @@ fn main() {
         denied.historical_policy_allowed = false;
         denied.historical_time = None;
         let mut state = initial(d.clone());
+        let mut rival_replica = FixtureReplica::new(state.clone()).unwrap();
         if reverse {
-            state = drive(
+            state = drive_with_port(
                 state,
                 Event::OfferReplica(Box::new(rival.clone())),
                 denied.clone(),
+                &mut rival_replica.session,
             )
             .state;
         }
         for op in [a.clone(), dependent] {
-            state = drive(state, Event::OfferReplica(Box::new(op.clone())), facts(&op)).state;
+            state = drive_with_port(
+                state,
+                Event::OfferReplica(Box::new(op.clone())),
+                facts(&op),
+                &mut rival_replica.session,
+            )
+            .state;
         }
         if !reverse {
-            state = drive(state, Event::OfferReplica(Box::new(rival)), denied).state;
+            state = drive_with_port(
+                state,
+                Event::OfferReplica(Box::new(rival)),
+                denied,
+                &mut rival_replica.session,
+            )
+            .state;
         }
         traces.push(json!({"scenario":"AD", "reverse":reverse, "result":projection_trace(&state,&d.instance)}));
     }
@@ -147,13 +168,15 @@ fn main() {
             ),
         );
         seed(&mut state, dependent);
-        state = drive(
+        let mut fork_replica = FixtureReplica::new(state.clone()).unwrap();
+        state = drive_with_port(
             state,
             Event::OfferFork(Box::new(ForkEvidence {
                 first,
                 second: second.clone(),
             })),
             facts(&second),
+            &mut fork_replica.session,
         )
         .state;
         let before_recovery = projection_trace(&state, &d.instance);
@@ -192,10 +215,11 @@ fn main() {
             }],
             insert("fresh-atom-b", Some("atom-a"), "B"),
         );
-        let recovered = drive(
+        let recovered = drive_with_port(
             state,
             Event::SubmitLocal(Box::new(fresh.clone())),
             facts(&fresh),
+            &mut fork_replica.session,
         );
         let fresh_local_receipt = recovered
             .effects
@@ -226,10 +250,11 @@ fn main() {
         let mut invalid = facts(&reused);
         invalid.certificate.epoch = "epoch-1".into();
         invalid.issuance_unique = false;
-        let refused = drive(
+        let refused = drive_with_port(
             recovered.state,
             Event::SubmitLocal(Box::new(reused)),
             invalid,
+            &mut fork_replica.session,
         );
         let reused_origin_rejected = refused.effects.contains(&Effect::Report(Outcome::Invalid));
         traces.push(json!({"scenario":"AB", "reverse":reverse, "before_recovery":before_recovery,
@@ -241,6 +266,7 @@ fn main() {
     let mut isolated = initial(d.clone());
     isolated.instances.extend(initial(y.clone()).instances);
     seed(&mut isolated, a.clone());
+    let mut isolated_replica = FixtureReplica::new(isolated.clone()).unwrap();
     let allowed_y = candidate(
         &y,
         "writer-e0",
@@ -249,10 +275,11 @@ fn main() {
         vec![],
         insert("atom-y", None, "Y"),
     );
-    isolated = drive(
+    isolated = drive_with_port(
         isolated,
         Event::SubmitLocal(Box::new(allowed_y.clone())),
         facts(&allowed_y),
+        &mut isolated_replica.session,
     )
     .state;
     let forbidden_y = candidate(
@@ -265,7 +292,12 @@ fn main() {
     );
     let mut denied = facts(&forbidden_y);
     denied.current_allowed = false;
-    let refused = drive(isolated, Event::SubmitLocal(Box::new(forbidden_y)), denied);
+    let refused = drive_with_port(
+        isolated,
+        Event::SubmitLocal(Box::new(forbidden_y)),
+        denied,
+        &mut isolated_replica.session,
+    );
     traces.push(json!({"scenario":"isolation", "x_instance":format!("{:?}",d.instance),
         "y_instance":format!("{:?}",y.instance),
         "denied":refused.effects.contains(&Effect::Report(Outcome::Denied)),
@@ -276,6 +308,8 @@ fn main() {
     let mut right = initial(d.clone());
     seed(&mut left, seed_a.clone());
     seed(&mut right, seed_a);
+    let mut left_replica = FixtureReplica::new(left.clone()).unwrap();
+    let mut right_replica = FixtureReplica::new(right.clone()).unwrap();
     let b = candidate(
         &d,
         "b",
@@ -300,8 +334,18 @@ fn main() {
         }],
         insert("c", Some("a"), "C"),
     );
-    let left_local = drive(left, Event::SubmitLocal(Box::new(b.clone())), facts(&b));
-    let right_local = drive(right, Event::SubmitLocal(Box::new(c.clone())), facts(&c));
+    let left_local = drive_with_port(
+        left,
+        Event::SubmitLocal(Box::new(b.clone())),
+        facts(&b),
+        &mut left_replica.session,
+    );
+    let right_local = drive_with_port(
+        right,
+        Event::SubmitLocal(Box::new(c.clone())),
+        facts(&c),
+        &mut right_replica.session,
+    );
     let receipts = [
         left_local
             .effects
@@ -312,15 +356,17 @@ fn main() {
             .iter()
             .any(|e| matches!(e, Effect::Report(Outcome::AcceptedLocal(_)))),
     ];
-    let left = drive(
+    let left = drive_with_port(
         left_local.state,
         Event::OfferReplica(Box::new(c.clone())),
         facts(&c),
+        &mut left_replica.session,
     );
-    let right = drive(
+    let right = drive_with_port(
         right_local.state,
         Event::OfferReplica(Box::new(b.clone())),
         facts(&b),
+        &mut right_replica.session,
     );
     traces.push(json!({"scenario":"ABC", "local_receipts":receipts,
         "left":projection_trace(&left.state,&d.instance), "right":projection_trace(&right.state,&d.instance)}));

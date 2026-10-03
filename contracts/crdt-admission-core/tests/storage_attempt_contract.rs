@@ -24,6 +24,20 @@ fn reserved(kind: CommitKind) -> (State, CommitPlan, AttemptBinding) {
             phase: AttemptPhase::Reserved,
         },
     );
+    let prepare = PrepareRequest {
+        owner: state.storage_owner.clone().unwrap(),
+        invocation: InvocationId {
+            namespace: state.invocation_namespace,
+            number: 7,
+        },
+        binding: binding_for(&p),
+    };
+    state.retired_storage_invocations.insert(
+        prepare.invocation.clone(),
+        StorageInvocation::Prepare(prepare),
+    );
+    // Invocation8 is the explicitly injected resolve request in each consumer.
+    state.next_effect_id = 9;
     (state, p, a)
 }
 #[test]
@@ -79,7 +93,7 @@ fn sta003_pending_lookup_retains_started_write_until_late_commit_all_kinds() {
         s.commits.remove(&p.id);
         s.unknown_commits.insert(p.id, p.clone());
         let q = resolve_request(&p, 40, OperationKind::Inspect);
-        s.lookups.insert(40, q.clone());
+        register_lookup(&mut s, q.clone()).unwrap();
         let pending = step(
             &s,
             Event::LookupResolved(ResolveReply {
@@ -347,19 +361,18 @@ fn sta005_unissued_foreign_or_changed_retired_callback_cannot_create_integrity_s
 fn sta011_driver_uses_caller_owned_session_across_continuations() {
     let d = descriptor("x");
     let c = candidate(&d, "a", 0, None, vec![], insert("a", None, "A"));
-    let mut producer = storage_host::MemoryHost::new();
-    let mut session = producer.open(storage_host::open_request()).unwrap();
+    let mut replica = FixtureReplica::new(initial(d.clone())).unwrap();
     let first = drive_with_port(
         initial(d.clone()),
         Event::SubmitLocal(Box::new(c.clone())),
         facts(&c),
-        &mut session,
+        &mut replica.session,
     );
     let next = drive_with_port(
         first.state,
         Event::ResumeRecovery(d.instance),
         facts(&c),
-        &mut session,
+        &mut replica.session,
     );
     assert!(
         first
@@ -374,5 +387,50 @@ fn sta011_driver_uses_caller_owned_session_across_continuations() {
             Effect::Report(Outcome::AcceptedLocal(_)) | Effect::Lookup(_)
         )),
         "continuation must use the same explicit port"
+    );
+}
+
+#[test]
+fn issued_lookup_retains_full_request_on_consumption() {
+    let (mut s, p, _) = reserved(CommitKind::AcceptedBatch);
+    s.commits.remove(&p.id);
+    s.unknown_commits.insert(p.id, p.clone());
+    register_attempt(&mut s, &p);
+    let q = resolve_request(&p, 40, OperationKind::Inspect);
+    register_lookup(&mut s, q.clone()).unwrap();
+    let result = step(
+        &s,
+        Event::LookupResolved(ResolveReply {
+            request: q.clone(),
+            result: ResolveResult::Pending,
+        }),
+    );
+    assert!(!result.state.lookups.contains_key(&40));
+    assert!(!result.state.storage_invocations.contains_key(&q.invocation));
+    assert_eq!(
+        result.state.retired_storage_invocations[&q.invocation],
+        StorageInvocation::Resolve(q)
+    );
+    assert_eq!(result.state.unknown_commits[&p.id], p);
+}
+#[test]
+fn identical_unissued_lookup_reply_cannot_acquire_callback_authority() {
+    let (mut s, p, _) = reserved(CommitKind::AcceptedBatch);
+    s.commits.remove(&p.id);
+    s.unknown_commits.insert(p.id, p.clone());
+    register_attempt(&mut s, &p);
+    let q = resolve_request(&p, 40, OperationKind::Inspect);
+    let result = step(
+        &s,
+        Event::LookupResolved(ResolveReply {
+            request: q,
+            result: ResolveResult::Pending,
+        }),
+    );
+    assert_eq!(result.state, s);
+    assert!(
+        result
+            .effects
+            .contains(&Effect::Report(Outcome::CallbackMismatch))
     );
 }

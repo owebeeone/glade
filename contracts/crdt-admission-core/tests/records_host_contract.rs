@@ -106,19 +106,33 @@ fn icd006_revoked_expired_unadmitted_rival_preserves_ad_and_receipts() {
             }
             denied.current_allowed = false;
             let mut state = initial(d.clone());
+            let mut replica = FixtureReplica::new(state.clone()).unwrap();
             if reverse {
-                state = drive(
+                state = drive_with_port(
                     state,
                     Event::OfferReplica(Box::new(rival.clone())),
                     denied.clone(),
+                    &mut replica.session,
                 )
                 .state;
             }
             for c in [a.clone(), dependent.clone()] {
-                state = drive(state, Event::OfferReplica(Box::new(c.clone())), facts(&c)).state;
+                state = drive_with_port(
+                    state,
+                    Event::OfferReplica(Box::new(c.clone())),
+                    facts(&c),
+                    &mut replica.session,
+                )
+                .state;
             }
             if !reverse {
-                state = drive(state, Event::OfferReplica(Box::new(rival.clone())), denied).state;
+                state = drive_with_port(
+                    state,
+                    Event::OfferReplica(Box::new(rival.clone())),
+                    denied,
+                    &mut replica.session,
+                )
+                .state;
             }
             let read = cut(&state, d.instance.clone());
             assert_eq!(
@@ -316,7 +330,7 @@ fn icd010_unknown_commit_retains_reservation_and_foreign_callback_cannot_accept(
     let plan = staged_plan(&d, c.clone());
     state.commits.insert(7, plan.clone());
     register_attempt(&mut state, &plan);
-    state.next_effect_id = 8;
+    state.next_effect_id = 9;
     let unknown = step(
         &state,
         Event::CommitResolved({
@@ -668,7 +682,7 @@ fn icd010_commit_callbacks_bind_batch_revision_and_have_three_distinct_outcomes(
     let mut state = initial(d.clone());
     state.commits.insert(plan.id, plan.clone());
     register_attempt(&mut state, &plan);
-    state.next_effect_id = 8;
+    state.next_effect_id = 9;
     for (id, digest, revision) in [
         (8, plan.batch.digest(), 1),
         (7, [9; 32], 1),
@@ -771,7 +785,7 @@ fn icd010_lookup_recovery_binds_request_and_restores_original_receipt() {
     let mut state = initial(d.clone());
     state.unknown_commits.insert(7, plan.clone());
     register_attempt(&mut state, &plan);
-    state.lookups.insert(40, request.clone());
+    register_lookup(&mut state, request.clone()).unwrap();
     state.next_effect_id = 41;
     let receipt = plan.acceptances[0].receipt.clone();
     let foreign = step(
@@ -911,7 +925,7 @@ fn icd006_delayed_prior_cut_committed_callback_retains_historical_admission() {
     register_attempt(&mut state, &plan);
     // Trusted host began under the plan's valid cut, physically committed, then
     // observed revocation before delivering the delayed barrier reply.
-    state.next_effect_id = 8;
+    state.next_effect_id = 9;
     let changed = step(
         &state,
         Event::ObservePolicy {

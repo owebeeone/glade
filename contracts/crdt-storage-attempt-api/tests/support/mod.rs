@@ -16,6 +16,11 @@ struct Ledger {
     revisions: BTreeMap<Instance, u64>,
     critical_used: usize,
     observations: BTreeMap<Instance, LocalPrecondition>,
+    genesis_custody: BTreeMap<Instance, Bytes>,
+}
+pub struct OwnedFixtureSeed {
+    pub recovery: Recovery,
+    pub genesis_custody: BTreeMap<Instance, Bytes>,
 }
 pub struct MemoryHost {
     ledger: Rc<RefCell<Ledger>>,
@@ -36,11 +41,54 @@ impl MemoryHost {
             || recovery.attempts.len() > recovery.limits.attempts
             || recovery.revisions.len() > recovery.limits.instances
             || recovery.preparing.len() > recovery.limits.instances
+            || recovery.limits.invocation_history == 0
+            || recovery.invocation_count > recovery.limits.invocation_history
+            || !u64::try_from(recovery.invocation_count)
+                .is_ok_and(|n| n <= recovery.invocation_high_water)
+            || recovery
+                .attempts
+                .len()
+                .checked_add(recovery.preparing.len())
+                .is_none_or(|n| n > recovery.invocation_count)
         {
             return Err(Fault::Integrity);
         }
         let mut attempts = BTreeMap::new();
         for a in recovery.attempts {
+            validate_binding(&recovery.limits, &a.attempt.binding)?;
+            let current = *recovery
+                .revisions
+                .get(&a.attempt.id.instance)
+                .ok_or(Fault::Integrity)?;
+            let original_cut = a.attempt.binding.prestart.as_ref().map(|p| p.cut.clone());
+            match &a.phase {
+                AttemptPhase::Reserved => {}
+                AttemptPhase::Started { cut } => {
+                    if cut != &original_cut {
+                        return Err(Fault::Integrity);
+                    }
+                }
+                AttemptPhase::Terminal(TerminalOutcome::Committed {
+                    revision,
+                    storage,
+                    receipts,
+                    start_cut,
+                }) => {
+                    if a.attempt.binding.expected_revision.checked_add(1) != Some(*revision)
+                        || *revision > current
+                        || storage != &a.attempt.binding.storage
+                        || receipts != &a.attempt.binding.receipts
+                        || start_cut != &original_cut
+                    {
+                        return Err(Fault::Integrity);
+                    }
+                }
+                AttemptPhase::Terminal(TerminalOutcome::NonCommit { revision, storage }) => {
+                    if *revision > current || storage != &a.attempt.binding.storage {
+                        return Err(Fault::Integrity);
+                    }
+                }
+            }
             if a.attempt.id.store != recovery.owner.store
                 || a.attempt.id.instance != a.attempt.binding.plan.instance
                 || a.attempt.id.number >= recovery.next_attempt
@@ -58,6 +106,7 @@ impl MemoryHost {
         }
         let mut queued = BTreeMap::new();
         for b in recovery.preparing {
+            validate_binding(&recovery.limits, &b)?;
             if queued.insert(b.plan.instance.clone(), b).is_some() {
                 return Err(Fault::Integrity);
             }
@@ -69,15 +118,56 @@ impl MemoryHost {
                 namespace: Some(recovery.invocation_namespace),
                 owner_floor: recovery.owner.generation,
                 invocation_floor: recovery.invocation_high_water,
-                invocation_count: usize::try_from(recovery.invocation_high_water)
-                    .map_err(|_| Fault::Capacity)?,
+                invocation_count: recovery.invocation_count,
                 next_attempt: recovery.next_attempt,
                 attempts,
                 queued,
                 revisions: recovery.revisions,
                 critical_used,
                 observations: BTreeMap::new(),
+                genesis_custody: BTreeMap::new(),
             })),
+        })
+    }
+    /// Explicit owned test continuation, not a live import/reopen protocol.
+    pub fn from_owned_fixture(seed: OwnedFixtureSeed) -> Result<MemorySession, Fault> {
+        let open = OpenRequest {
+            owner: seed.recovery.owner.clone(),
+            invocation_namespace: seed.recovery.invocation_namespace,
+            limits: seed.recovery.limits.clone(),
+        };
+        if seed.genesis_custody.len() > open.limits.instances {
+            return Err(Fault::Capacity);
+        }
+        let mut bytes = 0usize;
+        for (instance, image) in &seed.genesis_custody {
+            if !seed.recovery.revisions.contains_key(instance)
+                || instance.incarnation.len() > open.limits.max_name_bytes
+            {
+                return Err(Fault::Integrity);
+            }
+            bytes = bytes
+                .checked_add(image.value().len())
+                .ok_or(Fault::Capacity)?;
+        }
+        let host = Self::restore(seed.recovery)?;
+        {
+            let mut l = host.ledger.borrow_mut();
+            l.critical_used = l.critical_used.checked_add(bytes).ok_or(Fault::Capacity)?;
+            if l.critical_used > open.limits.critical_bytes {
+                return Err(Fault::Capacity);
+            }
+            l.genesis_custody = seed.genesis_custody;
+            // The explicit test seed asserts this execution already owns the scope.
+            // This never reopens a real store or validates an external ownership floor.
+            l.active = Some(open.owner.clone());
+        }
+        Ok(MemorySession {
+            ledger: host.ledger,
+            open,
+            hold_prepare: false,
+            lost_ack: false,
+            hold_publish: false,
         })
     }
     pub fn new() -> Self {
@@ -125,6 +215,23 @@ impl StorageAttemptHost for MemoryHost {
     }
 }
 impl MemorySession {
+    pub fn fixture_seed(&self) -> OwnedFixtureSeed {
+        let l = self.ledger.borrow();
+        OwnedFixtureSeed {
+            recovery: Recovery {
+                owner: self.open.owner.clone(),
+                invocation_namespace: self.open.invocation_namespace,
+                limits: self.open.limits.clone(),
+                preparing: l.queued.values().cloned().collect(),
+                revisions: l.revisions.clone(),
+                attempts: l.attempts.values().cloned().collect(),
+                next_attempt: l.next_attempt,
+                invocation_high_water: l.invocation_floor,
+                invocation_count: l.invocation_count,
+            },
+            genesis_custody: l.genesis_custody.clone(),
+        }
+    }
     pub fn observe_policy(
         &mut self,
         instance: Instance,
@@ -171,70 +278,7 @@ impl MemorySession {
         Ok(())
     }
     fn validate(&self, b: &Binding) -> Result<(), Fault> {
-        let z = &self.open.limits;
-        if b.batch.value().len() > z.max_batch_bytes
-            || b.receipts.len() > z.max_receipts
-            || b.plan.instance.incarnation.len() > z.max_name_bytes
-            || b.prestart
-                .as_ref()
-                .is_some_and(|p| p.windows.len() > z.max_windows)
-        {
-            return Err(Fault::Capacity);
-        }
-        if b.storage != StorageClass::VolatileTest
-            || b.plan.number == u64::MAX
-            || b.expected_revision == u64::MAX
-            || b.receipts
-                .iter()
-                .any(|r| r.instance != b.plan.instance || r.storage != b.storage)
-            || matches!(b.kind, CommitKind::Candidate | CommitKind::SecurityEvidence)
-                && !b.receipts.is_empty()
-            || b.kind == CommitKind::AcceptedBatch && b.receipts.is_empty()
-        {
-            return Err(Fault::BindingMismatch);
-        }
-        if let Some(p) = &b.prestart {
-            if p.windows.is_empty()
-                || p.cut.time.earliest_ms > p.cut.time.latest_ms
-                || p.windows.iter().any(|w| w.not_before_ms >= w.not_after_ms)
-            {
-                return Err(Fault::BindingMismatch);
-            }
-        }
-        let mut footprint = 256usize
-            .checked_add(b.batch.value().len())
-            .ok_or(Fault::Capacity)?;
-        footprint = footprint
-            .checked_add(b.plan.instance.incarnation.len())
-            .ok_or(Fault::Capacity)?;
-        for receipt in &b.receipts {
-            footprint = footprint
-                .checked_add(160)
-                .and_then(|n| n.checked_add(receipt.instance.incarnation.len()))
-                .ok_or(Fault::Capacity)?;
-        }
-        if let Some(prestart) = &b.prestart {
-            footprint = footprint
-                .checked_add(
-                    prestart
-                        .windows
-                        .len()
-                        .checked_mul(16)
-                        .ok_or(Fault::Capacity)?,
-                )
-                .ok_or(Fault::Capacity)?;
-        }
-        if footprint > z.critical_per_attempt {
-            return Err(Fault::Capacity);
-        }
-        // Checked charges even though this storage host neither computes eligibility nor consumes edit quota.
-        b.charges
-            .edit
-            .checked_add(b.charges.recovery)
-            .and_then(|n| n.checked_add(b.charges.evidence))
-            .and_then(|n| n.checked_add(b.charges.pending))
-            .ok_or(Fault::Capacity)?;
-        Ok(())
+        validate_binding(&self.open.limits, b)
     }
     fn preparation(&mut self, q: PrepareRequest, recover_only: bool) -> PrepareReply {
         let result = self.prepare_inner(&q, recover_only);
@@ -459,6 +503,7 @@ impl StorageAttemptSession for MemorySession {
             attempts: l.attempts.values().cloned().collect(),
             next_attempt: l.next_attempt,
             invocation_high_water: l.invocation_floor,
+            invocation_count: l.invocation_count,
         }))
     }
     fn prepare(&mut self, q: PrepareRequest) -> PrepareReply {
@@ -672,5 +717,71 @@ pub fn portable_conformance<S: StorageAttemptSession>(s: &mut S) -> Result<(), &
     {
         return Err("old worker cannot rebase past fence");
     }
+    Ok(())
+}
+
+fn validate_binding(z: &Limits, b: &Binding) -> Result<(), Fault> {
+    if b.batch.value().len() > z.max_batch_bytes
+        || b.receipts.len() > z.max_receipts
+        || b.plan.instance.incarnation.len() > z.max_name_bytes
+        || b.prestart
+            .as_ref()
+            .is_some_and(|p| p.windows.len() > z.max_windows)
+    {
+        return Err(Fault::Capacity);
+    }
+    if b.storage != StorageClass::VolatileTest
+        || b.plan.number == u64::MAX
+        || b.expected_revision == u64::MAX
+        || b.receipts
+            .iter()
+            .any(|r| r.instance != b.plan.instance || r.storage != b.storage)
+        || matches!(b.kind, CommitKind::Candidate | CommitKind::SecurityEvidence)
+            && !b.receipts.is_empty()
+        || b.kind == CommitKind::AcceptedBatch && b.receipts.is_empty()
+    {
+        return Err(Fault::BindingMismatch);
+    }
+    if let Some(p) = &b.prestart {
+        if p.windows.is_empty()
+            || p.cut.time.earliest_ms > p.cut.time.latest_ms
+            || p.windows.iter().any(|w| w.not_before_ms >= w.not_after_ms)
+        {
+            return Err(Fault::BindingMismatch);
+        }
+    }
+    let mut footprint = 256usize
+        .checked_add(b.batch.value().len())
+        .ok_or(Fault::Capacity)?;
+    footprint = footprint
+        .checked_add(b.plan.instance.incarnation.len())
+        .ok_or(Fault::Capacity)?;
+    for receipt in &b.receipts {
+        footprint = footprint
+            .checked_add(160)
+            .and_then(|n| n.checked_add(receipt.instance.incarnation.len()))
+            .ok_or(Fault::Capacity)?;
+    }
+    if let Some(prestart) = &b.prestart {
+        footprint = footprint
+            .checked_add(
+                prestart
+                    .windows
+                    .len()
+                    .checked_mul(16)
+                    .ok_or(Fault::Capacity)?,
+            )
+            .ok_or(Fault::Capacity)?;
+    }
+    if footprint > z.critical_per_attempt {
+        return Err(Fault::Capacity);
+    }
+    // Checked charges even though this storage host neither computes eligibility nor consumes edit quota.
+    b.charges
+        .edit
+        .checked_add(b.charges.recovery)
+        .and_then(|n| n.checked_add(b.charges.evidence))
+        .and_then(|n| n.checked_add(b.charges.pending))
+        .ok_or(Fault::Capacity)?;
     Ok(())
 }

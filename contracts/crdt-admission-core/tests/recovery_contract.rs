@@ -195,7 +195,7 @@ fn every_atomic_kind_recovers_committed_absent_and_unknown_without_fake_admissio
             assert!(!uncertain.state.commits.contains_key(&plan.id));
             state = uncertain.state;
             let q = request(&plan, 40);
-            state.lookups.insert(q.invocation.number, q.clone());
+            register_lookup(&mut state, q.clone()).unwrap();
             state.next_effect_id = 41;
             let resolution = match outcome {
                 0 => committed(&plan),
@@ -341,7 +341,7 @@ fn retention_committed_lookup_binds_batch_storage_revision_and_empty_receipts() 
     let d = descriptor("x");
     let (mut state, plan) = retention_plan(&d, CommitKind::SecurityEvidence);
     let q = request(&plan, 40);
-    state.lookups.insert(q.invocation.number, q.clone());
+    register_lookup(&mut state, q.clone()).unwrap();
     for mutation in 0..4 {
         let mut terminal = match committed_result(&plan) {
             ResolveResult::Terminal(t) => t,
@@ -412,13 +412,15 @@ fn genuine_e0_fork_then_fresh_e1_local_recovery_keeps_ab_and_old_receipts_both_o
         let mut state = initial(d.clone());
         seed(&mut state, a.clone());
         seed(&mut state, first.clone());
-        let forked = drive(
+        let mut replica = FixtureReplica::new(state.clone()).unwrap();
+        let forked = drive_with_port(
             state,
             Event::OfferFork(Box::new(ForkEvidence {
                 first,
                 second: second.clone(),
             })),
             facts(&second),
+            &mut replica.session,
         );
         let before = cut(&forked.state, d.instance.clone());
         assert_eq!(before.quarantine["writer-e0"], 1);
@@ -436,10 +438,11 @@ fn genuine_e0_fork_then_fresh_e1_local_recovery_keeps_ab_and_old_receipts_both_o
             }],
             insert("fresh-b", Some("a"), "B"),
         );
-        let recovered = drive(
+        let recovered = drive_with_port(
             forked.state,
             Event::SubmitLocal(Box::new(fresh.clone())),
             facts(&fresh),
+            &mut replica.session,
         );
         assert!(
             recovered
@@ -484,10 +487,11 @@ fn genuine_e0_fork_then_fresh_e1_local_recovery_keeps_ab_and_old_receipts_both_o
         let mut invalid = facts(&reused);
         invalid.certificate.epoch = "epoch-1".into();
         invalid.issuance_unique = false;
-        let refused = drive(
+        let refused = drive_with_port(
             recovered.state,
             Event::SubmitLocal(Box::new(reused)),
             invalid,
+            &mut replica.session,
         );
         assert!(refused.effects.contains(&Effect::Report(Outcome::Invalid)));
     }
@@ -498,6 +502,14 @@ fn trusted_restoration_invalidates_live_lookup_and_preserves_identity_high_water
     let d = descriptor("x");
     let (mut restored, plan) = retention_plan(&d, CommitKind::Candidate);
     let retired = request(&plan, 40);
+    register_lookup(&mut restored, retired.clone()).unwrap();
+    let issued = restored
+        .storage_invocations
+        .remove(&retired.invocation)
+        .unwrap();
+    restored
+        .retired_storage_invocations
+        .insert(retired.invocation.clone(), issued);
     // Host restoration must invalidate outstanding transport invocations while
     // retaining validated high-water state; this is not a disk-restore proof.
     restored.lookups.clear();
