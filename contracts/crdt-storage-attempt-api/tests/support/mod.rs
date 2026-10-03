@@ -58,6 +58,7 @@ impl MemoryHost {
             return Err(Fault::Integrity);
         }
         let mut attempts = BTreeMap::new();
+        let mut committed_revisions: BTreeMap<Instance, BTreeSet<u64>> = BTreeMap::new();
         let mut identities = BTreeSet::new();
         let mut unresolved = BTreeSet::new();
         for a in recovery.attempts {
@@ -78,6 +79,18 @@ impl MemoryHost {
                 return Err(Fault::Integrity);
             }
             let original_cut = a.attempt.binding.prestart.as_ref().map(|p| p.cut.clone());
+            if matches!(
+                a.phase,
+                AttemptPhase::Started { .. }
+                    | AttemptPhase::Terminal(TerminalOutcome::Committed { .. })
+            ) && a.attempt.binding.prestart.as_ref().is_some_and(|p| {
+                p.windows.iter().any(|w| {
+                    p.cut.time.earliest_ms < w.not_before_ms
+                        || p.cut.time.latest_ms > w.not_after_ms
+                })
+            }) {
+                return Err(Fault::Integrity);
+            }
             match &a.phase {
                 AttemptPhase::Reserved => {}
                 AttemptPhase::Started { cut } => {
@@ -91,7 +104,11 @@ impl MemoryHost {
                     receipts,
                     start_cut,
                 }) => {
-                    if a.attempt.binding.expected_revision.checked_add(1) != Some(*revision)
+                    if !committed_revisions
+                        .entry(a.attempt.id.instance.clone())
+                        .or_default()
+                        .insert(*revision)
+                        || a.attempt.binding.expected_revision.checked_add(1) != Some(*revision)
                         || *revision > current
                         || storage != &a.attempt.binding.storage
                         || receipts != &a.attempt.binding.receipts
@@ -101,7 +118,10 @@ impl MemoryHost {
                     }
                 }
                 AttemptPhase::Terminal(TerminalOutcome::NonCommit { revision, storage }) => {
-                    if *revision > current || storage != &a.attempt.binding.storage {
+                    if *revision != a.attempt.binding.expected_revision
+                        || *revision > current
+                        || storage != &a.attempt.binding.storage
+                    {
                         return Err(Fault::Integrity);
                     }
                 }
@@ -111,6 +131,14 @@ impl MemoryHost {
                 || a.attempt.id.number >= recovery.next_attempt
                 || attempts.insert(a.attempt.binding.plan.clone(), a).is_some()
             {
+                return Err(Fault::Integrity);
+            }
+        }
+        // Full history has no GC/import base: unique positive revisions must cover 1..=head.
+        // Compare finite cardinality rather than iterate an attacker-carried revision range.
+        for (instance, current) in &recovery.revisions {
+            let count = committed_revisions.get(instance).map_or(0, BTreeSet::len);
+            if u64::try_from(count).ok() != Some(*current) {
                 return Err(Fault::Integrity);
             }
         }

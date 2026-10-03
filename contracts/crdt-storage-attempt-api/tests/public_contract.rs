@@ -852,3 +852,260 @@ fn reopen_validates_retained_consumption_before_changing_owner_or_floors() {
         );
     }
 }
+
+fn authentic_revision_history(commits: u64) -> Recovery {
+    let mut host = MemoryHost::new();
+    let mut session = host.open(open_request()).unwrap();
+    for number in 1..=commits {
+        let mut b = binding("x", CommitKind::Candidate, number);
+        b.expected_revision = number - 1;
+        let a = prepared(session.prepare(prepare_request(b, number * 2 - 1)));
+        assert!(
+            matches!(session.begin(BeginRequest { request: resolution(a, number * 2, OperationKind::Begin), current: cut() }).result, ResolveResult::Terminal(t) if matches!(t.outcome, TerminalOutcome::Committed { revision, .. } if revision == number))
+        );
+    }
+    let RecoveryResult::Validated(r) = session.recover() else {
+        panic!("authentic retained history required")
+    };
+    *r
+}
+
+#[test]
+fn authentic_two_commit_recovery_rejects_distinct_duplicate_revision() {
+    let authentic = authentic_revision_history(2);
+    assert_eq!(
+        authentic.revisions.values().copied().collect::<Vec<_>>(),
+        vec![2]
+    );
+    assert_ne!(
+        authentic.attempts[0].attempt.id,
+        authentic.attempts[1].attempt.id
+    );
+    assert_ne!(
+        authentic.attempts[0].attempt.binding.batch,
+        authentic.attempts[1].attempt.binding.batch
+    );
+    MemoryHost::restore(authentic.clone()).unwrap();
+    let mut bad = authentic.clone();
+    bad.attempts[1].attempt.binding.expected_revision = 0;
+    let AttemptPhase::Terminal(TerminalOutcome::Committed { revision, .. }) =
+        &mut bad.attempts[1].phase
+    else {
+        panic!("second authentic terminal")
+    };
+    *revision = 1;
+    assert!(
+        matches!(MemoryHost::restore(bad), Err(Fault::Integrity)),
+        "distinct commits cannot own the same resulting revision"
+    );
+}
+
+#[test]
+fn full_retained_commit_history_rejects_missing_head_gaps_and_unbacked_current_revision() {
+    let authentic = authentic_revision_history(3);
+    for mutation in 0..6 {
+        let mut bad = authentic.clone();
+        match mutation {
+            0 => {
+                bad.attempts.remove(2);
+            }
+            1 => {
+                bad.attempts.remove(0);
+            }
+            2 => {
+                bad.attempts.remove(1);
+            }
+            3 => {
+                *bad.revisions.values_mut().next().unwrap() = 4;
+            }
+            4 => {
+                bad.attempts.clear();
+            }
+            _ => {
+                bad.revisions
+                    .insert(binding("y", CommitKind::Candidate, 1).plan.instance, 1);
+            }
+        }
+        assert!(
+            matches!(MemoryHost::restore(bad), Err(Fault::Integrity)),
+            "full-history inconsistency {mutation}"
+        );
+    }
+    MemoryHost::restore(authentic).unwrap();
+}
+
+#[test]
+fn sequential_commits_repeated_noncommit_and_independent_revision_spaces_restore() {
+    let mut independent = MemoryHost::new();
+    let mut both = independent.open(open_request()).unwrap();
+    for (name, invocation) in [("x", 1), ("y", 3)] {
+        let a = prepared(both.prepare(prepare_request(
+            binding(name, CommitKind::Candidate, 1),
+            invocation,
+        )));
+        both.begin(BeginRequest {
+            request: resolution(a, invocation + 1, OperationKind::Begin),
+            current: cut(),
+        });
+    }
+    let RecoveryResult::Validated(independent) = both.recover() else {
+        panic!("independent histories")
+    };
+    assert_eq!(
+        independent.revisions.values().copied().collect::<Vec<_>>(),
+        vec![1, 1]
+    );
+    MemoryHost::restore(*independent).unwrap();
+    let mut host = MemoryHost::new();
+    let mut s = host.open(open_request()).unwrap();
+    for (name, plan, expected, invocation, commit) in [
+        ("x", 1, 0, 1, true),
+        ("x", 2, 1, 3, true),
+        ("x", 3, 2, 5, false),
+        ("x", 4, 2, 7, false),
+        ("y", 1, 0, 9, true),
+    ] {
+        let mut b = binding(name, CommitKind::Candidate, plan);
+        b.expected_revision = expected;
+        let a = prepared(s.prepare(prepare_request(b, invocation)));
+        let reply = if commit {
+            s.begin(BeginRequest {
+                request: resolution(a, invocation + 1, OperationKind::Begin),
+                current: cut(),
+            })
+        } else {
+            s.request_fence(resolution(a, invocation + 1, OperationKind::Fence))
+        };
+        assert!(
+            matches!(reply.result, ResolveResult::Terminal(ref t) if match t.outcome { TerminalOutcome::Committed { revision, .. } => commit && revision == expected + 1, TerminalOutcome::NonCommit { revision, .. } => !commit && revision == expected })
+        );
+    }
+    let RecoveryResult::Validated(authentic) = s.recover() else {
+        panic!("complete history")
+    };
+    assert_eq!(
+        authentic.revisions[&binding("x", CommitKind::Candidate, 1).plan.instance],
+        2
+    );
+    assert_eq!(
+        authentic.revisions[&binding("y", CommitKind::Candidate, 1).plan.instance],
+        1
+    );
+    assert_eq!(
+        authentic
+            .attempts
+            .iter()
+            .filter(|a| matches!(
+                a.phase,
+                AttemptPhase::Terminal(TerminalOutcome::NonCommit { revision: 2, .. })
+            ))
+            .count(),
+        2
+    );
+    let mut restored = MemoryHost::restore((*authentic).clone()).unwrap();
+    let mut open = open_request();
+    open.owner.generation = 2;
+    let mut r = restored.open(open.clone()).unwrap();
+    let RecoveryResult::Validated(exported) = r.recover() else {
+        panic!("restored history")
+    };
+    assert_eq!(exported.attempts, authentic.attempts);
+    assert_eq!(exported.revisions, authentic.revisions);
+    for (offset, retained) in authentic.attempts.iter().enumerate() {
+        let mut q = resolution(
+            retained.attempt.clone(),
+            11 + u64::try_from(offset).unwrap(),
+            OperationKind::Inspect,
+        );
+        q.owner = open.owner.clone();
+        let AttemptPhase::Terminal(outcome) = &retained.phase else {
+            panic!("historical terminal")
+        };
+        assert_eq!(
+            r.inspect(q).result,
+            ResolveResult::Terminal(Box::new(Terminal {
+                attempt: retained.attempt.clone(),
+                outcome: outcome.clone()
+            }))
+        );
+    }
+}
+
+#[test]
+fn restored_started_and_committed_cuts_must_fit_their_immutable_windows() {
+    for hold in [false, true] {
+        let mut host = MemoryHost::new();
+        let mut s = host.open(open_request()).unwrap();
+        let a = prepared(s.prepare(prepare_request(
+            binding("x", CommitKind::AcceptedBatch, 1),
+            1,
+        )));
+        s.hold_publication(hold);
+        let result = s
+            .begin(BeginRequest {
+                request: resolution(a, 2, OperationKind::Begin),
+                current: cut(),
+            })
+            .result;
+        assert!(matches!(
+            result,
+            ResolveResult::Started { .. } | ResolveResult::Terminal(_)
+        ));
+        let RecoveryResult::Validated(authentic) = s.recover() else {
+            panic!("authentic protected start")
+        };
+        MemoryHost::restore((*authentic).clone()).unwrap();
+        for before in [true, false] {
+            let mut bad = (*authentic).clone();
+            let window = &mut bad.attempts[0]
+                .attempt
+                .binding
+                .prestart
+                .as_mut()
+                .unwrap()
+                .windows[0];
+            if before {
+                window.not_before_ms = 22;
+            } else {
+                window.not_after_ms = 20;
+            }
+            assert!(
+                matches!(MemoryHost::restore(bad), Err(Fault::Integrity)),
+                "protected phase hold{hold} before{before} cannot claim a cut outside immutable windows"
+            );
+        }
+    }
+}
+
+#[test]
+fn restored_noncommit_must_retain_its_bindings_unchanged_revision() {
+    let mut host = MemoryHost::restore(authentic_revision_history(1)).unwrap();
+    let mut open = open_request();
+    open.owner.generation = 2;
+    let mut s = host.open(open.clone()).unwrap();
+    let mut b = binding("x", CommitKind::Candidate, 2);
+    b.expected_revision = 1;
+    let mut q = prepare_request(b, 3);
+    q.owner = open.owner.clone();
+    let a = prepared(s.prepare(q));
+    let mut q = resolution(a, 4, OperationKind::Fence);
+    q.owner = open.owner;
+    assert!(
+        matches!(s.request_fence(q).result, ResolveResult::Terminal(t) if matches!(t.outcome, TerminalOutcome::NonCommit { revision: 1, .. }))
+    );
+    let RecoveryResult::Validated(authentic) = s.recover() else {
+        panic!("authentic fence history")
+    };
+    MemoryHost::restore((*authentic).clone()).unwrap();
+    let mut bad = *authentic;
+    let AttemptPhase::Terminal(TerminalOutcome::NonCommit { revision, .. }) =
+        &mut bad.attempts[1].phase
+    else {
+        panic!("original negative terminal")
+    };
+    *revision = 0;
+    assert!(
+        matches!(MemoryHost::restore(bad), Err(Fault::Integrity)),
+        "NonCommit cannot change the binding's application revision"
+    );
+}
