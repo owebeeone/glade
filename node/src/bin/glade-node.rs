@@ -479,8 +479,13 @@ async fn run(
             }
         }
         for (share, name) in &workspaces {
-            server.serve_workspace(share, name).await?;
-            println!("workspace {share} serving");
+            let serving = server.serve_workspace(share, name).await?;
+            let status = if serving {
+                "serving"
+            } else {
+                "following existing owner"
+            };
+            println!("workspace {share} {status}");
         }
     }
 

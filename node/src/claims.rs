@@ -17,8 +17,10 @@
 //! Step 4.4's question 5); (5) runs after it.
 //!
 //! Serving a workspace ([`Server::serve_workspace`]) mints the entry (diffed —
-//! re-serving appends nothing) + the first claim (epoch = fold max + 1, so a
-//! restarted or taking-over node fences out any stale claim), then RENEWS the
+//! re-serving appends nothing) + the first claim (epoch = fold max + 1 on
+//! creation or resuming our own ownership). A known remote owner, even with
+//! an expired lease, is followed, never displaced by configuration alone:
+//! directory synchronization is not application-data readiness. Then RENEWS the
 //! lease on a cadence while serving, kept by the wall clock the leases expire
 //! on, never by tokio's alone, which stops while the machine sleeps (Step R).
 //! Lease expiry stays an absolute wall-clock stamp judged at each reader's
@@ -268,12 +270,16 @@ impl Server {
         Ok(seeded)
     }
 
-    /// Serve `share` from this node (F1): mint the `WorkspaceEntry` (diffed)
-    /// and the first `ServeClaim` (epoch = fold max + 1), join the renewal
-    /// set. In-process idempotent: a share already being served is a no-op,
-    /// and so is `home`, in the set from adoption on.
-    pub async fn serve_workspace(&self, share: &str, name: &str) -> io::Result<()> {
-        serve_workspace_on(&self.shared, share, name).await.map(|_| ())
+    /// Configure `share` (F1). Create or resume our own claim and renew it;
+    /// follow a known remote owner without minting an entry or claim. Expiry
+    /// is not permission to take over without a data-transfer protocol.
+    /// Returns true when in our renewal set, false when following. Repeated
+    /// calls, including `home`, are idempotent. This is not a quorum election
+    /// and cannot discover an owner absent from our directory view.
+    pub async fn serve_workspace(&self, share: &str, name: &str) -> io::Result<bool> {
+        serve_workspace_on(&self.shared, share, name).await?;
+        let state = self.shared.dir.get().expect("serve requires adoption");
+        Ok(state.inner.lock().await.served.contains_key(share))
     }
 
     /// Which node serves `share` now, by the adopted registry's fold at this
@@ -288,7 +294,7 @@ impl Server {
 
 /// The mint itself, callable from the create ceremony (`exchange.rs`) as well
 /// as [`Server::serve_workspace`]. Returns whether anything NEW was minted —
-/// false = we already held the live serve (the re-create idempotence case).
+/// false = already configured locally, or a known remote owner is retained.
 pub(crate) async fn serve_workspace_on(shared: &Arc<Shared>, share: &str, name: &str) -> io::Result<bool> {
     let Some(state) = shared.dir.get() else {
         return Err(other("no directory authority (adopt_boot first)"));
@@ -298,16 +304,25 @@ pub(crate) async fn serve_workspace_on(shared: &Arc<Shared>, share: &str, name: 
     if dir.served.contains_key(share) {
         return Ok(false); // already serving: records diff to nothing
     }
+    // Decide from the SERVED replica, which contains peer claims the boot
+    // registry may not know. Include expired claims: their data did not
+    // evaporate with the lease. Ranking is the same epoch/node-id order as
+    // routing. No network reachability or partial local cache proves a safe
+    // transfer. Holding the directory lock also serializes local creates.
+    let epoch = {
+        let st = shared.store.lock().await;
+        let prior = last_claim(&st, share);
+        if prior.as_ref().is_some_and(|claim| claim.node != node) {
+            return Ok(false);
+        }
+        max_claim_epoch(&st, share)
+            .checked_add(1)
+            .ok_or_else(|| other("workspace claim epoch exhausted"))?
+    };
     let entry = WorkspaceEntry {
         workspace: share.into(),
         name: name.into(),
         eligible_hosts: vec![node.clone()],
-    };
-    // Epoch fencing reads the SERVED replica (it may hold peer claims the
-    // boot registry never saw); +1 bumps over any stale claim, ours or not.
-    let epoch = 1 + {
-        let st = shared.store.lock().await;
-        max_claim_epoch(&st, share)
     };
     let claim = ServeClaim {
         node: node.clone(),
@@ -344,6 +359,15 @@ pub(crate) async fn create_workspace(shared: &Arc<Shared>, req: &WorkspaceCreate
     };
     let name = if req.name.is_empty() { req.workspace.clone() } else { req.name.clone() };
     let created = serve_workspace_on(shared, &req.workspace, &name).await?;
+    if !state.inner.lock().await.served.contains_key(&req.workspace) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "workspace {} has a known remote owner; create is not an ownership transfer",
+                req.workspace
+            ),
+        ));
+    }
     Ok(WorkspaceCreateRes {
         workspace: req.workspace.clone(),
         node: state.node_id.clone(),
@@ -506,21 +530,30 @@ pub(crate) fn home_epoch(store: &Store, node: &str) -> i64 {
     home.map(|claim| claim.epoch).max().unwrap_or(1)
 }
 
-/// Highest claim epoch the replica has seen for `share` — live or lapsed;
-/// fencing bumps over both.
+/// Highest claim epoch the replica has seen for `share` — live or lapsed.
 pub(crate) fn max_claim_epoch(store: &Store, share: &str) -> i64 {
-    let mut max = 0;
+    last_claim(store, share).map_or(0, |claim| claim.epoch)
+}
+
+/// The last known owner, irrespective of lease expiry. This is a startup
+/// safety check, NOT a live routing answer or proof that its data survived.
+fn last_claim(store: &Store, share: &str) -> Option<ServeClaim> {
+    let mut best: Option<ServeClaim> = None;
     for (origin, _) in store.heads(HOME, G_CLAIMS, &[]) {
         for op in store.scan(HOME, G_CLAIMS, &[], &origin, i64::MIN) {
             let Some(c) = envelope::folded(&op, ServeClaim::from_cbor) else {
                 continue;
             };
-            if c.share == share && c.epoch > max {
-                max = c.epoch;
+            if c.share == share
+                && best
+                    .as_ref()
+                    .is_none_or(|b| crate::registry::rank_claims(&c, b).is_gt())
+            {
+                best = Some(c);
             }
         }
     }
-    max
+    best
 }
 
 // How a test changes the grant fold at run time, as a runtime route would
@@ -692,6 +725,83 @@ mod tests {
         ops.iter()
             .filter(|op| op.glade_id == glade_id && pick(&envelope::record_bytes(&op.payload)))
             .count()
+    }
+
+    /// The directory can be complete while the application replica is empty.
+    /// Neither a live nor an expired remote claim proves a safe takeover.
+    #[tokio::test]
+    async fn a_configured_workspace_does_not_take_over_a_known_remote_owner() {
+        for (case, expiry) in [("live", i64::MAX), ("expired", 0)] {
+            let (shared, sys) = adopted(&format!("cold-owner-{case}")).await;
+            let peer = boot_at(fresh(&format!("cold-owner-{case}-peer")), "peer").unwrap();
+            let mut registry = peer.registry.clone();
+            registry
+                .append(
+                    Record::Serve(ServeClaim {
+                        node: peer.node_id.clone(),
+                        share: "ws-cold".into(),
+                        lease_expiry_ms: expiry,
+                        epoch: 7,
+                    }),
+                    &peer.node_id,
+                )
+                .unwrap();
+            let server = Server {
+                shared: shared.clone(),
+            };
+            server.seed_registry(&registry.snapshot()).await;
+            let before = saved(&sys);
+            assert!(
+                !server.serve_workspace("ws-cold", "cold").await.unwrap(),
+                "{case}: a directory claim is not application-data readiness"
+            );
+            let state = shared.dir.get().unwrap();
+            assert!(!state.inner.lock().await.served.contains_key("ws-cold"));
+            assert_eq!(saved(&sys), before, "no competing entry or claim persisted");
+            renew_leases(&shared).await;
+            assert_eq!(
+                published_serve(&*shared.store.lock().await, "ws-cold"),
+                (0, 1)
+            );
+
+            // The explicit create ceremony must not become a takeover bypass
+            // or report this node as the owner of somebody else's workspace.
+            let request = WorkspaceCreateReq {
+                workspace: "ws-cold".into(),
+                name: "cold".into(),
+                target: state.node_id.clone(),
+            };
+            assert!(create_workspace(&shared, &request).await.is_err());
+        }
+    }
+
+    /// A restart may renew its own expired claim; it is not a cold takeover.
+    #[tokio::test]
+    async fn a_configured_workspace_resumes_its_own_expired_claim() {
+        let (shared, _) = adopted("resume-own-workspace").await;
+        let node = shared.dir.get().unwrap().node_id.clone();
+        testing::accept(
+            &shared,
+            vec![Record::Serve(ServeClaim {
+                node: node.clone(),
+                share: "ws-resume".into(),
+                lease_expiry_ms: 0,
+                epoch: 7,
+            })],
+        )
+        .await
+        .unwrap();
+        assert!(serve_workspace_on(&shared, "ws-resume", "resume")
+            .await
+            .unwrap());
+        assert_eq!(max_claim_epoch(&*shared.store.lock().await, "ws-resume"), 8);
+        assert_eq!(
+            who_serves(&*shared.store.lock().await, "ws-resume", now_ms()),
+            Some(node)
+        );
+        assert!(!serve_workspace_on(&shared, "ws-resume", "resume")
+            .await
+            .unwrap());
     }
 
     /// Slice profile SP-L1 (plan Step 4.4): a serve whose save fails folds,

@@ -427,6 +427,15 @@ subscribe's share and glade id, the reason's code, and no `corr` (answer 2).
 client keeps its store across restarts. A client's `from` changes nothing: R4
 cuts the gap. The peer path reads it (`mesh.rs:327-328`).
 
+**Configured ownership safety (2026-10-03, CJ-1..4).** A configured workspace
+MUST NOT automatically replace a known remote claimant, even when its lease
+has expired. Directory catch-up is not application-data catch-up. The node
+follows that owner; absent/unreachable follows W1/W5. First creation and
+resuming self-owned storage keep their existing claim/renewal path.
+`workspace.create` MUST NOT bypass this rule. See
+[the cold-join correction](GladeCrossNodeWritesPlan.md#8-cold-configured-join--settings-regression-2026-10-03)
+for evidence and limits: this is not transfer, consensus, or divergent-data repair.
+
 **The client libraries** (answers 3 and 4, built in Steps 3.1 to 3.4).
 `append`, `send_ops` / `sendOps` and `subscribe` keep their signatures;
 `subscribe` returns after the replay, and returns a refusal as an empty zone.

@@ -665,3 +665,66 @@ inputs:  CW 2.1 -> X2.1   CW 2.2 -> X2.2   slice 4.3 part 2 -> X4.1
   private zone stays private by routing only. App ops stay unsigned (D5).
 - **No change for the suppliers or the desk:** glade-gyld and glade-gwz write
   where their share is served, so they stay `Local`. **Nothing is published.**
+
+## 8. Cold configured join — settings regression, 2026-10-03
+
+The two-node Gyld desk exposed a missing case: both app declarations name
+`ws-razel`. B pulled A's directory, then startup minted epoch max + 1 for B,
+without acquiring A's application data. A new empty-key smoke test passed,
+but an existing settings value stayed at A while B accepted a competing value.
+This supersedes the assumption above that every supplier stays `Local`.
+
+Bounded correction (not an ownership-transfer protocol):
+
+- **CJ-1:** Configuration MUST NOT displace the last known remote claimant.
+  Startup ranks all known claims, expired included, by the existing epoch/node
+  ordering. It follows a remote owner without minting a workspace entry or claim
+  or joining the renewal set. Lease expiry or link failure MUST NOT be treated
+  as proof of data readiness; normal W1/W5 unavailable behavior still applies.
+- **CJ-2:** A first creation or a restart whose last known claimant is self MAY
+  mint its next epoch, with the existing durable acceptance and renewal rules.
+  Repeated configuration remains idempotent. `home` remains special: each node
+  serves it, unchanged. The node MUST retain its application data across restart.
+- **CJ-3:** `workspace.create` targeting a node that knows a remote owner MUST
+  fail as data, not perform a takeover or report local creation. An explicit
+  synchronized/fenced transfer remains separate work.
+- **CJ-4:** Both composition roots MUST use the same decision and report
+  `following existing owner` instead of `serving` when they do not claim it.
+  `Server::serve_workspace` now returns `Result<bool>`: true means in the local
+  renewal set; false means following. It is not a replication receipt.
+
+Evidence: `claims::tests::a_configured_workspace_does_not_take_over_a_known_remote_owner`
+covers live and expired remote claims, unchanged persistent records, no renewal,
+and the create refusal; `a_configured_workspace_resumes_its_own_expired_claim`
+covers own restart and repeated configuration. The booted
+`cross_node_writes::unix::a_cold_configured_node_follows_existing_data_instead_of_taking_over`
+starts A, writes existing data, starts B with the same workspace declaration,
+checks fresh reads and writes in both directions, then restarts B and repeats.
+Run it under both roots. The existing cross-node journey retains the unreachable
+holder, denied writer, SWMR conflict and holder-restart checks.
+
+Limits: no repair of already divergent replicas; no proof of completeness from
+a non-empty cache; no transfer, election or protection against two first boots
+with mutually unknown ownership. Peer discovery is not consensus. A follower's
+subscribe acknowledgement still describes its local replica (R7); subsequent
+holder data arrives live. These limits MUST NOT be described as solved by CJ-1.
+
+Verification on 2026-10-03: the cold-join journey was RED (B received no existing
+ops) before the fix, GREEN afterwards under both roots. The focused claims
+suite ran 20 tests in 1.12 s; the two cross-node journeys ran in about 3.4 s
+(execution, not cold compilation). `sh glade/node/check.sh` passed all nine
+components, including 498 tests under each root, with its pre-existing
+format/lint and source-checker gaps unchanged. No dependency or allowlist was
+relaxed. The original TypeScript settings reproduction also converged after
+the fix, with pre-existing data and a follower-originated update.
+
+The Gyld launcher is an affected consumer: its readiness check MUST accept the
+explicit following status, not require every node to claim `ws-razel`. Its
+regression was RED first; all 106 launcher tests and Ruff checks passed. This
+remains per-process readiness, not a claim of cross-node replication.
+
+The live local pair was backed up and restarted with the rebuilt node. On an
+isolated test principal, theme, zoom and font-size updates through each node
+were acknowledged, reached the other node and changed both browsers' rendered
+styles without reload. The owner's existing appearance stayed unchanged. This
+does not certify or repair either replica's pre-fix historical op set.

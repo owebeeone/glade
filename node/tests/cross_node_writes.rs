@@ -189,15 +189,19 @@ mod unix {
     /// The endpoint id of instance `name` under `home`, as `glade-node
     /// endpoint-id` prints it, its key minted first if it has none.
     fn endpoint_id(home: &Path, name: &str) -> String {
+        identity(home, name, "endpoint-id")
+    }
+
+    fn identity(home: &Path, name: &str, kind: &str) -> String {
         let mut command = Command::new(env!("CARGO_BIN_EXE_glade-node"));
         command
-            .args(["endpoint-id", "--name", name])
+            .args([kind, "--name", name])
             .env("GLADE_HOME", home)
             .env("HOME", home)
             .env_remove(VARIABLE);
         let printed = command.output().expect("run glade-node endpoint-id");
         let said = String::from_utf8_lossy(&printed.stderr);
-        assert!(printed.status.success(), "endpoint-id {name}: {said}");
+        assert!(printed.status.success(), "{kind} {name}: {said}");
         String::from_utf8(printed.stdout)
             .unwrap()
             .trim()
@@ -395,6 +399,66 @@ mod unix {
             };
             checks.check(&format!("{check}, at {name}"), held);
         }
+    }
+
+    /// Unlike the original journey, BOTH apps declare the workspace and H
+    /// already holds content before B joins. Directory sync alone must not
+    /// make an empty B the holder, even after B is restarted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cold_configured_node_follows_existing_data_instead_of_taking_over() {
+        let dir = scratch("cold-configured-join");
+        let home = dir.join("glade-home");
+        let (h_key, b_key) = (endpoint_id(&home, "h"), endpoint_id(&home, "b"));
+        let b_id = identity(&home, "b", "node-id");
+        let app = dir.join("shared.glade");
+        std::fs::write(&app, format!(
+            "glade-app v1\napp shared\nworkspace {SHARE} shared\nseed {b_id} {SHARE} read.*,write.*\n"
+        )).unwrap();
+        let app = app.to_str().unwrap();
+        let h = Node::start(
+            &home,
+            false,
+            &["--name", "h", "--app", app, "--peer", &b_key],
+        )
+        .await;
+        let mut hw = Session::open(h.port()).await;
+        let old = op(VALUE, Shape::Value, "established", 0, None);
+        is(hw.write(&old).await, ErrorCode::Ok, "").unwrap();
+        let to_h = format!("{h_key}@{}", h.peer_at());
+        let args = ["--name", "b", "--app", app, "--peer", &to_h];
+        let b = Node::start(&home, false, &args).await;
+
+        // Fresh readers, not a browser cache; the existing operation must
+        // reach B before any new operation is written on either side.
+        let mut br = Session::open(b.port()).await;
+        br.subscribe(&[VALUE]).await.unwrap();
+        br.holds(&[&old]).await.unwrap();
+        let update = op(VALUE, Shape::Value, "established", 1, Some(&old));
+        let mut bw = Session::open(b.port()).await;
+        is(bw.write(&update).await, ErrorCode::Ok, "").unwrap();
+        let from_h = op(VALUE, Shape::Value, "established", 2, Some(&update));
+        is(hw.write(&from_h).await, ErrorCode::Ok, "").unwrap();
+        let want = [&old, &update, &from_h];
+        for port in [h.port(), b.port()] {
+            let mut reader = Session::open(port).await;
+            reader.subscribe(&[VALUE]).await.unwrap();
+            reader.holds(&want).await.unwrap();
+        }
+
+        drop((br, bw));
+        drop(b);
+        let b = Node::start(&home, false, &args).await;
+        let mut reader = Session::open(b.port()).await;
+        reader.subscribe(&[VALUE]).await.unwrap();
+        reader.holds(&want).await.unwrap();
+        // A new write through the restarted follower must still reach H.
+        let after = op(VALUE, Shape::Value, "established", 3, Some(&from_h));
+        is(reader.write(&after).await, ErrorCode::Ok, "").unwrap();
+        let mut hr = Session::open(h.port()).await;
+        hr.subscribe(&[VALUE]).await.unwrap();
+        hr.holds(&[&old, &update, &from_h, &after]).await.unwrap();
+        drop((hr, reader, hw, b, h));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]

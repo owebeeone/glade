@@ -682,8 +682,13 @@ pub fn node_plan() -> Plan<(), NodeStart> {
             |_cx: Cx<Run>, (start, declared, storage, _peers, _records): WorkspacesNeeds| async move {
                 let server = storage.server()?;
                 for (share, name) in declared.iter() {
-                    server.serve_workspace(share, name).await?;
-                    start.console.out(&format!("workspace {share} serving"));
+                    let serving = server.serve_workspace(share, name).await?;
+                    let status = if serving {
+                        "serving"
+                    } else {
+                        "following existing owner"
+                    };
+                    start.console.out(&format!("workspace {share} {status}"));
                 }
                 Ok(())
             },
