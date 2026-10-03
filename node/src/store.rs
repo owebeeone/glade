@@ -268,6 +268,15 @@ impl Store {
         Ok(store)
     }
 
+    /// Q4-A: permanently retire this legacy store for a later verified migration cut.
+    /// Draft consumer signature only; no successful seal is implemented yet.
+    pub fn seal_legacy(&mut self) -> Result<(), StoreError> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Q4-A legacy store seal is not implemented",
+        ).into())
+    }
+
     /// The `home` journals `open` set aside, if any.
     pub fn set_aside(&self) -> Option<&SetAside> {
         self.aside.as_ref()
