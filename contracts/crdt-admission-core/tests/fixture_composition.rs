@@ -252,3 +252,18 @@ fn seeded_terminal_requires_original_custody_and_accounting() {
         old.result
     );
 }
+
+#[test]
+fn historical_prior_cut_fixture_registers_multiline_inspect_through_full_helper() {
+    let source = include_str!("records_host_contract.rs");
+    let historical = source
+        .split("fn icd006_delayed_prior_cut_committed_callback_retains_historical_admission()")
+        .nth(1)
+        .unwrap();
+    assert!(
+        !historical.contains("unknown\n        .lookups\n        .insert"),
+        "secondary-only multiline lookup insertion leaves Inspect40 unissued"
+    );
+    assert!(historical.contains("register_lookup(&mut unknown"));
+    assert!(historical.contains("unknown.storage_invocations"));
+}

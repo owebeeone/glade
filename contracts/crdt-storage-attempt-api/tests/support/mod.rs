@@ -1,7 +1,11 @@
 // Development-only deterministic bounded Records port fixture. No physical claims.
 use glade_crdt_storage_attempt_api::*;
 
-use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, BTreeSet},
+    rc::Rc,
+};
 #[derive(Default)]
 struct Ledger {
     active: Option<Owner>,
@@ -54,12 +58,25 @@ impl MemoryHost {
             return Err(Fault::Integrity);
         }
         let mut attempts = BTreeMap::new();
+        let mut identities = BTreeSet::new();
+        let mut unresolved = BTreeSet::new();
         for a in recovery.attempts {
+            if !identities.insert(a.attempt.id.clone())
+                || (!matches!(a.phase, AttemptPhase::Terminal(_))
+                    && !unresolved.insert(a.attempt.id.instance.clone()))
+            {
+                return Err(Fault::Integrity);
+            }
             validate_binding(&recovery.limits, &a.attempt.binding)?;
             let current = *recovery
                 .revisions
                 .get(&a.attempt.id.instance)
                 .ok_or(Fault::Integrity)?;
+            if !matches!(a.phase, AttemptPhase::Terminal(_))
+                && a.attempt.binding.expected_revision != current
+            {
+                return Err(Fault::Integrity);
+            }
             let original_cut = a.attempt.binding.prestart.as_ref().map(|p| p.cut.clone());
             match &a.phase {
                 AttemptPhase::Reserved => {}
@@ -107,9 +124,24 @@ impl MemoryHost {
         let mut queued = BTreeMap::new();
         for b in recovery.preparing {
             validate_binding(&recovery.limits, &b)?;
-            if queued.insert(b.plan.instance.clone(), b).is_some() {
+            if b.expected_revision != *recovery.revisions.get(&b.plan.instance).unwrap_or(&0) {
                 return Err(Fault::Integrity);
             }
+            if attempts.contains_key(&b.plan)
+                || !unresolved.insert(b.plan.instance.clone())
+                || queued.insert(b.plan.instance.clone(), b).is_some()
+            {
+                return Err(Fault::Integrity);
+            }
+        }
+        let mut instances: BTreeSet<_> = recovery.revisions.keys().cloned().collect();
+        instances.extend(queued.keys().cloned());
+        if instances.len() > recovery.limits.instances
+            || instances
+                .iter()
+                .any(|i| i.incarnation.len() > recovery.limits.max_name_bytes)
+        {
+            return Err(Fault::Capacity);
         }
         Ok(Self {
             ledger: Rc::new(RefCell::new(Ledger {
@@ -201,6 +233,51 @@ impl StorageAttemptHost for MemoryHost {
         {
             return Err(Fault::Capacity);
         }
+        // Validate the complete retained image under proposed bounds before ownership changes.
+        Self::restore(Recovery {
+            owner: request.owner.clone(),
+            invocation_namespace: request.invocation_namespace,
+            limits: limits.clone(),
+            preparing: l.queued.values().cloned().collect(),
+            revisions: l.revisions.clone(),
+            attempts: l.attempts.values().cloned().collect(),
+            next_attempt: l.next_attempt,
+            invocation_high_water: l.invocation_floor,
+            invocation_count: l.invocation_count,
+        })
+        .map_err(|e| {
+            if e == Fault::Integrity {
+                Fault::Capacity
+            } else {
+                e
+            }
+        })?;
+        let mut reserved = l
+            .attempts
+            .len()
+            .checked_mul(limits.critical_per_attempt)
+            .ok_or(Fault::Capacity)?;
+        for (instance, bytes) in &l.genesis_custody {
+            if instance.incarnation.len() > limits.max_name_bytes {
+                return Err(Fault::Capacity);
+            }
+            reserved = reserved
+                .checked_add(bytes.value().len())
+                .ok_or(Fault::Capacity)?;
+        }
+        if l.observations.len() > limits.instances
+            || l.observations
+                .keys()
+                .any(|i| i.incarnation.len() > limits.max_name_bytes)
+            || reserved < l.critical_used
+            || reserved > limits.critical_bytes
+            || l.revisions
+                .keys()
+                .any(|i| i.incarnation.len() > limits.max_name_bytes)
+        {
+            return Err(Fault::Capacity);
+        }
+        l.critical_used = reserved;
         l.store = Some(request.owner.store.clone());
         l.namespace = Some(request.invocation_namespace);
         l.owner_floor = request.owner.generation;
@@ -316,6 +393,9 @@ impl MemorySession {
         }
         if let Err(e) = self.validate(b) {
             return PrepareResult::Refused(e);
+        }
+        if b.expected_revision != *l.revisions.get(&b.plan.instance).unwrap_or(&0) {
+            return PrepareResult::Refused(Fault::BindingMismatch);
         }
         if !l.revisions.contains_key(&b.plan.instance)
             && !l.queued.contains_key(&b.plan.instance)

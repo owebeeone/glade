@@ -595,3 +595,260 @@ fn restored_capacity_and_binding_phase_consistency_are_validated() {
         );
     }
 }
+
+#[test]
+fn fresh_revision_mismatch_refuses_before_reserved_or_queued_for_every_kind() {
+    for kind in [
+        CommitKind::Candidate,
+        CommitKind::AcceptedBatch,
+        CommitKind::SecurityEvidence,
+        CommitKind::QualifiedFork,
+    ] {
+        for expected in [0, 2] {
+            for fence in [false, true] {
+                for hold in [false, true] {
+                    let mut h = MemoryHost::new();
+                    let mut s = h.open(open_request()).unwrap();
+                    let original = binding("x", kind.clone(), 1);
+                    let a = prepared(s.prepare(prepare_request(original.clone(), 1)));
+                    let committed = s
+                        .begin(BeginRequest {
+                            request: resolution(a.clone(), 2, OperationKind::Begin),
+                            current: cut(),
+                        })
+                        .result;
+                    assert!(
+                        matches!(committed, ResolveResult::Terminal(ref t) if matches!(t.outcome, TerminalOutcome::Committed { revision: 1, .. }))
+                    );
+                    assert_eq!(
+                        s.recover_plan(prepare_request(original, 3)).result,
+                        PrepareResult::Prepared(Box::new(a.clone()))
+                    );
+                    let before = s.fixture_seed().recovery;
+                    s.hold_preparation(hold);
+                    let mut bad = binding("x", kind.clone(), 2);
+                    bad.expected_revision = expected;
+                    assert_eq!(
+                        s.prepare(prepare_request(bad.clone(), 4)).result,
+                        PrepareResult::Refused(Fault::BindingMismatch),
+                        "kind {kind:?}, expected {expected}, fence {fence}, hold {hold}"
+                    );
+                    let fake = AttemptBinding {
+                        id: AttemptId {
+                            store: open_request().owner.store,
+                            instance: bad.plan.instance.clone(),
+                            number: before.next_attempt,
+                        },
+                        binding: bad.clone(),
+                    };
+                    let request = resolution(
+                        fake,
+                        5,
+                        if fence {
+                            OperationKind::Fence
+                        } else {
+                            OperationKind::Begin
+                        },
+                    );
+                    let result = if fence {
+                        s.request_fence(request).result
+                    } else {
+                        s.begin(BeginRequest {
+                            request,
+                            current: cut(),
+                        })
+                        .result
+                    };
+                    assert_eq!(result, ResolveResult::Pending);
+                    assert_eq!(
+                        s.recover_plan(prepare_request(bad, 6)).result,
+                        PrepareResult::Pending
+                    );
+                    let after = s.fixture_seed().recovery;
+                    assert_eq!(after.attempts, before.attempts);
+                    assert_eq!(after.preparing, before.preparing);
+                    assert_eq!(after.revisions, before.revisions);
+                    assert_eq!(after.next_attempt, before.next_attempt);
+                    MemoryHost::restore(after).unwrap();
+                    assert_eq!(
+                        s.inspect(resolution(a, 7, OperationKind::Inspect)).result,
+                        committed
+                    );
+                    s.hold_preparation(false);
+                    let mut valid = binding("x", kind.clone(), 3);
+                    valid.expected_revision = 1;
+                    let pending = prepared(s.prepare(prepare_request(valid.clone(), 8)));
+                    s.hold_publication(true);
+                    assert!(matches!(
+                        s.begin(BeginRequest {
+                            request: resolution(pending.clone(), 9, OperationKind::Begin),
+                            current: cut()
+                        })
+                        .result,
+                        ResolveResult::Started { .. }
+                    ));
+                    let mut rival = valid.clone();
+                    rival.plan.number = 4;
+                    rival.expected_revision = 2;
+                    assert_eq!(
+                        s.prepare(prepare_request(rival, 10)).result,
+                        PrepareResult::Refused(Fault::Unavailable)
+                    );
+                    assert_eq!(
+                        s.recover_plan(prepare_request(valid, 11)).result,
+                        PrepareResult::Prepared(Box::new(pending.clone()))
+                    );
+                    assert_eq!(
+                        s.publish(&pending, open_request().owner),
+                        ResolveResult::Terminal(Box::new(Terminal {
+                            attempt: pending.clone(),
+                            outcome: TerminalOutcome::Committed {
+                                revision: 2,
+                                storage: pending.binding.storage.clone(),
+                                receipts: pending.binding.receipts.clone(),
+                                start_cut: pending.binding.prestart.as_ref().map(|p| p.cut.clone())
+                            }
+                        }))
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn restoration_rejects_identity_and_unresolved_overlap_but_keeps_history_and_y() {
+    let mut h = MemoryHost::new();
+    let mut s = h.open(open_request()).unwrap();
+    let first = prepared(s.prepare(prepare_request(binding("x", CommitKind::Candidate, 1), 1)));
+    s.request_fence(resolution(first, 2, OperationKind::Fence));
+    let second = prepared(s.prepare(prepare_request(binding("x", CommitKind::Candidate, 2), 3)));
+    s.request_fence(resolution(second, 4, OperationKind::Fence));
+    prepared(s.prepare(prepare_request(binding("x", CommitKind::Candidate, 3), 5)));
+    let good = s.fixture_seed().recovery;
+    for mutation in 0..8 {
+        let mut bad = good.clone();
+        let mut extra = bad.attempts[2].clone();
+        extra.attempt.binding.plan.number = 4;
+        match mutation {
+            0 => {
+                bad.attempts.push(extra);
+            }
+            1 => {
+                extra.attempt.id.number = bad.next_attempt;
+                bad.next_attempt += 1;
+                bad.attempts.push(extra);
+            }
+            2 => {
+                bad.preparing.push(extra.attempt.binding);
+            }
+            3 => {
+                bad.attempts.pop();
+                bad.preparing.push(binding("x", CommitKind::Candidate, 3));
+                bad.preparing.push(binding("x", CommitKind::Candidate, 4));
+            }
+            4 => {
+                bad.attempts[1].attempt.id = bad.attempts[0].attempt.id.clone();
+            }
+            5 => {
+                bad.attempts[2].attempt.binding.expected_revision = 1;
+            }
+            6 => {
+                bad.preparing.push(binding("y", CommitKind::Candidate, 1));
+                bad.limits.instances = 1;
+            }
+            _ => {
+                bad.attempts.pop();
+                let mut queued = binding("x", CommitKind::Candidate, 3);
+                queued.expected_revision = 1;
+                bad.preparing.push(queued);
+            }
+        }
+        bad.invocation_count += 2;
+        bad.invocation_high_water += 2;
+        assert!(
+            MemoryHost::restore(bad).is_err(),
+            "overlap mutation {mutation}"
+        );
+    }
+    let mut restored = MemoryHost::restore(good.clone()).unwrap();
+    let mut open = open_request();
+    open.owner.generation = 2;
+    let mut r = restored.open(open.clone()).unwrap();
+    let mut q = prepare_request(binding("y", CommitKind::Candidate, 1), 6);
+    q.owner = open.owner.clone();
+    let y = prepared(r.prepare(q));
+    let mut q = resolution(y, 7, OperationKind::Begin);
+    q.owner = open.owner;
+    assert!(
+        matches!(r.begin(BeginRequest { request: q, current: cut() }).result, ResolveResult::Terminal(t) if matches!(t.outcome, TerminalOutcome::Committed { revision: 1, .. }))
+    );
+    let recovered = r.fixture_seed().recovery;
+    assert_eq!(&recovered.attempts[..3], &good.attempts);
+    MemoryHost::restore(recovered).unwrap();
+}
+
+#[test]
+fn reopen_validates_retained_consumption_before_changing_owner_or_floors() {
+    for reduction in 0..9 {
+        let mut h = MemoryHost::new();
+        let mut s = h.open(open_request()).unwrap();
+        for (name, n) in [("x", 1), ("y", 3)] {
+            let a = prepared(s.prepare(prepare_request(
+                binding(name, CommitKind::AcceptedBatch, 1),
+                n,
+            )));
+            s.request_fence(resolution(a, n + 1, OperationKind::Fence));
+        }
+        let before = s.fixture_seed().recovery;
+        assert_eq!(s.close(), CloseResult::Closed);
+        let mut smaller = open_request();
+        smaller.owner.generation = 2;
+        match reduction {
+            0 => smaller.limits.max_batch_bytes = 1,
+            1 => smaller.limits.max_receipts = 0,
+            2 => smaller.limits.max_windows = 0,
+            3 => smaller.limits.max_name_bytes = 0,
+            4 => smaller.limits.critical_per_attempt = 1,
+            5 => smaller.limits.critical_bytes = 8191,
+            6 => smaller.limits.attempts = 1,
+            7 => smaller.limits.invocation_history = 3,
+            _ => smaller.limits.instances = 1,
+        }
+        assert!(
+            matches!(h.open(smaller), Err(Fault::Capacity)),
+            "bound reduction {reduction}"
+        );
+        assert_eq!(s.fixture_seed().recovery, before);
+        let mut compatible = open_request();
+        compatible.owner.generation = 2;
+        let mut next = h.open(compatible.clone()).unwrap();
+        let recovered = next.fixture_seed().recovery;
+        assert_eq!(recovered.owner, compatible.owner);
+        assert_eq!(recovered.attempts, before.attempts);
+        assert_eq!(recovered.revisions, before.revisions);
+        assert_eq!(recovered.next_attempt, before.next_attempt);
+        assert_eq!(recovered.invocation_count, before.invocation_count);
+        assert_eq!(
+            recovered.invocation_high_water,
+            before.invocation_high_water
+        );
+        MemoryHost::restore(recovered).unwrap();
+        let mut q = resolution(
+            before.attempts[0].attempt.clone(),
+            5,
+            OperationKind::Inspect,
+        );
+        q.owner = compatible.owner;
+        assert_eq!(
+            next.inspect(q).result,
+            ResolveResult::Terminal(Box::new(Terminal {
+                attempt: before.attempts[0].attempt.clone(),
+                outcome: match &before.attempts[0].phase {
+                    AttemptPhase::Terminal(t) => t.clone(),
+                    _ => unreachable!(),
+                }
+            }))
+        );
+    }
+}

@@ -973,10 +973,14 @@ fn icd006_delayed_prior_cut_committed_callback_retains_historical_admission() {
     unknown.commits.remove(&7);
     unknown.unknown_commits.insert(7, plan.clone());
     register_attempt(&mut unknown, &plan);
-    unknown.next_effect_id = 41;
-    unknown
-        .lookups
-        .insert(40, resolve_request(&plan, 40, OperationKind::Inspect));
+    let issued = resolve_request(&plan, 40, OperationKind::Inspect);
+    register_lookup(&mut unknown, issued.clone()).unwrap();
+    assert_eq!(unknown.lookups[&40], issued);
+    assert_eq!(
+        unknown.storage_invocations[&issued.invocation],
+        StorageInvocation::Resolve(issued)
+    );
+    assert_eq!(unknown.next_effect_id, 41);
     let recovered = step(
         &unknown,
         Event::LookupResolved({
@@ -1014,4 +1018,41 @@ fn icd006_delayed_prior_cut_committed_callback_retains_historical_admission() {
             ))),
         "ICD-006 prior-cut unknown recovery returns original receipt after current revocation"
     );
+}
+
+#[test]
+fn prior_cut_inspect40_distinguishes_issued_authority_from_identical_unissued_reply() {
+    let d = descriptor("x");
+    let plan = staged_plan(
+        &d,
+        candidate(&d, "a", 0, None, vec![], insert("a", None, "A")),
+    );
+    let mut state = initial(d.clone());
+    state.instances.get_mut(&d.instance).unwrap().policy = Bytes::new(b"revoked-test-cut".to_vec());
+    state.unknown_commits.insert(plan.id, plan.clone());
+    register_attempt(&mut state, &plan);
+    let q = resolve_request(&plan, 40, OperationKind::Inspect);
+    let reply = ResolveReply {
+        request: q.clone(),
+        result: committed_result(&plan),
+    };
+    let before = state.clone();
+    let unissued = step(&state, Event::LookupResolved(reply.clone()));
+    assert_eq!(unissued.state, before);
+    assert!(
+        unissued
+            .effects
+            .contains(&Effect::Report(Outcome::CallbackMismatch))
+    );
+    register_lookup(&mut state, q.clone()).unwrap();
+    assert_eq!(state.lookups[&40], q);
+    assert_eq!(
+        state.storage_invocations[&q.invocation],
+        StorageInvocation::Resolve(q)
+    );
+    assert_eq!(state.next_effect_id, 41);
+    let issued = step(&state, Event::LookupResolved(reply));
+    assert!(issued.effects.contains(&Effect::Report(Outcome::ExactRetry(
+        plan.acceptances[0].receipt.clone()
+    ))));
 }
