@@ -303,11 +303,7 @@ impl Store {
 
     // Production supplies an immediate callback. Tests can pause here to attack
     // the actual OS lock and prove a seal cannot overtake the journal mutation.
-    fn append_with(
-        &mut self,
-        op: Op,
-        after_check: impl FnOnce(),
-    ) -> Result<Append, StoreError> {
+    fn append_with(&mut self, op: Op, after_check: impl FnOnce()) -> Result<Append, StoreError> {
         let _guard = legacy_seal::unsealed(&self.root)?;
         after_check();
         self.validate_surface_contract(&op)?;
