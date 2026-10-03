@@ -2,13 +2,13 @@
 # ARCH-002's negative fixture for this workspace, failing CLOSED, on the
 # witness's pattern (../dev-docs/async-witness/arch002-fixture.sh).
 #
-# The claim is that no contract crate here can take a framework dependency
+# The claim is that no classified library here can take a framework dependency
 # without the architecture gate refusing it. A gate never seen to refuse proves
 # nothing, so for EVERY workspace member in turn this script injects `shaku`
 # into that crate's manifest and requires the gate to refuse with exactly
 # `ARCH-002 <crate>: undeclared dependency normal:shaku`. Anything else fails
 # here: a PASS, another diagnostic, a checker that could not run `cargo
-# metadata`, or a member count that differs from the policy's contracts.
+# metadata`, or a member count that differs from the policy's classified libraries.
 #
 # Everything happens on a COPY in a temporary directory; the live manifests,
 # lockfile and policy are only read. The copy keeps the tree's depth below the
@@ -35,11 +35,16 @@ ln -s "$gwz_root/glade-decl-rs" "$work/glade-decl-rs"
 # yields a broken copy, which the positive control refuses to trust.
 members=$(sed -n 's/^members = \[\(.*\)\]$/\1/p' "$contract_root/Cargo.toml" | tr -d '" ' | tr ',' ' ')
 count=$(printf '%s\n' $members | grep -c .)
-contracts=$(grep -c '"role": "contract"' "$contract_root/architecture-policy.json")
-if [ "$count" != "$contracts" ]; then
-    echo "ARCH-002 fixture: $count members but $contracts contracts in the policy; the fixture must cover every contract" >&2
+classified=$(python3 - "$contract_root/architecture-policy.json" <<'PYCODE'
+import json, sys
+print(len(json.load(open(sys.argv[1]))["packages"]))
+PYCODE
+)
+if [ "$count" != "$classified" ]; then
+    echo "ARCH-002 fixture: $count members but $classified classified libraries; every member must be covered" >&2
     exit 1
 fi
+ln -s "$gwz_root/glade/wire-rs" "$work/glade/wire-rs"
 (cd "$contract_root" && tar -cf - Cargo.toml Cargo.lock architecture-policy.json $members) |
     (cd "$copy" && tar -xf -)
 
@@ -94,4 +99,4 @@ for member in $members; do
     cp "$contract_root/$member/Cargo.toml" "$manifest"
     refused=$((refused + 1))
 done
-printf 'ARCH-002 fixture: the gate refused the injected framework dependency in all %s contract crates\n' "$refused"
+printf 'ARCH-002 fixture: the gate refused the injected framework dependency in all %s classified libraries\n' "$refused"

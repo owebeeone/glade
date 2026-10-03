@@ -2,7 +2,7 @@
 
 This independent Cargo workspace adds contracts alongside the working node/client,
 not inside discovery. It does not replace or link into the demo. It now contains
-ten draft contracts: binding, invocation, subscription, replica synchronization,
+ten draft contracts plus one Pure admission component: binding, invocation, subscription, replica synchronization,
 resource lifecycle and persistence, plus the four assembly ports below (carrier,
 clock, grant, signer). These are a first reviewable boundary layer, not a complete
 stable Glade SDK or working implementation.
@@ -77,16 +77,20 @@ key-resolution tests.
 
 ## Fast checks and gate scope
 
-From the GWZ root: `sh glade/contracts/check.sh` runs all ten contract packages.
+From the GWZ root: `sh glade/contracts/check.sh` selects the ten contracts and the new Pure component. At IC-1 its domain suite deliberately remains RED until contract review and implementation.
 Pass `binding`, `invocation`, `subscription`, `sync`, `lifecycle`, `persistence`,
-`carrier`, `clock`, `grant` or `signer` for one package.
+`carrier`, `clock`, `grant`, `signer` or `crdt-admission` for one package.
 `sh glade/contracts/test-selection.sh` verifies those selections.
 All selections include the local architecture gate and enable conformance tests.
 `sh glade/contracts/arch002-fixture.sh` injects `shaku` into each contract crate in
 turn, on a temporary copy, and requires the gate to refuse each with ARCH-002; it
 is a separate command, not part of `check.sh`.
-There are no concrete consumers yet; future contract changes MUST also test their
-affected consumers, not just the selected interface package.
+The new internal admission component has a compiling downstream Rust Records model
+and released Taut text JS consumer; these are volatile trusted-evidence fixtures,
+not live node adapters. Its behavioral tests intentionally fail the safe-refusing
+scaffold. Future contract changes MUST test affected consumers. See
+[IC-1 contract](../../dev-docs/GladeIndependentCrdtAdmissionContract.md) for exact
+GREEN scaffold checks, RED commands and remaining live gates.
 
 The script explicitly adopts the existing architecture checker for **this nested
 workspace only**, using `architecture-policy.json`. The checker is obtained from

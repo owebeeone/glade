@@ -60,6 +60,20 @@
       "dependencies": [],
       "traits": { "SignerPort": ["node_id", "sign", "verify"] },
       "conformance_tests": ["public_contract"]
+    },
+    "glade-crdt-admission-core": {
+      "role": "pure",
+      "reason": "Internal deterministic event/effect contract; refusing scaffold; no I/O, clock, signing or merge implementation; traits would add no substitution contract.",
+      "dependencies": [
+        "normal:glade-wire",
+        "normal:sha2",
+        "dev:serde_json",
+        "dev:syn"
+      ],
+      "conformance_tests": [
+        "records_host_contract",
+        "source_boundaries"
+      ]
     }
   }
 }
