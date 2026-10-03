@@ -21,6 +21,8 @@
 //! keeps the newest checkpoint of each chain, in its origin's chain on
 //! `dir.checkpoints`, which a serve sends first.
 
+mod legacy_seal;
+
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -269,12 +271,14 @@ impl Store {
     }
 
     /// Q4-A: permanently retire this legacy store for a later verified migration cut.
-    /// Draft consumer signature only; no successful seal is implemented yet.
+    /// An error may leave a seal. There is no automatic unseal or activation.
     pub fn seal_legacy(&mut self) -> Result<(), StoreError> {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "Q4-A legacy store seal is not implemented",
-        ).into())
+        legacy_seal::seal_with(&self.root, |_| Ok(())).map_err(StoreError::Io)
+    }
+
+    #[allow(dead_code)]
+    fn append_with(&mut self, _op: Op, _after_check: impl FnOnce()) -> Result<Append, StoreError> {
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "Q4-A lock consumer scaffold").into())
     }
 
     /// The `home` journals `open` set aside, if any.

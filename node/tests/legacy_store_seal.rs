@@ -1,30 +1,28 @@
 //! Q4-A compiling consumers: a legacy-store interlock, never a Raft receipt.
-#[cfg(unix)]
-mod unix_profile {
+mod common {
     use std::fs;
     use std::path::PathBuf;
 
-    use glade_node::server::Server;
     use glade_node::store::{Append, Store, StoreError};
     use glade_wire::generated::{Op, Shape};
 
-    const MARKER: &str = "legacy-store.sealed";
+    pub(super) const MARKER: &str = "legacy-store.sealed";
 
-    struct Fixture(PathBuf);
+    pub(super) struct Fixture(pub(super) PathBuf);
 
     impl Fixture {
-        fn new(label: &str) -> Self {
+        pub(super) fn new(label: &str) -> Self {
             let path =
                 std::env::temp_dir().join(format!("glade-q4-seal-{}-{label}", std::process::id()));
             fs::create_dir_all(&path).unwrap();
             Self(path)
         }
 
-        fn store(&self) -> Store {
+        pub(super) fn store(&self) -> Store {
             Store::open(&self.0).unwrap()
         }
 
-        fn journal(&self) -> Vec<u8> {
+        pub(super) fn journal(&self) -> Vec<u8> {
             fs::read(self.0.join("77732d72617a656c").join("7461622d61.log")).unwrap()
         }
     }
@@ -35,7 +33,7 @@ mod unix_profile {
         }
     }
 
-    fn value(seq: i64, payload: &[u8]) -> Op {
+    pub(super) fn value(seq: i64, payload: &[u8]) -> Op {
         Op {
             share: "ws-razel".into(),
             glade_id: "gyld.appearance".into(),
@@ -50,7 +48,7 @@ mod unix_profile {
         }
     }
 
-    fn refused(result: Result<Append, StoreError>) {
+    pub(super) fn refused(result: Result<Append, StoreError>) {
         assert!(
             matches!(result, Err(StoreError::Io(ref e))
         if e.kind() == std::io::ErrorKind::PermissionDenied),
@@ -73,7 +71,77 @@ mod unix_profile {
             [op]
         );
     }
+    #[test]
+    fn ls004_unknown_marker_bytes_are_not_absence() {
+        let f = Fixture::new("unknown-marker");
+        let mut store = f.store();
+        store.append(value(0, b"before")).unwrap();
+        let before = f.journal();
+        fs::write(f.0.join(MARKER), b"unrecognized interrupted publication").unwrap();
+        refused(store.append(value(1, b"after")));
+        assert!(Store::open(&f.0).is_err());
+        assert_eq!(f.journal(), before);
+    }
+    #[test]
+    fn ls004_directory_marker_and_lock_io_error_fail_closed() {
+        let f = Fixture::new("directory-marker");
+        let mut store = f.store();
+        fs::create_dir(f.0.join(MARKER)).unwrap();
+        refused(store.append(value(0, b"blocked")));
+        assert!(Store::open(&f.0).is_err());
 
+        let bad = Fixture::new("lock-io");
+        let mut store = bad.store();
+        let lock = bad.0.join("legacy-store.lock");
+        if lock.exists() {
+            fs::remove_file(&lock).unwrap();
+        }
+        fs::create_dir(&lock).unwrap();
+        assert!(store.append(value(0, b"blocked")).is_err());
+        assert!(store.seal_legacy().is_err());
+        assert!(Store::open(&bad.0).is_err());
+    }
+    #[test]
+    fn ls005_refused_open_never_repairs_a_torn_legacy_journal() {
+        let f = Fixture::new("no-repair");
+        let mut store = f.store();
+        store.append(value(0, b"complete")).unwrap();
+        let path = f.0.join("77732d72617a656c").join("7461622d61.log");
+        let mut torn = f.journal();
+        torn.extend_from_slice(&[40, 0, 0, 0, 0x81]);
+        fs::write(&path, &torn).unwrap();
+        fs::write(f.0.join(MARKER), []).unwrap();
+        drop(store);
+        assert!(
+            Store::open(&f.0).is_err(),
+            "sealed open must fail before replay"
+        );
+        assert_eq!(fs::read(path).unwrap(), torn);
+    }
+
+    #[test]
+    fn ls004_empty_marker_closes_new_duplicate_and_fork_before_proof_writes() {
+        let f = Fixture::new("empty-marker");
+        let mut store = f.store();
+        let original = value(0, b"original");
+        store.append(original.clone()).unwrap();
+        let before = f.journal();
+        fs::write(f.0.join(MARKER), []).unwrap();
+        refused(store.append(original));
+        refused(store.append(value(0, b"fork")));
+        refused(store.append(value(1, b"next")));
+        assert!(Store::open(&f.0).is_err());
+        assert!(!f.0.join("proofs").exists());
+        assert_eq!(f.journal(), before);
+    }
+}
+
+#[cfg(unix)]
+mod unix_profile {
+    use super::common::*;
+    use glade_node::server::Server;
+    use glade_node::store::{Append, Store};
+    use std::fs;
     #[test]
     fn ls002_success_seals_both_existing_handles_and_shared_server_reopen() {
         let f = Fixture::new("seal-success");
@@ -103,57 +171,6 @@ mod unix_profile {
         );
         first.seal_legacy().expect("idempotent monotonic retry");
     }
-
-    #[test]
-    fn ls004_unknown_marker_bytes_are_not_absence() {
-        let f = Fixture::new("unknown-marker");
-        let mut store = f.store();
-        store.append(value(0, b"before")).unwrap();
-        let before = f.journal();
-        fs::write(f.0.join(MARKER), b"unrecognized interrupted publication").unwrap();
-        refused(store.append(value(1, b"after")));
-        assert!(Store::open(&f.0).is_err());
-        assert_eq!(f.journal(), before);
-    }
-
-    #[test]
-    fn ls004_directory_marker_and_lock_io_error_fail_closed() {
-        let f = Fixture::new("directory-marker");
-        let mut store = f.store();
-        fs::create_dir(f.0.join(MARKER)).unwrap();
-        refused(store.append(value(0, b"blocked")));
-        assert!(Store::open(&f.0).is_err());
-
-        let bad = Fixture::new("lock-io");
-        let mut store = bad.store();
-        let lock = bad.0.join("legacy-store.lock");
-        if lock.exists() {
-            fs::remove_file(&lock).unwrap();
-        }
-        fs::create_dir(&lock).unwrap();
-        assert!(store.append(value(0, b"blocked")).is_err());
-        assert!(store.seal_legacy().is_err());
-        assert!(Store::open(&bad.0).is_err());
-    }
-
-    #[test]
-    fn ls005_refused_open_never_repairs_a_torn_legacy_journal() {
-        let f = Fixture::new("no-repair");
-        let mut store = f.store();
-        store.append(value(0, b"complete")).unwrap();
-        let path = f.0.join("77732d72617a656c").join("7461622d61.log");
-        let mut torn = f.journal();
-        torn.extend_from_slice(&[40, 0, 0, 0, 0x81]);
-        fs::write(&path, &torn).unwrap();
-        fs::write(f.0.join(MARKER), []).unwrap();
-        drop(store);
-        assert!(
-            Store::open(&f.0).is_err(),
-            "sealed open must fail before replay"
-        );
-        assert_eq!(fs::read(path).unwrap(), torn);
-    }
-
     #[test]
     fn ls007_sealing_one_root_does_not_enroll_or_stop_another() {
         let selected = Fixture::new("selected");
@@ -167,21 +184,15 @@ mod unix_profile {
         );
         assert!(!separate.0.join(MARKER).exists());
     }
-
-    #[cfg(unix)]
-    mod unix {
-        use super::*;
-
-        #[test]
-        fn ls004_dangling_marker_is_present_and_never_followed() {
-            let f = Fixture::new("dangling");
-            let mut store = f.store();
-            std::os::unix::fs::symlink("missing", f.0.join(MARKER)).unwrap();
-            refused(store.append(value(0, b"blocked")));
-            assert!(Store::open(&f.0).is_err());
-            assert!(store.seal_legacy().is_err());
-            assert!(!f.0.join("missing").exists());
-        }
+    #[test]
+    fn ls004_dangling_marker_is_present_and_never_followed() {
+        let f = Fixture::new("dangling");
+        let mut store = f.store();
+        std::os::unix::fs::symlink("missing", f.0.join(MARKER)).unwrap();
+        refused(store.append(value(0, b"blocked")));
+        assert!(Store::open(&f.0).is_err());
+        assert!(store.seal_legacy().is_err());
+        assert!(!f.0.join("missing").exists());
     }
 }
 
