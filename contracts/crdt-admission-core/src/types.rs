@@ -1,29 +1,8 @@
 //! Typed INTERNAL semantics; JSON traces are harness output, not a wire schema.
 use std::collections::BTreeMap;
 
+pub use glade_crdt_storage_attempt_api::*;
 use glade_wire::{cbor, generated::Op};
-use sha2::{Digest as _, Sha256};
-
-pub type Digest = [u8; 32];
-
-/// Owned immutable bytes. Every binding uses the digest computed from these bytes.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Bytes {
-    value: Vec<u8>,
-    digest: Digest,
-}
-impl Bytes {
-    pub fn new(value: Vec<u8>) -> Self {
-        let digest = Sha256::digest(&value).into();
-        Self { value, digest }
-    }
-    pub fn value(&self) -> &[u8] {
-        &self.value
-    }
-    pub fn digest(&self) -> Digest {
-        self.digest
-    }
-}
 
 /// No independently supplied decoded fields can disagree with canonical inner bytes.
 #[derive(Clone, Debug, PartialEq)]
@@ -44,11 +23,6 @@ impl Operation {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Instance {
-    pub descriptor: Digest,
-    pub incarnation: String,
-}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AdmissionMode {
     Independent,
@@ -87,16 +61,6 @@ pub struct Slot {
     pub instance: Instance,
     pub origin: String,
     pub seq: i64,
-}
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TimeInterval {
-    pub earliest_ms: u64,
-    pub latest_ms: u64,
-}
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Window {
-    pub not_before_ms: u64,
-    pub not_after_ms: u64,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OriginCertificate {
@@ -171,38 +135,11 @@ pub struct Candidate {
     pub operation: Operation,
     pub evidence: EvidenceSet,
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum StorageClass {
-    VolatileTest,
-    LocalProcessRestart,
-}
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Receipt {
-    pub instance: Instance,
-    pub operation: Digest,
-    pub admission: Digest,
-    pub stable_id: Digest,
-    pub storage: StorageClass,
-}
 #[derive(Clone, Debug, PartialEq)]
 pub struct Accepted {
     pub candidate: Candidate,
     pub facts: Facts,
     pub receipt: Receipt,
-}
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Charges {
-    pub edit: usize,
-    pub recovery: usize,
-    pub evidence: usize,
-    pub pending: usize,
-}
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CommitKind {
-    AcceptedBatch,
-    Candidate,
-    SecurityEvidence,
-    QualifiedFork,
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct StagedAcceptance {
@@ -220,11 +157,6 @@ pub struct PendingVerification {
     pub verified: Option<Facts>,
     pub verified_query: Option<Query>,
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LocalPrecondition {
-    pub policy: Digest,
-    pub time: TimeInterval,
-}
 #[derive(Clone, Debug, PartialEq)]
 pub struct CommitPlan {
     pub id: u64,
@@ -239,56 +171,22 @@ pub struct CommitPlan {
     pub qualified_forks: Vec<ForkEvidence>,
     pub charges: Charges,
 }
+pub type CommitReply = ResolveReply;
+pub type LookupRequest = ResolveRequest;
+pub type LookupReply = ResolveReply;
+pub type CommitResult = ResolveResult;
+pub type LookupResult = ResolveResult;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CommitResult {
-    Committed {
-        revision: u64,
-        storage: StorageClass,
-    },
-    KnownNotCommitted,
-    OutcomeUnknown,
+pub struct KernelAttempt {
+    pub attempt: AttemptBinding,
+    pub phase: AttemptPhase,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CommitReply {
-    pub plan_id: u64,
-    pub instance: Instance,
-    pub batch_digest: Digest,
-    pub result: CommitResult,
-}
-/// Storage attests the whole original atomic batch, including retention-only work.
-/// Receipts are exactly the staged admissions; no synthetic retention receipt.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BatchCommitted {
-    pub batch_digest: Digest,
-    pub revision: u64,
-    pub storage: StorageClass,
-    pub receipts: Vec<Receipt>,
-}
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum LookupResult {
-    Committed { batch: BatchCommitted },
-    KnownAbsent,
-    Unknown,
-}
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LookupRequest {
-    /// Fresh checked invocation identity, distinct from the immutable plan ID.
-    pub lookup_id: u64,
-    pub plan_id: u64,
-    pub expected_revision: u64,
-    pub instance: Instance,
-    pub operation: Option<Digest>,
-    pub batch_digest: Digest,
-}
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LookupReply {
-    pub lookup_id: u64,
-    pub plan_id: u64,
-    pub expected_revision: u64,
-    pub instance: Instance,
-    pub operation: Option<Digest>,
-    pub batch_digest: Digest,
-    pub result: LookupResult,
+pub enum StorageInvocation {
+    Prepare(PrepareRequest),
+    RecoverPlan(PrepareRequest),
+    Resolve(ResolveRequest),
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct ForkEvidence {
@@ -336,7 +234,9 @@ pub enum Event {
     SubmitLocal(Box<Candidate>),
     OfferReplica(Box<Candidate>),
     EvidenceResolved(Box<EvidenceReply>),
+    PrepareResolved(PrepareReply),
     CommitResolved(CommitReply),
+    FenceResolved(ResolveReply),
     LookupResolved(LookupReply),
     ObservePolicy {
         instance: Instance,
@@ -355,7 +255,13 @@ pub enum Event {
 pub enum Effect {
     Verify(Query),
     Seal(Query),
-    Commit(CommitPlan),
+    Prepare {
+        plan: CommitPlan,
+        request: PrepareRequest,
+    },
+    RecoverPlan(PrepareRequest),
+    Begin(BeginRequest),
+    Fence(ResolveRequest),
     Lookup(LookupRequest),
     RequestMissing(Vec<Slot>),
     OfferMissing(Vec<Candidate>),
@@ -376,6 +282,9 @@ pub struct InstanceState {
     pub pending: Vec<Slot>,
     pub quarantine: BTreeMap<String, i64>,
     pub policy: Bytes,
+    /// Sticky observed recovery loss. No clearing event exists in this contract.
+    pub recovery_incomplete: bool,
+    pub storage_integrity_failed: bool,
     pub time_floor_ms: u64,
     pub policy_time: TimeInterval,
     pub used: Charges,
@@ -386,8 +295,26 @@ pub struct State {
     pub queries: BTreeMap<u64, PendingVerification>,
     pub commits: BTreeMap<u64, CommitPlan>,
     pub unknown_commits: BTreeMap<u64, CommitPlan>,
-    /// Keyed by lookup_id; Unknown retires invocation, not reserved plan.
+    /// Keyed by invocation scalar inside invocation_namespace; Pending retires
+    /// only that invocation, never the reserved plan.
     pub lookups: BTreeMap<u64, LookupRequest>,
+    /// Bound to caller-owned validated store/session and never inferred from peers.
+    pub storage_owner: Option<Owner>,
+    /// Finite session declaration caps ledger, callbacks and critical reservations.
+    pub storage_limits: Option<Limits>,
+    pub plan_namespace: Digest,
+    pub invocation_namespace: Digest,
+    pub attempts: BTreeMap<PlanKey, KernelAttempt>,
+    pub preparing: BTreeMap<PlanKey, PrepareRequest>,
+    /// Outstanding exact issued requests only.
+    pub storage_invocations: BTreeMap<InvocationId, StorageInvocation>,
+    /// Consumed requests retained within invocation_history, for duplicate versus
+    /// contradictory-result authentication. No implicit retirement/GC on reopen.
+    pub retired_storage_invocations: BTreeMap<InvocationId, StorageInvocation>,
+    /// Retained for the incarnation, even after reservation release.
+    pub terminal_results: BTreeMap<AttemptId, Terminal>,
+    /// First contradictory bound assertion per attempt, capped by retained attempts.
+    pub terminal_conflicts: BTreeMap<AttemptId, Terminal>,
     pub next_effect_id: u64,
 }
 #[derive(Clone, Debug, PartialEq)]

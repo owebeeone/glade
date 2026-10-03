@@ -1,0 +1,15 @@
+[package]
+name = "glade-crdt-storage-attempt-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+sha2 = "0.10"
+
+[dev-dependencies]
+syn = { version = "2", features = ["full", "visit"] }
+
+[lints]
+workspace = true

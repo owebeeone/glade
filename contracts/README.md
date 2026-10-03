@@ -77,15 +77,21 @@ key-resolution tests.
 
 ## Fast checks and gate scope
 
-From the GWZ root: `sh glade/contracts/check.sh` selects the ten contracts and the new Pure component. At IC-1 its domain suite deliberately remains RED until contract review and implementation.
+From the GWZ root: `sh glade/contracts/check.sh` selects eleven contracts and the Pure component. At IC-1 its domain suite deliberately remains RED until contract review and implementation.
 Pass `binding`, `invocation`, `subscription`, `sync`, `lifecycle`, `persistence`,
-`carrier`, `clock`, `grant`, `signer` or `crdt-admission` for one package.
+`carrier`, `clock`, `grant` or `signer` for one package. `crdt-admission` and
+`crdt-storage-attempt` select both the new storage-attempt contract and its
+admission-core consumer.
 `sh glade/contracts/test-selection.sh` verifies those selections.
 All selections include the local architecture gate and enable conformance tests.
 `sh glade/contracts/arch002-fixture.sh` injects `shaku` into each contract crate in
 turn, on a temporary copy, and requires the gate to refuse each with ARCH-002; it
 is a separate command, not part of `check.sh`.
-The new internal admission component has a compiling downstream Rust Records model
+The proposed `glade-crdt-storage-attempt-api` Contract package provides exclusive
+session recovery/close and exact prepare/recover-plan/begin/inspect/fence operations.
+Its bounded development host proves model conformance, including rejecting mutants;
+physical storage and successful kernel behavior remain later gates.
+The internal admission component has a compiling downstream Rust Records model
 and released Taut text JS consumer; these are volatile trusted-evidence fixtures,
 not live node adapters. Its behavioral tests intentionally fail the safe-refusing
 scaffold. Future contract changes MUST test affected consumers. See

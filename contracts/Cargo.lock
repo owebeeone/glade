@@ -75,8 +75,16 @@ version = "0.0.0"
 name = "glade-crdt-admission-core"
 version = "0.0.0"
 dependencies = [
+ "glade-crdt-storage-attempt-api",
  "glade-wire",
  "serde_json",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "glade-crdt-storage-attempt-api"
+version = "0.0.0"
+dependencies = [
  "sha2",
  "syn 2.0.119",
 ]

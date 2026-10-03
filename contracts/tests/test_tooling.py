@@ -15,10 +15,15 @@ class ContractToolingTests(unittest.TestCase):
     def test_new_pure_selection_is_explicit_and_all_keeps_contracts(self):
         result = subprocess.run(['sh', str(ROOT / 'check.sh'), '--list', 'crdt-admission'], capture_output=True, text=True, env=ENV)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), 'glade-crdt-admission-core')
+        self.assertEqual(result.stdout.splitlines(), ['glade-crdt-storage-attempt-api', 'glade-crdt-admission-core'])
         selected = subprocess.run(['sh', str(ROOT / 'check.sh'), '--list', 'all'], capture_output=True, text=True, env=ENV)
-        self.assertEqual(len(selected.stdout.splitlines()), 11)
+        self.assertEqual(len(selected.stdout.splitlines()), 12)
         self.assertIn('glade-signer-api', selected.stdout.splitlines())
+
+    def test_storage_selector_includes_affected_pure_consumer(self):
+        selected = subprocess.run(['sh', str(ROOT / 'check.sh'), '--list', 'crdt-storage-attempt'], capture_output=True, text=True, env=ENV)
+        self.assertEqual(selected.returncode, 0, selected.stderr)
+        self.assertEqual(selected.stdout.splitlines(), ['glade-crdt-storage-attempt-api', 'glade-crdt-admission-core'])
 
     def test_framework_guard_handles_pure_member_and_keeps_exact_refusals(self):
         with tempfile.TemporaryDirectory(prefix='icd-tooling-') as temporary:
@@ -44,6 +49,8 @@ class ContractToolingTests(unittest.TestCase):
             self.assertEqual(guarded.returncode, 0, guarded.stdout + guarded.stderr)
             self.assertIn('ARCH-002 fixture: the gate refused', guarded.stdout)
             self.assertIn('glade-fixture-pure', guarded.stdout)
+            self.assertIn('all 13 classified libraries', guarded.stdout)
+            self.assertIn('glade-crdt-storage-attempt-api: undeclared dependency normal:shaku', guarded.stdout)
             self.assertNotIn('cargo metadata failed', guarded.stdout)
 
 

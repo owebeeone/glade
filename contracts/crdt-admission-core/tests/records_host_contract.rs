@@ -315,14 +315,20 @@ fn icd010_unknown_commit_retains_reservation_and_foreign_callback_cannot_accept(
     let mut state = initial(d.clone());
     let plan = staged_plan(&d, c.clone());
     state.commits.insert(7, plan.clone());
+    register_attempt(&mut state, &plan);
     state.next_effect_id = 8;
     let unknown = step(
         &state,
-        Event::CommitResolved(CommitReply {
-            plan_id: 7,
-            instance: d.instance.clone(),
-            batch_digest: plan.batch.digest(),
-            result: CommitResult::OutcomeUnknown,
+        Event::CommitResolved({
+            let mut reply = commit_reply(&plan, 8, ResolveResult::Pending);
+            reply.request.attempt.binding.plan.number = 7;
+            reply.request.attempt.id.instance = d.instance.clone();
+            reply.request.attempt.binding.plan.instance = reply.request.attempt.id.instance.clone();
+            if plan.batch.digest() != plan.batch.digest() {
+                reply.request.attempt.binding.batch =
+                    Bytes::new(b"changed-callback-batch".to_vec());
+            }
+            reply
         }),
     );
     assert_eq!(
@@ -334,14 +340,26 @@ fn icd010_unknown_commit_retains_reservation_and_foreign_callback_cannot_accept(
     foreign.incarnation = "foreign".into();
     let wrong = step(
         &unknown.state,
-        Event::CommitResolved(CommitReply {
-            plan_id: 7,
-            instance: foreign,
-            batch_digest: plan.batch.digest(),
-            result: CommitResult::Committed {
-                revision: 1,
-                storage: StorageClass::VolatileTest,
-            },
+        Event::CommitResolved({
+            let mut reply = commit_reply(
+                &plan,
+                8,
+                terminal_result(
+                    &plan,
+                    plan.batch.digest(),
+                    1,
+                    StorageClass::VolatileTest,
+                    plan.acceptances.iter().map(|a| a.receipt.clone()).collect(),
+                ),
+            );
+            reply.request.attempt.binding.plan.number = 7;
+            reply.request.attempt.id.instance = foreign;
+            reply.request.attempt.binding.plan.instance = reply.request.attempt.id.instance.clone();
+            if plan.batch.digest() != plan.batch.digest() {
+                reply.request.attempt.binding.batch =
+                    Bytes::new(b"changed-callback-batch".to_vec());
+            }
+            reply
         }),
     );
     assert!(
@@ -372,7 +390,7 @@ fn icd013_edit_capacity_preserves_recovery_reserves() {
     let recovering = drive(state, Event::OfferReplica(Box::new(c.clone())), facts(&c));
     assert!(
         recovering.effects.iter().any(
-            |e| matches!(e, Effect::Commit(p) if p.charges.edit == 0 && p.charges.recovery > 0)
+            |e| matches!(e, Effect::Prepare {plan:p,..} if p.charges.edit == 0 && p.charges.recovery > 0)
         ),
         "ICD-013 retained peer history uses reserved recovery budget"
     );
@@ -623,12 +641,10 @@ fn icd010_old_receipt_retry_does_not_reauthorize_or_reappend() {
             .contains(&Effect::Report(Outcome::ExactRetry(expected))),
         "ICD-010 exact old identity returns stable receipt"
     );
-    assert!(
-        !result
-            .effects
-            .iter()
-            .any(|e| matches!(e, Effect::Commit(_) | Effect::Verify(_)))
-    );
+    assert!(!result.effects.iter().any(|e| matches!(
+        e,
+        Effect::Prepare { .. } | Effect::Begin(_) | Effect::Verify(_)
+    )));
 }
 #[test]
 fn icd013_recovery_exhaustion_is_explicit_and_cannot_spend_edit_budget() {
@@ -651,6 +667,7 @@ fn icd010_commit_callbacks_bind_batch_revision_and_have_three_distinct_outcomes(
     let plan = staged_plan(&d, c.clone());
     let mut state = initial(d.clone());
     state.commits.insert(plan.id, plan.clone());
+    register_attempt(&mut state, &plan);
     state.next_effect_id = 8;
     for (id, digest, revision) in [
         (8, plan.batch.digest(), 1),
@@ -659,14 +676,27 @@ fn icd010_commit_callbacks_bind_batch_revision_and_have_three_distinct_outcomes(
     ] {
         let result = step(
             &state,
-            Event::CommitResolved(CommitReply {
-                plan_id: id,
-                instance: d.instance.clone(),
-                batch_digest: digest,
-                result: CommitResult::Committed {
-                    revision,
-                    storage: StorageClass::VolatileTest,
-                },
+            Event::CommitResolved({
+                let mut reply = commit_reply(
+                    &plan,
+                    8,
+                    terminal_result(
+                        &plan,
+                        plan.batch.digest(),
+                        revision,
+                        StorageClass::VolatileTest,
+                        plan.acceptances.iter().map(|a| a.receipt.clone()).collect(),
+                    ),
+                );
+                reply.request.attempt.binding.plan.number = id;
+                reply.request.attempt.id.instance = d.instance.clone();
+                reply.request.attempt.binding.plan.instance =
+                    reply.request.attempt.id.instance.clone();
+                if digest != plan.batch.digest() {
+                    reply.request.attempt.binding.batch =
+                        Bytes::new(b"changed-callback-batch".to_vec());
+                }
+                reply
             }),
         );
         assert!(
@@ -679,11 +709,16 @@ fn icd010_commit_callbacks_bind_batch_revision_and_have_three_distinct_outcomes(
     }
     let failed = step(
         &state,
-        Event::CommitResolved(CommitReply {
-            plan_id: 7,
-            instance: d.instance.clone(),
-            batch_digest: plan.batch.digest(),
-            result: CommitResult::KnownNotCommitted,
+        Event::CommitResolved({
+            let mut reply = commit_reply(&plan, 8, noncommit_result(&plan));
+            reply.request.attempt.binding.plan.number = 7;
+            reply.request.attempt.id.instance = d.instance.clone();
+            reply.request.attempt.binding.plan.instance = reply.request.attempt.id.instance.clone();
+            if plan.batch.digest() != plan.batch.digest() {
+                reply.request.attempt.binding.batch =
+                    Bytes::new(b"changed-callback-batch".to_vec());
+            }
+            reply
         }),
     );
     assert!(
@@ -693,14 +728,26 @@ fn icd010_commit_callbacks_bind_batch_revision_and_have_three_distinct_outcomes(
     assert!(failed.state.instances[&d.instance].accepted.is_empty());
     let committed = step(
         &state,
-        Event::CommitResolved(CommitReply {
-            plan_id: 7,
-            instance: d.instance.clone(),
-            batch_digest: plan.batch.digest(),
-            result: CommitResult::Committed {
-                revision: 1,
-                storage: StorageClass::VolatileTest,
-            },
+        Event::CommitResolved({
+            let mut reply = commit_reply(
+                &plan,
+                8,
+                terminal_result(
+                    &plan,
+                    plan.batch.digest(),
+                    1,
+                    StorageClass::VolatileTest,
+                    plan.acceptances.iter().map(|a| a.receipt.clone()).collect(),
+                ),
+            );
+            reply.request.attempt.binding.plan.number = 7;
+            reply.request.attempt.id.instance = d.instance.clone();
+            reply.request.attempt.binding.plan.instance = reply.request.attempt.id.instance.clone();
+            if plan.batch.digest() != plan.batch.digest() {
+                reply.request.attempt.binding.batch =
+                    Bytes::new(b"changed-callback-batch".to_vec());
+            }
+            reply
         }),
     );
     assert_eq!(
@@ -720,36 +767,38 @@ fn icd010_lookup_recovery_binds_request_and_restores_original_receipt() {
     let d = descriptor("x");
     let c = candidate(&d, "a", 0, None, vec![], insert("a", None, "A"));
     let plan = staged_plan(&d, c.clone());
-    let request = LookupRequest {
-        lookup_id: 40,
-        plan_id: 7,
-        expected_revision: 0,
-        instance: d.instance.clone(),
-        operation: Some(c.operation.canonical().digest()),
-        batch_digest: plan.batch.digest(),
-    };
+    let request = resolve_request(&plan, 40, OperationKind::Inspect);
     let mut state = initial(d.clone());
     state.unknown_commits.insert(7, plan.clone());
+    register_attempt(&mut state, &plan);
     state.lookups.insert(40, request.clone());
     state.next_effect_id = 41;
     let receipt = plan.acceptances[0].receipt.clone();
     let foreign = step(
         &state,
-        Event::LookupResolved(LookupReply {
-            lookup_id: 40,
-            plan_id: 7,
-            expected_revision: 0,
-            instance: d.instance.clone(),
-            operation: Some([9; 32]),
-            batch_digest: request.batch_digest,
-            result: LookupResult::Committed {
-                batch: BatchCommitted {
-                    batch_digest: plan.batch.digest(),
-                    receipts: vec![receipt.clone()],
-                    revision: 1,
-                    storage: StorageClass::VolatileTest,
-                },
-            },
+        Event::LookupResolved({
+            let mut reply = ResolveReply {
+                request: resolve_request(&plan, 40, OperationKind::Inspect),
+                result: terminal_result(
+                    &plan,
+                    plan.batch.digest(),
+                    1,
+                    StorageClass::VolatileTest,
+                    vec![receipt.clone()],
+                ),
+            };
+            reply.request.attempt.binding.plan.number = 7;
+            reply.request.attempt.binding.expected_revision = 0;
+            reply.request.attempt.id.instance = d.instance.clone();
+            reply.request.attempt.binding.plan.instance = reply.request.attempt.id.instance.clone();
+            if Some([9; 32]) != plan.acceptances.first().map(|a| a.receipt.operation) {
+                reply.request.attempt.binding.receipts[0].operation = [9; 32];
+            }
+            if request.attempt.binding.batch.digest() != plan.batch.digest() {
+                reply.request.attempt.binding.batch =
+                    Bytes::new(b"changed-callback-batch".to_vec());
+            }
+            reply
         }),
     );
     assert!(
@@ -761,21 +810,36 @@ fn icd010_lookup_recovery_binds_request_and_restores_original_receipt() {
     assert_eq!(foreign.state.unknown_commits.get(&7), Some(&plan));
     let found = step(
         &state,
-        Event::LookupResolved(LookupReply {
-            lookup_id: 40,
-            plan_id: 7,
-            expected_revision: 0,
-            instance: d.instance.clone(),
-            operation: request.operation,
-            batch_digest: request.batch_digest,
-            result: LookupResult::Committed {
-                batch: BatchCommitted {
-                    batch_digest: plan.batch.digest(),
-                    receipts: vec![receipt.clone()],
-                    revision: 1,
-                    storage: StorageClass::VolatileTest,
-                },
-            },
+        Event::LookupResolved({
+            let mut reply = ResolveReply {
+                request: resolve_request(&plan, 40, OperationKind::Inspect),
+                result: terminal_result(
+                    &plan,
+                    plan.batch.digest(),
+                    1,
+                    StorageClass::VolatileTest,
+                    vec![receipt.clone()],
+                ),
+            };
+            reply.request.attempt.binding.plan.number = 7;
+            reply.request.attempt.binding.expected_revision = 0;
+            reply.request.attempt.id.instance = d.instance.clone();
+            reply.request.attempt.binding.plan.instance = reply.request.attempt.id.instance.clone();
+            if request
+                .attempt
+                .binding
+                .receipts
+                .first()
+                .map(|r| r.operation)
+                != plan.acceptances.first().map(|a| a.receipt.operation)
+            {
+                reply.request.attempt.binding.receipts[0].operation = [9; 32];
+            }
+            if request.attempt.binding.batch.digest() != plan.batch.digest() {
+                reply.request.attempt.binding.batch =
+                    Bytes::new(b"changed-callback-batch".to_vec());
+            }
+            reply
         }),
     );
     assert!(
@@ -785,12 +849,10 @@ fn icd010_lookup_recovery_binds_request_and_restores_original_receipt() {
         "ICD-010 uncertain committed batch recovers original receipt"
     );
     assert_eq!(found.state.instances[&d.instance].accepted[0].candidate, c);
-    assert!(
-        !found
-            .effects
-            .iter()
-            .any(|e| matches!(e, Effect::Seal(_) | Effect::Commit(_)))
-    );
+    assert!(!found.effects.iter().any(|e| matches!(
+        e,
+        Effect::Seal(_) | Effect::Prepare { .. } | Effect::Begin(_)
+    )));
 }
 
 #[test]
@@ -834,12 +896,10 @@ fn icd006_stale_verification_after_policy_change_cannot_seal_or_commit() {
             .contains(&Effect::Report(Outcome::PolicyPending)),
         "ICD-006 matched old-cut validation must require fresh policy before sealing"
     );
-    assert!(
-        !stale
-            .effects
-            .iter()
-            .any(|e| matches!(e, Effect::Seal(_) | Effect::Commit(_)))
-    );
+    assert!(!stale.effects.iter().any(|e| matches!(
+        e,
+        Effect::Seal(_) | Effect::Prepare { .. } | Effect::Begin(_)
+    )));
 }
 #[test]
 fn icd006_delayed_prior_cut_committed_callback_retains_historical_admission() {
@@ -848,6 +908,7 @@ fn icd006_delayed_prior_cut_committed_callback_retains_historical_admission() {
     let plan = staged_plan(&d, c);
     let mut state = initial(d.clone());
     state.commits.insert(7, plan.clone());
+    register_attempt(&mut state, &plan);
     // Trusted host began under the plan's valid cut, physically committed, then
     // observed revocation before delivering the delayed barrier reply.
     state.next_effect_id = 8;
@@ -864,14 +925,26 @@ fn icd006_delayed_prior_cut_committed_callback_retains_historical_admission() {
     );
     let delayed = step(
         &changed.state,
-        Event::CommitResolved(CommitReply {
-            plan_id: 7,
-            instance: d.instance.clone(),
-            batch_digest: plan.batch.digest(),
-            result: CommitResult::Committed {
-                revision: 1,
-                storage: StorageClass::VolatileTest,
-            },
+        Event::CommitResolved({
+            let mut reply = commit_reply(
+                &plan,
+                8,
+                terminal_result(
+                    &plan,
+                    plan.batch.digest(),
+                    1,
+                    StorageClass::VolatileTest,
+                    plan.acceptances.iter().map(|a| a.receipt.clone()).collect(),
+                ),
+            );
+            reply.request.attempt.binding.plan.number = 7;
+            reply.request.attempt.id.instance = d.instance.clone();
+            reply.request.attempt.binding.plan.instance = reply.request.attempt.id.instance.clone();
+            if plan.batch.digest() != plan.batch.digest() {
+                reply.request.attempt.binding.batch =
+                    Bytes::new(b"changed-callback-batch".to_vec());
+            }
+            reply
         }),
     );
     assert!(
@@ -885,35 +958,38 @@ fn icd006_delayed_prior_cut_committed_callback_retains_historical_admission() {
     let mut unknown = changed.state;
     unknown.commits.remove(&7);
     unknown.unknown_commits.insert(7, plan.clone());
+    register_attempt(&mut unknown, &plan);
     unknown.next_effect_id = 41;
-    unknown.lookups.insert(
-        40,
-        LookupRequest {
-            lookup_id: 40,
-            plan_id: 7,
-            expected_revision: 0,
-            instance: d.instance.clone(),
-            operation: Some(plan.acceptances[0].receipt.operation),
-            batch_digest: plan.batch.digest(),
-        },
-    );
+    unknown
+        .lookups
+        .insert(40, resolve_request(&plan, 40, OperationKind::Inspect));
     let recovered = step(
         &unknown,
-        Event::LookupResolved(LookupReply {
-            lookup_id: 40,
-            plan_id: 7,
-            expected_revision: 0,
-            instance: d.instance.clone(),
-            operation: Some(plan.acceptances[0].receipt.operation),
-            batch_digest: plan.batch.digest(),
-            result: LookupResult::Committed {
-                batch: BatchCommitted {
-                    batch_digest: plan.batch.digest(),
-                    receipts: vec![plan.acceptances[0].receipt.clone()],
-                    revision: 1,
-                    storage: StorageClass::VolatileTest,
-                },
-            },
+        Event::LookupResolved({
+            let mut reply = ResolveReply {
+                request: resolve_request(&plan, 40, OperationKind::Inspect),
+                result: terminal_result(
+                    &plan,
+                    plan.batch.digest(),
+                    1,
+                    StorageClass::VolatileTest,
+                    vec![plan.acceptances[0].receipt.clone()],
+                ),
+            };
+            reply.request.attempt.binding.plan.number = 7;
+            reply.request.attempt.binding.expected_revision = 0;
+            reply.request.attempt.id.instance = d.instance.clone();
+            reply.request.attempt.binding.plan.instance = reply.request.attempt.id.instance.clone();
+            if Some(plan.acceptances[0].receipt.operation)
+                != plan.acceptances.first().map(|a| a.receipt.operation)
+            {
+                reply.request.attempt.binding.receipts[0].operation = [9; 32];
+            }
+            if plan.batch.digest() != plan.batch.digest() {
+                reply.request.attempt.binding.batch =
+                    Bytes::new(b"changed-callback-batch".to_vec());
+            }
+            reply
         }),
     );
     assert!(

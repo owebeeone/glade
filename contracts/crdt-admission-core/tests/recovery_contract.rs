@@ -60,39 +60,21 @@ fn retention_plan(d: &Descriptor, kind: CommitKind) -> (State, CommitPlan) {
         }
     }
     state.unknown_commits.insert(plan.id, plan.clone());
+    register_attempt(&mut state, &plan);
     state.next_effect_id = 40;
     (state, plan)
 }
 fn request(plan: &CommitPlan, lookup_id: u64) -> LookupRequest {
-    LookupRequest {
-        lookup_id,
-        plan_id: plan.id,
-        expected_revision: plan.expected_revision,
-        instance: plan.instance.clone(),
-        operation: plan.acceptances.first().map(|a| a.receipt.operation),
-        batch_digest: plan.batch.digest(),
-    }
+    resolve_request(plan, lookup_id, OperationKind::Inspect)
 }
 fn reply(q: &LookupRequest, result: LookupResult) -> Event {
-    Event::LookupResolved(LookupReply {
-        lookup_id: q.lookup_id,
-        plan_id: q.plan_id,
-        expected_revision: q.expected_revision,
-        instance: q.instance.clone(),
-        operation: q.operation,
-        batch_digest: q.batch_digest,
+    Event::LookupResolved(ResolveReply {
+        request: q.clone(),
         result,
     })
 }
 fn committed(plan: &CommitPlan) -> LookupResult {
-    LookupResult::Committed {
-        batch: BatchCommitted {
-            batch_digest: plan.batch.digest(),
-            revision: plan.expected_revision + 1,
-            storage: StorageClass::VolatileTest,
-            receipts: plan.acceptances.iter().map(|a| a.receipt.clone()).collect(),
-        },
-    }
+    committed_result(plan)
 }
 #[test]
 fn repeated_unknown_lookup_retires_invocation_and_old_replies_preserve_new_lookup() {
@@ -110,9 +92,9 @@ fn repeated_unknown_lookup_retires_invocation_and_old_replies_preserve_new_looku
             }
         })
         .expect("first lookup invocation");
-    let unknown = step(&l1.state, reply(&q1, LookupResult::Unknown));
+    let unknown = step(&l1.state, reply(&q1, ResolveResult::Pending));
     assert!(
-        !unknown.state.lookups.contains_key(&q1.lookup_id),
+        !unknown.state.lookups.contains_key(&q1.invocation.number),
         "Unknown retires only invocation"
     );
     assert_eq!(unknown.state.unknown_commits.get(&plan.id), Some(&plan));
@@ -128,11 +110,14 @@ fn repeated_unknown_lookup_retires_invocation_and_old_replies_preserve_new_looku
             }
         })
         .expect("fresh lookup invocation");
-    assert!(q2.lookup_id > q1.lookup_id);
-    assert_eq!(q2.plan_id, q1.plan_id);
+    assert!(q2.invocation.number > q1.invocation.number);
+    assert_eq!(
+        q2.attempt.binding.plan.number,
+        q1.attempt.binding.plan.number
+    );
     for result in [
-        LookupResult::Unknown,
-        LookupResult::KnownAbsent,
+        ResolveResult::Pending,
+        noncommit_result(&plan),
         committed(&plan),
     ] {
         let stale = step(&l2.state, reply(&q1, result));
@@ -154,12 +139,10 @@ fn repeated_unknown_lookup_retires_invocation_and_old_replies_preserve_new_looku
                 plan.acceptances[0].receipt.clone()
             )))
     );
-    assert!(
-        !recovered
-            .effects
-            .iter()
-            .any(|e| matches!(e, Effect::Seal(_) | Effect::Commit(_)))
-    );
+    assert!(!recovered.effects.iter().any(|e| matches!(
+        e,
+        Effect::Seal(_) | Effect::Prepare { .. } | Effect::Begin(_)
+    )));
 }
 #[test]
 fn lookup_invocation_counter_exhaustion_refuses_without_wrap_or_reservation_loss() {
@@ -188,13 +171,20 @@ fn every_atomic_kind_recovers_committed_absent_and_unknown_without_fake_admissio
             let old = state.instances[&d.instance].accepted.clone();
             state.unknown_commits.remove(&plan.id);
             state.commits.insert(plan.id, plan.clone());
+            register_attempt(&mut state, &plan);
             let uncertain = step(
                 &state,
-                Event::CommitResolved(CommitReply {
-                    plan_id: plan.id,
-                    instance: plan.instance.clone(),
-                    batch_digest: plan.batch.digest(),
-                    result: CommitResult::OutcomeUnknown,
+                Event::CommitResolved({
+                    let mut reply = commit_reply(&plan, 8, ResolveResult::Pending);
+                    reply.request.attempt.binding.plan.number = plan.id;
+                    reply.request.attempt.id.instance = plan.instance.clone();
+                    reply.request.attempt.binding.plan.instance =
+                        reply.request.attempt.id.instance.clone();
+                    if plan.batch.digest() != plan.batch.digest() {
+                        reply.request.attempt.binding.batch =
+                            Bytes::new(b"changed-callback-batch".to_vec());
+                    }
+                    reply
                 }),
             );
             assert_eq!(
@@ -205,16 +195,16 @@ fn every_atomic_kind_recovers_committed_absent_and_unknown_without_fake_admissio
             assert!(!uncertain.state.commits.contains_key(&plan.id));
             state = uncertain.state;
             let q = request(&plan, 40);
-            state.lookups.insert(q.lookup_id, q.clone());
+            state.lookups.insert(q.invocation.number, q.clone());
             state.next_effect_id = 41;
             let resolution = match outcome {
                 0 => committed(&plan),
-                1 => LookupResult::KnownAbsent,
-                _ => LookupResult::Unknown,
+                1 => noncommit_result(&plan),
+                _ => ResolveResult::Pending,
             };
             let result = step(&state, reply(&q, resolution));
             assert!(
-                !result.state.lookups.contains_key(&q.lookup_id),
+                !result.state.lookups.contains_key(&q.invocation.number),
                 "matching response retires invocation"
             );
             assert_eq!(
@@ -351,33 +341,41 @@ fn retention_committed_lookup_binds_batch_storage_revision_and_empty_receipts() 
     let d = descriptor("x");
     let (mut state, plan) = retention_plan(&d, CommitKind::SecurityEvidence);
     let q = request(&plan, 40);
-    state.lookups.insert(q.lookup_id, q.clone());
+    state.lookups.insert(q.invocation.number, q.clone());
     for mutation in 0..4 {
-        let mut batch = BatchCommitted {
-            batch_digest: plan.batch.digest(),
-            revision: 1,
-            storage: StorageClass::VolatileTest,
-            receipts: vec![],
+        let mut terminal = match committed_result(&plan) {
+            ResolveResult::Terminal(t) => t,
+            _ => unreachable!(),
         };
         match mutation {
-            0 => batch.batch_digest = [9; 32],
-            1 => batch.revision = 0,
-            2 => batch.storage = StorageClass::LocalProcessRestart,
-            _ => {
-                batch.receipts = vec![
-                    accepted(candidate(
-                        &d,
-                        "foreign",
-                        0,
-                        None,
-                        vec![],
-                        insert("z", None, "Z"),
-                    ))
-                    .receipt,
-                ]
+            0 => terminal.attempt.binding.batch = Bytes::new(b"changed".to_vec()),
+            1 => {
+                if let TerminalOutcome::Committed { revision, .. } = &mut terminal.outcome {
+                    *revision = 0;
+                }
             }
-        };
-        let mismatch = step(&state, reply(&q, LookupResult::Committed { batch }));
+            2 => {
+                if let TerminalOutcome::Committed { storage, .. } = &mut terminal.outcome {
+                    *storage = StorageClass::LocalProcessRestart;
+                }
+            }
+            _ => {
+                if let TerminalOutcome::Committed { receipts, .. } = &mut terminal.outcome {
+                    *receipts = vec![
+                        accepted(candidate(
+                            &d,
+                            "foreign",
+                            0,
+                            None,
+                            vec![],
+                            insert("z", None, "Z"),
+                        ))
+                        .receipt,
+                    ];
+                }
+            }
+        }
+        let mismatch = step(&state, reply(&q, ResolveResult::Terminal(terminal)));
         assert!(
             mismatch
                 .effects
@@ -516,8 +514,8 @@ fn trusted_restoration_invalidates_live_lookup_and_preserves_identity_high_water
             }
         })
         .expect("new restoration invocation");
-    assert!(current.lookup_id > retired.lookup_id);
-    let old = step(&renewed.state, reply(&retired, LookupResult::KnownAbsent));
+    assert!(current.invocation.number > retired.invocation.number);
+    let old = step(&renewed.state, reply(&retired, noncommit_result(&plan)));
     assert_eq!(old.state, renewed.state);
     assert!(
         old.effects

@@ -66,7 +66,7 @@
       "reason": "Internal deterministic event/effect contract; refusing scaffold; no I/O, clock, signing or merge implementation; traits would add no substitution contract.",
       "dependencies": [
         "normal:glade-wire",
-        "normal:sha2",
+        "normal:glade-crdt-storage-attempt-api",
         "dev:serde_json",
         "dev:syn"
       ],
@@ -74,6 +74,15 @@
         "records_host_contract",
         "source_boundaries"
       ]
+    },
+    "glade-crdt-storage-attempt-api": {
+      "role": "contract",
+      "dependencies": ["normal:sha2", "dev:syn"],
+      "traits": {
+        "StorageAttemptHost": ["open"],
+        "StorageAttemptSession": ["recover", "prepare", "recover_plan", "begin", "inspect", "request_fence", "close"]
+      },
+      "conformance_tests": ["public_contract", "source_boundaries"]
     }
   }
 }

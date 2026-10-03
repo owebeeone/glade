@@ -5,8 +5,10 @@ for name in binding invocation subscription sync lifecycle persistence carrier c
     actual=$(sh "$selection_root/check.sh" --list "$name")
     test "$actual" = "glade-$name-api"
 done
-test "$(sh "$selection_root/check.sh" --list crdt-admission)" = "glade-crdt-admission-core"
-test "$(sh "$selection_root/check.sh" --list all | wc -l | tr -d ' ')" = 11
+for name in crdt-admission crdt-storage-attempt; do
+    test "$(sh "$selection_root/check.sh" --list "$name")" = "$(printf 'glade-crdt-storage-attempt-api\nglade-crdt-admission-core')"
+done
+test "$(sh "$selection_root/check.sh" --list all | wc -l | tr -d ' ')" = 12
 if sh "$selection_root/check.sh" --list invalid >/dev/null 2>&1; then
     echo "Invalid selector was accepted" >&2
     exit 1

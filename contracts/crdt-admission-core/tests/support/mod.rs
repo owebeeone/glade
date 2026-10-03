@@ -48,6 +48,8 @@ pub fn initial(d: Descriptor) -> State {
         pending: vec![],
         quarantine: BTreeMap::new(),
         policy: Bytes::new(b"granted-test-cut".to_vec()),
+        recovery_incomplete: false,
+        storage_integrity_failed: false,
         time_floor_ms: 10,
         policy_time: TimeInterval {
             earliest_ms: 20,
@@ -62,6 +64,10 @@ pub fn initial(d: Descriptor) -> State {
     };
     State {
         instances: BTreeMap::from([(instance, value)]),
+        storage_owner: Some(storage_host::open_request().owner),
+        storage_limits: Some(storage_host::open_request().limits),
+        plan_namespace: [4; 32],
+        invocation_namespace: [2; 32],
         ..State::default()
     }
 }
@@ -166,7 +172,18 @@ pub fn seed(state: &mut State, c: Candidate) {
 }
 /// Compiled downstream host executes the public effects, never private kernel helpers.
 /// Test evidence is intentionally trusted; commit replies attest VOLATILE test retention.
-pub fn drive(mut state: State, first: Event, supplied: Facts) -> Transition {
+pub fn drive(state: State, first: Event, supplied: Facts) -> Transition {
+    let mut records_host = storage_host::MemoryHost::new();
+    let mut host = records_host.open(storage_host::open_request()).unwrap();
+    drive_with_port(state, first, supplied, &mut host)
+}
+/// Caller owns the session and retains it across event/effect continuations.
+pub fn drive_with_port<S: StorageAttemptSession>(
+    mut state: State,
+    first: Event,
+    supplied: Facts,
+    host: &mut S,
+) -> Transition {
     let mut known = BTreeMap::new();
     for instance in state.instances.values() {
         for record in &instance.accepted {
@@ -240,15 +257,21 @@ pub fn drive(mut state: State, first: Event, supplied: Facts) -> Transition {
                         verdict: Verdict::Sealed(Bytes::new(b"test-sealed-admission".to_vec())),
                     })))
                 }
-                Effect::Commit(plan) => pending.push(Event::CommitResolved(CommitReply {
-                    plan_id: plan.id,
-                    instance: plan.instance.clone(),
-                    batch_digest: plan.batch.digest(),
-                    result: CommitResult::Committed {
-                        revision: plan.expected_revision + 1,
-                        storage: StorageClass::VolatileTest,
-                    },
-                })),
+                Effect::Prepare { request, .. } => {
+                    pending.push(Event::PrepareResolved(host.prepare(request.clone())));
+                }
+                Effect::RecoverPlan(request) => {
+                    pending.push(Event::PrepareResolved(host.recover_plan(request.clone())));
+                }
+                Effect::Begin(request) => {
+                    pending.push(Event::CommitResolved(host.begin(request.clone())));
+                }
+                Effect::Lookup(request) => {
+                    pending.push(Event::LookupResolved(host.inspect(request.clone())));
+                }
+                Effect::Fence(request) => {
+                    pending.push(Event::FenceResolved(host.request_fence(request.clone())));
+                }
                 _ => {}
             }
             observed.push(effect);
@@ -330,4 +353,120 @@ pub fn staged_plan(d: &Descriptor, c: Candidate) -> CommitPlan {
             pending: 0,
         },
     }
+}
+
+#[allow(dead_code)]
+pub mod storage_host {
+    include!("../../../crdt-storage-attempt-api/tests/support/mod.rs");
+}
+
+pub fn binding_for(plan: &CommitPlan) -> Binding {
+    Binding {
+        plan: PlanKey {
+            namespace: [4; 32],
+            instance: plan.instance.clone(),
+            number: plan.id,
+        },
+        batch: plan.batch.clone(),
+        expected_revision: plan.expected_revision,
+        storage: StorageClass::VolatileTest,
+        kind: plan.kind.clone(),
+        charges: plan.charges.clone(),
+        receipts: plan.acceptances.iter().map(|a| a.receipt.clone()).collect(),
+        prestart: plan
+            .local_precondition
+            .clone()
+            .map(|cut| StartPrecondition {
+                cut,
+                windows: plan
+                    .acceptances
+                    .iter()
+                    .map(|a| a.facts.permit_window.clone())
+                    .collect(),
+            }),
+    }
+}
+pub fn attempt(plan: &CommitPlan) -> AttemptBinding {
+    AttemptBinding {
+        id: AttemptId {
+            store: StoreIncarnation([1; 32]),
+            instance: plan.instance.clone(),
+            number: 1,
+        },
+        binding: binding_for(plan),
+    }
+}
+pub fn resolve_request(plan: &CommitPlan, number: u64, operation: OperationKind) -> ResolveRequest {
+    ResolveRequest {
+        owner: storage_host::open_request().owner,
+        invocation: InvocationId {
+            namespace: [2; 32],
+            number,
+        },
+        operation,
+        attempt: attempt(plan),
+    }
+}
+#[allow(dead_code)]
+pub fn committed_result(plan: &CommitPlan) -> ResolveResult {
+    ResolveResult::Terminal(Box::new(Terminal {
+        attempt: attempt(plan),
+        outcome: TerminalOutcome::Committed {
+            revision: plan.expected_revision.checked_add(1).unwrap(),
+            storage: StorageClass::VolatileTest,
+            receipts: plan.acceptances.iter().map(|a| a.receipt.clone()).collect(),
+            start_cut: plan.local_precondition.clone(),
+        },
+    }))
+}
+pub fn noncommit_result(plan: &CommitPlan) -> ResolveResult {
+    ResolveResult::Terminal(Box::new(Terminal {
+        attempt: attempt(plan),
+        outcome: TerminalOutcome::NonCommit {
+            revision: plan.expected_revision,
+            storage: StorageClass::VolatileTest,
+        },
+    }))
+}
+pub fn commit_reply(plan: &CommitPlan, number: u64, result: ResolveResult) -> ResolveReply {
+    ResolveReply {
+        request: resolve_request(plan, number, OperationKind::Begin),
+        result,
+    }
+}
+pub fn register_attempt(state: &mut State, plan: &CommitPlan) {
+    let a = attempt(plan);
+    state.attempts.insert(
+        a.binding.plan.clone(),
+        KernelAttempt {
+            attempt: a,
+            phase: AttemptPhase::Reserved,
+        },
+    );
+    let q = resolve_request(plan, 8, OperationKind::Begin);
+    state
+        .storage_invocations
+        .insert(q.invocation.clone(), StorageInvocation::Resolve(q));
+}
+
+pub fn terminal_result(
+    plan: &CommitPlan,
+    digest: Digest,
+    revision: u64,
+    storage: StorageClass,
+    receipts: Vec<Receipt>,
+) -> ResolveResult {
+    let mut a = attempt(plan);
+    if digest != plan.batch.digest() {
+        a.binding.batch = Bytes::new(b"changed-result-batch".to_vec());
+    }
+    ResolveResult::Terminal(Box::new(Terminal {
+        attempt: a,
+        outcome: TerminalOutcome::Committed {
+            revision,
+            storage,
+            receipts,
+            start_cut: plan.local_precondition.clone(),
+        },
+    }))
 }
