@@ -333,6 +333,7 @@ impl Durable {
     }
     /// The stopped binary's state, opened at its selected floor as it left it.
     fn stopped(h: &History, side: Side, root: &Path) -> Self {
+        crate::test_support::children::settled();
         let floor = Bytes::new(std::fs::read(root.join("trusted/replica.floor")).unwrap()).digest();
         let mut request = request(&h.f, side);
         request.expected_floor = floor;
@@ -396,6 +397,7 @@ impl Durable {
 /// its configured peers, the assembly holding that one carrier, the replica
 /// recovered before exchange, then the carrier bound as `PEER_CARRIER` binds.
 async fn open_peer(profile: &Path, at: u16) -> Arc<IndependentReplica> {
+    crate::test_support::children::settled();
     let provision = Arc::new(Provision::read(profile).unwrap());
     let keys = provision.peers.iter().map(|(_, (endpoint, _))| *endpoint);
     let door = Arc::new(Door::new(keys, |_| {}));
@@ -522,6 +524,7 @@ fn converged(
 /// start (`IndependentReplica::open`: node-locked open, validated load and
 /// replay/classification of retained inputs), then read and closed.
 fn recovered(profile: &Path) -> Durable {
+    crate::test_support::children::settled();
     let provision = Arc::new(Provision::read(profile).unwrap());
     let module = Arc::new(NodeAssembly::builder().build());
     let replica = IndependentReplica::open(module, provision, IrohCarrier::new(None)).unwrap();

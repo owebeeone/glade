@@ -123,6 +123,7 @@ fn node_locked_reopen_refuses_explicit_wrong_plan_namespace() {
         ReplicaRecoverySession::close(&mut session),
         CloseResult::Closed
     ));
+    crate::test_support::children::settled();
     let mut host = DiskHost::new(evidence(&f), config(&root, false));
     let mut wrong = request(&f, [0; 32]);
     wrong.plan_namespace = [99; 32];
@@ -130,6 +131,7 @@ fn node_locked_reopen_refuses_explicit_wrong_plan_namespace() {
         matches!(host.open_node(wrong), Err(Fault::BindingMismatch)),
         "explicit plan namespace cannot silently adapt to retained authority"
     );
+    crate::test_support::children::settled();
     let mut host = DiskHost::new(evidence(&f), config(&root, false));
     let mut restored = host.open_node(request(&f, [0; 32])).unwrap();
     assert!(matches!(restored.load(), LoadResult::Validated(_)));

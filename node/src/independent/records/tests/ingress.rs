@@ -54,6 +54,7 @@ fn unknown_abandon_retains_unretired_owned_permit_until_durable_selection() {
     );
     drop(session);
     let digest = Bytes::new(std::fs::read(root.join("trusted/replica.floor")).unwrap()).digest();
+    crate::test_support::children::settled();
     let mut host = DiskHost::new(evidence(&f), config(&root, false));
     let mut session = host.open_replica(request(&f, digest)).unwrap();
     let ReconstructResult::Cut(cut) =
@@ -148,6 +149,7 @@ async fn drained_partial_receive_can_retain_loss_and_close_without_false_complet
     );
     drop(session);
     let digest = Bytes::new(std::fs::read(root.join("trusted/replica.floor")).unwrap()).digest();
+    crate::test_support::children::settled();
     let mut host = DiskHost::new(evidence(&f), config(&root, false));
     let mut session = host.open_replica(request(&f, digest)).unwrap();
     let ReconstructResult::Cut(cut) =
@@ -254,6 +256,7 @@ async fn unknown_settlement_keeps_exact_owned_observation_and_failed_loss_write_
     );
     drop(session);
     let digest = Bytes::new(std::fs::read(root.join("trusted/replica.floor")).unwrap()).digest();
+    crate::test_support::children::settled();
     let mut host = DiskHost::new(evidence(&f), config(&root, false));
     let mut session = host.open_replica(request(&f, digest)).unwrap();
     let ReconstructResult::Cut(value) =

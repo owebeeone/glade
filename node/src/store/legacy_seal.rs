@@ -291,7 +291,8 @@ mod tests {
             let mut store = f.store();
             store.append(op(0)).unwrap();
             let before = f.journal();
-            let mut child = Command::new(std::env::current_exe().unwrap())
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
                 .env_clear()
                 .env("GLADE_SEAL_WORKER_ROOT", &f.0)
                 .env("GLADE_SEAL_WORKER_CUT", format!("{cut:?}"))
@@ -304,9 +305,8 @@ mod tests {
                 ])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .unwrap();
+                .stderr(Stdio::piped());
+            let mut child = crate::test_support::children::spawn(&mut command).unwrap();
             let stdout = child.stdout.take().unwrap();
             let (tx, rx) = mpsc::channel();
             let reader = std::thread::spawn(move || {

@@ -120,6 +120,7 @@ async fn full_inventory_keeps_two_native_original_receipts_for_one_operation() {
     drop(first);
     let digest =
         Bytes::new(std::fs::read(roots[0].join("trusted/replica.floor")).unwrap()).digest();
+    crate::test_support::children::settled();
     let mut host = DiskHost::new(evidence(&f), config(&roots[0], false));
     let mut restored = host.open_replica(request(&f, digest)).unwrap();
     assert_eq!(restored.node_history().unwrap(), all);

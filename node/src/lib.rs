@@ -51,3 +51,10 @@ pub mod ws;
 // copy.
 pub use glade_wire::cbor;
 extern crate self as glade_node;
+
+// Test-only support shared by the whole test executable. The condition sits
+// on this braced module, never on a lone declaration.
+#[cfg(test)]
+mod test_support {
+    pub(crate) mod children;
+}

@@ -49,7 +49,8 @@ fn observation_floor_child() {
 fn actual_process_kill_keeps_new_observed_floor_and_refuses_missing_observation_image() {
     let f = ic3_disk_fixture::disk_profile();
     let root = root("observation-floor-ahead");
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
         .env_clear()
         .env("IC3_OBSERVATION_ROOT", &root)
         .args([
@@ -59,9 +60,8 @@ fn actual_process_kill_keeps_new_observed_floor_and_refuses_missing_observation_
             "--nocapture",
         ])
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
+        .stderr(std::process::Stdio::null());
+    let mut child = crate::test_support::children::spawn(&mut command).unwrap();
     let stdout = child.stdout.take().unwrap();
     let (send, receive) = std::sync::mpsc::channel();
     let reader = std::thread::spawn(move || {
@@ -95,6 +95,7 @@ fn actual_process_kill_keeps_new_observed_floor_and_refuses_missing_observation_
     assert_eq!(retained.floor.issuance.time_floor_ms, 80);
     assert!(retained.observing);
     assert!(retained.pending.is_some());
+    crate::test_support::children::settled();
     let mut host = DiskHost::new(evidence(&f), config(&root, false));
     let original = request(&f, digest);
     assert!(StorageAttemptHost::open(

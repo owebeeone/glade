@@ -105,6 +105,7 @@ fn all_four_genuine_native_kinds_couple_original_custody_and_reopen_projection()
         drop(session);
         let digest =
             Bytes::new(std::fs::read(root.join("trusted/replica.floor")).unwrap()).digest();
+        crate::test_support::children::settled();
         let mut host = DiskHost::new(evidence(&f), config(&root, false));
         let mut session = host.open_replica(request(&f, digest)).unwrap();
         let LoadResult::Validated(reopened) = session.load() else {

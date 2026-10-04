@@ -200,7 +200,8 @@ mod tests {
             let path = root.join("instance.floor");
             let old = Bytes::new(b"old exact floor".to_vec());
             replace(&path, &old, 4096, |_| Ok(())).unwrap();
-            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
                 .env_clear()
                 .env("IC3_B2_FLOOR_PATH", &path)
                 .env("IC3_B2_FLOOR_CUT", format!("{cut:?}"))
@@ -211,9 +212,8 @@ mod tests {
                     "--nocapture",
                 ])
                 .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-                .unwrap();
+                .stderr(std::process::Stdio::piped());
+            let mut child = crate::test_support::children::spawn(&mut command).unwrap();
             let stdout = child.stdout.take().unwrap();
             let (tx, rx) = std::sync::mpsc::channel();
             let reader = std::thread::spawn(move || {

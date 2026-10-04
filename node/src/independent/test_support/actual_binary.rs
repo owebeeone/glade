@@ -167,7 +167,8 @@ pub(crate) struct Process {
 }
 impl Process {
     pub(crate) fn start(profile: &Path, port: u16) -> Self {
-        let mut child = Command::new(glade_node())
+        let mut command = Command::new(glade_node());
+        command
             .env_clear()
             .args([
                 "--independent-config",
@@ -175,9 +176,8 @@ impl Process {
                 &port.to_string(),
             ])
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::piped());
+        let mut child = crate::test_support::children::spawn(&mut command).unwrap();
         let lines = Arc::new(Mutex::new(Vec::new()));
         let mut readers = Vec::new();
         let outputs: Vec<Box<dyn std::io::Read + Send>> = vec![
@@ -243,10 +243,11 @@ impl Process {
     }
     /// SIGTERM, then a successful exit within the bound.
     pub(crate) async fn stop(&mut self) {
-        assert!(Command::new("/bin/kill")
-            .env_clear()
-            .args(["-TERM", &self.child.id().to_string()])
-            .status()
+        let mut kill = Command::new("/bin/kill");
+        kill.env_clear()
+            .args(["-TERM", &self.child.id().to_string()]);
+        assert!(crate::test_support::children::spawn(&mut kill)
+            .and_then(|mut kill| kill.wait())
             .unwrap()
             .success());
         let status = tokio::time::timeout(Duration::from_secs(8), async {

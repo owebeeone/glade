@@ -143,7 +143,8 @@ fn ingress_cut_child() {
     panic!("all exact selected cuts must be reached");
 }
 fn killed(stage: usize, cut: usize, root: &std::path::Path) {
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
         .env_clear()
         .env("IC3_GUARD_ROOT", root)
         .env("IC3_GUARD_STAGE", stage.to_string())
@@ -155,9 +156,8 @@ fn killed(stage: usize, cut: usize, root: &std::path::Path) {
             "--nocapture",
         ])
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
+        .stderr(std::process::Stdio::null());
+    let mut child = crate::test_support::children::spawn(&mut command).unwrap();
     let stdout = child.stdout.take().unwrap();
     let (send, receive) = std::sync::mpsc::channel();
     let reader = std::thread::spawn(move || {

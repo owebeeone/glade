@@ -77,7 +77,8 @@ fn actual_process_death_at_all_26_marker_and_observation_selection_cuts() {
     let f = ic3_disk_fixture::disk_profile();
     for (index, cut) in cuts().into_iter().enumerate() {
         let root = root(&format!("marker-cut-{index}"));
-        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
             .env_clear()
             .env("IC3_MARKER_ROOT", &root)
             .env("IC3_MARKER_CUT", index.to_string())
@@ -88,9 +89,8 @@ fn actual_process_death_at_all_26_marker_and_observation_selection_cuts() {
                 "--nocapture",
             ])
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
+            .stderr(std::process::Stdio::null());
+        let mut child = crate::test_support::children::spawn(&mut command).unwrap();
         let stdout = child.stdout.take().unwrap();
         let (send, receive) = std::sync::mpsc::channel();
         let reader = std::thread::spawn(move || {
@@ -155,6 +155,7 @@ fn actual_process_death_at_all_26_marker_and_observation_selection_cuts() {
                 "unresolved protected source observation {cut:?} cannot reset"
             );
             assert_eq!(std::fs::read(&floor_path).unwrap(), before);
+            crate::test_support::children::settled();
             let mut host = DiskHost::new(evidence(&f), config(&root, false));
             let original = request(&f, digest);
             assert!(StorageAttemptHost::open(

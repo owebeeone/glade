@@ -149,7 +149,8 @@ fn actual_killed_protected_started_cut_commits_original_receipt_despite_current_
     use std::io::BufRead;
     let f = ic3_disk_fixture::disk_profile();
     let root = root("started-revocation");
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
         .env_clear()
         .env("IC3_NATIVE_ROOT", &root)
         .env("IC3_NATIVE_STAGE", "1")
@@ -161,9 +162,8 @@ fn actual_killed_protected_started_cut_commits_original_receipt_despite_current_
             "--nocapture",
         ])
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
+        .stderr(std::process::Stdio::null());
+    let mut child = crate::test_support::children::spawn(&mut command).unwrap();
     let stdout = child.stdout.take().unwrap();
     let (send, receive) = std::sync::mpsc::channel();
     let reader = std::thread::spawn(move || {

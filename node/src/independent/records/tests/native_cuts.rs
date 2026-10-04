@@ -121,7 +121,8 @@ fn qualify(stages: std::ops::Range<usize>) {
     for stage in stages {
         for (cut, selected) in cuts().into_iter().enumerate() {
             let root = root(&format!("native-cut-{stage}-{cut}"));
-            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
                 .env_clear()
                 .env("IC3_NATIVE_ROOT", &root)
                 .env("IC3_NATIVE_STAGE", stage.to_string())
@@ -133,9 +134,8 @@ fn qualify(stages: std::ops::Range<usize>) {
                     "--nocapture",
                 ])
                 .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .unwrap();
+                .stderr(std::process::Stdio::null());
+            let mut child = crate::test_support::children::spawn(&mut command).unwrap();
             let stdout = child.stdout.take().unwrap();
             let (send, receive) = std::sync::mpsc::channel();
             let reader = std::thread::spawn(move || {

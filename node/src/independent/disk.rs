@@ -299,6 +299,7 @@ mod tests {
             Err(Fault::Ownership)
         ));
         drop(layout);
+        crate::test_support::children::settled();
         assert!(matches!(
             DiskLayout::open(&data, &floor, [74; 32]),
             Err(Fault::Integrity)
@@ -306,6 +307,7 @@ mod tests {
         let reopened = DiskLayout::open(&data, &floor, [75; 32])
             .expect("registered roots reopen through the unchanged stable lock inode");
         drop(reopened);
+        crate::test_support::children::settled();
         let old = base.join("old-data");
         fs::rename(&data, &old).unwrap();
         fs::create_dir(&data).unwrap();
@@ -321,6 +323,81 @@ mod tests {
         );
         fs::remove_dir_all(base).unwrap();
     }
+    /// A root released while other threads of this process spawn children
+    /// reopens, every time, once the spawns in flight have settled
+    /// (`crate::test_support::children`): the new process of a spawn holds a
+    /// copy of the released lock until its exec completes, and a reopen that
+    /// meets the copy is refused `Ownership`.
+    #[test]
+    fn released_root_reopens_after_in_flight_child_spawns_settle() {
+        use crate::test_support::children;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let base = fs::canonicalize("/tmp")
+            .unwrap()
+            .join(format!("glade-ic3-b2-spawning-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir(&base).unwrap();
+        let data = base.join("data");
+        let floor = base.join("trusted-floor");
+        let mut layout = Some(DiskLayout::provision(&data, &floor, [75; 32]).unwrap());
+        let (done, spawned) = (AtomicBool::new(false), AtomicUsize::new(0));
+        let mut reopened = 0_usize;
+        let refused = std::thread::scope(|scope| {
+            let spawners: Vec<_> = (0..4)
+                .map(|_| {
+                    scope.spawn(|| {
+                        while !done.load(Ordering::SeqCst) {
+                            let child = children::spawn(
+                                std::process::Command::new(std::env::current_exe()?)
+                                    .env_clear()
+                                    .args(["--exact", "no-such-test"])
+                                    .stdout(std::process::Stdio::null())
+                                    .stderr(std::process::Stdio::null()),
+                            );
+                            let waited = child.and_then(|mut child| child.wait());
+                            if let Err(error) = waited {
+                                done.store(true, Ordering::SeqCst);
+                                return Err(error);
+                            }
+                            spawned.fetch_add(1, Ordering::SeqCst);
+                        }
+                        Ok(())
+                    })
+                })
+                .collect();
+            let mut refused = None;
+            while spawned.load(Ordering::SeqCst) < 200 && !done.load(Ordering::SeqCst) {
+                drop(layout.take());
+                children::settled();
+                match DiskLayout::open(&data, &floor, [75; 32]) {
+                    Ok(value) => {
+                        layout = Some(value);
+                        reopened += 1;
+                    }
+                    Err(fault) => {
+                        refused = Some(fault);
+                        break;
+                    }
+                }
+            }
+            done.store(true, Ordering::SeqCst);
+            for spawner in spawners {
+                spawner
+                    .join()
+                    .unwrap()
+                    .expect("children of this test spawn and exit");
+            }
+            refused
+        });
+        assert_eq!(
+            refused,
+            None,
+            "a released root reopens after spawns settle ({reopened} reopens, {} children)",
+            spawned.load(Ordering::SeqCst)
+        );
+        drop(layout);
+        fs::remove_dir_all(base).unwrap();
+    }
     #[test]
     #[ignore = "B2 qualification requires the preserved exact committed legacy executable fixture"]
     fn actual_committed_legacy_executable_refuses_the_disposable_ic3_root() {
@@ -331,15 +408,15 @@ mod tests {
         fs::create_dir(&base).unwrap();
         let data = base.join("data");
         let layout = DiskLayout::provision(&data, &base.join("trusted-floor"), [75; 32]).unwrap();
-        let mut child =
-            std::process::Command::new("/private/tmp/ic3-b2-legacy-e8097861/glade-node-legacy")
-                .env_clear()
-                .arg("0")
-                .arg(&data)
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-                .unwrap();
+        let mut command =
+            std::process::Command::new("/private/tmp/ic3-b2-legacy-e8097861/glade-node-legacy");
+        command
+            .env_clear()
+            .arg("0")
+            .arg(&data)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = crate::test_support::children::spawn(&mut command).unwrap();
         let mut exited = false;
         for _ in 0..100 {
             if child.try_wait().unwrap().is_some() {

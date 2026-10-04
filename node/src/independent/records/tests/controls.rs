@@ -250,6 +250,7 @@ fn durable_current_expiry_floor_preserves_historical_original_receipt_and_projec
     );
     drop(session);
     let digest = Bytes::new(std::fs::read(root.join("trusted/replica.floor")).unwrap()).digest();
+    crate::test_support::children::settled();
     let mut host = DiskHost::new(evidence(&f), config(&root, false));
     let mut session = host.open_replica(request(&f, digest)).unwrap();
     let LoadResult::Validated(reopened) = session.load() else {
@@ -368,6 +369,7 @@ fn structurally_valid_pending_next_with_bad_authenticated_state_refuses_before_f
     drop(session);
     let before = std::fs::read(root.join("trusted/replica.floor")).unwrap();
     let digest = Bytes::new(before.clone()).digest();
+    crate::test_support::children::settled();
     let mut host = DiskHost::new(evidence(&f), config(&root, false));
     assert!(
         host.open_replica(request(&f, digest)).is_err(),

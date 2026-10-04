@@ -177,6 +177,7 @@ fn nonrecursive_pair_selection_and_exact_pending_fallback_retain_all_floors() {
         Err(Fault::Unavailable)
     );
     drop(pair);
+    crate::test_support::children::settled();
     let layout = DiskLayout::open(&data, &trusted, [6; 32]).unwrap();
     let pair = PairStore::open(layout, bounds.clone())
         .expect("old image plus exact advanced floor, never false terminal");
@@ -221,6 +222,7 @@ fn installed_next_image_finishes_lost_selection_reply_without_hash_recursion() {
         })
         .is_err());
     drop(pair);
+    crate::test_support::children::settled();
     let layout = DiskLayout::open(&data, &trusted, [6; 32]).unwrap();
     let pair = PairStore::open(layout, bounds).unwrap();
     assert_eq!(pair.image, next);
@@ -287,6 +289,7 @@ fn completed_next_image_installs_exact_guard_settlement_after_missing_selection(
         })
         .is_err());
     drop(pair);
+    crate::test_support::children::settled();
     let layout = DiskLayout::open(&data, &trusted, [6; 32]).unwrap();
     let pair = PairStore::open(layout, bounds).unwrap();
     assert_eq!(
@@ -368,6 +371,7 @@ fn failed_recovery_resync_keeps_original_pending_floor_and_does_not_select() {
     let before = floors::read(&trusted.join("replica.floor"), bounds.bytes)
         .unwrap()
         .digest();
+    crate::test_support::children::settled();
     let layout = DiskLayout::open(&data, &trusted, [6; 32]).unwrap();
     let mut reached = false;
     let result = PairStore::open_with(layout, bounds.clone(), |cut| {
@@ -388,6 +392,7 @@ fn failed_recovery_resync_keeps_original_pending_floor_and_does_not_select() {
             .digest(),
         before
     );
+    crate::test_support::children::settled();
     let layout = DiskLayout::open(&data, &trusted, [6; 32]).unwrap();
     let mut order = vec![];
     let pair = PairStore::open_with(layout, bounds, |cut| {
@@ -482,6 +487,7 @@ fn closed_observation_marker_format_refuses_previous_independent_reader_and_pres
         "unrelated checkpoint cannot clear unknown observation authority"
     );
     drop(pair);
+    crate::test_support::children::settled();
     let layout = DiskLayout::open(&root.join("data"), &root.join("trusted"), [6; 32]).unwrap();
     assert!(matches!(
         PairStore::open(layout, bounds),

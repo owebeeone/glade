@@ -80,7 +80,8 @@ fn terminal_before_callback_child() {
 fn actual_process_kill_recovers_selected_terminal_through_original_core_callback_before_load() {
     let f = ic3_disk_fixture::disk_profile();
     let root = root("terminal-before-callback");
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
         .env_clear()
         .env("IC3_NATIVE_ROOT", &root)
         .args([
@@ -90,9 +91,8 @@ fn actual_process_kill_recovers_selected_terminal_through_original_core_callback
             "--nocapture",
         ])
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
+        .stderr(std::process::Stdio::null());
+    let mut child = crate::test_support::children::spawn(&mut command).unwrap();
     let stdout = child.stdout.take().unwrap();
     let (send, receive) = std::sync::mpsc::channel();
     let reader = std::thread::spawn(move || {
@@ -134,6 +134,7 @@ fn actual_process_kill_recovers_selected_terminal_through_original_core_callback
     );
     drop(session);
     let digest = Bytes::new(std::fs::read(root.join("trusted/replica.floor")).unwrap()).digest();
+    crate::test_support::children::settled();
     let mut host = DiskHost::new(evidence(&f), config(&root, false));
     let mut session = host.open_replica(request(&f, digest)).unwrap();
     let LoadResult::Validated(twice) = session.load() else {
@@ -154,7 +155,8 @@ fn actual_process_kill_recovers_selected_terminal_through_original_core_callback
 fn actual_process_kill_recovers_original_owned_seal_continuation_without_new_link_authority() {
     let f = ic3_disk_fixture::disk_profile();
     let root = root("seal-query");
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
         .env_clear()
         .env("IC3_NATIVE_ROOT", &root)
         .env("IC3_NATIVE_STOP", "seal-query")
@@ -165,9 +167,8 @@ fn actual_process_kill_recovers_original_owned_seal_continuation_without_new_lin
             "--nocapture",
         ])
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
+        .stderr(std::process::Stdio::null());
+    let mut child = crate::test_support::children::spawn(&mut command).unwrap();
     let stdout = child.stdout.take().unwrap();
     let (send, receive) = std::sync::mpsc::channel();
     let reader = std::thread::spawn(move || {
