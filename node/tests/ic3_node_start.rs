@@ -1108,12 +1108,53 @@ async fn wait_idle(
     .await
     .expect("matching actual full-cut settled idle snapshots before shutdown")
 }
+/// The first witness port; every port handed out lies below 32768, under
+/// every default OS ephemeral range (Linux 32768, macOS 49152).
+const FIRST_PORT: u16 = 20000;
+/// Ports in each test process's own block; 32 blocks end below 32768.
+const BLOCK_PORTS: u16 = 384;
+const BLOCKS: u32 = 32;
+const _: () = assert!(FIRST_PORT as u32 + BLOCKS * BLOCK_PORTS as u32 <= 32768);
+/// The next offset into this test process's block.
+static NEXT_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+/// A loopback port for a node's listener and carrier (TCP and UDP), free when
+/// handed out. A port released by `bind(0)` was unsafe: the node binds it
+/// some time later, and meanwhile any socket's own `bind(0)`, a parallel
+/// witness's carrier for one, could take it ("Address already in use"). No
+/// `bind(0)` hands out these: they are below the ephemeral ranges, drawn from
+/// this process's own block (by process id) and never repeated in it. The
+/// library witnesses' `actual_binary::port` allocates the same way.
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    let block = FIRST_PORT + u16::try_from(std::process::id() % BLOCKS).unwrap() * BLOCK_PORTS;
+    loop {
+        let offset = NEXT_PORT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            offset < BLOCK_PORTS,
+            "this test process used all {BLOCK_PORTS} witness ports of its block"
+        );
+        let port = block + offset;
+        let at = (std::net::Ipv4Addr::LOCALHOST, port);
+        if std::net::TcpListener::bind(at).is_ok() && std::net::UdpSocket::bind(at).is_ok() {
+            return port;
+        }
+    }
+}
+/// A witness's port is one no `bind(0)` hands out, in any process: below
+/// every default OS ephemeral range (Linux 32768, macOS 49152), and never the
+/// same twice in this process.
+#[test]
+fn witness_ports_are_below_the_ephemeral_ranges_and_distinct() {
+    let ports: Vec<u16> = (0..8).map(|_| free_port()).collect();
+    for port in &ports {
+        assert!(
+            *port < 32768,
+            "{port} is in an OS ephemeral range: {ports:?}"
+        );
+    }
+    let mut distinct = ports.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(distinct.len(), ports.len(), "{ports:?}");
 }
 fn hex(key: &Digest) -> String {
     key.iter().map(|byte| format!("{byte:02x}")).collect()

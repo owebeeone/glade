@@ -3,10 +3,11 @@
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// Ports the owner's running desk instances hold; never offered to a witness.
+/// Ports the owner's running desk instances hold; all below the witness ports.
 const DESK_PORTS: [u16; 6] = [5173, 5180, 8080, 8087, 9099, 9106];
 
 /// The glade-node binary in this test executable's own target directory
@@ -144,18 +145,52 @@ fn inputs(listed: &str) -> Vec<PathBuf> {
     paths
 }
 
-/// A loopback port for a witness's listener and carrier, never a desk port.
+/// The first witness port. Every port handed out lies below 32768, under
+/// every default OS ephemeral range (Linux 32768, macOS 49152), and above
+/// every desk port.
+const FIRST_PORT: u16 = 20000;
+/// Ports in each test process's own block; 32 blocks end below 32768.
+const BLOCK_PORTS: u16 = 384;
+const BLOCKS: u32 = 32;
+const _: () = assert!(above_desk() && FIRST_PORT as u32 + BLOCKS * BLOCK_PORTS as u32 <= 32768);
+const fn above_desk() -> bool {
+    let mut at = 0;
+    while at < DESK_PORTS.len() {
+        if DESK_PORTS[at] >= FIRST_PORT {
+            return false;
+        }
+        at += 1;
+    }
+    true
+}
+/// The next offset into this test process's block. Test-only.
+static NEXT_PORT: AtomicU16 = AtomicU16::new(0);
+
+/// A loopback port for a witness's listener and carrier (TCP and UDP), free
+/// when handed out. A port released by `bind(0)` was unsafe: the node binds
+/// it some time later, and meanwhile any socket's own `bind(0)`, a parallel
+/// witness's carrier for one, could take it ("Address already in use"). No
+/// `bind(0)` hands out these: they are below the ephemeral ranges, drawn
+/// from this process's own block (by process id) and never repeated in it.
 pub(crate) fn port() -> u16 {
+    let block = FIRST_PORT + u16::try_from(std::process::id() % BLOCKS).unwrap() * BLOCK_PORTS;
     loop {
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        if !DESK_PORTS.contains(&port) {
+        let offset = NEXT_PORT.fetch_add(1, Ordering::SeqCst);
+        assert!(
+            offset < BLOCK_PORTS,
+            "this test process used all {BLOCK_PORTS} witness ports of its block"
+        );
+        let port = block + offset;
+        if free(port) {
             return port;
         }
     }
+}
+
+/// Whether nothing holds `port` on loopback, over TCP or UDP.
+fn free(port: u16) -> bool {
+    let at = (std::net::Ipv4Addr::LOCALHOST, port);
+    std::net::TcpListener::bind(at).is_ok() && std::net::UdpSocket::bind(at).is_ok()
 }
 
 /// One actual glade-node process started `env_clear` on an independent
@@ -392,5 +427,30 @@ mod tests {
             .unwrap_err()
             .contains("name no source"));
         std::fs::remove_dir_all(root).unwrap();
+    }
+    /// A witness's port is one no `bind(0)` hands out, in any process: below
+    /// every default OS ephemeral range (Linux 32768, macOS 49152), and never
+    /// the same twice in this process, nor a desk port.
+    #[test]
+    fn witness_ports_are_below_the_ephemeral_ranges_distinct_and_not_desk_ports() {
+        let ports: Vec<u16> = (0..8).map(|_| port()).collect();
+        for port in &ports {
+            assert!(
+                *port < 32768,
+                "{port} is in an OS ephemeral range: {ports:?}"
+            );
+            assert!(!DESK_PORTS.contains(port), "{port} is a desk port");
+        }
+        let mut distinct = ports.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(distinct.len(), ports.len(), "{ports:?}");
+    }
+    #[test]
+    fn a_port_held_over_tcp_or_udp_is_not_free() {
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        assert!(!free(tcp.local_addr().unwrap().port()));
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        assert!(!free(udp.local_addr().unwrap().port()));
     }
 }
