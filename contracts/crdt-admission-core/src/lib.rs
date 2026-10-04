@@ -67,11 +67,24 @@ fn frontier(
         return;
     };
     if heads.len() > v.descriptor.bounds.max_origins
+        || heads.keys().any(|origin| origin.is_empty())
         || heads
             .values()
             .any(|(n, _)| *n < 0 || *n >= 9_007_199_254_740_991)
     {
         effects.push(Effect::Report(Outcome::Invalid));
+        return;
+    }
+    if state.storage_limits.as_ref().is_none_or(|z| {
+        instance.incarnation.len() > z.max_name_bytes
+            || heads.keys().any(|origin| origin.len() > z.max_name_bytes)
+    }) {
+        state
+            .instances
+            .get_mut(&instance)
+            .expect("selected instance")
+            .recovery_incomplete = true;
+        effects.push(Effect::Report(Outcome::Capacity));
         return;
     }
     let mut missing = vec![];
@@ -95,8 +108,8 @@ fn frontier(
             });
         }
     }
-    let union: std::collections::BTreeSet<_> = v.pending.iter().chain(missing.iter()).collect();
-    if union.len() > v.descriptor.bounds.pending_items {
+    let union = projection::pending_slots(state, &instance, &missing);
+    if !projection::pending_fits(state, &instance, &union, 0) {
         state
             .instances
             .get_mut(&instance)

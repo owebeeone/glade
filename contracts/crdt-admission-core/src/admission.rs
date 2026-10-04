@@ -107,6 +107,7 @@ pub(crate) fn offer(s: &mut State, c: Candidate, local: bool, effects: &mut Vec<
                 .map(|q| &q.candidate.operation.inner().origin),
         )
         .collect();
+    let slots = projection::pending_slots(s, &c.instance, &[]);
     if c.operation.inner().origin.len() > z.max_name_bytes
         || c.operation
             .inner()
@@ -124,6 +125,7 @@ pub(crate) fn offer(s: &mut State, c: Candidate, local: bool, effects: &mut Vec<
         || (!origins.contains(&c.operation.inner().origin)
             && origins.len() >= v.descriptor.bounds.max_origins)
         || (local && v.used.edit >= v.descriptor.bounds.edit_bytes)
+        || bytes.is_none_or(|n| !projection::pending_fits(s, &c.instance, &slots, n))
     {
         if !local {
             s.instances
@@ -148,6 +150,12 @@ pub(crate) fn offer(s: &mut State, c: Candidate, local: bool, effects: &mut Vec<
         Mode::Historical
     };
     let Some(id) = lifecycle::allocate(s) else {
+        if !local {
+            s.instances
+                .get_mut(&c.instance)
+                .expect("selected instance")
+                .recovery_incomplete = true;
+        }
         effects.push(Effect::Report(Outcome::Capacity));
         return;
     };
@@ -214,6 +222,10 @@ pub(crate) fn evidence(s: &mut State, r: EvidenceReply, effects: &mut Vec<Effect
         effects.push(Effect::Report(Outcome::CallbackMismatch));
         return;
     };
+    if s.instances[&p.candidate.instance].storage_integrity_failed {
+        effects.push(Effect::Report(Outcome::IntegrityConflict));
+        return;
+    }
     if matches!(r.verdict, Verdict::Unavailable) {
         effects.push(Effect::Report(Outcome::Unavailable));
         return;
@@ -302,6 +314,15 @@ pub(crate) fn evidence(s: &mut State, r: EvidenceReply, effects: &mut Vec<Effect
             }
             let missing = projection::missing(v, &p.candidate);
             if !missing.is_empty() {
+                let slots = projection::pending_slots(s, &p.candidate.instance, &missing);
+                if !projection::pending_fits(s, &p.candidate.instance, &slots, 0) {
+                    s.instances
+                        .get_mut(&p.candidate.instance)
+                        .expect("selected instance")
+                        .recovery_incomplete = true;
+                    effects.push(Effect::Report(Outcome::Capacity));
+                    return;
+                }
                 effects.push(Effect::RequestMissing(missing.clone()));
                 effects.push(Effect::Report(Outcome::MissingHistory(missing)));
                 if !local {
@@ -409,6 +430,10 @@ pub(crate) fn fork(s: &mut State, p: ForkEvidence, effects: &mut Vec<Effect>) {
         effects.push(Effect::Report(Outcome::Invalid));
         return;
     };
+    if v.storage_integrity_failed {
+        effects.push(Effect::Report(Outcome::IntegrityConflict));
+        return;
+    }
     let first = v.accepted.iter().any(|a| a.candidate == p.first);
     let second = v.accepted.iter().any(|a| a.candidate == p.second);
     if first && second {

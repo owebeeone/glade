@@ -70,6 +70,10 @@ pub(crate) fn stage(
     effects: &mut Vec<Effect>,
 ) {
     let instance = records[0].instance.clone();
+    if s.instances[&instance].storage_integrity_failed {
+        effects.push(Effect::Report(Outcome::IntegrityConflict));
+        return;
+    }
     if s.commits
         .values()
         .chain(s.unknown_commits.values())
@@ -101,13 +105,23 @@ pub(crate) fn stage(
         },
     };
     let bounds = &v.descriptor.bounds;
+    let missing: Vec<_> = if kind == CommitKind::Candidate {
+        records
+            .iter()
+            .flat_map(|c| projection::missing(v, c))
+            .collect()
+    } else {
+        vec![]
+    };
+    let slots = projection::pending_slots(s, &instance, &missing);
     let enough = callbacks::add(&v.used, &charges).is_some_and(|n| {
         n.edit <= bounds.edit_bytes
             && n.recovery <= bounds.recovery_bytes
             && n.evidence <= bounds.evidence_bytes
             && n.pending <= bounds.pending_bytes
     }) && (kind != CommitKind::Candidate || v.candidates.len() < bounds.pending_items)
-        && v.revision < u64::MAX;
+        && v.revision < u64::MAX
+        && projection::pending_fits(s, &instance, &slots, charges.pending);
     if !enough {
         if local.is_none() {
             s.instances
@@ -121,6 +135,12 @@ pub(crate) fn stage(
     let descriptor = v.descriptor.clone();
     let revision = v.revision;
     let Some(id) = lifecycle::allocate(s) else {
+        if local.is_none() {
+            s.instances
+                .get_mut(&instance)
+                .expect("selected instance")
+                .recovery_incomplete = true;
+        }
         effects.push(Effect::Report(Outcome::Capacity));
         return;
     };
@@ -173,12 +193,14 @@ pub(crate) fn stage(
     }
     let v = &s.instances[&instance];
     let b = &v.descriptor.bounds;
-    if callbacks::add(&v.used, &p.charges).is_none_or(|n| {
-        n.edit > b.edit_bytes
-            || n.recovery > b.recovery_bytes
-            || n.evidence > b.evidence_bytes
-            || n.pending > b.pending_bytes
-    }) {
+    if !projection::pending_fits(s, &instance, &slots, p.charges.pending)
+        || callbacks::add(&v.used, &p.charges).is_none_or(|n| {
+            n.edit > b.edit_bytes
+                || n.recovery > b.recovery_bytes
+                || n.evidence > b.evidence_bytes
+                || n.pending > b.pending_bytes
+        })
+    {
         if p.local_precondition.is_none() {
             s.instances
                 .get_mut(&instance)

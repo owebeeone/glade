@@ -121,6 +121,14 @@ pub(crate) fn resolve(
     s.retired_storage_invocations
         .insert(r.request.invocation.clone(), request);
     s.lookups.remove(&r.request.invocation.number);
+    // An older observation can finish its invocation, but cannot reopen the
+    // immutable terminal already learned through another issued operation.
+    if !matches!(r.result, ResolveResult::Terminal(_))
+        && s.terminal_results.contains_key(&r.request.attempt.id)
+    {
+        effects.push(Effect::Report(Outcome::CallbackMismatch));
+        return;
+    }
     match r.result {
         ResolveResult::Pending | ResolveResult::Refused(_) | ResolveResult::Started { .. } => {
             if let ResolveResult::Started { cut } = r.result {

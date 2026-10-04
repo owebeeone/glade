@@ -48,7 +48,66 @@ pub(crate) fn missing(v: &InstanceState, c: &Candidate) -> Vec<Slot> {
                 Some(s)
             }
         })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
         .collect()
+}
+/// Reserve the deduplicated union, including unpublished owned candidate work.
+pub(crate) fn pending_slots(s: &State, instance: &Instance, extra: &[Slot]) -> BTreeSet<Slot> {
+    let v = &s.instances[instance];
+    let mut slots: BTreeSet<_> = v.pending.iter().chain(extra).cloned().collect();
+    for c in &v.candidates {
+        slots.extend(missing(v, c));
+    }
+    for p in s.commits.values().chain(s.unknown_commits.values()) {
+        if &p.instance == instance && p.kind == CommitKind::Candidate {
+            for c in &p.records {
+                slots.extend(missing(v, c));
+            }
+        }
+    }
+    slots
+}
+pub(crate) fn pending_fits(
+    s: &State,
+    instance: &Instance,
+    slots: &BTreeSet<Slot>,
+    extra_bytes: usize,
+) -> bool {
+    let v = &s.instances[instance];
+    let Some(z) = &s.storage_limits else {
+        return false;
+    };
+    // Slot owns its fixed representation and both variable strings. Count
+    // those retained bytes alongside charged candidates and live queries;
+    // hints do not fabricate durable storage charges.
+    let bytes = slots
+        .iter()
+        .fold(v.used.pending.checked_add(extra_bytes), |n, slot| {
+            n?.checked_add(std::mem::size_of::<Slot>())?
+                .checked_add(slot.instance.incarnation.len())?
+                .checked_add(slot.origin.len())
+        });
+    let bytes = s
+        .queries
+        .values()
+        .filter(|q| &q.candidate.instance == instance)
+        .fold(bytes, |n, q| {
+            n?.checked_add(crate::admission::candidate_size(&q.candidate)?)
+        });
+    let bytes = s
+        .commits
+        .values()
+        .chain(s.unknown_commits.values())
+        .filter(|p| &p.instance == instance)
+        .fold(bytes, |n, p| n?.checked_add(p.charges.pending));
+    slots.len() <= v.descriptor.bounds.pending_items
+        && slots.iter().all(|slot| {
+            !slot.origin.is_empty()
+                && slot.origin.len() <= z.max_name_bytes
+                && slot.instance.incarnation.len() <= z.max_name_bytes
+        })
+        && bytes.is_some_and(|n| n <= v.descriptor.bounds.pending_bytes)
 }
 pub(crate) fn eligible(v: &InstanceState) -> BTreeSet<Digest> {
     let mut set = BTreeSet::new();
