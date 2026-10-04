@@ -85,14 +85,13 @@ fn actual_reserved_fence_wins_and_late_exact_or_contrary_callbacks_never_reopen_
     let mut session = host.open_replica(request(&f, [0; 32])).unwrap();
     let begin = prepared(&mut session, &f);
     changed_policy(&mut session, &f);
-    let fence = session
-        .pair
-        .as_ref()
-        .unwrap()
-        .image
-        .state
+    let state = &session.pair.as_ref().unwrap().image.state;
+    // ObservePolicy now drives its selected Fence callback automatically;
+    // recover the same original request whether still live or retired.
+    let fence = state
         .storage_invocations
         .values()
+        .chain(state.retired_storage_invocations.values())
         .find_map(|invocation| match invocation {
             StorageInvocation::Resolve(request) if request.operation == OperationKind::Fence => {
                 Some(request.clone())

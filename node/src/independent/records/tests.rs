@@ -101,3 +101,9 @@ mod ingress_capacity;
 
 #[path = "tests/marker_cuts.rs"]
 mod marker_cuts;
+
+#[path = "tests/oversized_loss.rs"]
+mod oversized_loss;
+
+#[path = "tests/retained_cut_crash.rs"]
+mod retained_cut_crash;

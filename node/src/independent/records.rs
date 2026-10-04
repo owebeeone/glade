@@ -278,8 +278,8 @@ impl<P: PolicyClock> ReplicaRecoverySession for DiskSession<P> {
             .insert(guard.id.clone(), GuardStatus::Active(guard.clone()));
         loss::reserve(&pair.image, &reserved, &guard)?;
         authentication::begin(self)?;
-        let (cut, policy) = self.evidence.current()?;
-        authentication::persist(self)?;
+        self.evidence.current()?;
+        let (cut, policy) = authentication::persist_observed(self)?;
         let pair = self.pair.as_mut().ok_or(Fault::Ownership)?;
         guards::fresh(&self.request, pair, &guard)?;
         let policy_digest =

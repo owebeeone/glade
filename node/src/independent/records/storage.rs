@@ -200,7 +200,18 @@ pub(super) fn begin<P: PolicyClock>(
                         .windows
                         .iter()
                         .all(|window| super::super::auth::fits(&observation.time, window));
-                authentication::persist(session)?;
+                let (retained, _) = authentication::persist_observed(session)?;
+                // Persistence may have learned a later cut than observe().
+                // Start requires the exact sealed policy and full interval at
+                // this protected barrier; a changed cut resolves NonCommit.
+                allow = allow
+                    && super::super::namespace::record_bytes(
+                        &retained.policy,
+                        &session.evidence.config.limits,
+                    )?
+                    .digest()
+                        == precondition.cut.policy
+                    && retained.time.as_ref() == Some(&precondition.cut.time);
             }
             let pair = session.pair.as_ref().ok_or(Fault::Ownership)?;
             let mut recovery = pair.image.recovery.clone();

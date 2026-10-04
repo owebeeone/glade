@@ -87,14 +87,20 @@ fn disabled_associated_foreign_and_field_declarations_are_checked() {
 #[test]
 fn actual_node_independent_subtree_and_disabled_branches_are_checked() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../node");
-    for file in files(&root.join("src/independent"))
+    let selected: Vec<_> = files(&root.join("src/independent"))
         .into_iter()
         .chain(files(&root.join("tests/ic3_disk_remediation")))
+        .chain(files(&root.join("tests/ic3_disk_remediation2")))
         .chain([
             root.join("tests/ic3_boundary.rs"),
             root.join("tests/ic3_disk.rs"),
         ])
-    {
+        .collect();
+    assert!(
+        selected.contains(&root.join("tests/ic3_disk_remediation2/mod.rs")),
+        "new public remediation consumer must be parsed, including disabled branches"
+    );
+    for file in selected {
         assert!(
             violations(&std::fs::read_to_string(&file).unwrap()).is_empty(),
             "{}",

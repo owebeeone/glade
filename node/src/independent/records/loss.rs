@@ -111,7 +111,9 @@ pub(super) fn pending<P: PolicyClock>(
             observation,
             checkpoint,
         } => {
-            let observed = observation.bytes.clone();
+            // Preserve the original boxed continuation without allocating a
+            // second full copy of a possibly oversized receive result.
+            let observed = Bytes::new(observation.bytes.digest().to_vec());
             retain_with(session, permit, observed, Some((observation, checkpoint)))
         }
         persist::PendingIngress::Loss {
@@ -137,16 +139,23 @@ pub(super) fn retain_with<P: PolicyClock>(
         {
             return Err(Fault::Ownership);
         }
-        if observed.value().len() > permit.guard().max_bytes {
+        // A failed normal settlement is already an owned, drained host
+        // continuation. Its oversized input is never installed in the image:
+        // only the fixed digest enters the reserved conservative loss marker.
+        // Direct caller-provided loss prefixes retain their original bound.
+        if settlement.is_none() && observed.value().len() > permit.guard().max_bytes {
             return Err(Fault::Capacity);
         }
         let mut checkpoint = session.checkpoint_template()?;
         let bytes = marker(
             permit.guard(),
             checkpoint.image.generation,
-            permit
-                .received_digest()
-                .unwrap_or_else(|| observed.digest()),
+            permit.received_digest().unwrap_or_else(|| {
+                settlement
+                    .as_ref()
+                    .map(|(observation, _)| observation.bytes.digest())
+                    .unwrap_or_else(|| observed.digest())
+            }),
             &checkpoint.image.limits.decode,
         )?;
         checkpoint.image.permanent_loss.push(bytes.clone());
