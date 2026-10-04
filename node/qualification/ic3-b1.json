@@ -2,7 +2,7 @@
   "version": 1,
   "phase": "IC3-B1",
   "status": "accepted",
-  "implementation_revision": "a47691598df648eb8c9554b27f3d06b0cffcf596",
+  "implementation_revision": "9cc4ac318b70b9e3a359c4142f0bbe3314c1dfed",
   "accepted_review_record": "434df3f4aae0cfc116072db95a294283978d0c6e",
   "reviewed_root_revision": "f0b1c325f9e0eff27b4eefadac8084bff3505e73",
   "acceptance_document": {
@@ -87,5 +87,11 @@
     "dev-docs/history/GladeIndependentCrdtProductionIntegrationB-Remediation2SourcePins.json": "10399a62aa9330378baa6457bdf199c43b29abfea5c9efb9426cb4c649aaf4bd",
     "dev-docs/history/GladeIndependentCrdtProductionIntegrationB-Remediation2RunLog.md.gz": "28c07bef73a2b83848418998b2218a8017fea5037887d575ca08890779eb1c03"
   },
-  "scope": "Genuine strict Ed25519 signed development direct-root provider, current owned bounded policy/clock intervals, scoped local possession and immutable historical admission. Coupled Unix LocalProcessRestart persistence accepted separately in same record. No production enrollment, browser activation, quorum, power-loss or arbitrary offline authorization promise."
+  "scope": "Genuine strict Ed25519 signed development direct-root provider, current owned bounded policy/clock intervals, scoped local possession and immutable historical admission. Coupled Unix LocalProcessRestart persistence accepted separately in same record. No production enrollment, browser activation, quorum, power-loss or arbitrary offline authorization promise.",
+  "authenticated_implementation_revision": "a47691598df648eb8c9554b27f3d06b0cffcf596",
+  "representation_gate_fixture_correction": {
+    "path": "contracts/crdt-recovery-codec/compat/test_gate.py",
+    "sha256": "c2c29a522b5bc7eee84957791a2fb35bfbccd35293f06c9c26c4f497c43a532a",
+    "scope": "Only negative-fixture independence from live accepted pins. Production gate, schema, bytes and authentication runtime unchanged from accepted source. This test-only correction is part of pending aggregate C review, not a new authentication acceptance."
+  }
 }
