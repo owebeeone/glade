@@ -44,3 +44,10 @@ impl<P: PolicyClock> ConfiguredIndependentAdapters<P> {
 }
 
 pub(crate) mod node;
+
+// Test-only support shared by the actual-binary library witnesses. The
+// condition sits on this braced module, never on a lone declaration.
+#[cfg(test)]
+mod test_support {
+    pub(super) mod actual_binary;
+}

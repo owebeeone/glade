@@ -407,163 +407,35 @@ async fn empty_full_manifest_cannot_claim_unaccounted_payload_bytes() {
 // production binary owns all automatic peer transfer. No client ferries history.
 #[tokio::test(flavor = "multi_thread")]
 async fn actual_binaries_exchange_ancestry_and_security_evidence_both_arrival_orders() {
-    use std::io::{BufRead, BufReader};
-    use std::process::{Child, Command, Stdio};
-    struct Process {
-        child: Child,
-        lines: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-        readers: Vec<std::thread::JoinHandle<()>>,
-    }
-    impl Process {
-        fn start(profile: &std::path::Path, port: u16) -> Self {
-            let binary =
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/glade-node");
-            let mut child = Command::new(binary)
-                .env_clear()
-                .args([
-                    "--independent-config",
-                    profile.to_str().unwrap(),
-                    &port.to_string(),
-                ])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .unwrap();
-            let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-            let mut readers = Vec::new();
-            let outputs: Vec<Box<dyn std::io::Read + Send>> = vec![
-                Box::new(child.stdout.take().unwrap()),
-                Box::new(child.stderr.take().unwrap()),
-            ];
-            for output in outputs {
-                let owned = lines.clone();
-                readers.push(std::thread::spawn(move || {
-                    for line in BufReader::new(output).lines() {
-                        match line {
-                            Ok(line) => owned.lock().unwrap().push(line),
-                            Err(_) => {
-                                break;
-                            }
-                        }
-                    }
-                }));
-            }
-            println!(
-                "actual ancestry node pid={} profile={}",
-                child.id(),
-                profile.display()
-            );
-            Self {
-                child,
-                lines,
-                readers,
-            }
-        }
-        async fn wait(&mut self, prefix: &str) {
-            let result = tokio::time::timeout(std::time::Duration::from_secs(8), async {
-                loop {
-                    if self
-                        .lines
-                        .lock()
-                        .unwrap()
-                        .iter()
-                        .any(|line| line.starts_with(prefix))
-                    {
-                        break;
-                    }
-                    if let Some(status) = self.child.try_wait().unwrap() {
-                        panic!(
-                            "actual node pid {} exited {status}: {:?}",
-                            self.child.id(),
-                            self.lines.lock().unwrap()
-                        );
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    use crate::independent::test_support::actual_binary::{port, Process};
+    async fn synchronized(a: &Process, b: &Process, require_complete: bool) {
+        tokio::time::timeout(std::time::Duration::from_secs(8), async {
+            loop {
+                let owned = [a.lines(), b.lines()];
+                let latest: Vec<_> = owned
+                    .iter()
+                    .map(|lines| {
+                        lines
+                            .iter()
+                            .rev()
+                            .find_map(|line| line.strip_prefix("independent idle "))
+                            .map(str::to_owned)
+                    })
+                    .collect();
+                if latest[0].is_some()
+                    && latest[0] == latest[1]
+                    && (!require_complete
+                        || latest[0]
+                            .as_ref()
+                            .is_some_and(|line| line.ends_with(" complete=true")))
+                {
+                    break;
                 }
-            })
-            .await;
-            assert!(
-                result.is_ok(),
-                "actual node missing {prefix}: {:?}",
-                self.lines.lock().unwrap()
-            );
-        }
-        async fn synchronized(a: &Self, b: &Self, require_complete: bool) {
-            tokio::time::timeout(std::time::Duration::from_secs(8), async {
-                loop {
-                    let owned = [
-                        a.lines.lock().unwrap().clone(),
-                        b.lines.lock().unwrap().clone(),
-                    ];
-                    let latest: Vec<_> = owned
-                        .iter()
-                        .map(|lines| {
-                            lines
-                                .iter()
-                                .rev()
-                                .find_map(|line| line.strip_prefix("independent idle "))
-                                .map(str::to_owned)
-                        })
-                        .collect();
-                    if latest[0].is_some()
-                        && latest[0] == latest[1]
-                        && (!require_complete
-                            || latest[0]
-                                .as_ref()
-                                .is_some_and(|line| line.ends_with(" complete=true")))
-                    {
-                        break;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                }
-            })
-            .await
-            .expect("actual ancestry/security settled matching idle cut before shutdown");
-        }
-        async fn stop(&mut self) {
-            assert!(Command::new("/bin/kill")
-                .env_clear()
-                .args(["-TERM", &self.child.id().to_string()])
-                .status()
-                .unwrap()
-                .success());
-            let status = tokio::time::timeout(std::time::Duration::from_secs(8), async {
-                loop {
-                    if let Some(status) = self.child.try_wait().unwrap() {
-                        break status;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                }
-            })
-            .await
-            .unwrap();
-            for reader in self.readers.drain(..) {
-                reader.join().unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
-            assert!(
-                status.success(),
-                "actual node close: {:?}",
-                self.lines.lock().unwrap()
-            );
-        }
-    }
-    impl Drop for Process {
-        fn drop(&mut self) {
-            if self.child.try_wait().unwrap().is_none() {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
-            }
-            for reader in self.readers.drain(..) {
-                let _ = reader.join();
-            }
-        }
-    }
-    fn port() -> u16 {
-        std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
+        })
+        .await
+        .expect("actual ancestry/security settled matching idle cut before shutdown");
     }
     fn profile(
         f: &Fixture,
@@ -726,7 +598,7 @@ async fn actual_binaries_exchange_ancestry_and_security_evidence_both_arrival_or
         } else {
             second.wait("independent exchanged ").await;
         }
-        Process::synchronized(&first, &second, false).await;
+        synchronized(&first, &second, false).await;
         first.stop().await;
         second.stop().await;
         for (index, root_path) in roots.iter().enumerate() {
@@ -796,7 +668,7 @@ async fn actual_binaries_exchange_ancestry_and_security_evidence_both_arrival_or
         } else {
             first.wait("independent exchanged ").await;
         }
-        Process::synchronized(&first, &second, true).await;
+        synchronized(&first, &second, true).await;
         first.stop().await;
         second.stop().await;
         let mut histories = Vec::new();
