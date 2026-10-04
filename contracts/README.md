@@ -87,16 +87,20 @@ All selections include the local architecture gate and enable conformance tests.
 `sh glade/contracts/arch002-fixture.sh` injects `shaku` into each contract crate in
 turn, on a temporary copy, and requires the gate to refuse each with ARCH-002; it
 is a separate command, not part of `check.sh`.
-The proposed `glade-crdt-storage-attempt-api` Contract package provides exclusive
+The accepted internal `glade-crdt-storage-attempt-api` Contract package provides exclusive
 session recovery/close and exact prepare/recover-plan/begin/inspect/fence operations.
 Its bounded development host proves model conformance, including rejecting mutants;
-physical storage and successful kernel behavior remain later gates.
+physical storage remains a later gate.
 The internal admission component has a compiling downstream Rust Records model
 and released Taut text JS consumer; these are volatile trusted-evidence fixtures,
-not live node adapters. Its behavioral tests intentionally fail the safe-refusing
-scaffold. Future contract changes MUST test affected consumers. See
-[IC-1 contract](../../dev-docs/GladeIndependentCrdtAdmissionContract.md) for exact
-GREEN scaffold checks, RED commands and remaining live gates.
+not live node adapters. IC-2 replaces the refusing scaffold with the Pure admission,
+reconciliation and immutable batch encoder. Its original behavioral consumers and
+released text rows now pass; component acceptance still requires the recorded
+independent Code/State gate. Future contract changes MUST test affected consumers.
+See the [accepted internal contract](../../dev-docs/GladeIndependentCrdtStorageAttemptContract.md),
+[implementation checkpoint](../../dev-docs/GladeIndependentCrdtAdmissionKernelImplementation.md)
+and [review ledger](../../dev-docs/GladeIndependentCrdtAdmission-ReviewCycle.md)
+for exact evidence, review status and remaining live gates.
 
 The script explicitly adopts the existing architecture checker for **this nested
 workspace only**, using `architecture-policy.json`. The checker is obtained from

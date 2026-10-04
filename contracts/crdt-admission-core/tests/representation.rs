@@ -1,4 +1,4 @@
-//! GREEN representation/scaffold checks make no admission-success claim.
+//! Immutable representation and deterministic Pure boundary checks.
 // Shared fixture has helpers consumed by the separate behavioral suite.
 #[allow(dead_code)]
 mod support;
@@ -24,17 +24,19 @@ fn operation_bytes_and_digest_are_derived_and_owned() {
     );
 }
 #[test]
-fn refusing_scaffold_preserves_state_and_emits_no_side_effects() {
+fn pure_step_is_deterministic_preserves_caller_input_and_read_only_state() {
     let d = descriptor("x");
     let c = candidate(&d, "a", 0, None, vec![], insert("a", None, "A"));
     let state = initial(d.clone());
-    for event in [
-        Event::SubmitLocal(Box::new(c.clone())),
-        Event::OfferReplica(Box::new(c)),
-        Event::Read(d.instance),
-    ] {
-        let result = step(&state, event);
-        assert_eq!(result.state, state);
-        assert_eq!(result.effects, vec![Effect::Report(Outcome::Unavailable)]);
-    }
+    let original = state.clone();
+    let event = Event::SubmitLocal(Box::new(c));
+    let first = step(&state, event.clone());
+    assert_eq!(first, step(&state, event));
+    assert_eq!(state, original);
+    assert!(first.effects.iter().any(|e| matches!(e, Effect::Verify(_))));
+    let read = step(&first.state, Event::Read(d.instance));
+    assert_eq!(read.state, first.state);
+    assert!(
+        matches!(read.effects.as_slice(), [Effect::Report(Outcome::Read(c))] if !c.complete_local)
+    );
 }
