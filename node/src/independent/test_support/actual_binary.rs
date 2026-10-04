@@ -36,9 +36,12 @@ pub(crate) fn glade_node() -> PathBuf {
     }
 }
 
-/// `binary` if it exists and is no older than every input its Cargo dep-info
-/// (`<binary>.d`) names; at least one input must lie under `sources`. Test-only
-/// files are not inputs of the binary, so editing one does not refuse it.
+/// `binary` if it exists and no source it was built from is newer. Its inputs
+/// are those its Cargo dep-info `<binary>.d` names, which `cargo build` writes
+/// with the whole closure (at least one must lie under `sources`). `cargo
+/// test` writes none beside the binary, so then they are the `.rs` files
+/// under `sources` outside the test-only paths ([`test_only`]). Either way an
+/// edit to a test-only file does not refuse a binary that cannot contain it.
 fn current(binary: &Path, sources: &Path) -> Result<PathBuf, String> {
     let built = std::fs::metadata(binary)
         .and_then(|meta| meta.modified())
@@ -48,11 +51,14 @@ fn current(binary: &Path, sources: &Path) -> Result<PathBuf, String> {
                 binary.display()
             )
         })?;
-    let (info, listed) = dep_info(binary)?;
-    let inputs = inputs(&listed);
+    let info = binary.with_extension("d");
+    let inputs = match std::fs::read_to_string(&info) {
+        Ok(listed) => inputs(&listed),
+        Err(_) => scanned(sources)?,
+    };
     if !inputs.iter().any(|input| input.starts_with(sources)) {
         return Err(format!(
-            "actual glade-node dep-info {} names no source under {}",
+            "actual glade-node inputs ({} or a scan) name no source under {}",
             info.display(),
             sources.display()
         ));
@@ -78,49 +84,35 @@ fn current(binary: &Path, sources: &Path) -> Result<PathBuf, String> {
     Ok(binary.to_path_buf())
 }
 
-/// The dep-info Cargo recorded for `binary`, and where: `<binary>.d` beside it
-/// after `cargo build`; after `cargo test`, which writes dep-info only under
-/// `deps/`, that of the `deps/` executable the binary was copied or linked
-/// from (the same name stem, size and modification time).
-fn dep_info(binary: &Path) -> Result<(PathBuf, String), String> {
-    let beside = binary.with_extension("d");
-    if let Ok(listed) = std::fs::read_to_string(&beside) {
-        return Ok((beside, listed));
-    }
-    let missing = |why: String| {
-        format!(
-            "actual glade-node dep-info missing at {} and under deps/: {why}",
-            beside.display()
-        )
-    };
-    let built = std::fs::metadata(binary).map_err(|error| missing(error.to_string()))?;
-    let stamp = (built.len(), built.modified().ok());
-    let deps = binary.with_file_name("deps");
-    let stem = binary
-        .file_stem()
-        .map(|stem| format!("{}-", stem.to_string_lossy().replace('-', "_")))
-        .unwrap_or_default();
-    let entries = std::fs::read_dir(&deps).map_err(|error| missing(error.to_string()))?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let named = path
-            .file_stem()
-            .is_some_and(|name| name.to_string_lossy().starts_with(&stem));
-        if !named || path.extension() != binary.extension() {
-            continue;
-        }
-        let Ok(meta) = std::fs::metadata(&path) else {
-            continue;
-        };
-        if (meta.len(), meta.modified().ok()) != stamp {
-            continue;
-        }
-        let info = path.with_extension("d");
-        if let Ok(listed) = std::fs::read_to_string(&info) {
-            return Ok((info, listed));
+/// Every `.rs` file under `root` that the binary can be built from: all of
+/// them but the test-only paths.
+fn scanned(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut found = vec![];
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let entries = std::fs::read_dir(&dir)
+            .map_err(|error| format!("cannot scan sources {}: {error}", dir.display()))?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if test_only(&path) {
+                continue;
+            }
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                found.push(path);
+            }
         }
     }
-    Err(missing("no deps/ executable matches the binary".into()))
+    Ok(found)
+}
+
+/// The crate's test-only source paths: a `tests` directory, a `tests.rs`
+/// file, or a `test_support` directory. Test modules inline in a production
+/// file are not here: editing one rebuilds the binary in a full test run.
+fn test_only(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|name| name == "tests" || name == "tests.rs" || name == "test_support")
 }
 
 /// The inputs a Makefile-style dep-info line names after `<target>: `, with
@@ -339,42 +331,35 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// `cargo test` writes no `<binary>.d`: the dep-info read is that of the
-    /// `deps/` executable the binary was copied from, never a decoy's.
+    /// `cargo test` writes no `<binary>.d`: the inputs are then the `.rs`
+    /// files under the sources outside the test-only paths.
     #[test]
-    fn cargo_test_layout_reads_the_dep_info_of_the_deps_executable_it_copied() {
-        let root = scratch("deps");
-        let (lib, binary) = (root.join("src/lib.rs"), root.join("glade-node"));
+    fn without_dep_info_the_non_test_sources_are_the_inputs() {
+        let root = scratch("scan");
+        let (lib, binary) = (root.join("src/deeper/lib.rs"), root.join("glade-node"));
         let sources = root.join("src");
-        std::fs::create_dir_all(root.join("deps")).unwrap();
-        let (copied, decoy) = (
-            root.join("deps/glade_node-0aa1"),
-            root.join("deps/glade_node-0bb2"),
-        );
-        let then = SystemTime::now() - Duration::from_secs(60);
         let built = SystemTime::now();
-        touch(&lib, then);
-        for path in [&binary, &copied] {
-            std::fs::write(path, b"same bytes").unwrap();
-            touch(path, built);
-        }
-        std::fs::write(&decoy, b"a decoy of another size").unwrap();
-        touch(&decoy, built);
-        let decoy_input = root.join("src/decoy.rs");
-        touch(&decoy_input, built + Duration::from_secs(60));
-        info(&decoy, &[&decoy_input]);
-        info(&copied, &[&lib]);
+        let later = built + Duration::from_secs(60);
+        touch(&lib, built - Duration::from_secs(60));
+        touch(&binary, built);
         assert_eq!(current(&binary, &sources), Ok(binary.clone()));
-        touch(&lib, built + Duration::from_secs(60));
+        // Test-only paths are not inputs: edits there keep the binary.
+        for test_only in [
+            "src/tests.rs",
+            "src/deeper/tests/witness.rs",
+            "src/test_support/harness.rs",
+        ] {
+            let path = root.join(test_only);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            touch(&path, later);
+        }
+        assert_eq!(current(&binary, &sources), Ok(binary.clone()));
+        touch(&lib, later);
         let stale = current(&binary, &sources).unwrap_err();
         assert!(
             stale.contains("stale") && stale.contains("lib.rs"),
             "{stale}"
         );
-        std::fs::remove_file(copied.with_extension("d")).unwrap();
-        assert!(current(&binary, &sources)
-            .unwrap_err()
-            .contains("dep-info missing"));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -388,9 +373,10 @@ mod tests {
             .contains("binary missing"));
         let then = SystemTime::now() - Duration::from_secs(60);
         touch(&binary, then);
+        // No dep-info and no source to scan: nothing proves it current.
         assert!(current(&binary, &sources)
             .unwrap_err()
-            .contains("dep-info missing"));
+            .contains("name no source"));
         touch(&lib, SystemTime::now());
         info(&binary, &[&lib]);
         let stale = current(&binary, &sources).unwrap_err();
@@ -403,7 +389,7 @@ mod tests {
         info(&binary, &[&root.join("glade-node")]);
         assert!(current(&binary, &sources)
             .unwrap_err()
-            .contains("names no source"));
+            .contains("name no source"));
         std::fs::remove_dir_all(root).unwrap();
     }
 }
