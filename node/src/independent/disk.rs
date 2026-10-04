@@ -304,6 +304,9 @@ mod tests {
             DiskLayout::open(&data, &floor, [74; 32]),
             Err(Fault::Integrity)
         ));
+        // That refused open took both locks before it checked the marker, and
+        // released them: a release in this process like any other.
+        crate::test_support::children::settled();
         let reopened = DiskLayout::open(&data, &floor, [75; 32])
             .expect("registered roots reopen through the unchanged stable lock inode");
         drop(reopened);
