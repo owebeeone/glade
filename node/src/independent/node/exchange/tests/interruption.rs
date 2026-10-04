@@ -882,22 +882,26 @@ async fn witness(cut: &Cut) {
         );
     }
     // Once lost, later successful full inventories do not clear the loss:
-    // the cut's exact loss survives restart and retry. A heal round that
-    // itself times out may add a further, equally permanent loss.
-    let kept = |losses: &[GuardStatus], held: &[GuardStatus]| {
-        losses.iter().all(|loss| held.contains(loss))
-    };
-    assert!(
-        kept(&after.losses(), &healed.losses()),
-        "{}: loss kept; healed {}",
+    // the cut's exact loss survives restart and retry, and the retry itself
+    // adds none on either side.
+    assert_eq!(
+        healed.losses(),
+        after.losses(),
+        "{}: exactly the cut's loss; healed {}",
         cut.name,
         healed.summary()
     );
-    assert!(after
-        .image
-        .permanent_loss
-        .iter()
-        .all(|marker| healed.image.permanent_loss.contains(marker)));
+    assert_eq!(
+        healed.image.permanent_loss, after.image.permanent_loss,
+        "{}: permanent loss markers",
+        cut.name
+    );
+    assert!(
+        peer_state.losses().is_empty(),
+        "{}: the peer loses nothing; peer {}",
+        cut.name,
+        peer_state.summary()
+    );
     if lossy {
         assert!(healed.loss && !healed.complete, "{}: sticky", cut.name);
         assert_eq!(
@@ -905,7 +909,7 @@ async fn witness(cut: &Cut) {
             "{}: a lossy node reports no idle cut",
             cut.name
         );
-    } else if healed.losses().is_empty() {
+    } else {
         assert!(
             node_idle
                 .as_ref()
