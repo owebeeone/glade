@@ -571,6 +571,7 @@ async fn finish_service(
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod interruption;
     #[test]
     fn inbound_busy_completion_keeps_original_outbound_worker_registered() {
         let remote = [1; 32];

@@ -447,9 +447,11 @@ pub(crate) fn node_reference(bundle: &TransferBundle, raw: &Bytes) -> RecordRef 
     node_ingress::bundle_ref(bundle, raw)
 }
 
+// Visible to the rest of `independent`'s own tests, which reuse its loaded
+// fixtures instead of loading the same files as second modules.
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     #[path = "../tests.rs"]
-    mod content;
+    pub(in crate::independent) mod content;
 }

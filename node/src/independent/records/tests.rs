@@ -2,7 +2,7 @@
 use super::*;
 use crate::independent::{EvidenceConfig, SessionRequest, TrustedCut};
 #[path = "../../../tests/ic3_auth_fixture/mod.rs"]
-mod ic3_auth_fixture;
+pub(in crate::independent) mod ic3_auth_fixture;
 use ic3_auth_fixture::*;
 #[derive(Clone)]
 struct Source(TrustedCut);
@@ -72,6 +72,11 @@ fn config(root: &std::path::Path, provision: bool) -> DiskRootConfig {
 mod controls;
 #[path = "../../../tests/ic3_disk_fixture/mod.rs"]
 mod ic3_disk_fixture;
+/// The larger disposable storage profile for `independent` tests outside
+/// this module (its fixture functions are visible only here).
+pub(in crate::independent) fn disk_profile() -> Fixture {
+    ic3_disk_fixture::disk_profile()
+}
 
 #[path = "tests/restart.rs"]
 mod restart;
