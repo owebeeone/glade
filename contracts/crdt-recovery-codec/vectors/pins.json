@@ -1,7 +1,7 @@
 {
   "version": 1,
-  "status": "candidate-content-pins-awaiting-parent-commit",
-  "implementation_revision": null,
+  "status": "committed-content-pins",
+  "implementation_revision": "7d26ba6e6d133db650a37ff49eba71644ea370a6",
   "languages": {
     "rust": "rustc 1.96.0 (ac68faa20 2026-05-25)",
     "typescript": "Node v22.19.0 built-in TypeScript transform",
@@ -22,6 +22,6 @@
     "src/values.rs": "5bedfa464a3dc29ffaff4ac2acfc772059861a671a1ed5750fa3a18b2bb10162",
     "check-vectors.sh": "d198e8df96e1dbe9897ad5e87389d6f89d2e5e2f93eeb6117619445144e91ec0"
   },
-  "qualification": "structural representation only; real authenticated provider remains B1",
+  "qualification": "source-qualified structural representation only; genuine authenticated provider remains IC3-B1",
   "crypto_qualification": null
 }
