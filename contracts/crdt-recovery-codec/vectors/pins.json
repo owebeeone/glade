@@ -1,7 +1,7 @@
 {
   "version": 1,
   "status": "committed-content-pins",
-  "implementation_revision": "3bf66efecc59fd24261e13787e4c8fc3f822ca57",
+  "implementation_revision": "a47691598df648eb8c9554b27f3d06b0cffcf596",
   "languages": {
     "rust": "rustc 1.96.0 (ac68faa20 2026-05-25)",
     "typescript": "Node v22.19.0 built-in TypeScript transform",
@@ -36,6 +36,11 @@
     "vectors/schema.json": "330469e231c2d74dd7bbf4e76b4de576c1613efcbba3fdeb2aad77b6d8ac8d18",
     "tests/remediation1.rs": "cee3400163f5fb5ff5e103954de838e4d17df5b55099fb23bf709fb08651b89c"
   },
-  "qualification": "corrected committed structural representation only; genuine authenticated provider remains IC3-B1",
-  "crypto_qualification": null
+  "qualification": "Committed canonical representation and accepted genuine scoped IC3-B1 provider; bounded development profile only",
+  "crypto_qualification": {
+    "evidence_revision": "ee306a2858cd05163f84884efe44ffba77243b88",
+    "path": "node/qualification/ic3-b1.json",
+    "sha256": "2273bd892c5716913d8b44da006121fa73ce9ed63738cccae898719c42603249",
+    "accepted_review_record": "434df3f4aae0cfc116072db95a294283978d0c6e"
+  }
 }
