@@ -759,6 +759,14 @@ async fn automatic_exchange_case(authorized: bool) {
     )
     .unwrap();
     profiles[1][7] = Bytes::new([77; 32].to_vec());
+    // The refused case keeps the shared profile's 1000 ms: it settles no idle
+    // cut and shuts down with rounds in flight, whose drain the deadline also
+    // bounds, under the 5 s shutdown bound below.
+    if authorized {
+        for profile in &mut profiles {
+            profile[11] = encode(&(50_u64, EXCHANGE_DEADLINE_MS), &limits()).unwrap();
+        }
+    }
     let keys = [glade_node::signing::public_key(&NODE), second_key];
     let endpoints = [
         glade_node::signing::public_key(&[44; 32]),
@@ -841,6 +849,7 @@ async fn automatic_exchange_case(authorized: bool) {
                     .collect()
             },
             None,
+            EXCHANGE_SETTLE,
         )
         .await;
         let higher = usize::from(keys[1] > keys[0]);
@@ -878,6 +887,7 @@ async fn automatic_exchange_case(authorized: bool) {
                     .collect()
             },
             Some(&previous),
+            EXCHANGE_SETTLE,
         )
         .await;
     }
@@ -1055,8 +1065,22 @@ fn proof(f: &Fixture, writer: &Digest, nodes: &[Digest]) -> EvidenceSet {
         admission: None,
     }
 }
-async fn wait_idle(read: impl Fn() -> Vec<Vec<String>>, previous: Option<&str>) -> String {
-    tokio::time::timeout(std::time::Duration::from_secs(8), async {
+/// The automatic-exchange witness's scheduling deadline, as the other
+/// two-node witnesses use: every dial, send and guarded receive is bounded by
+/// it, and a started receive that times out is permanent loss by design,
+/// after which no complete idle cut can settle; under load one step can take
+/// over a second. It also bounds the busy backoff: when both nodes dial at
+/// once both answer busy and the larger key waits one deadline (`serve`).
+const EXCHANGE_DEADLINE_MS: u64 = 5000;
+/// Settling covers the rounds themselves (8 s) plus one such backoff.
+const EXCHANGE_SETTLE: std::time::Duration =
+    std::time::Duration::from_millis(8000 + EXCHANGE_DEADLINE_MS);
+async fn wait_idle(
+    read: impl Fn() -> Vec<Vec<String>>,
+    previous: Option<&str>,
+    settle: std::time::Duration,
+) -> String {
+    tokio::time::timeout(settle, async {
         loop {
             let lines = read();
             let latest: Vec<_> = lines
@@ -1961,6 +1985,7 @@ mod actual_processes {
                 ]
             },
             None,
+            std::time::Duration::from_secs(8),
         )
         .await;
         a.stop().await;
