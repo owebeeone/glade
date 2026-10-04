@@ -26,7 +26,7 @@ fn observation_floor_child() {
             if cut == PairCut::Intent(FloorCut::BeforeTemp) {
                 ordinal += 1;
             }
-            if ordinal == 2 && cut == PairCut::Image(SlotCut::BeforeWrite) {
+            if ordinal == 1 && cut == PairCut::Image(SlotCut::BeforeWrite) {
                 println!("observation-floor-ready");
                 std::io::stdout().flush().unwrap();
                 loop {
@@ -46,7 +46,7 @@ fn observation_floor_child() {
     panic!("fresh observed floor intent must be durable before selected image");
 }
 #[test]
-fn actual_process_kill_keeps_new_observed_floor_and_recovers_old_valid_pending_image() {
+fn actual_process_kill_keeps_new_observed_floor_and_refuses_missing_observation_image() {
     let f = ic3_disk_fixture::disk_profile();
     let root = root("observation-floor-ahead");
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
@@ -84,27 +84,32 @@ fn actual_process_kill_keeps_new_observed_floor_and_recovers_old_valid_pending_i
         latest_ms: 81,
     });
     let mut host = DiskHost::new(provider, config(&root, false));
-    let mut session = host
-        .open_replica(request(&f, digest))
-        .expect("old valid image reattaches while authoritative new floor is never reset");
-    let LoadResult::Validated(loaded) = session.load() else {
-        panic!("truthful pending image after lost current observation image");
-    };
-    assert_eq!(loaded.authoritative_floor.issuance.time_floor_ms, 80);
-    assert_eq!(
-        loaded.image.state.instances[&f.query.instance].time_floor_ms,
-        80
+    assert!(
+        host.open_replica(request(&f, digest)).is_err(),
+        "missing next observation image cannot discharge the protected unknown cut"
     );
-    assert!(loaded.image.state.instances[&f.query.instance]
-        .accepted
-        .is_empty());
-    assert!(!loaded.image.state.queries.is_empty());
-    let reconstruction = session.reconstruction_request().unwrap();
-    let ReconstructResult::Cut(cut) = session.reconstruct_cut(reconstruction) else {
-        panic!("combined unknown observation cut");
-    };
-    assert!(!cut.complete_local);
-    assert!(session.evidence.authorized.is_empty());
-    drop(session);
+    let bytes = std::fs::read(root.join("trusted/replica.floor")).unwrap();
+    let intent: CreationIntent = decode_profile(f.identity.intent.value(), &limits()).unwrap();
+    let retained: crate::independent::disk::FloorEnvelope =
+        decode(&bytes, &intent.limits.decode).unwrap();
+    assert_eq!(retained.floor.issuance.time_floor_ms, 80);
+    assert!(retained.observing);
+    assert!(retained.pending.is_some());
+    let mut host = DiskHost::new(evidence(&f), config(&root, false));
+    let original = request(&f, digest);
+    assert!(StorageAttemptHost::open(
+        &mut host,
+        OpenRequest {
+            owner: original.owner,
+            invocation_namespace: original.invocation_namespace,
+            limits: original.limits.storage
+        }
+    )
+    .is_err());
+    assert_eq!(
+        std::fs::read(root.join("trusted/replica.floor")).unwrap(),
+        bytes,
+        "neither open form may reset the advanced floor or infer a terminal receipt"
+    );
     std::fs::remove_dir_all(root).unwrap();
 }

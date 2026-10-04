@@ -11,6 +11,7 @@ use std::{
 struct Status {
     started: bool,
     drained: bool,
+    received: Option<(usize, glade_crdt_admission_data::Digest)>,
     closed: bool,
 }
 pub struct IngressAuthority {
@@ -84,6 +85,21 @@ impl IngressAuthority {
     pub fn can_settle(&self, permit: &IngressPermit) -> Result<(), Fault> {
         self.eligible(permit, true)
     }
+    /// Normal settlement requires the issuer-owned exact successful bounded receive.
+    pub fn can_settle_received(&self, permit: &IngressPermit, bytes: &Bytes) -> Result<(), Fault> {
+        self.can_settle(permit)?;
+        if bytes.value().len() > permit.guard.max_bytes {
+            return Err(Fault::Capacity);
+        }
+        let state = permit.status.lock().map_err(|_| Fault::Integrity)?;
+        let Some((len, digest)) = state.received else {
+            return Err(Fault::BindingMismatch);
+        };
+        if bytes.value().len() != len || bytes.digest() != digest {
+            return Err(Fault::BindingMismatch);
+        }
+        Ok(())
+    }
     /// Checks never-started abandonment eligibility without retiring the capability.
     pub fn can_abandon(&self, permit: &IngressPermit) -> Result<(), Fault> {
         self.eligible(permit, false)
@@ -128,6 +144,10 @@ impl IngressAuthority {
     }
 }
 impl IngressPermit {
+    /// Issuer-recorded successful bounded result, never a caller-authored assertion.
+    pub fn received_digest(&self) -> Option<glade_crdt_admission_data::Digest> {
+        self.status.lock().ok()?.received.map(|(_, digest)| digest)
+    }
     pub fn guard(&self) -> &ReceiveGuard {
         &self.guard
     }
@@ -145,6 +165,11 @@ impl<F: Future<Output = Result<Bytes, Fault>>> Future for GuardedReceive<F> {
                 let permit = this.permit.take().expect("future polled after completion");
                 if let Ok(mut state) = permit.status.lock() {
                     state.drained = true;
+                    state.received = value
+                        .as_ref()
+                        .ok()
+                        .filter(|bytes| bytes.value().len() <= permit.guard.max_bytes)
+                        .map(|bytes| (bytes.value().len(), bytes.digest()));
                 }
                 Poll::Ready((permit, value))
             }

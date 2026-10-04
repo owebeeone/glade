@@ -53,6 +53,7 @@ impl<P: PolicyClock> DiskSession<P> {
             || self.pair.as_ref().is_some_and(|pair| {
                 let state = &pair.image.state;
                 pair.uncertain()
+                    || pair.envelope.observing
                     || pair.envelope.pending.is_some()
                     || pair
                         .envelope
@@ -88,6 +89,10 @@ impl<P: PolicyClock> DiskSession<P> {
     pub fn retry_ingress(&mut self, guard: &GuardId) -> PersistResult {
         persist::retry(self, guard)
     }
+    /// Converts only this host's already-drained retained continuation to loss.
+    pub fn retain_pending_ingress_loss(&mut self, guard: &GuardId) -> PersistResult {
+        loss::pending(self, guard)
+    }
     pub fn submit_local(
         &mut self,
         candidate: Candidate,
@@ -108,9 +113,10 @@ impl<P: PolicyClock> DiskSession<P> {
             return Err(Fault::Ownership);
         }
         self.pair.as_ref().ok_or(Fault::Ownership)?.owned()?;
-        let challenge = self.evidence.issue_challenge(request)?;
+        authentication::begin(self)?;
+        let challenge = self.evidence.issue_challenge(request);
         authentication::persist(self)?;
-        Ok(challenge)
+        challenge
     }
     pub fn authenticate(
         &mut self,
@@ -122,8 +128,10 @@ impl<P: PolicyClock> DiskSession<P> {
             return Err(Fault::Ownership);
         }
         self.pair.as_ref().ok_or(Fault::Ownership)?.owned()?;
-        self.evidence.authenticate(response, channel, session)?;
-        authentication::persist(self)
+        authentication::begin(self)?;
+        let result = self.evidence.authenticate(response, channel, session);
+        authentication::persist(self)?;
+        result
     }
 
     pub fn reconstruction_request(&self) -> Result<ReconstructionRequest, Fault> {
@@ -240,6 +248,7 @@ impl<P: PolicyClock> ReplicaRecoverySession for DiskSession<P> {
             return LoadResult::Unavailable;
         };
         if pair.owned().is_err()
+            || pair.envelope.observing
             || genesis::validate(&mut self.evidence, &self.request, pair).is_err()
         {
             return LoadResult::Unavailable;
@@ -256,10 +265,23 @@ impl<P: PolicyClock> ReplicaRecoverySession for DiskSession<P> {
         if self.closing {
             return Err(Fault::Ownership);
         }
-        let pair = self.pair.as_mut().ok_or(Fault::Ownership)?;
+        let pair = self.pair.as_ref().ok_or(Fault::Ownership)?;
         pair.owned()?;
         guards::fresh(&self.request, pair, &guard)?;
+        let mut reserved = pair.envelope.floor.clone();
+        reserved.guard_high_water = reserved
+            .guard_high_water
+            .checked_add(1)
+            .ok_or(Fault::Capacity)?;
+        reserved
+            .guards
+            .insert(guard.id.clone(), GuardStatus::Active(guard.clone()));
+        loss::reserve(&pair.image, &reserved, &guard)?;
+        authentication::begin(self)?;
         let (cut, policy) = self.evidence.current()?;
+        authentication::persist(self)?;
+        let pair = self.pair.as_mut().ok_or(Fault::Ownership)?;
+        guards::fresh(&self.request, pair, &guard)?;
         let policy_digest =
             super::namespace::record_bytes(&cut.policy, &self.evidence.config.limits)?.digest();
         if policy_digest != pair.envelope.floor.issuance.policy_digest
@@ -335,6 +357,7 @@ impl<P: PolicyClock> ReplicaRecoverySession for DiskSession<P> {
             return ReconstructResult::Unavailable;
         };
         if pair.owned().is_err()
+            || pair.envelope.observing
             || genesis::validate(&mut self.evidence, &self.request, pair).is_err()
         {
             return ReconstructResult::Unavailable;
@@ -352,6 +375,7 @@ impl<P: PolicyClock> StorageAttemptSession for DiskSession<P> {
             return RecoveryResult::Unavailable;
         };
         if pair.owned().is_err()
+            || pair.envelope.observing
             || genesis::validate(&mut self.evidence, &self.request, pair).is_err()
         {
             return RecoveryResult::Unavailable;

@@ -12,6 +12,7 @@ pub(super) fn queries<P: PolicyClock>(session: &mut DiskSession<P>) -> Result<()
             query: query.clone(),
             identity: session.request.identity.clone(),
         };
+        authentication::begin(session)?;
         let reply = if let Some(original) = &pending.verified_query {
             let facts = bindings::local_facts(&mut session.evidence, &session.request, original)?;
             if pending.verified.as_ref() != Some(&facts) {

@@ -8,7 +8,10 @@ pub(super) fn prepare<P: PolicyClock>(
         let pair = session.pair.as_ref().ok_or(Fault::Ownership)?;
         pair.owned()?;
         let state = &pair.image.state;
-        let issued = state.storage_invocations.get(&request.invocation);
+        let issued = state
+            .storage_invocations
+            .get(&request.invocation)
+            .or_else(|| state.retired_storage_invocations.get(&request.invocation));
         if request.owner != session.request.owner
             || request.invocation.namespace != session.request.invocation_namespace
             || !matches!(issued, Some(StorageInvocation::Prepare(q) | StorageInvocation::RecoverPlan(q)) if q == &request)
@@ -182,6 +185,7 @@ pub(super) fn begin<P: PolicyClock>(
             let mut allow = true;
             if let Some(precondition) = &request.request.attempt.binding.prestart {
                 // Provider-owned observation; caller Begin.current is never authority.
+                authentication::begin(session)?;
                 let observation = glade_crdt_evidence_api::EvidencePort::observe(
                     &mut session.evidence,
                     &session.request.instance,

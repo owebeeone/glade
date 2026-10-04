@@ -81,6 +81,53 @@ pub(super) fn retain<P: PolicyClock>(
     permit: IngressPermit,
     observed: Bytes,
 ) -> PersistResult {
+    retain_with(session, permit, observed, None)
+}
+pub(super) fn pending<P: PolicyClock>(
+    session: &mut DiskSession<P>,
+    guard: &GuardId,
+) -> PersistResult {
+    let ready = (|| {
+        session.pair.as_ref().ok_or(Fault::Ownership)?.owned()?;
+        let permit = match session.pending_ingress.get(guard) {
+            Some(
+                persist::PendingIngress::Settle { permit, .. }
+                | persist::PendingIngress::Loss { permit, .. },
+            ) => permit,
+            _ => return Err(Fault::Ownership),
+        };
+        session.authority.can_settle(permit)
+    })();
+    if let Err(fault) = ready {
+        return PersistResult::Refused(fault);
+    }
+    match session
+        .pending_ingress
+        .remove(guard)
+        .expect("owned pending checked")
+    {
+        persist::PendingIngress::Settle {
+            permit,
+            observation,
+            checkpoint,
+        } => {
+            let observed = observation.bytes.clone();
+            retain_with(session, permit, observed, Some((observation, checkpoint)))
+        }
+        persist::PendingIngress::Loss {
+            permit,
+            observed,
+            settlement,
+        } => retain_with(session, permit, observed, settlement),
+        _ => unreachable!("only drained settlement/loss checked"),
+    }
+}
+pub(super) fn retain_with<P: PolicyClock>(
+    session: &mut DiskSession<P>,
+    permit: IngressPermit,
+    observed: Bytes,
+    settlement: Option<(Box<Observation>, Box<Checkpoint>)>,
+) -> PersistResult {
     let result = (|| {
         session.authority.can_settle(&permit)?;
         let pair = session.pair.as_ref().ok_or(Fault::Ownership)?;
@@ -97,7 +144,9 @@ pub(super) fn retain<P: PolicyClock>(
         let bytes = marker(
             permit.guard(),
             checkpoint.image.generation,
-            observed.digest(),
+            permit
+                .received_digest()
+                .unwrap_or_else(|| observed.digest()),
             &checkpoint.image.limits.decode,
         )?;
         checkpoint.image.permanent_loss.push(bytes.clone());
@@ -126,7 +175,11 @@ pub(super) fn retain<P: PolicyClock>(
     } else if session.authority.owns(&permit) {
         session.pending_ingress.insert(
             permit.guard().id.clone(),
-            persist::PendingIngress::Loss { permit, observed },
+            persist::PendingIngress::Loss {
+                permit,
+                observed,
+                settlement,
+            },
         );
     }
     outcome

@@ -1,10 +1,35 @@
 //! Authentication custody and trusted policy/time observations use the same selected image.
 use super::super::namespace::{codec_fault, record_bytes};
 use super::*;
+pub(super) fn begin<P: PolicyClock>(session: &mut DiskSession<P>) -> Result<(), Fault> {
+    let pair = session.pair.as_mut().ok_or(Fault::Ownership)?;
+    pair.observation_marker(true, |cut| {
+        (session.observe_cut)(DiskOperation::Observation, cut)
+    })
+}
 pub(super) fn persist<P: PolicyClock>(session: &mut DiskSession<P>) -> Result<(), Fault> {
+    begin(session)?;
     let (cut, policy) = session.evidence.current()?;
     let policy_bytes = record_bytes(&cut.policy, &session.evidence.config.limits)?;
     let time = cut.time.ok_or(Fault::Unavailable)?;
+    let pair = session.pair.as_mut().ok_or(Fault::Ownership)?;
+    let cached = pair
+        .image
+        .state
+        .instances
+        .get(&session.request.instance)
+        .ok_or(Fault::Integrity)?;
+    if cached.policy == policy_bytes
+        && cached.policy_time == time
+        && pair.image.sessions == session.evidence.session_custody()
+        && pair.envelope.floor.issuance.time_floor_ms == session.evidence.observed_time_floor
+        && pair.envelope.floor.issuance.policy_generation == policy.generation
+        && pair.envelope.floor.issuance.policy_digest == policy_bytes.digest()
+    {
+        return pair.observation_marker(false, |cut| {
+            (session.observe_cut)(DiskOperation::Observation, cut)
+        });
+    }
     let mut request = session.checkpoint_template()?;
     request.image.state = glade_crdt_admission_core::step(
         &request.image.state,

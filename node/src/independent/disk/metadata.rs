@@ -35,6 +35,7 @@ pub(crate) struct FloorEnvelope {
     pub pending: Option<PendingMetadata>,
     pub completion: Option<ReplicaFloor>,
     pub unmaterialized: Vec<PendingMetadata>,
+    pub observing: bool,
 }
 impl Canonical for PendingMetadata {
     const KIND: &'static str = "Ic3DiskPending/v1";
@@ -68,17 +69,18 @@ impl Canonical for PendingMetadata {
     }
 }
 impl Canonical for FloorEnvelope {
-    const KIND: &'static str = "Ic3DiskFloor/v1";
+    const KIND: &'static str = "Ic3DiskFloor/v2";
     fn preflight_value(
         value: &Cbor,
         budget: &mut DecodeBudget<'_>,
         depth: usize,
     ) -> Result<(), Error> {
-        let fields = fields(value, 4)?;
+        let fields = fields(value, 5)?;
         ReplicaFloor::preflight_value(&fields[0].1, budget, depth + 1)?;
         <Option<PendingMetadata>>::preflight_value(&fields[1].1, budget, depth + 1)?;
         <Option<ReplicaFloor>>::preflight_value(&fields[2].1, budget, depth + 1)?;
-        <Vec<PendingMetadata>>::preflight_value(&fields[3].1, budget, depth + 1)
+        <Vec<PendingMetadata>>::preflight_value(&fields[3].1, budget, depth + 1)?;
+        bool::preflight_value(&fields[4].1, budget, depth + 1)
     }
     fn encode_value(&self) -> Cbor {
         Cbor::Map(vec![
@@ -86,15 +88,17 @@ impl Canonical for FloorEnvelope {
             (1, self.pending.encode_value()),
             (2, self.completion.encode_value()),
             (3, self.unmaterialized.encode_value()),
+            (4, self.observing.encode_value()),
         ])
     }
     fn decode_value(value: &Cbor) -> Result<Self, Error> {
-        let fields = fields(value, 4)?;
+        let fields = fields(value, 5)?;
         Ok(Self {
             floor: Canonical::decode_value(&fields[0].1)?,
             pending: Canonical::decode_value(&fields[1].1)?,
             completion: Canonical::decode_value(&fields[2].1)?,
             unmaterialized: Canonical::decode_value(&fields[3].1)?,
+            observing: Canonical::decode_value(&fields[4].1)?,
         })
     }
 }

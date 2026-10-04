@@ -96,6 +96,7 @@ fn all_four_genuine_native_kinds_couple_original_custody_and_reopen_projection()
                 assert!(!value.quarantine.is_empty());
             }
         }
+        retained_prepare_replays(&mut session, &loaded.image);
         let before = loaded.image.state.clone();
         assert_eq!(
             ReplicaRecoverySession::close(&mut session),
@@ -113,9 +114,50 @@ fn all_four_genuine_native_kinds_couple_original_custody_and_reopen_projection()
             reopened.image.state, before,
             "once-only full kind restoration"
         );
+        retained_prepare_replays(&mut session, &reopened.image);
         drop(session);
         std::fs::remove_dir_all(root).unwrap();
     }
+}
+pub(super) fn retained_prepare_replays(session: &mut DiskSession<Source>, image: &ReplicaImage) {
+    for original in image
+        .state
+        .storage_invocations
+        .values()
+        .chain(image.state.retired_storage_invocations.values())
+    {
+        let StorageInvocation::Prepare(original) = original else {
+            continue;
+        };
+        let attempt = image
+            .recovery
+            .attempts
+            .iter()
+            .find(|attempt| attempt.attempt.binding.plan == original.binding.plan)
+            .unwrap();
+        for reply in [
+            session.prepare(original.clone()),
+            session.recover_plan(original.clone()),
+        ] {
+            assert!(
+                reply.result == PrepareResult::Prepared(Box::new(attempt.attempt.clone())),
+                "exact complete issued request retains original binding without new admission"
+            );
+        }
+        let mut changed = original.clone();
+        changed.binding.expected_revision = changed.binding.expected_revision.saturating_add(1);
+        assert!(matches!(
+            session.prepare(changed).result,
+            PrepareResult::Refused(_)
+        ));
+    }
+    let LoadResult::Validated(after) = session.load() else {
+        panic!("same complete recovery")
+    };
+    assert_eq!(
+        &after.image, image,
+        "request lookup changes no counters, charges, receipts or phase"
+    );
 }
 
 #[test]
@@ -169,4 +211,105 @@ fn genuine_already_accepted_fork_proof_keeps_original_zero_new_receipt_batch_sha
     );
     drop(session);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn each_genuine_kind_keeps_live_and_retired_prepare_authority_while_reserved() {
+    for kind in [
+        CommitKind::AcceptedBatch,
+        CommitKind::Candidate,
+        CommitKind::SecurityEvidence,
+        CommitKind::QualifiedFork,
+    ] {
+        let f = ic3_disk_fixture::disk_profile();
+        let root = root(&format!("prepare-live-{kind:?}"));
+        let mut host = DiskHost::new(evidence(&f), config(&root, true));
+        let mut session = host.open_replica(request(&f, [0; 32])).unwrap();
+        if kind == CommitKind::QualifiedFork {
+            ic3_disk_fixture::local_authorization(&f, &mut session, 92);
+            let mut first = Candidate {
+                instance: f.query.instance.clone(),
+                operation: f.query.operation.clone(),
+                evidence: f.query.evidence.clone(),
+            };
+            first.evidence.admission = None;
+            session.submit_local(first, [90; 32], [91; 32]).unwrap();
+        }
+        let candidate = match kind {
+            CommitKind::AcceptedBatch => offered(
+                &f,
+                br#"{"after":null,"atom_id":"a","kind":"insert","text":"A"}"#,
+                0,
+            ),
+            CommitKind::Candidate => offered(
+                &f,
+                br#"{"after":null,"atom_id":"b","kind":"insert","text":"B"}"#,
+                1,
+            ),
+            CommitKind::SecurityEvidence => offered(&f, b"invalid payload", 0),
+            CommitKind::QualifiedFork => offered(
+                &f,
+                br#"{"after":null,"atom_id":"b","kind":"insert","text":"B"}"#,
+                0,
+            ),
+        };
+        let mut effects =
+            super::super::runtime::event(&mut session, Event::OfferReplica(Box::new(candidate)))
+                .unwrap();
+        let mut found = false;
+        for _ in 0..16 {
+            let effect = effects
+                .into_iter()
+                .find(|effect| {
+                    matches!(
+                        effect,
+                        Effect::Verify(_) | Effect::Seal(_) | Effect::Prepare { .. }
+                    )
+                })
+                .expect("bounded signed core preparation path");
+            let callback = match effect {
+                Effect::Verify(query) | Effect::Seal(query) => {
+                    super::super::authentication::begin(&mut session).unwrap();
+                    let reply = glade_crdt_evidence_api::EvidencePort::verify(
+                        &mut session.evidence,
+                        glade_crdt_evidence_api::BoundQuery {
+                            query,
+                            identity: f.identity.clone(),
+                        },
+                    );
+                    super::super::runtime::retain_observed(&mut session).unwrap();
+                    Event::EvidenceResolved(Box::new(reply))
+                }
+                Effect::Prepare { request, .. } => {
+                    let reply = session.prepare(request);
+                    assert!(matches!(reply.result, PrepareResult::Prepared(_)));
+                    let LoadResult::Validated(live) = session.load() else {
+                        panic!("live exact original request")
+                    };
+                    retained_prepare_replays(&mut session, &live.image);
+                    assert!(matches!(
+                        live.image.recovery.attempts.last().unwrap().phase,
+                        AttemptPhase::Reserved
+                    ));
+                    super::super::runtime::event(&mut session, Event::PrepareResolved(reply))
+                        .unwrap();
+                    let LoadResult::Validated(retired) = session.load() else {
+                        panic!("retired exact request before Begin")
+                    };
+                    retained_prepare_replays(&mut session, &retired.image);
+                    assert!(matches!(
+                        retired.image.recovery.attempts.last().unwrap().phase,
+                        AttemptPhase::Reserved
+                    ));
+                    found = true;
+                    break;
+                }
+                _ => unreachable!(),
+            };
+            effects = super::super::runtime::event(&mut session, callback).unwrap();
+        }
+        assert!(found);
+        drop(session);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

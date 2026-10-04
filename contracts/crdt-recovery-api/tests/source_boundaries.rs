@@ -89,7 +89,11 @@ fn actual_node_independent_subtree_and_disabled_branches_are_checked() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../node");
     for file in files(&root.join("src/independent"))
         .into_iter()
-        .chain(std::iter::once(root.join("tests/ic3_boundary.rs")))
+        .chain(files(&root.join("tests/ic3_disk_remediation")))
+        .chain([
+            root.join("tests/ic3_boundary.rs"),
+            root.join("tests/ic3_disk.rs"),
+        ])
     {
         assert!(
             violations(&std::fs::read_to_string(&file).unwrap()).is_empty(),

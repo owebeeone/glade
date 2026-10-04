@@ -118,6 +118,7 @@ pub(super) fn drain<P: PolicyClock>(
         }
         let callback = match effect {
             Effect::Verify(query) => {
+                authentication::begin(session)?;
                 let reply = session.evidence.verify(BoundQuery {
                     query,
                     identity: session.request.identity.clone(),
@@ -126,6 +127,7 @@ pub(super) fn drain<P: PolicyClock>(
                 Some(Event::EvidenceResolved(Box::new(reply)))
             }
             Effect::Seal(query) => {
+                authentication::begin(session)?;
                 let reply = session.evidence.seal(BoundQuery {
                     query,
                     identity: session.request.identity.clone(),
@@ -264,11 +266,12 @@ pub(super) fn reattach<P: PolicyClock>(session: &mut DiskSession<P>) -> Result<(
 pub(super) fn retain_observed<P: PolicyClock>(session: &mut DiskSession<P>) -> Result<(), Fault> {
     let pair = session.pair.as_ref().ok_or(Fault::Ownership)?;
     let policy = session.evidence.observed_policy.ok_or(Fault::Unavailable)?;
-    if policy
-        != (
-            pair.envelope.floor.issuance.policy_generation,
-            pair.envelope.floor.issuance.policy_digest,
-        )
+    if pair.envelope.observing
+        || policy
+            != (
+                pair.envelope.floor.issuance.policy_generation,
+                pair.envelope.floor.issuance.policy_digest,
+            )
         || session.evidence.observed_time_floor > pair.envelope.floor.issuance.time_floor_ms
     {
         authentication::persist(session)?;

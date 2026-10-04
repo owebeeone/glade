@@ -12,6 +12,7 @@ pub(super) enum PendingIngress {
     Loss {
         permit: IngressPermit,
         observed: Bytes,
+        settlement: Option<(Box<Observation>, Box<Checkpoint>)>,
     },
 }
 
@@ -106,6 +107,9 @@ pub(super) fn settle<P: PolicyClock>(
         {
             return Err(Fault::Ownership);
         }
+        session
+            .authority
+            .can_settle_received(&permit, &observation.bytes)?;
         observations::checked(&session.evidence, permit.guard(), &observation)?;
         let mut expected = pair.image.observations.clone();
         expected.push(observation.clone());
@@ -222,7 +226,11 @@ pub(super) fn retry<P: PolicyClock>(
             checkpoint,
         } => settle(session, permit, *observation, *checkpoint),
         PendingIngress::Abandon { permit } => abandon(session, permit),
-        PendingIngress::Loss { permit, observed } => super::loss::retain(session, permit, observed),
+        PendingIngress::Loss {
+            permit,
+            observed,
+            settlement,
+        } => super::loss::retain_with(session, permit, observed, settlement),
     }
 }
 

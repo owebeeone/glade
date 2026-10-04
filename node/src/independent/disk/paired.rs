@@ -11,6 +11,7 @@ pub(crate) enum PairCut {
     Selection(FloorCut),
     RecoveryBeforeSync,
     RecoveryFileSynced,
+    ObservationMarker(FloorCut),
 }
 pub(crate) struct PairStore {
     layout: DiskLayout,
@@ -65,6 +66,34 @@ impl PairStore {
     pub(crate) fn floor_digest(&self) -> Result<Digest, Fault> {
         self.layout.floor_digest(self.bounds.bytes)
     }
+    pub(crate) fn observation_marker(
+        &mut self,
+        observing: bool,
+        mut at: impl FnMut(PairCut) -> Result<(), Fault>,
+    ) -> Result<(), Fault> {
+        self.owned()?;
+        if self.envelope.pending.is_some() {
+            return Err(Fault::Unavailable);
+        }
+        if self.envelope.observing == observing {
+            return Ok(());
+        }
+        let mut next = self.envelope.clone();
+        next.floor.sequence = next.floor.sequence.checked_add(1).ok_or(Fault::Capacity)?;
+        next.observing = observing;
+        validation::envelope(&next, &self.image, &self.bounds)?;
+        let bytes = encode(&next, &self.bounds).map_err(validation::codec_fault)?;
+        self.uncertain = true;
+        floors::replace(
+            &self.layout.floor.join("replica.floor"),
+            &bytes,
+            self.bounds.bytes,
+            |cut| at(PairCut::ObservationMarker(cut)),
+        )?;
+        self.envelope = next;
+        self.uncertain = false;
+        Ok(())
+    }
 
     pub(crate) fn create(
         layout: DiskLayout,
@@ -95,6 +124,7 @@ impl PairStore {
             pending: None,
             completion: None,
             unmaterialized: vec![],
+            observing: false,
         };
         validation::envelope(&envelope, &image, &bounds)?;
         let encoded = encode(&envelope, &bounds).map_err(validation::codec_fault)?;
@@ -124,6 +154,14 @@ impl PairStore {
         let mut envelope: FloorEnvelope =
             decode(bytes.value(), &bounds).map_err(validation::codec_fault)?;
         validation::pending(&envelope)?;
+        if envelope.observing
+            && !envelope
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.kind == DiskOperation::Observation)
+        {
+            return Err(Fault::Unavailable);
+        }
         // The fixed capacity comes from the originally selected typed image. Neither a
         // torn next image nor a caller may change that reservation on reopen.
         let selected = envelope.floor.selected.clone();
@@ -152,6 +190,9 @@ impl PairStore {
                     let mut candidate = envelope.clone();
                     candidate.floor = candidate.completion.take().ok_or(Fault::Integrity)?;
                     candidate.pending = None;
+                    if pending.kind == DiskOperation::Observation {
+                        candidate.observing = false;
+                    }
                     checked(&next, &candidate)?;
                     at(PairCut::RecoveryBeforeSync)?;
                     slots[usize::from(pending.next.slot)].resync()?;
@@ -159,8 +200,12 @@ impl PairStore {
                     layout.owned()?;
                     image = next;
                     envelope.floor = envelope.completion.take().ok_or(Fault::Integrity)?;
+                    envelope.observing = candidate.observing;
                 }
                 Err(Fault::Integrity) => {
+                    if envelope.observing {
+                        return Err(Fault::Unavailable);
+                    }
                     if envelope.unmaterialized.len() >= image.limits.guard_history {
                         return Err(Fault::Capacity);
                     }
@@ -293,6 +338,9 @@ impl PairStore {
         selected.floor = selected.completion.take().ok_or(Fault::Integrity)?;
         selected.floor.intent = None;
         selected.pending = None;
+        if kind == DiskOperation::Observation {
+            selected.observing = false;
+        }
         validation::envelope(&selected, &image, &self.bounds)?;
         let selected_bytes = encode(&selected, &self.bounds).map_err(validation::codec_fault)?;
         let encoded = encode(&staged, &self.bounds).map_err(validation::codec_fault)?;

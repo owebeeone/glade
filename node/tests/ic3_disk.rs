@@ -388,3 +388,5 @@ fn genuine_challenge_response_custody_and_consumption_survive_owned_reopen() {
 mod ic3_disk_fixture;
 
 mod ic3_disk_native;
+
+mod ic3_disk_remediation;

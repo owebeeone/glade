@@ -98,3 +98,6 @@ mod ingress_cuts;
 mod ingress_cancellation;
 #[path = "tests/ingress_capacity.rs"]
 mod ingress_capacity;
+
+#[path = "tests/marker_cuts.rs"]
+mod marker_cuts;

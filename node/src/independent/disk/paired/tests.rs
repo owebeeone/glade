@@ -439,3 +439,53 @@ fn malformed_next_image_is_refused_before_any_intent_or_slot_write() {
     drop(pair);
     fs::remove_dir_all(root).unwrap();
 }
+
+#[allow(dead_code)]
+#[path = "tests/legacy_v1.rs"]
+mod legacy_v1;
+#[test]
+fn closed_observation_marker_format_refuses_previous_independent_reader_and_preserves_unrelated_publications(
+) {
+    let root = root("marker-closed-format");
+    let (image, floor, bounds) = initial();
+    let layout = DiskLayout::provision(&root.join("data"), &root.join("trusted"), [6; 32]).unwrap();
+    let mut pair = PairStore::create(layout, image, floor, bounds.clone()).unwrap();
+    let prior = legacy_v1::FloorEnvelope {
+        floor: pair.envelope.floor.clone(),
+        pending: None,
+        completion: None,
+        unmaterialized: vec![],
+    };
+    let old = encode(&prior, &bounds).unwrap();
+    assert!(
+        decode::<FloorEnvelope>(old.value(), &bounds).is_err(),
+        "v1 is refused rather than silently migrated"
+    );
+    pair.observation_marker(true, |_| Ok(())).unwrap();
+    let current = encode(&pair.envelope, &bounds).unwrap();
+    assert!(
+        decode::<legacy_v1::FloorEnvelope>(current.value(), &bounds).is_err(),
+        "byte-exact 9dbc v1 decoder refuses the unsupported protected v2 floor"
+    );
+    let projected = pair.envelope.floor.clone();
+    pair.floor_only(projected, |_| Ok(())).unwrap();
+    assert!(pair.envelope.observing);
+    let mut next = pair.image.clone();
+    next.generation += 1;
+    next.predecessor = pair.envelope.floor.selected.digest;
+    next.prior_floor = pair.envelope.floor.clone();
+    let projected = pair.envelope.floor.clone();
+    pair.transact(next, projected, DiskOperation::Checkpoint, |_| Ok(()))
+        .unwrap();
+    assert!(
+        pair.envelope.observing,
+        "unrelated checkpoint cannot clear unknown observation authority"
+    );
+    drop(pair);
+    let layout = DiskLayout::open(&root.join("data"), &root.join("trusted"), [6; 32]).unwrap();
+    assert!(matches!(
+        PairStore::open(layout, bounds),
+        Err(Fault::Unavailable)
+    ));
+    std::fs::remove_dir_all(root).unwrap();
+}

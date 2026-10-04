@@ -134,3 +134,48 @@ fn eligibility_queries_preserve_owned_lifecycle_and_refuse_foreign_closed_or_sta
     assert_eq!(owner.can_abandon(&permit), Err(Fault::Ownership));
     assert!(owner.can_close());
 }
+
+#[test]
+fn normal_settlement_matches_only_owned_success_and_refuses_over_bound_before_comparison() {
+    let mut owner = IngressAuthority::new(8);
+    let original = Bytes::new(vec![7]);
+    let permit = owner.issue(guard()).unwrap();
+    let mut receive = owner
+        .receive(permit, || ready(Ok(original.clone())))
+        .unwrap();
+    let mut cx = Context::from_waker(Waker::noop());
+    let Poll::Ready((permit, _)) = Pin::new(&mut receive).poll(&mut cx) else {
+        panic!("ready")
+    };
+    assert_eq!(
+        owner.can_settle_received(&permit, &Bytes::new(vec![0; 1025])),
+        Err(Fault::Capacity)
+    );
+    assert_eq!(
+        owner.can_settle_received(&permit, &Bytes::new(vec![7, 8])),
+        Err(Fault::BindingMismatch)
+    );
+    assert_eq!(
+        owner.can_settle_received(&permit, &Bytes::new(vec![8])),
+        Err(Fault::BindingMismatch)
+    );
+    assert_eq!(owner.can_settle_received(&permit, &original), Ok(()));
+    assert_eq!(permit.received_digest(), Some(original.digest()));
+    assert!(!owner.can_close());
+    owner.settle(&permit).unwrap();
+    let mut g = guard();
+    g.id.number = 2;
+    let permit = owner.issue(g).unwrap();
+    let mut receive = owner
+        .receive(permit, || ready(Err(Fault::Unavailable)))
+        .unwrap();
+    let Poll::Ready((permit, _)) = Pin::new(&mut receive).poll(&mut cx) else {
+        panic!("ready error")
+    };
+    assert_eq!(permit.received_digest(), None);
+    assert_eq!(
+        owner.can_settle_received(&permit, &original),
+        Err(Fault::BindingMismatch)
+    );
+    assert_eq!(owner.can_settle(&permit), Ok(()));
+}

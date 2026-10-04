@@ -195,6 +195,7 @@ fn qualify(stages: std::ops::Range<usize>) {
                 AttemptPhase::Terminal(TerminalOutcome::Committed { .. })
             ));
             assert_eq!(loaded.image.state.terminal_results.len(), attempts);
+            super::kinds::retained_prepare_replays(&mut session, &loaded.image);
             let reconstruction = session.reconstruction_request().unwrap();
             let ReconstructResult::Cut(result) = session.reconstruct_cut(reconstruction) else {
                 panic!("combined native recovery cut");

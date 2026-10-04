@@ -156,7 +156,15 @@ fn genuine_ordinary_policy_observation_cannot_consume_preallocated_critical_regi
     let root = root("ordinary-critical-reserve");
     let mut host = DiskHost::new(evidence(&f), config(&root, true));
     let mut session = host.open_replica(request(&f, [0; 32])).unwrap();
-    let original_floor = session.pair.as_ref().unwrap().floor_digest().unwrap();
+    let original_selection = session
+        .pair
+        .as_ref()
+        .unwrap()
+        .envelope
+        .floor
+        .selected
+        .clone();
+    let original_image = session.pair.as_ref().unwrap().image.clone();
     physical_allocation::assert_owned_slots(&root, 100_000);
     let mut policy: PolicyBody = decode_signed_body(&f.policy, &limits()).unwrap();
     policy.generation = 1;
@@ -181,13 +189,22 @@ fn genuine_ordinary_policy_observation_cannot_consume_preallocated_critical_regi
             not_after_ms: 100,
         },
     });
-    assert!(matches!(result, Err(Fault::Capacity)), "signed ordinary policy bytes must leave the physically allocated critical region available");
-    assert_eq!(
-        session.pair.as_ref().unwrap().floor_digest().unwrap(),
-        original_floor,
-        "ordinary refusal precedes floor intent and preserves usable image"
+    assert!(
+        matches!(result, Err(Fault::Capacity)),
+        "signed ordinary policy bytes must leave the physically allocated critical region available"
     );
+    assert_eq!(
+        session.pair.as_ref().unwrap().envelope.floor.selected,
+        original_selection,
+        "ordinary refusal cannot consume preallocated image/critical region"
+    );
+    assert_eq!(session.pair.as_ref().unwrap().image, original_image);
     assert!(!session.pair.as_ref().unwrap().uncertain());
+    assert!(session.pair.as_ref().unwrap().envelope.observing);
+    assert!(
+        matches!(session.load(), LoadResult::Unavailable),
+        "learned oversized cut cannot restore cached authority"
+    );
     drop(session);
     std::fs::remove_dir_all(root).unwrap();
 }
