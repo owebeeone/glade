@@ -116,6 +116,9 @@ mod interpreted_budget;
 #[path = "tests/observation_barrier.rs"]
 mod observation_barrier;
 
+#[path = "tests/resume_refusal.rs"]
+mod resume_refusal;
+
 /// Every physical cut this session reaches, in order, through its own private
 /// observation hook; for `independent` witnesses outside this module too.
 pub(in crate::independent) fn record_cuts<P: PolicyClock>(

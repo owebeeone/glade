@@ -165,7 +165,14 @@ impl<P: PolicyClock> DiskSession<P> {
                 }
             }
             let inventory = original.ok_or(Fault::BindingMismatch)?;
-            self.node_offer(bundle, &reference, &inventory, guard.source, guard.channel)?;
+            // A refused re-offer, transient or not, leaves this exact obligation
+            // Missing (unresolved, never complete); it cannot refuse the start.
+            if self
+                .node_offer(bundle, &reference, &inventory, guard.source, guard.channel)
+                .is_err()
+            {
+                continue;
+            }
         }
         if !observations.is_empty() {
             self.classify_node_inputs()?;
