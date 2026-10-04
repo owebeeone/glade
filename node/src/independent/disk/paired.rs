@@ -112,7 +112,7 @@ impl PairStore {
         {
             return Err(Fault::Integrity);
         }
-        let bytes = encode(&image, &bounds).map_err(validation::codec_fault)?;
+        let bytes = restorable(&image, &bounds)?;
         let mut slots = [
             SlotFile::reserve(&layout.data.join("image.0"), image.limits.image_bytes)?,
             SlotFile::reserve(&layout.data.join("image.1"), image.limits.image_bytes)?,
@@ -285,7 +285,7 @@ impl PairStore {
             return Err(Fault::Integrity);
         }
         validation::advance(old, &projected)?;
-        let bytes = encode(&image, &self.bounds).map_err(validation::codec_fault)?;
+        let bytes = restorable(&image, &self.bounds)?;
         if bytes.value().len() > image.limits.image_bytes {
             return Err(Fault::Capacity);
         }
@@ -367,6 +367,13 @@ impl PairStore {
         self.uncertain = false;
         Ok(())
     }
+}
+/// Encode an image only if its reopen decodes it under the same limits. `encode`
+/// bounds the outer syntax; `decode` also interprets every embedded Operation.
+fn restorable(image: &ReplicaImage, bounds: &DecodeLimits) -> Result<Bytes, Fault> {
+    let bytes = encode(image, bounds).map_err(validation::codec_fault)?;
+    decode::<ReplicaImage>(bytes.value(), bounds).map_err(validation::codec_fault)?;
+    Ok(bytes)
 }
 #[cfg(test)]
 mod tests {
