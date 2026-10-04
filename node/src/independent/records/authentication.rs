@@ -14,32 +14,33 @@ pub(super) fn persist<P: PolicyClock>(session: &mut DiskSession<P>) -> Result<()
 /// Return the exact validated observation only after its barrier is selected.
 /// Callers making a current authorization decision must use this complete cut,
 /// not an earlier consultation or the scalar issuance lower bound.
+/// The provider is read first, once. A cut already equal to the owned, settled
+/// durable floor's needs no barrier and is returned with no marker write. Any
+/// other reading, a failed one included, then takes the barrier as before: the
+/// marker, then that reading's outcome, persistence and the marker's clear.
 pub(super) fn persist_observed<P: PolicyClock>(
     session: &mut DiskSession<P>,
 ) -> Result<(TrustedCut, PolicyBody), Fault> {
+    let observed = session.evidence.current();
+    if let Ok((cut, policy)) = &observed {
+        let settled = session.pair.as_ref().is_some_and(|pair| {
+            pair.owned().is_ok() && pair.envelope.pending.is_none() && !pair.envelope.observing
+        });
+        if settled && matches!(durable(session, cut, policy), Ok(true)) {
+            return observed;
+        }
+    }
     begin(session)?;
-    let (cut, policy) = session.evidence.current()?;
-    let policy_bytes = record_bytes(&cut.policy, &session.evidence.config.limits)?;
-    let time = cut.time.clone().ok_or(Fault::Unavailable)?;
-    let pair = session.pair.as_mut().ok_or(Fault::Ownership)?;
-    let cached = pair
-        .image
-        .state
-        .instances
-        .get(&session.request.instance)
-        .ok_or(Fault::Integrity)?;
-    if cached.policy == policy_bytes
-        && cached.policy_time == time
-        && pair.image.sessions == session.evidence.session_custody()
-        && pair.envelope.floor.issuance.time_floor_ms == session.evidence.observed_time_floor
-        && pair.envelope.floor.issuance.policy_generation == policy.generation
-        && pair.envelope.floor.issuance.policy_digest == policy_bytes.digest()
-    {
+    let (cut, policy) = observed?;
+    if durable(session, &cut, &policy)? {
+        let pair = session.pair.as_mut().ok_or(Fault::Ownership)?;
         pair.observation_marker(false, |cut| {
             (session.observe_cut)(DiskOperation::Observation, cut)
         })?;
         return Ok((cut, policy));
     }
+    let policy_bytes = record_bytes(&cut.policy, &session.evidence.config.limits)?;
+    let time = cut.time.clone().ok_or(Fault::Unavailable)?;
     let mut request = session.checkpoint_template()?;
     let transition = glade_crdt_admission_core::step(
         &request.image.state,
@@ -100,4 +101,27 @@ pub(super) fn persist_observed<P: PolicyClock>(
     // retire it through the ordinary core callback path, not by dropping it.
     super::runtime::drain(session, transition.effects)?;
     Ok((cut, policy))
+}
+/// The provider's cut equals the durable floor's: policy bytes and time, session
+/// custody, time floor, policy generation and digest.
+fn durable<P: PolicyClock>(
+    session: &DiskSession<P>,
+    cut: &TrustedCut,
+    policy: &PolicyBody,
+) -> Result<bool, Fault> {
+    let policy_bytes = record_bytes(&cut.policy, &session.evidence.config.limits)?;
+    let time = cut.time.clone().ok_or(Fault::Unavailable)?;
+    let pair = session.pair.as_ref().ok_or(Fault::Ownership)?;
+    let cached = pair
+        .image
+        .state
+        .instances
+        .get(&session.request.instance)
+        .ok_or(Fault::Integrity)?;
+    Ok(cached.policy == policy_bytes
+        && cached.policy_time == time
+        && pair.image.sessions == session.evidence.session_custody()
+        && pair.envelope.floor.issuance.time_floor_ms == session.evidence.observed_time_floor
+        && pair.envelope.floor.issuance.policy_generation == policy.generation
+        && pair.envelope.floor.issuance.policy_digest == policy_bytes.digest())
 }

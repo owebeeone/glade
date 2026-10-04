@@ -113,6 +113,23 @@ mod oversized_loss;
 #[path = "tests/interpreted_budget.rs"]
 mod interpreted_budget;
 
+#[path = "tests/observation_barrier.rs"]
+mod observation_barrier;
+
+/// Every physical cut this session reaches, in order, through its own private
+/// observation hook; for `independent` witnesses outside this module too.
+pub(in crate::independent) fn record_cuts<P: PolicyClock>(
+    session: &mut DiskSession<P>,
+) -> std::sync::Arc<std::sync::Mutex<Vec<(DiskOperation, crate::independent::disk::PairCut)>>> {
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    session.observe_cut = Box::new(move |operation, cut| {
+        log.lock().unwrap().push((operation, cut));
+        Ok(())
+    });
+    seen
+}
+
 #[path = "tests/retained_cut_crash.rs"]
 mod retained_cut_crash;
 

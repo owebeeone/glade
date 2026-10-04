@@ -1,6 +1,7 @@
 //! Private actual-node adaptation of the frozen owned admission/recovery ports.
 use super::super::namespace::{codec_fault, signed_body};
 use super::*;
+use crate::independent::TrustedCut;
 use crate::signing::public_key;
 impl<P: PolicyClock> DiskSession<P> {
     pub(crate) fn local_request(
@@ -38,15 +39,17 @@ impl<P: PolicyClock> DiskSession<P> {
             window: request.window,
         })
     }
+    /// A guard bounded from the caller's current trusted observation (its
+    /// round's, or the local receive's own `node_observe`).
     pub(crate) fn node_guard(
-        &mut self,
+        &self,
+        cut: &TrustedCut,
         source: Digest,
         channel: Digest,
         role: &str,
         deadline: u64,
     ) -> Result<ReceiveGuard, Fault> {
-        let (cut, _) = authentication::persist_observed(self)?;
-        let time = cut.time.ok_or(Fault::Unavailable)?;
+        let time = cut.time.as_ref().ok_or(Fault::Unavailable)?;
         let pair = self.pair.as_ref().ok_or(Fault::Ownership)?;
         let floor = &pair.envelope.floor;
         Ok(ReceiveGuard {

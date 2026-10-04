@@ -1,6 +1,7 @@
 //! Private finite carrier rounds use committed native history, never maximum heads.
 use super::super::namespace::{codec_fault, sign_record, signed_body};
 use super::*;
+use crate::independent::TrustedCut;
 use crate::signing::public_key;
 use std::collections::BTreeMap;
 
@@ -176,16 +177,23 @@ impl<P: PolicyClock> DiskSession<P> {
         pair.owned()?;
         history(&pair.image)
     }
+    /// A round's one trusted observation, taken before its first HELLO (by the
+    /// exchange gate's holder unless the round is busy). Every HELLO, ready,
+    /// header and guard step of that round authorizes against it instead of
+    /// consulting the provider again.
+    pub(crate) fn node_observe(&mut self) -> Result<(TrustedCut, PolicyBody), Fault> {
+        authentication::persist_observed(self)
+    }
     pub(crate) fn node_hello(
-        &mut self,
+        &self,
+        observed: &(TrustedCut, PolicyBody),
         target: Digest,
-        dialer: Digest,
-        acceptor: Digest,
+        (dialer, acceptor): (Digest, Digest),
         exporter: Digest,
         nonce: Digest,
         role: &str,
     ) -> Result<SignedRecord, Fault> {
-        self.node_holder(target)?;
+        self.node_holder(observed, target)?;
         sign_record(
             &self.evidence.config.node_seed,
             &ExchangeHello {
@@ -202,8 +210,11 @@ impl<P: PolicyClock> DiskSession<P> {
             &self.request.limits.decode,
         )
     }
-    pub(crate) fn node_holder(&mut self, remote: Digest) -> Result<(), Fault> {
-        let (cut, policy) = authentication::persist_observed(self)?;
+    fn node_holder(
+        &self,
+        (cut, policy): &(TrustedCut, PolicyBody),
+        remote: Digest,
+    ) -> Result<(), Fault> {
         let local = public_key(&self.evidence.config.node_seed);
         if !policy.replica_holders.contains(&local)
             || !policy.replica_holders.contains(&remote)
@@ -219,11 +230,11 @@ impl<P: PolicyClock> DiskSession<P> {
         Ok(())
     }
     pub(crate) fn node_verify_hello(
-        &mut self,
+        &self,
+        observed: &(TrustedCut, PolicyBody),
         record: &SignedRecord,
         source: Digest,
-        dialer: Digest,
-        acceptor: Digest,
+        (dialer, acceptor): (Digest, Digest),
         exporter: Digest,
         role: &str,
     ) -> Result<(), Fault> {
@@ -240,7 +251,7 @@ impl<P: PolicyClock> DiskSession<P> {
         {
             return Err(Fault::Integrity);
         }
-        self.node_holder(source)
+        self.node_holder(observed, source)
     }
     pub(crate) fn node_inventory(&self, records: &[TransferBundle]) -> Result<Inventory, Fault> {
         let mut entries = Vec::new();
@@ -272,12 +283,13 @@ impl<P: PolicyClock> DiskSession<P> {
         })
     }
     pub(crate) fn node_inventory_header(
-        &mut self,
+        &self,
+        observed: &(TrustedCut, PolicyBody),
         inventory: &Inventory,
         target: Digest,
         channel: Digest,
     ) -> Result<SignedRecord, Fault> {
-        self.node_holder(target)?;
+        self.node_holder(observed, target)?;
         sign_record(
             &self.evidence.config.node_seed,
             &InventoryHeaderBody {

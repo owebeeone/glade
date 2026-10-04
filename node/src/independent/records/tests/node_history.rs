@@ -70,8 +70,14 @@ async fn full_inventory_keeps_two_native_original_receipts_for_one_operation() {
         .node_inventory(std::slice::from_ref(&original_b))
         .unwrap();
     let channel = [99; 32];
+    let observed = second.node_observe().unwrap();
     let header = second
-        .node_inventory_header(&inventory, crate::signing::public_key(&NODE), channel)
+        .node_inventory_header(
+            &observed,
+            &inventory,
+            crate::signing::public_key(&NODE),
+            channel,
+        )
         .unwrap();
     let raw = encode(&(header, inventory.clone()), &limits()).unwrap();
     retain(
@@ -148,7 +154,10 @@ async fn retain(
     raw: Bytes,
     expected: Vec<RecordRef>,
 ) {
-    let guard = session.node_guard(source, channel, role, 1000).unwrap();
+    let (cut, _) = session.node_observe().unwrap();
+    let guard = session
+        .node_guard(&cut, source, channel, role, 1000)
+        .unwrap();
     let permit = session.begin_ingress(guard).unwrap();
     let bytes = raw.clone();
     let (permit, result) = session
@@ -175,8 +184,15 @@ async fn peer_bundle_cannot_settle_without_earlier_exact_full_manifest() {
     let original = session.node_history().unwrap().remove(0);
     let raw = encode_profile(&original, &limits()).unwrap();
     let reference = super::super::node_ingress::bundle_ref(&original, &raw);
+    let (cut, _) = session.node_observe().unwrap();
     let guard = session
-        .node_guard(crate::signing::public_key(&NODE), [99; 32], "bundle", 1000)
+        .node_guard(
+            &cut,
+            crate::signing::public_key(&NODE),
+            [99; 32],
+            "bundle",
+            1000,
+        )
         .unwrap();
     let id = guard.id.clone();
     let permit = session.begin_ingress(guard).unwrap();
@@ -248,8 +264,9 @@ async fn promoted_child_keeps_original_candidate_custody_after_ancestor_arrival(
         .unwrap();
     let source = crate::signing::public_key(&NODE);
     let channel = [98; 32];
+    let observed = session.node_observe().unwrap();
     let header = session
-        .node_inventory_header(&inventory, source, channel)
+        .node_inventory_header(&observed, &inventory, source, channel)
         .unwrap();
     retain(
         &mut session,
@@ -321,8 +338,9 @@ async fn signed_full_inventory_wrong_total_cannot_claim_complete_known_cut() {
     inventory.total_bytes += 1;
     let source = crate::signing::public_key(&NODE);
     let channel = [97; 32];
+    let observed = session.node_observe().unwrap();
     let header = session
-        .node_inventory_header(&inventory, source, channel)
+        .node_inventory_header(&observed, &inventory, source, channel)
         .unwrap();
     retain(
         &mut session,
@@ -372,12 +390,14 @@ async fn empty_full_manifest_cannot_claim_unaccounted_payload_bytes() {
     inventory.total_bytes = 1;
     let source = crate::signing::public_key(&NODE);
     let channel = [96; 32];
+    let observed = session.node_observe().unwrap();
     let header = session
-        .node_inventory_header(&inventory, source, channel)
+        .node_inventory_header(&observed, &inventory, source, channel)
         .unwrap();
     let raw = encode(&(header, inventory), &limits()).unwrap();
+    let (cut, _) = session.node_observe().unwrap();
     let guard = session
-        .node_guard(source, channel, "inventory", 1000)
+        .node_guard(&cut, source, channel, "inventory", 1000)
         .unwrap();
     let id = guard.id.clone();
     let permit = session.begin_ingress(guard).unwrap();

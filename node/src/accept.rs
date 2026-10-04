@@ -330,7 +330,9 @@ pub(crate) async fn independent_local(
         // This guard names the actual local holding/admitting adapter. Writer
         // identity remains the separately authenticated original requester.
         let source = crate::signing::public_key(&replica.provision.node_seed);
+        let (cut, _) = session.node_observe()?;
         let guard = session.node_guard(
+            &cut,
             source,
             channel,
             "local-qualification",

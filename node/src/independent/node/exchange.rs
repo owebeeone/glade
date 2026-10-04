@@ -47,6 +47,7 @@ async fn handshake(
     replica: &IndependentReplica,
     link: &dyn CarrierLink,
     dialing: bool,
+    observed: &(TrustedCut, PolicyBody),
 ) -> Result<(Digest, Digest, Digest, Digest), Fault> {
     let endpoint: Digest = link
         .remote_id()
@@ -72,7 +73,14 @@ async fn handshake(
     let own_role = if dialing { "dialer" } else { "acceptor" };
     let peer_role = if dialing { "acceptor" } else { "dialer" };
     let hello = with(replica, |session| {
-        session.node_hello(remote, dialer, acceptor, exporter, nonce, own_role)
+        session.node_hello(
+            observed,
+            remote,
+            (dialer, acceptor),
+            exporter,
+            nonce,
+            own_role,
+        )
     })?;
     send(
         link,
@@ -82,16 +90,23 @@ async fn handshake(
     .await?;
     let peer = control(link, replica).await?;
     with(replica, |session| {
-        session.node_verify_hello(&peer, remote, dialer, acceptor, exporter, peer_role)
+        session.node_verify_hello(
+            observed,
+            &peer,
+            remote,
+            (dialer, acceptor),
+            exporter,
+            peer_role,
+        )
     })?;
     let peer_body: ExchangeHello =
         decode_signed_body(&peer, &replica.provision.request.limits.decode)
             .map_err(|_| Fault::Integrity)?;
     let confirmed = with(replica, |session| {
         session.node_hello(
+            observed,
             remote,
-            dialer,
-            acceptor,
+            (dialer, acceptor),
             exporter,
             peer_body.nonce,
             &format!("{own_role}-confirmed"),
@@ -106,10 +121,10 @@ async fn handshake(
     let response = control(link, replica).await?;
     with(replica, |session| {
         session.node_verify_hello(
+            observed,
             &response,
             remote,
-            dialer,
-            acceptor,
+            (dialer, acceptor),
             exporter,
             &format!("{peer_role}-confirmed"),
         )
@@ -136,13 +151,20 @@ async fn recv_frame(link: &dyn CarrierLink, bound: usize) -> Result<Bytes, Fault
 async fn guarded<F: Future<Output = Result<Bytes, Fault>>>(
     replica: &IndependentReplica,
     link: &dyn CarrierLink,
+    observed: &(TrustedCut, PolicyBody),
     source: Digest,
     channel: Digest,
     role: &str,
     make: impl FnOnce(usize) -> F,
 ) -> Result<Bytes, Fault> {
     let received = with(replica, |session| {
-        let guard = session.node_guard(source, channel, role, replica.provision.deadline_ms)?;
+        let guard = session.node_guard(
+            &observed.0,
+            source,
+            channel,
+            role,
+            replica.provision.deadline_ms,
+        )?;
         let bound = guard.max_bytes;
         let permit = session.begin_ingress(guard)?;
         session.receive_ingress(permit, || make(bound))
@@ -220,13 +242,14 @@ fn inventory_body(inventory: &Inventory, limits: &DecodeLimits) -> Result<Bytes,
 async fn inventory_phase(
     replica: &IndependentReplica,
     link: &dyn CarrierLink,
+    observed: &(TrustedCut, PolicyBody),
     remote: Digest,
     channel: Digest,
     role: &str,
     own: &Inventory,
 ) -> Result<Inventory, Fault> {
     let header = with(replica, |session| {
-        session.node_inventory_header(own, remote, channel)
+        session.node_inventory_header(observed, own, remote, channel)
     })?;
     // Both sides send their finite phase frames, then only this single owned
     // receive consumes the peer's exact two frames. No competing receiver.
@@ -244,7 +267,7 @@ async fn inventory_phase(
         )
         .await?;
     }
-    let raw = guarded(replica, link, remote, channel, role, |bound| async move {
+    let receive = |bound: usize| async move {
         let header = recv_frame(link, bound).await?;
         let signed: SignedRecord =
             decode_profile(header.value(), &replica.provision.request.limits.decode)
@@ -288,8 +311,8 @@ async fn inventory_phase(
         let mut limits = replica.provision.request.limits.decode.clone();
         limits.bytes = bound;
         encode(&(signed, inventory), &limits).map_err(|_| Fault::Capacity)
-    })
-    .await?;
+    };
+    let raw = guarded(replica, link, observed, remote, channel, role, receive).await?;
     let (_, inventory): (SignedRecord, Inventory) =
         decode(raw.value(), &replica.provision.request.limits.decode)
             .map_err(|_| Fault::Integrity)?;
@@ -301,8 +324,14 @@ async fn round(
     dialing: bool,
     console: &dyn Console,
 ) -> Result<Digest, Fault> {
+    // One trusted observation per round, made by the exchange gate's holder
+    // before its first HELLO; all of the round's steps authorize against it.
+    // A busy round (gate held elsewhere) answers on its own single observation
+    // and begins no guard.
+    let owner = replica.exchange_gate.try_lock();
+    let observed = with(replica, |session| session.node_observe())?;
     let (remote, channel, own_nonce, peer_nonce) =
-        handshake(replica, link.as_ref(), dialing).await?;
+        handshake(replica, link.as_ref(), dialing, &observed).await?;
     let local_endpoint = public_key(&replica.provision.endpoint_seed);
     let remote_endpoint: Digest = link
         .remote_id()
@@ -317,13 +346,19 @@ async fn round(
     };
     let own_role = if dialing { "dialer" } else { "acceptor" };
     let peer_role = if dialing { "acceptor" } else { "dialer" };
-    let owner = replica.exchange_gate.try_lock();
     let role = format!(
         "{own_role}-{}",
         if owner.is_ok() { "ready" } else { "busy" }
     );
     let ready = with(replica, |session| {
-        session.node_hello(remote, dialer, acceptor, channel, peer_nonce, &role)
+        session.node_hello(
+            &observed,
+            remote,
+            (dialer, acceptor),
+            channel,
+            peer_nonce,
+            &role,
+        )
     })?;
     send(
         link.as_ref(),
@@ -348,7 +383,14 @@ async fn round(
         let busy = body.role == format!("{peer_role}-busy");
         let expected = format!("{peer_role}-{}", if busy { "busy" } else { "ready" });
         with(replica, |session| {
-            session.node_verify_hello(&response, remote, dialer, acceptor, channel, &expected)
+            session.node_verify_hello(
+                &observed,
+                &response,
+                remote,
+                (dialer, acceptor),
+                channel,
+                &expected,
+            )
         })?;
         if body.nonce != own_nonce {
             return Err(Fault::Integrity);
@@ -356,7 +398,7 @@ async fn round(
         if busy {
             return Err(Fault::Capacity);
         }
-        round_history(replica, link.as_ref(), remote, channel, console).await
+        round_history(replica, link.as_ref(), &observed, remote, channel, console).await
     }
     .await;
     replica.exchange_active.lock().map_err(unavailable)?.take();
@@ -366,6 +408,7 @@ async fn round(
 async fn round_history(
     replica: &IndependentReplica,
     link: &dyn CarrierLink,
+    observed: &(TrustedCut, PolicyBody),
     remote: Digest,
     channel: Digest,
     console: &dyn Console,
@@ -375,14 +418,14 @@ async fn round_history(
         .map_err(|_| Fault::Capacity)?
         .digest();
     let own = with(replica, |session| session.node_inventory(&records))?;
-    let incoming = inventory_phase(replica, link, remote, channel, "inventory", &own)
+    let incoming = inventory_phase(replica, link, observed, remote, channel, "inventory", &own)
         .await
         .map_err(|error| {
             console.err(&format!("independent inventory: {error:?}"));
             error
         })?;
     let missing = with(replica, |session| session.node_missing(&incoming))?;
-    let requested = inventory_phase(replica, link, remote, channel, "page", &missing)
+    let requested = inventory_phase(replica, link, observed, remote, channel, "page", &missing)
         .await
         .map_err(|error| {
             console.err(&format!("independent request: {error:?}"));
@@ -416,9 +459,15 @@ async fn round_history(
     };
     let receiver = async {
         for reference in &missing.entries {
-            let raw = guarded(replica, link, remote, channel, "bundle", |bound| {
-                recv_frame(link, bound)
-            })
+            let raw = guarded(
+                replica,
+                link,
+                observed,
+                remote,
+                channel,
+                "bundle",
+                |bound| recv_frame(link, bound),
+            )
             .await?;
             let bundle: TransferBundle =
                 decode_profile(raw.value(), &replica.provision.request.limits.decode)
