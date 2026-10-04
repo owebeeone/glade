@@ -1,0 +1,91 @@
+{
+  "version": 1,
+  "phase": "IC3-B1",
+  "status": "accepted",
+  "implementation_revision": "a47691598df648eb8c9554b27f3d06b0cffcf596",
+  "accepted_review_record": "434df3f4aae0cfc116072db95a294283978d0c6e",
+  "reviewed_root_revision": "f0b1c325f9e0eff27b4eefadac8084bff3505e73",
+  "acceptance_document": {
+    "repository": "glade-wz",
+    "path": "dev-docs/history/GladeIndependentCrdtProductionIntegrationPhysicalHost-Acceptance.md",
+    "sha256": "9a680cb6d38f9bc4468bc1efb1a10e626af12693b1adf63018b8d2f00312eb11"
+  },
+  "witnesses": {
+    "genuine-provider-positive": {
+      "test": "genuine_historical_admission_verifies_exact_scoped_signed_records",
+      "assertion": "Verified with exact query, signatures/descriptor/payload/issuance true and scoped historical policy/admitter",
+      "source": "node/tests/ic3_auth.rs"
+    },
+    "bad-signature": {
+      "test": "bad_signature_wrong_domain_or_altered_namespace_are_invalid",
+      "assertion": "mutation0 corrupts real signature; Invalid",
+      "source": "node/tests/ic3_auth.rs"
+    },
+    "wrong-domain": {
+      "test": "bad_signature_wrong_domain_or_altered_namespace_are_invalid",
+      "assertion": "mutation1 changes certificate purpose to POLICY_DOMAIN; Invalid",
+      "source": "node/tests/ic3_auth.rs"
+    },
+    "revoked": {
+      "test": "uncertain_expired_or_revoked_current_cut_does_not_change_historical_validity",
+      "assertion": "signed chained policy revokes writer and clears admitters; current observe denied; valid historical admission preserved",
+      "source": "node/tests/ic3_auth.rs"
+    },
+    "expired": {
+      "test": "uncertain_expired_or_revoked_current_cut_does_not_change_historical_validity",
+      "assertion": "[101,102] current interval after permit deadline; current_allowed false",
+      "source": "node/tests/ic3_auth.rs"
+    },
+    "time-uncertain": {
+      "test": "uncertain_expired_or_revoked_current_cut_does_not_change_historical_validity",
+      "assertion": "absent trusted interval returns Unavailable; straddling [100,101] denied",
+      "source": "node/tests/ic3_auth.rs"
+    },
+    "local-session-replay": {
+      "test": "local_possession_seal_and_foreign_or_replayed_session_controls",
+      "assertion": "genuine signed possession seals admission; response replay and foreign provider refuse; missing possession and modified verified facts Invalid",
+      "source": "node/tests/ic3_auth.rs"
+    },
+    "historical-admission": {
+      "test": "genuine_historical_admission_verifies_exact_scoped_signed_records; uncertain_expired_or_revoked_current_cut_does_not_change_historical_validity",
+      "assertion": "original admission verifies before and after current revocation/expiry; current peer authorization does not remint historical receipt",
+      "source": "node/tests/ic3_auth.rs"
+    }
+  },
+  "test_command": [
+    "cargo",
+    "test",
+    "--manifest-path",
+    "glade/node/Cargo.toml",
+    "--locked",
+    "--offline",
+    "--test",
+    "ic3_auth"
+  ],
+  "executed_test_result": {
+    "passed": 16,
+    "failed": 0,
+    "evidence": "GladeIndependentCrdtProductionIntegrationB-Remediation2RunLog.md.gz"
+  },
+  "source_hashes": {
+    "node/tests/ic3_auth.rs": "2ced06ec8ac72e1932d655805e82ebb7f0fea2a792d3688fca1b76f7cb8a40dd",
+    "node/tests/ic3_auth_fixture/mod.rs": "4bc515d842fa604eda35690c9368e26a4f263ff04c44823bdf02994ab035e46b",
+    "node/src/independent/auth.rs": "55047a1eb05983c767812eb5f1a4e5bb89011284289fdc58c3ea2621390d9e8b"
+  },
+  "review_report_hashes": {
+    "dev-docs/history/GladeIndependentCrdtProductionIntegrationPhysicalHostFull-ReviewCode-2.md": "ddb1f632a49a2d8f486c0c6ed54a79801eeac6172f5aaf779deb7dfe66c8bd18",
+    "dev-docs/history/GladeIndependentCrdtProductionIntegrationPhysicalHostFull-ReviewState-2.md": "29985d46d38267900771f7938683c5066d48d0274fc3f015de87a52b3fbcc4cb",
+    "dev-docs/history/GladeIndependentCrdtProductionIntegrationPhysicalHost-ReviewCode-2.md": "6883ecf62b4e48729de31aaf2e1cc8772df7e2b6eb5de9399abb6f6ff6875314",
+    "dev-docs/history/GladeIndependentCrdtProductionIntegrationPhysicalHost-ReviewState-2.md": "5d5f449f2043d6867d4198d433ad037c198b3e386933b287ef40fab4cc7499f5",
+    "dev-docs/history/GladeIndependentCrdtProductionIntegrationPhysicalHostClosure-ReviewCode-2.md": "7fcdb2deee9e6cb5c1af0792ebbf2ad3a110e8e9f8cd86aec91ac7638b2026d0",
+    "dev-docs/history/GladeIndependentCrdtProductionIntegrationPhysicalHostClosure-ReviewState-2.md": "7a5a57916457144b007cf21813a40feda7aacac51458b7b0694f6669f7ab23a1",
+    "dev-docs/history/GladeIndependentCrdtProductionIntegrationPhysicalHost-ReviewSurface-2.md": "418bb01b8d4932ed996caef4c058266e6ecd54a658f69bba14372802dadd3d7d",
+    "dev-docs/history/GladeIndependentCrdtProductionIntegrationPhysicalHostFull-ReviewCode-2-Erratum.md": "b291461f0c6c8023c98664cdfbfc697976397f399663665137bcdbc48064764c"
+  },
+  "evidence_artifact_hashes": {
+    "dev-docs/history/GladeIndependentCrdtProductionIntegrationB-Remediation2Evidence.md": "01d11eddf7187383982b8096042bf5c282dd9890f271be234bac46480a12c16e",
+    "dev-docs/history/GladeIndependentCrdtProductionIntegrationB-Remediation2SourcePins.json": "10399a62aa9330378baa6457bdf199c43b29abfea5c9efb9426cb4c649aaf4bd",
+    "dev-docs/history/GladeIndependentCrdtProductionIntegrationB-Remediation2RunLog.md.gz": "28c07bef73a2b83848418998b2218a8017fea5037887d575ca08890779eb1c03"
+  },
+  "scope": "Genuine strict Ed25519 signed development direct-root provider, current owned bounded policy/clock intervals, scoped local possession and immutable historical admission. Coupled Unix LocalProcessRestart persistence accepted separately in same record. No production enrollment, browser activation, quorum, power-loss or arbitrary offline authorization promise."
+}
