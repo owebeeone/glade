@@ -520,6 +520,64 @@ fn converged(
         && settled
         && latest.is_some_and(|observation| observation.expected == refs))
 }
+fn guard_of(status: &GuardStatus) -> &ReceiveGuard {
+    match status {
+        GuardStatus::Active(guard)
+        | GuardStatus::Settled { guard, .. }
+        | GuardStatus::Abandoned { guard, .. }
+        | GuardStatus::Loss { guard, .. } => guard,
+    }
+}
+/// The peer's last round, from its live custody: the channel its newest
+/// guard carries, and how many guards the node opens on that channel: its
+/// full-inventory and request receives, then one per bundle the peer sent,
+/// that is per entry of the node's request the peer retained.
+fn last_round(peer: &IndependentReplica) -> (Digest, usize) {
+    with(peer, |session| {
+        let LoadResult::Validated(loaded) = session.load() else {
+            return Err(Fault::Unavailable);
+        };
+        let guards = loaded.authoritative_floor.guards.values().map(guard_of);
+        let latest = guards.max_by_key(|guard| guard.id.number);
+        let channel = latest.ok_or(Fault::Unavailable)?.channel;
+        let request = loaded
+            .authoritative_floor
+            .guards
+            .values()
+            .map(guard_of)
+            .find(|guard| guard.channel == channel && guard.role == "page")
+            .ok_or(Fault::Unavailable)?;
+        let sent = loaded
+            .image
+            .observations
+            .iter()
+            .find(|observation| observation.guard == request.id)
+            .map_or(0, |observation| observation.expected.len());
+        Ok((channel, 2 + sent))
+    })
+    .expect("the peer's last round left its guards")
+}
+/// Whether the running node's durable floor (the file it replaces
+/// atomically) holds `opened` guards on `channel`, none of them active.
+fn node_settled(h: &History, root: &Path, channel: Digest, opened: usize) -> bool {
+    let Ok(bytes) = std::fs::read(root.join("trusted/replica.floor")) else {
+        return false;
+    };
+    let limits = request(&h.f, UNDER_TEST).limits.decode;
+    let Ok(envelope) = decode::<crate::independent::disk::FloorEnvelope>(&bytes, &limits) else {
+        return false;
+    };
+    let on: Vec<_> = envelope
+        .floor
+        .guards
+        .values()
+        .filter(|status| guard_of(status).channel == channel)
+        .collect();
+    on.len() == opened
+        && !on
+            .iter()
+            .any(|status| matches!(status, GuardStatus::Active(_)))
+}
 /// A stopped replica reopened exactly as the binary reopens one on its next
 /// start (`IndependentReplica::open`: node-locked open, validated load and
 /// replay/classification of retained inputs), then read and closed.
@@ -825,10 +883,8 @@ async fn witness(cut: &Cut) {
         },
     )
     .await;
-    // Quiesce before the clean stops, so no stop lands inside a last no-op
-    // round: a lossless replica's serve reports a settled idle cut only with
-    // no round in flight. A node holding loss never reports one, so after the
-    // peer's report its last round's tail gets a bounded drain.
+    // The settled idle reports: a lossless replica's serve reports one only
+    // with no round in flight; a node holding loss never reports one.
     let lossy = !cut.guards.is_empty();
     let quiet = tokio::time::Instant::now() + Duration::from_secs(10);
     while tokio::time::Instant::now() < quiet
@@ -836,13 +892,26 @@ async fn witness(cut: &Cut) {
     {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    if lossy {
-        tokio::time::sleep(Duration::from_millis(1000)).await;
-    }
+    // Quiesce before the clean stops: a stop inside a round is permanent
+    // loss by design, and a lossy node still wants a confirming round, which
+    // a busy backoff can start seconds after the reports. Holding the peer's
+    // exchange gate waits out a round in flight on the peer and turns every
+    // later round, either way, busy before any guard. The node can then only
+    // be finishing the round it shared with the peer's last one, and the stop
+    // waits until every guard the node opened for that round has settled.
+    let busy = peer.exchange_gate.lock().await;
+    let (channel, opened) = last_round(&peer);
+    eventually(
+        "the node settles every guard of the peer's last round",
+        || node_settled(&h, node_root, channel, opened),
+        || format!("{}: node {:?}", cut.name, node.lines()),
+    )
+    .await;
     let node_idle = idle(&node.lines());
     node.stop().await;
     stop.send(()).unwrap();
     serving.await.unwrap().unwrap();
+    drop(busy);
     peer.carrier.close().await;
     peer.close().unwrap();
     drop(peer);
