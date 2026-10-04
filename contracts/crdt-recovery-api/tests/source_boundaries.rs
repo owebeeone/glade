@@ -94,12 +94,37 @@ fn actual_node_independent_subtree_and_disabled_branches_are_checked() {
         .chain([
             root.join("tests/ic3_boundary.rs"),
             root.join("tests/ic3_disk.rs"),
+            root.join("src/lifecycle.rs"),
+            root.join("src/accept.rs"),
+            root.join("src/server.rs"),
+            root.join("src/iroh_carrier.rs"),
+            root.join("src/assembly/config.rs"),
+            root.join("src/bin/glade-node.rs"),
+            root.join("tests/ic3_node_start.rs"),
+            root.join("tests/ic3_node_inbox.rs"),
+            root.join("tests/ic3_hello.rs"),
         ])
         .collect();
     assert!(
         selected.contains(&root.join("tests/ic3_disk_remediation2/mod.rs")),
         "new public remediation consumer must be parsed, including disabled branches"
     );
+    for path in [
+        "src/lifecycle.rs",
+        "src/accept.rs",
+        "src/server.rs",
+        "src/iroh_carrier.rs",
+        "src/assembly/config.rs",
+        "src/bin/glade-node.rs",
+        "tests/ic3_node_start.rs",
+        "tests/ic3_node_inbox.rs",
+        "tests/ic3_hello.rs",
+    ] {
+        assert!(
+            selected.contains(&root.join(path)),
+            "actual C source must be parsed even in disabled branches: {path}"
+        );
+    }
     for file in selected {
         assert!(
             violations(&std::fs::read_to_string(&file).unwrap()).is_empty(),

@@ -137,7 +137,7 @@ pub(super) fn settle<P: PolicyClock>(
             },
         );
         observations::retained(
-            &session.evidence,
+            &mut session.evidence,
             &session.request,
             &request.image,
             &projected,

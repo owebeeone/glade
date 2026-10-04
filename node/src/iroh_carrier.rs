@@ -857,7 +857,17 @@ impl CarrierLink for IrohLink {
                     return frame.map(Some).inspect_err(|_| drop(link.end()));
                 }
                 let mut chunk = [0; 4096];
-                let read = half.stream.read(&mut chunk).await;
+                // Consume only the current frame. A caller may need a durable
+                // ingress guard before the next frame; read-ahead would cross
+                // that application-owned consumption boundary.
+                let remaining = if half.buf.len() < 4 {
+                    4 - half.buf.len()
+                } else {
+                    let head: [u8; 4] = half.buf[..4].try_into().expect("header present");
+                    4 + u32::from_le_bytes(head) as usize - half.buf.len()
+                };
+                let wanted = remaining.min(chunk.len());
+                let read = half.stream.read(&mut chunk[..wanted]).await;
                 let between_frames = half.buf.is_empty();
                 match read {
                     Ok(Some(n)) => half.buf.extend_from_slice(&chunk[..n]),
@@ -910,6 +920,61 @@ mod tests {
     use std::collections::BTreeSet;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::path::{Path, PathBuf};
+
+    /// IC3-SYNC-004: returning a control frame must not consume the next
+    /// history frame into an application-owned buffer before its guard exists.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn returned_control_frame_does_not_prefetch_following_history() {
+        let port = |seed| {
+            IrohCarrier::new(Some(Lent {
+                key: EndpointKey::from_seed([seed; 32]),
+                door: None,
+                relays: Relays::Off,
+                first_word: Duration::from_secs(2),
+            }))
+        };
+        let (a, b) = (port(81), port(82));
+        let config = || CarrierConfig {
+            local: CarrierAddr("127.0.0.1:0".into()),
+            max_frame_bytes: NonZeroUsize::new(2048).unwrap(),
+        };
+        let _ = a.bind(config()).await.unwrap();
+        let at = b.bind(config()).await.unwrap();
+        let (sent, received) = tokio::join!(a.dial(&at), b.accept());
+        let sent = sent.unwrap();
+        let received = received.unwrap().unwrap();
+        let state = |port: &IrohCarrier| match &*lock(&port.0.state) {
+            PortState::Bound { links, .. } => links.last().unwrap().upgrade().unwrap(),
+            _ => panic!("bound link"),
+        };
+        let outgoing = state(&a);
+        let incoming = state(&b);
+        let mut raw = vec![];
+        for body in [&b"HELLO"[..], &vec![7; 1024][..]] {
+            raw.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            raw.extend_from_slice(body);
+        }
+        outgoing
+            .send
+            .lock()
+            .await
+            .as_mut()
+            .unwrap()
+            .stream
+            .write_all(&raw)
+            .await
+            .unwrap();
+        assert_eq!(received.recv().await.unwrap(), Some(b"HELLO".to_vec()));
+        assert!(
+            incoming.recv.lock().await.as_ref().unwrap().buf.is_empty(),
+            "unguarded history was prefetched past the returned control frame"
+        );
+        assert_eq!(received.recv().await.unwrap(), Some(vec![7; 1024]));
+        sent.close().await;
+        received.close().await;
+        a.close().await;
+        b.close().await;
+    }
 
     /// Plan Step 4.5: `relay off` is no relay, and `relay n0` is n0's
     /// production relays, the four of iroh's `defaults::prod`, never its

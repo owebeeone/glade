@@ -8,6 +8,8 @@ mod genesis;
 mod guards;
 mod host;
 mod loss;
+mod node_exchange;
+mod node_ingress;
 mod observations;
 mod persist;
 mod reserves;
@@ -160,6 +162,20 @@ impl<P: PolicyClock> DiskSession<P> {
     }
 }
 impl<P: PolicyClock> DiskHost<P> {
+    /// Node-local locked restoration: trusted floor, never an image or caller
+    /// projection, supplies the retained namespace and exact open authority.
+    pub(crate) fn open_node(&mut self, mut request: ReplicaOpen) -> Result<DiskSession<P>, Fault> {
+        if self.roots.provision {
+            return self.open_owned(request, None);
+        }
+        let layout = DiskLayout::open(
+            &self.roots.data,
+            &self.roots.trusted_floor,
+            self.roots.registration,
+        )?;
+        request.expected_floor = layout.floor_digest(request.limits.decode.bytes)?;
+        self.open_owned(request, Some(layout))
+    }
     fn open_owned(
         &mut self,
         request: ReplicaOpen,
@@ -425,6 +441,10 @@ impl<P: PolicyClock> ReplicaRecoveryHost for DiskHost<P> {
     fn open_replica(&mut self, request: ReplicaOpen) -> Result<Self::Session, Fault> {
         self.open_owned(request, None)
     }
+}
+
+pub(crate) fn node_reference(bundle: &TransferBundle, raw: &Bytes) -> RecordRef {
+    node_ingress::bundle_ref(bundle, raw)
 }
 
 #[cfg(test)]

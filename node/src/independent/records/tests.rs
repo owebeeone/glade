@@ -107,3 +107,33 @@ mod oversized_loss;
 
 #[path = "tests/retained_cut_crash.rs"]
 mod retained_cut_crash;
+
+#[test]
+fn node_locked_reopen_refuses_explicit_wrong_plan_namespace() {
+    let f = Fixture::new();
+    let root = root("c-node-namespace");
+    let mut fresh = DiskHost::new(evidence(&f), config(&root, true));
+    let mut session = fresh.open_node(request(&f, [0; 32])).unwrap();
+    assert!(matches!(
+        ReplicaRecoverySession::close(&mut session),
+        CloseResult::Closed
+    ));
+    let mut host = DiskHost::new(evidence(&f), config(&root, false));
+    let mut wrong = request(&f, [0; 32]);
+    wrong.plan_namespace = [99; 32];
+    assert!(
+        matches!(host.open_node(wrong), Err(Fault::BindingMismatch)),
+        "explicit plan namespace cannot silently adapt to retained authority"
+    );
+    let mut host = DiskHost::new(evidence(&f), config(&root, false));
+    let mut restored = host.open_node(request(&f, [0; 32])).unwrap();
+    assert!(matches!(restored.load(), LoadResult::Validated(_)));
+    assert!(matches!(
+        ReplicaRecoverySession::close(&mut restored),
+        CloseResult::Closed
+    ));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[path = "tests/node_history.rs"]
+mod node_history;

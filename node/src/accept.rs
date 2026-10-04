@@ -290,6 +290,98 @@ fn hold(heads: &SharedHeads, op: &Op) {
     raise(heads_of(heads).entry(zone).or_default(), &op.origin, op.seq);
 }
 
+/// Private qualification dispatch: the declared independent instance owns both
+/// authenticated writer admission and the pre-consumption local custody guard.
+pub(crate) async fn independent_local(
+    replica: Arc<crate::independent::node::IndependentReplica>,
+    mut stream: tokio::net::TcpStream,
+    console: Arc<dyn crate::lifecycle::Console>,
+) -> Result<(), glade_crdt_admission_data::Fault> {
+    use glade_crdt_recovery_api::ReplicaRecoverySession;
+    use glade_crdt_recovery_codec::*;
+    let bound = replica.provision.request.limits.decode.bytes;
+    let control = crate::independent::node::read_frame(&mut stream, bound).await?;
+    let record: SignedRecord =
+        decode_profile(control.value(), &replica.provision.request.limits.decode)
+            .map_err(|_| Fault::Integrity)?;
+    let channel = crate::signing::random_seed().map_err(|_| Fault::Unavailable)?;
+    let nonce = crate::signing::random_seed().map_err(|_| Fault::Unavailable)?;
+    let challenge_nonce = crate::signing::random_seed().map_err(|_| Fault::Unavailable)?;
+    let challenge = {
+        let mut held = replica.session.lock().map_err(|_| Fault::Ownership)?;
+        held.as_mut().ok_or(Fault::Ownership)?.local_request(
+            record,
+            channel,
+            nonce,
+            challenge_nonce,
+        )?
+    };
+    let raw =
+        crate::independent::record_bytes(&challenge, &replica.provision.request.limits.decode)?;
+    crate::independent::node::write_frame(&mut stream, &raw).await?;
+    let response = crate::independent::node::read_frame(&mut stream, bound).await?;
+    let response = decode_profile(response.value(), &replica.provision.request.limits.decode)
+        .map_err(|_| Fault::Integrity)?;
+    let _guard_owner = replica.exchange_gate.lock().await;
+    let received = {
+        let mut held = replica.session.lock().map_err(|_| Fault::Ownership)?;
+        let session = held.as_mut().ok_or(Fault::Ownership)?;
+        session.authenticate(response, channel, nonce)?;
+        // This guard names the actual local holding/admitting adapter. Writer
+        // identity remains the separately authenticated original requester.
+        let source = crate::signing::public_key(&replica.provision.node_seed);
+        let guard = session.node_guard(
+            source,
+            channel,
+            "local-qualification",
+            replica.provision.deadline_ms,
+        )?;
+        let receive_bound = guard.max_bytes;
+        let permit = session.begin_ingress(guard)?;
+        console.out(&format!(
+            "independent local receive {}",
+            permit.guard().id.number
+        ));
+        session.receive_ingress(permit, || {
+            crate::independent::node::read_frame(&mut stream, receive_bound)
+        })?
+    };
+    let (permit, observed) = received.await;
+    let raw = {
+        let mut held = replica.session.lock().map_err(|_| Fault::Ownership)?;
+        let session = held.as_mut().ok_or(Fault::Ownership)?;
+        let raw = match observed {
+            Ok(raw) => raw,
+            Err(error) => {
+                session.retain_ingress_loss(permit, Bytes::new(vec![]));
+                return Err(error);
+            }
+        };
+        let bundle: TransferBundle =
+            match decode_profile(raw.value(), &replica.provision.request.limits.decode) {
+                Ok(bundle) => bundle,
+                Err(_) => {
+                    session.retain_ingress_loss(permit, raw);
+                    return Err(Fault::Integrity);
+                }
+            };
+        let reference = crate::independent::records::node_reference(&bundle, &raw);
+        session.finish_node_input(permit, raw, vec![reference])?;
+        let (outcomes, accepted) = session.local_result(bundle, channel, nonce)?;
+        let Some(accepted) = accepted else {
+            console.err(&format!("independent local outcomes: {outcomes:?}"));
+            return Err(Fault::Unavailable);
+        };
+        console.out(&format!(
+            "independent local committed {}",
+            crate::transport::hex(&accepted.candidate.operation.canonical().digest())
+        ));
+        encode_profile(&accepted, &replica.provision.request.limits.decode)
+            .map_err(|_| Fault::Capacity)?
+    };
+    crate::independent::node::write_frame(&mut stream, &raw).await
+}
+
 #[cfg(test)]
 mod tests {
     use std::future::Future;

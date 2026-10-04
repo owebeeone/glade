@@ -24,7 +24,7 @@ mod text_profile;
 pub use auth::{EvidenceConfig, GenuineEvidence, PolicyClock, SessionRequest, TrustedCut};
 pub use namespace::{record_bytes, sign_record, validate_namespace};
 
-mod records;
+pub(crate) mod records;
 pub use records::{DiskHost, DiskRootConfig, DiskSession};
 
 /// Explicit scoped provisioning; the default assembly remains refusing.
@@ -42,3 +42,5 @@ impl<P: PolicyClock> ConfiguredIndependentAdapters<P> {
         })
     }
 }
+
+pub(crate) mod node;

@@ -1,7 +1,7 @@
 //! `glade-node PORT STORE_DIR`, or `glade-node --profile ... [PORT] [STORE_DIR]`
 //! — run a glade node (GLP-0005 + GDL-036).
 //!
-//! Two invocation forms:
+//! Three serve invocation forms:
 //!
 //! **Legacy serve form** (neither `--profile` nor `--name`): `glade-node
 //! <port> <store_dir>` — the pre-seam contract, but for one change: the store
@@ -45,6 +45,15 @@
 //! same at every start, and its address as bound), and each peer with an
 //! address is dialed and the home share converged. Then it serves the
 //! app-data carrier as before.
+//!
+//! **Independent qualification form** (explicit, disposable): `glade-node
+//! --independent-config <absolute-profile> [PORT]` runs the same sdax/Shaku
+//! node scope with authenticated independent text admission, locked durable
+//! per-instance storage and fixed authorized Iroh peers. It accepts no legacy
+//! store, boot/profile/app/network/grant/lease/recovery flags. The closed profile
+//! owns fresh scratch data and trusted-floor roots, keys, descriptor, policy,
+//! trusted time and finite bounds; absence keeps the other forms unchanged.
+//! This form does not activate or migrate any existing resource or store.
 //!
 //! The endpoint has a door (plan Step 4.2b): it admits an endpoint key bound
 //! by a record the node holds, or one a peer entry names on first contact,
@@ -180,7 +189,8 @@ const USAGE: &str = "usage: glade-node <port> <store_dir> (the legacy form requi
     [--operator OP] [--app FILE.glade]... [--config PATH] \
     [--peer ID[@IP:PORT|@RELAY-URL]]... [--enforce-client-grants] [--recovery-out PATH] \
     [--lease-ms N] [port] [store_dir], or glade-node recovery --name NAME --out PATH, or \
-    glade-node endpoint-id --name NAME, or glade-node node-id --name NAME";
+    glade-node endpoint-id --name NAME, or glade-node node-id --name NAME, or \
+    glade-node --independent-config <absolute-profile> [PORT] (disposable IC3 qualification only)";
 
 /// The refusal of a legacy start with no store directory: the usage line on
 /// stderr, and exit 1, as every refused start.
@@ -262,7 +272,8 @@ async fn start() -> std::io::Result<ExitCode> {
     }
     let program = program_path();
     let (args, lease_flag) = take_lease_ms(args);
-    if assembled(std::env::var_os(ASSEMBLED))? {
+    let independent = args.iter().any(|arg| arg == "--independent-config");
+    if assembled(std::env::var_os(ASSEMBLED))? || independent {
         return run_assembled(args, program, lease_flag).await;
     }
     run(args, program, lease_flag).await?;
@@ -517,8 +528,14 @@ async fn run_assembled(
     };
     // The legacy form requires its store directory: refused, as `run`
     // refuses it, before the plan starts.
-    if !settings.booted() && settings.store_dir().is_none() {
+    if !settings.booted() && settings.store_dir().is_none() && settings.independent_config.is_none()
+    {
         return Err(usage());
+    }
+    let console: Arc<dyn Console> = Arc::new(StdConsole);
+    if settings.independent_config.is_some() {
+        // Refuse ambiguous opt-in before any legacy app/network input is read.
+        NodeStart::from_settings(settings.clone(), Vec::new(), console.clone())?;
     }
     // Every `--app` file is loaded, and two naming one app are refused, then
     // the network (plan Step 4.5) and the leases (plan Step 4.6), before the
@@ -531,7 +548,6 @@ async fn run_assembled(
     } else {
         Vec::new()
     };
-    let console: Arc<dyn Console> = Arc::new(StdConsole);
     let start = NodeStart::from_settings(settings, decls, console.clone())?;
     let mut stop = stop_signal::StopSignal::install()?;
     let runtime = Arc::new(TokioRuntime::new(tokio::runtime::Handle::current()));

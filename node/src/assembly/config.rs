@@ -45,6 +45,9 @@ pub struct Settings {
     /// be an absolute path. The legacy form ignores it, as it ignores
     /// `--peer`.
     pub config: Option<String>,
+    /// Explicit disposable IC3 qualification provisioning. Absent retains the
+    /// legacy store path; this does not activate an existing resource or store.
+    pub independent_config: Option<String>,
     /// The node's network: the `--config` file's, then the `--peer` flags'
     /// (`netconf::load`), which the composition root loads before it builds
     /// `NodeStart`. With no file, `127.0.0.1:0` alone, relays off.
@@ -54,7 +57,9 @@ pub struct Settings {
 impl Settings {
     /// Parse the arguments after the program name exactly as the hand-written
     /// root does: an unknown `--profile` is no profile, a flag given no value
-    /// reads as absent, and anything that is not a flag is positional. The
+    /// reads as absent, and anything that is not a flag is positional. Explicit
+    /// independent qualification is stricter: missing/repeated paths remain
+    /// present and malformed so NodeStart refuses rather than choosing legacy. The
     /// instance root, the program's path and the leases are not arguments,
     /// `--lease-ms` is taken out before this reads them, and the network is
     /// loaded from the file and the flags: the composition root sets them.
@@ -70,6 +75,14 @@ impl Settings {
                 "--recovery-out" => settings.recovery_out = args.next(),
                 "--peer" => settings.peers.extend(args.next()),
                 "--config" => settings.config = args.next(),
+                "--independent-config" => {
+                    let value = args.next().unwrap_or_default();
+                    settings.independent_config = Some(if settings.independent_config.is_some() {
+                        String::new()
+                    } else {
+                        value
+                    });
+                }
                 "--enforce-client-grants" => settings.enforce_client_grants = true,
                 _ => settings.positional.push(arg),
             }

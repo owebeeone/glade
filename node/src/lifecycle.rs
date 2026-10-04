@@ -43,6 +43,7 @@ use crate::assembly::{
     CommandLine, Config, Directory, InstanceSlot, NodeAssembly, Records, Settings,
 };
 use crate::grants::{CLIENT_GRANTS_ENFORCED, GRANTS_UNAVAILABLE};
+use crate::independent::node::{IndependentReplica, Provision};
 use crate::iroh_carrier::{IrohCarrier, Lent, FIRST_WORD};
 use crate::mesh::{release_links, PeerPort};
 use crate::netconf::Network;
@@ -142,6 +143,31 @@ impl NodeStart {
         decls: Vec<AppDecl>,
         console: Arc<dyn Console>,
     ) -> io::Result<NodeStart> {
+        if let Some(path) = &settings.independent_config {
+            if settings.booted()
+                || settings.operator.is_some()
+                || !settings.apps.is_empty()
+                || !settings.peers.is_empty()
+                || settings.config.is_some()
+                || settings.recovery_out.is_some()
+                || settings.enforce_client_grants
+                || settings.lease_ms.is_some()
+                || !decls.is_empty()
+                || settings.positional.len() > 1
+                || settings
+                    .positional
+                    .first()
+                    .is_some_and(|port| port.parse::<u16>().is_err())
+            {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput,"independent qualification cannot combine legacy/booted flags or store positionals"));
+            }
+            if !Path::new(path).is_absolute() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "independent configuration needs an absolute owned provisioning path",
+                ));
+            }
+        }
         let instance = match (settings.booted(), &settings.instance_root) {
             (false, _) => None,
             (true, Some(root)) => Some(InstanceAt {
@@ -175,6 +201,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 struct Instance {
     slot: InstanceSlot,
     booted: Option<Booted>,
+    independent: Option<(Arc<Provision>, IrohCarrier)>,
 }
 
 /// What the booted form reads from its instance before lending it.
@@ -201,7 +228,25 @@ impl Instance {
         Instance {
             slot: Arc::new(Mutex::new(None)),
             booted: None,
+            independent: None,
         }
+    }
+
+    fn qualification(path: &Path) -> io::Result<Instance> {
+        let provision = Arc::new(Provision::read(path)?);
+        let keys = provision.peers.iter().map(|(_, (endpoint, _))| *endpoint);
+        let door = Arc::new(Door::new(keys, |_| {}));
+        let carrier = IrohCarrier::new(Some(Lent {
+            key: EndpointKey::from_seed(provision.endpoint_seed),
+            door: Some(door),
+            relays: crate::netconf::Relays::Off,
+            first_word: Duration::from_millis(provision.deadline_ms),
+        }));
+        Ok(Instance {
+            slot: Arc::new(Mutex::new(None)),
+            booted: None,
+            independent: Some((provision, carrier)),
+        })
     }
 
     fn boot(start: &NodeStart, at: &InstanceAt) -> io::Result<Instance> {
@@ -265,6 +310,7 @@ impl Instance {
         Ok(Instance {
             slot: Arc::new(Mutex::new(Some(boot))),
             booted: Some(booted),
+            independent: None,
         })
     }
 
@@ -280,6 +326,7 @@ struct Storage {
     server: Mutex<Option<Server>>,
     sessions: Mutex<Option<Inbox>>,
     records: Mutex<Option<Inbox>>,
+    independent: Option<Arc<IndependentReplica>>,
 }
 
 impl Storage {
@@ -287,7 +334,29 @@ impl Storage {
     /// and say whether `home` is served. The legacy form requires its store
     /// directory (the owner's ruling of 2026-09-26): without one, nothing is
     /// opened.
-    async fn open(start: &NodeStart, instance: &Instance) -> io::Result<Storage> {
+    async fn open(
+        start: &NodeStart,
+        instance: &Instance,
+        declared: &Declared,
+    ) -> io::Result<Storage> {
+        if let Some((provision, carrier)) = &instance.independent {
+            let replica = IndependentReplica::open(
+                declared.module.clone(),
+                provision.clone(),
+                carrier.clone(),
+            )?;
+            let (_, sessions, records) = tasks::owners();
+            start.console.out(&format!(
+                "independent ready {}",
+                provision.request.descriptor.resource
+            ));
+            return Ok(Storage {
+                server: Mutex::new(None),
+                sessions: Mutex::new(Some(sessions)),
+                records: Mutex::new(Some(records)),
+                independent: Some(Arc::new(replica)),
+            });
+        }
         let dir = match (start.settings.store_dir(), &instance.booted) {
             (Some(dir), _) => PathBuf::from(dir),
             (None, Some(booted)) => booted.dir.join("cache").join("store"),
@@ -323,6 +392,7 @@ impl Storage {
             server: Mutex::new(Some(server)),
             sessions: Mutex::new(Some(sessions)),
             records: Mutex::new(Some(records)),
+            independent: None,
         })
     }
 
@@ -350,6 +420,9 @@ impl Storage {
     /// state holds (the instance lock, link handles) where the report cannot
     /// see it, so it is a cleanup failure here instead.
     fn release(&self) -> Result<(), Error> {
+        if let Some(replica) = &self.independent {
+            replica.close()?;
+        }
         drop(lock(&self.sessions).take());
         drop(lock(&self.records).take());
         let Some(server) = lock(&self.server).take() else {
@@ -384,13 +457,22 @@ impl Listener {
 /// `PeerCarrier`: the node's one peer adapter, bound on the network's sockets
 /// (plan Step 4.5b), as the mesh takes it, and the `peer` line its address
 /// gives; nothing in the legacy form.
-struct PeerBound(Option<(PeerPort, String)>);
+struct PeerBound(
+    Option<(PeerPort, String)>,
+    Option<(Arc<IndependentReplica>, String)>,
+);
 
 /// `Records`' handle: its inbox, until its serve body takes it.
-struct RecordsOwner(Mutex<Option<Inbox>>);
+struct RecordsOwner(
+    Mutex<Option<Inbox>>,
+    Option<(Arc<IndependentReplica>, Arc<dyn Console>)>,
+);
 
 /// The workspaces the app files declare, `(share, name)`: `Assembly`'s output.
-type Declared = Vec<(String, String)>;
+struct Declared {
+    workspaces: Vec<(String, String)>,
+    module: Arc<NodeAssembly>,
+}
 
 /// What `Workspaces` needs: the declared list and the store to serve it
 /// from, once the peers are dialed and `Records` owns the renewals.
@@ -414,6 +496,7 @@ struct SessionsServe {
     storage: Arc<Storage>,
     listener: Arc<Listener>,
     admitted: watch::Receiver<bool>,
+    console: Arc<dyn Console>,
 }
 
 /// Plan Step 3.2's module over the acquired instance. Its signer holds the
@@ -421,8 +504,15 @@ struct SessionsServe {
 /// adapter (plan Step 4.5b), the booted instance's: none in the legacy form.
 fn module(start: &NodeStart, instance: &Instance) -> NodeAssembly {
     let booted = instance.booted.as_ref();
-    let identity = booted.map(|booted| booted.identity);
-    let carrier = booted.map(|booted| booted.carrier.clone());
+    let identity = booted.map(|booted| booted.identity).or_else(|| {
+        instance
+            .independent
+            .as_ref()
+            .map(|(p, _)| NodeIdentity::from_key(p.node_seed))
+    });
+    let carrier = booted
+        .map(|booted| booted.carrier.clone())
+        .or_else(|| instance.independent.as_ref().map(|(_, c)| c.clone()));
     NodeAssembly::builder()
         .with_component_parameters::<CommandLine>(start.settings.clone())
         .with_component_parameters::<Records>(instance.slot.clone())
@@ -436,12 +526,12 @@ fn module(start: &NodeStart, instance: &Instance) -> NodeAssembly {
 /// declare. The module is dropped here; its record host answers `NotOpen`
 /// once `Storage` has adopted the instance.
 fn assemble(start: &NodeStart, instance: &Instance) -> Result<Declared, Error> {
-    let module = module(start, instance);
+    let module = Arc::new(module(start, instance));
     let config: Arc<dyn Config> = module.resolve();
     let directory: Arc<dyn Directory> = module.resolve();
     let mut workspaces = Vec::new();
     let Some(booted) = &instance.booted else {
-        return Ok(workspaces);
+        return Ok(Declared { workspaces, module });
     };
     for (path, decl) in config.settings().apps.iter().zip(&start.decls) {
         // The non-fatal channel (R10(a)), as the hand-written root prints it.
@@ -461,7 +551,7 @@ fn assemble(start: &NodeStart, instance: &Instance) -> Result<Declared, Error> {
                 .map(|w| (w.share.clone(), w.name.clone())),
         );
     }
-    Ok(workspaces)
+    Ok(Declared { workspaces, module })
 }
 
 /// Dial each of the network's peers that has an address, as the hand-written
@@ -494,7 +584,24 @@ async fn serve_sessions(cx: Cx<ServingPhase>, owner: Arc<SessionsOwner>) -> Resu
         storage,
         listener,
         mut admitted,
+        console,
     } = serve;
+    if let Some(replica) = &storage.independent {
+        if admitted.wait_for(|admit| *admit).await.is_err() {
+            return Ok(());
+        }
+        let held = listener.listener.lock().await;
+        if let Some(listener) = held.as_ref() {
+            crate::server::accept_independent_clients(
+                replica.clone(),
+                listener,
+                console,
+                cx.stop(),
+            )
+            .await?;
+        }
+        return Ok(());
+    }
     let shared = storage.shared()?;
     let mut tasks = JoinSet::new();
     let clients = async {
@@ -520,7 +627,13 @@ async fn serve_sessions(cx: Cx<ServingPhase>, owner: Arc<SessionsOwner>) -> Resu
 /// `Records`' serve body: the owner loop until its stop, then admission
 /// closed and every task cancelled and joined.
 async fn serve_records(cx: Cx<ServingPhase>, owner: Arc<RecordsOwner>) -> Result<(), Error> {
+    if let Some((replica, console)) = &owner.1 {
+        return Ok(
+            crate::independent::node::serve(replica.clone(), console.clone(), cx.stop()).await?,
+        );
+    }
     let Some(mut inbox) = lock(&owner.0).take() else {
+        cx.stop().await;
         return Ok(());
     };
     let mut tasks = JoinSet::new();
@@ -542,6 +655,11 @@ pub fn node_plan() -> Plan<(), NodeStart> {
         .resource(node::INSTANCE)
         .needs(start)
         .acquire(|cx: Cx<Acquire>, start: Arc<NodeStart>| async move {
+            if let Some(path) = start.settings.independent_config.clone() {
+                return cx
+                    .hold(move || async move { Instance::qualification(Path::new(&path)) })
+                    .await;
+            }
             if start.instance.is_none() {
                 return Ok(cx.hold_value(Instance::none()));
             }
@@ -574,7 +692,7 @@ pub fn node_plan() -> Plan<(), NodeStart> {
                 Arc<Instance>,
                 Arc<Declared>,
             )| async move {
-                cx.hold(move || async move { Storage::open(&start, &instance).await })
+                cx.hold(move || async move { Storage::open(&start, &instance, &_registered).await })
                     .await
             },
         )
@@ -582,18 +700,31 @@ pub fn node_plan() -> Plan<(), NodeStart> {
 
     let peer_carrier = p
         .resource(node::PEER_CARRIER)
-        .needs((instance, storage))
+        .needs((start, instance, storage))
         .acquire(
-            |cx: Cx<Acquire>, (instance, _storage): (Arc<Instance>, Arc<Storage>)| async move {
+            |cx: Cx<Acquire>, (start, instance, storage): (Arc<NodeStart>, Arc<Instance>, Arc<Storage>)| async move {
+                if let Some(replica) = &storage.independent {
+                    let replica = replica.clone();
+                    return cx.hold(move || async move {
+                        use glade_carrier_api::{CarrierAddr, CarrierConfig, CarrierPort};
+                        let config = CarrierConfig {
+                            local: CarrierAddr(format!("127.0.0.1:{}", start.settings.port())),
+                            max_frame_bytes: std::num::NonZeroUsize::new(replica.provision.request.limits.decode.bytes.min(replica.provision.request.limits.inbox_bytes))
+                                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput,"zero independent carrier bound"))?,
+                        };
+                        let at = replica.carrier.bind(config).await.map_err(|error| io::Error::other(format!("{error:?}")))?;
+                        Ok::<_,io::Error>(PeerBound(None, Some((replica, format!("independent peer {}",at.0)))))
+                    }).await;
+                }
                 let Some(booted) = instance.booted.as_ref() else {
-                    return Ok(cx.hold_value(PeerBound(None)));
+                    return Ok(cx.hold_value(PeerBound(None, None)));
                 };
                 let (carrier, network) = (booted.carrier.clone(), booted.network.clone());
                 let door = Some(booted.door.clone());
                 let port = PeerPort::iroh(&carrier, booted.identity, &booted.endpoint, door);
                 cx.hold(move || async move {
                     let line = carrier.bind_network(&network).await?;
-                    Ok::<_, io::Error>(PeerBound(Some((port, line))))
+                    Ok::<_, io::Error>(PeerBound(Some((port, line)), None))
                 })
                 .await
             },
@@ -602,6 +733,10 @@ pub fn node_plan() -> Plan<(), NodeStart> {
         // handle, out of the one adapter every clone shares, so neither the
         // mesh nor the module holds the address afterwards.
         .release(|_cx: Cx<Release>, bound: Arc<PeerBound>| async move {
+            if let Some((replica, _)) = &bound.1 {
+                use glade_carrier_api::CarrierPort;
+                replica.carrier.close().await;
+            }
             if let Some((peer, _)) = &bound.0 {
                 peer.port.close().await;
             }
@@ -625,12 +760,23 @@ pub fn node_plan() -> Plan<(), NodeStart> {
 
     let records = p
         .service(node::RECORDS)
-        .needs((storage, peer_carrier))
+        .needs((start, storage, peer_carrier))
         .stop_within(STOP_WITHIN)
         .initialize(
-            |_cx: Cx<Start>, (storage, _peer): (Arc<Storage>, Arc<PeerBound>)| async move {
-                let inbox = storage.inbox(&storage.records)?;
-                Ok(RecordsOwner(Mutex::new(Some(inbox))))
+            |_cx: Cx<Start>,
+             (start, storage, _peer): (Arc<NodeStart>, Arc<Storage>, Arc<PeerBound>)| async move {
+                let inbox = if storage.independent.is_some() {
+                    None
+                } else {
+                    Some(storage.inbox(&storage.records)?)
+                };
+                Ok(RecordsOwner(
+                    Mutex::new(inbox),
+                    storage
+                        .independent
+                        .as_ref()
+                        .map(|replica| (replica.clone(), start.console.clone())),
+                ))
             },
         )
         .serve(serve_records);
@@ -648,6 +794,9 @@ pub fn node_plan() -> Plan<(), NodeStart> {
                 Arc<Listener>,
             )| async move {
                 let inbox = storage.inbox(&storage.sessions)?;
+                if let Some((_, line)) = &peer.1 {
+                    start.console.out(line);
+                }
                 if let Some((port, line)) = &peer.0 {
                     storage.server()?.enable_mesh(port.clone()).await?;
                     start.console.out(line);
@@ -658,6 +807,7 @@ pub fn node_plan() -> Plan<(), NodeStart> {
                     storage,
                     listener,
                     admitted,
+                    console: start.console.clone(),
                 };
                 Ok(SessionsOwner {
                     serve: Mutex::new(Some(serve)),
@@ -671,7 +821,9 @@ pub fn node_plan() -> Plan<(), NodeStart> {
         .step(node::PEERS)
         .needs((start, storage, sessions))
         .run(|_cx: Cx<Run>, (start, storage, _sessions): (Arc<NodeStart>, Arc<Storage>, Arc<SessionsOwner>)| async move {
-            dial_peers(&start, &storage.server()?).await;
+            if storage.independent.is_none() {
+                dial_peers(&start, &storage.server()?).await;
+            }
             Ok(())
         });
 
@@ -680,8 +832,11 @@ pub fn node_plan() -> Plan<(), NodeStart> {
         .needs((start, assembly, storage, peers, records))
         .run(
             |_cx: Cx<Run>, (start, declared, storage, _peers, _records): WorkspacesNeeds| async move {
+                if storage.independent.is_some() {
+                    return Ok(());
+                }
                 let server = storage.server()?;
-                for (share, name) in declared.iter() {
+                for (share, name) in declared.workspaces.iter() {
                     let serving = server.serve_workspace(share, name).await?;
                     let status = if serving {
                         "serving"
@@ -761,6 +916,7 @@ mod tests {
             server: Mutex::new(Some(server)),
             sessions: Mutex::new(None),
             records: Mutex::new(None),
+            independent: None,
         };
         let refused = storage.release().expect_err("an escaped owner is refused");
         assert_eq!(
