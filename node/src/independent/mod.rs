@@ -16,3 +16,9 @@ impl IndependentAdapters {
         }
     }
 }
+
+mod auth;
+mod namespace;
+mod text_profile;
+pub use auth::{EvidenceConfig, GenuineEvidence, PolicyClock, SessionRequest, TrustedCut};
+pub use namespace::{record_bytes, sign_record, validate_namespace};

@@ -869,6 +869,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "glade-crdt-recovery-codec"
+version = "0.0.0"
+dependencies = [
+ "glade-crdt-admission-data",
+ "glade-crdt-storage-attempt-api",
+ "glade-wire",
+]
+
+[[package]]
 name = "glade-crdt-storage-attempt-api"
 version = "0.0.0"
 dependencies = [
@@ -890,6 +899,7 @@ dependencies = [
  "glade-crdt-admission-data",
  "glade-crdt-evidence-api",
  "glade-crdt-recovery-api",
+ "glade-crdt-recovery-codec",
  "glade-grant-api",
  "glade-persistence-api",
  "glade-signer-api",
