@@ -492,7 +492,13 @@ async fn actual_binaries_exchange_ancestry_and_security_evidence_both_arrival_or
                 &limits(),
             )
             .unwrap(),
-            encode(&(50_u64, 1000_u64), &limits()).unwrap(),
+            // Scheduling bounds (tick, deadline). Every dial, send and
+            // guarded receive is bounded by the deadline, and a started
+            // receive that times out is retained as permanent loss by
+            // design, after which no idle cut can settle. Under the full
+            // suite's load one step can take over a second, so the witness
+            // uses five, as the interruption witnesses do.
+            encode(&(50_u64, 5000_u64), &limits()).unwrap(),
         ]
     }
     for reverse in [false, true] {
