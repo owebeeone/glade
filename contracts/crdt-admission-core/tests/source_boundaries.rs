@@ -83,3 +83,18 @@ fn disabled_associated_foreign_and_field_declarations_are_checked() {
         assert_eq!(violations(source).len(), 1, "{source}");
     }
 }
+
+#[test]
+fn ic3_data_boundary_is_independent_of_the_pure_algorithm() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    assert!(
+        manifest.contains("glade-crdt-admission-data"),
+        "IC3-A2 data owns boundary independently"
+    );
+    let source = std::fs::read_to_string(root.join("src/types.rs")).unwrap();
+    assert!(
+        source.contains("pub use glade_crdt_admission_data::*"),
+        "old imports remain reexports"
+    );
+}

@@ -308,3 +308,10 @@ module! {
         providers = []
     }
 }
+
+// IC3A typed binding only; real authority/floor/transport are later reviewed adapters.
+impl NodeAssembly {
+    pub fn independent_adapters(&self) -> crate::independent::IndependentAdapters {
+        crate::independent::IndependentAdapters::refusing()
+    }
+}

@@ -6,6 +6,7 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+glade-crdt-admission-data = { path = "../crdt-admission-data" }
 glade-wire = { path = "../../wire-rs" }
 glade-crdt-storage-attempt-api = { path = "../crdt-storage-attempt-api" }
 

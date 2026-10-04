@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "status": "candidate-content-pins-awaiting-parent-commit",
+  "implementation_revision": null,
+  "languages": {
+    "rust": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+    "typescript": "Node v22.19.0 built-in TypeScript transform",
+    "python": "Python 3.11.16"
+  },
+  "files": {
+    "vectors/schema.json": "330469e231c2d74dd7bbf4e76b4de576c1613efcbba3fdeb2aad77b6d8ac8d18",
+    "vectors/input.json": "e299618c06ade06e3e21b4d831e218d5a613f562685ccd7c359df0e8e4ecb576",
+    "vectors/expected.json": "28060fdef1ed9db9c54da2094adeece4cc5c9d68ab4eb3e94113c7473ab952c2",
+    "vectors/negative.json": "d530a0d2dbd512bf193a1e9c5247dfebacfe15aa3a481a8e0ebb04598e2efd0a",
+    "compat/python.py": "f3b3b4225cbcbc8e1aafbc57ba818608608d55e96c7c8ed3945a32ca4d4afc6c",
+    "compat/typescript.ts": "c0c50661f6bb04e13b7bd95cf010361285fc55df4c1048ed07c85314311193e7",
+    "compat/gate.py": "e9236a3140516e536bb5b3929039b93404e514f7afd5415e7d8f28cbc3b97653",
+    "compat/test_gate.py": "805aaca212805bf5a9b095169d0105a66b655c9f46da5a36da85946e0c17f227",
+    "tests/vectors.rs": "35b59044e5543241b490c3c4bc79a105c0c28e1af61e434381ea40b7f5fdbfb6",
+    "src/profile.rs": "7bb2d23715b29d6c6e7ad33d3ca2bd5f4b6bfa9ad0566381e47ed4eb23550ca9",
+    "src/proofs.rs": "456683f191a60f9cb7e6e4fd66d9ea9472412de2398390fdd21ead3891e29bbf",
+    "src/values.rs": "5bedfa464a3dc29ffaff4ac2acfc772059861a671a1ed5750fa3a18b2bb10162",
+    "check-vectors.sh": "d198e8df96e1dbe9897ad5e87389d6f89d2e5e2f93eeb6117619445144e91ec0"
+  },
+  "qualification": "structural representation only; real authenticated provider remains B1",
+  "crypto_qualification": null
+}

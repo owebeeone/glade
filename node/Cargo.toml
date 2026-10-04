@@ -16,6 +16,10 @@ path = "src/bin/glade-node.rs"
 
 [dependencies]
 glade-wire = { path = "../wire-rs" }
+# IC3A: reviewed narrow owned data and required trusted ports. No physical success yet.
+glade-crdt-admission-data = { path = "../contracts/crdt-admission-data" }
+glade-crdt-evidence-api = { path = "../contracts/crdt-evidence-api" }
+glade-crdt-recovery-api = { path = "../contracts/crdt-recovery-api" }
 sha2 = "0.10"
 # `signal` (plan Step 3.3): the assembled root stops on SIGTERM or SIGINT. It adds
 # no crate: iroh's graph already builds tokio with it. `"1"` stays a range; the

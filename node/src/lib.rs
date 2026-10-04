@@ -21,6 +21,7 @@ pub mod exchange;
 pub mod frame;
 pub mod grants;
 pub mod iroh_carrier;
+pub mod independent;
 pub mod lifecycle;
 pub mod mesh;
 pub mod netconf;

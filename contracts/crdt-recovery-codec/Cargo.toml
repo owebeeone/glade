@@ -1,0 +1,15 @@
+[package]
+name = "glade-crdt-recovery-codec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+[dependencies]
+glade-crdt-admission-data = { path = "../crdt-admission-data" }
+glade-crdt-storage-attempt-api = { path = "../crdt-storage-attempt-api" }
+glade-wire = { path = "../../wire-rs" }
+[dev-dependencies]
+serde_json = "1"
+syn = { version = "2", features = ["full", "visit"] }
+[lints]
+workspace = true

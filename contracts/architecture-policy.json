@@ -63,9 +63,10 @@
     },
     "glade-crdt-admission-core": {
       "role": "pure",
-      "reason": "Internal deterministic event/effect contract; refusing scaffold; no I/O, clock, signing or merge implementation; traits would add no substitution contract.",
+      "reason": "Deterministic admission/projection and effect issuance; owned data reexports; no I/O, clock, signing or concrete adapter.",
       "dependencies": [
         "normal:glade-wire",
+        "normal:glade-crdt-admission-data",
         "normal:glade-crdt-storage-attempt-api",
         "dev:serde_json",
         "dev:syn"
@@ -83,6 +84,37 @@
         "StorageAttemptSession": ["recover", "prepare", "recover_plan", "begin", "inspect", "request_fence", "close"]
       },
       "conformance_tests": ["public_contract", "source_boundaries"]
+    },
+    "glade-crdt-evidence-api": {
+      "role": "contract",
+      "dependencies": ["normal:glade-crdt-admission-data", "normal:glade-crdt-storage-attempt-api", "dev:syn"],
+      "traits": {"EvidencePort": ["verify", "seal", "observe"]},
+      "conformance_tests": ["public_contract", "source_boundaries"]
+    },
+    "glade-crdt-recovery-api": {
+      "role": "contract",
+      "dependencies": ["normal:glade-crdt-admission-data", "normal:glade-crdt-storage-attempt-api", "dev:syn"],
+      "traits": {"ReplicaRecoveryHost": ["open_replica"], "ReplicaRecoverySession": ["load", "checkpoint", "begin_ingress", "receive_ingress", "settle_ingress", "abandon_ingress", "record_observation", "reconstruct_cut", "close"]},
+      "conformance_tests": ["public_contract", "source_boundaries"]
+    },
+    "glade-crdt-recovery-codec": {
+      "role": "protocol",
+      "reason": "Bounded deterministic complete owned representation and unchanged IC2 batch decoding; no physical, proof, host or algorithm dependency.",
+      "dependencies": ["normal:glade-crdt-admission-data", "normal:glade-crdt-storage-attempt-api", "normal:glade-wire", "dev:syn", "dev:serde_json"],
+      "conformance_tests": ["roundtrip", "source_boundaries"]
+    },
+    "glade-crdt-admission-data": {
+      "role": "protocol",
+      "reason": "Owned canonical internal values and operation binding extracted from the Pure consumer; representation tests without I/O or substitution-marker traits.",
+      "dependencies": [
+        "normal:glade-wire",
+        "normal:glade-crdt-storage-attempt-api",
+        "dev:syn"
+      ],
+      "conformance_tests": [
+        "representation",
+        "source_boundaries"
+      ]
     }
   }
 }

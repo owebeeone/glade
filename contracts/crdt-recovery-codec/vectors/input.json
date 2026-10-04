@@ -1,0 +1,663 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "IC3-CANON-CreationIntent",
+      "kind": "CreationIntent",
+      "value": {
+        "root_key": "0101010101010101010101010101010101010101010101010101010101010101",
+        "nonce": "0101010101010101010101010101010101010101010101010101010101010101",
+        "incarnation": "δ🌿",
+        "resource": "δ🌿",
+        "private_owner": "δ🌿",
+        "zone": "δ🌿",
+        "share": "δ🌿",
+        "glade_id": "δ🌿",
+        "key": "00ff",
+        "declaration_hash": "0101010101010101010101010101010101010101010101010101010101010101",
+        "declaration_version": "δ🌿",
+        "shape": {
+          "variant": "Crdt",
+          "fields": {}
+        },
+        "schema_identity": "δ🌿",
+        "schema_hash": "0101010101010101010101010101010101010101010101010101010101010101",
+        "schema_version": "δ🌿",
+        "parameters": "00ff",
+        "engine": "crdt.oracle/v1",
+        "payload_profile": "text_crdt.profile/v1",
+        "admission_profile": "glade.crdt.independent-admission/v1",
+        "authorization_profile": "bounded-offline-permit/v1",
+        "proof_profile": "ic3-direct-root-ed25519/v1",
+        "recovery_profile": "ic3-records-floor/v1",
+        "retention_policy": "full-history-no-gc/v1",
+        "rejoin_policy": "exact-evidence-full-cut/v1",
+        "corpus_identity": "δ🌿",
+        "corpus_version": "δ🌿",
+        "corpus_digest": "0101010101010101010101010101010101010101010101010101010101010101",
+        "mode": {
+          "variant": "Independent",
+          "fields": {}
+        },
+        "storage": {
+          "variant": "VolatileTest",
+          "fields": {}
+        },
+        "bounds": {
+          "max_operation_bytes": "8",
+          "max_origins": "8",
+          "max_refs": "8",
+          "edit_bytes": "8",
+          "recovery_bytes": "8",
+          "evidence_bytes": "8",
+          "pending_bytes": "8",
+          "pending_items": "8"
+        },
+        "limits": {
+          "storage": {
+            "instances": "8",
+            "attempts": "8",
+            "invocation_history": "8",
+            "max_batch_bytes": "8",
+            "max_receipts": "8",
+            "max_windows": "8",
+            "max_name_bytes": "8",
+            "critical_bytes": "8",
+            "critical_per_attempt": "8"
+          },
+          "decode": {
+            "bytes": "8",
+            "items": "8",
+            "depth": "8",
+            "name_bytes": "8"
+          },
+          "image_bytes": "8",
+          "guard_history": "8",
+          "inbox_items": "8",
+          "inbox_bytes": "8",
+          "inventory_items": "8",
+          "inventory_bytes": "8"
+        },
+        "initial_chain_base": "-9223372036854775808",
+        "migration_generation": "8"
+      }
+    },
+    {
+      "id": "IC3-CANON-SignedDescriptorBody",
+      "kind": "SignedDescriptorBody",
+      "value": {
+        "intent": "00ff",
+        "creation_root": "0101010101010101010101010101010101010101010101010101010101010101"
+      }
+    },
+    {
+      "id": "IC3-CANON-CertificateBody",
+      "kind": "CertificateBody",
+      "value": {
+        "instance": {
+          "descriptor": "0101010101010101010101010101010101010101010101010101010101010101",
+          "incarnation": "δ🌿"
+        },
+        "identity": {
+          "root": "0101010101010101010101010101010101010101010101010101010101010101",
+          "intent": "00ff",
+          "zone": "δ🌿",
+          "parameters": "00ff",
+          "declaration": "00ff",
+          "declaration_version": "δ🌿",
+          "schema": "00ff",
+          "schema_identity": "δ🌿",
+          "schema_version": "δ🌿",
+          "corpus_identity": "δ🌿",
+          "corpus_version": "δ🌿",
+          "corpus_digest": "0101010101010101010101010101010101010101010101010101010101010101",
+          "proof_profile": "ic3-direct-root-ed25519/v1",
+          "recovery_profile": "ic3-records-floor/v1",
+          "retention_policy": "full-history-no-gc/v1",
+          "rejoin_policy": "exact-evidence-full-cut/v1",
+          "initial_chain_base": "-9223372036854775808",
+          "migration_generation": "8"
+        },
+        "resource": "δ🌿",
+        "canonical_origin": "δ🌿",
+        "epoch": "δ🌿",
+        "display_name": "δ🌿",
+        "writer_key": "0101010101010101010101010101010101010101010101010101010101010101",
+        "requester": "δ🌿",
+        "creation_root": "0101010101010101010101010101010101010101010101010101010101010101",
+        "issuance": "18446744073709551615"
+      }
+    },
+    {
+      "id": "IC3-CANON-PermitBody",
+      "kind": "PermitBody",
+      "value": {
+        "instance": {
+          "descriptor": "0101010101010101010101010101010101010101010101010101010101010101",
+          "incarnation": "δ🌿"
+        },
+        "identity": {
+          "root": "0101010101010101010101010101010101010101010101010101010101010101",
+          "intent": "00ff",
+          "zone": "δ🌿",
+          "parameters": "00ff",
+          "declaration": "00ff",
+          "declaration_version": "δ🌿",
+          "schema": "00ff",
+          "schema_identity": "δ🌿",
+          "schema_version": "δ🌿",
+          "corpus_identity": "δ🌿",
+          "corpus_version": "δ🌿",
+          "corpus_digest": "0101010101010101010101010101010101010101010101010101010101010101",
+          "proof_profile": "ic3-direct-root-ed25519/v1",
+          "recovery_profile": "ic3-records-floor/v1",
+          "retention_policy": "full-history-no-gc/v1",
+          "rejoin_policy": "exact-evidence-full-cut/v1",
+          "initial_chain_base": "-9223372036854775808",
+          "migration_generation": "8"
+        },
+        "resource": "δ🌿",
+        "certificate": "0101010101010101010101010101010101010101010101010101010101010101",
+        "requester": "δ🌿",
+        "writer_key": "0101010101010101010101010101010101010101010101010101010101010101",
+        "canonical_origin": "δ🌿",
+        "action": {
+          "variant": "Append",
+          "fields": {}
+        },
+        "admitting_nodes": [
+          "0101010101010101010101010101010101010101010101010101010101010101"
+        ],
+        "policy": "0101010101010101010101010101010101010101010101010101010101010101",
+        "policy_generation": "8",
+        "window": {
+          "not_before_ms": "8",
+          "not_after_ms": "18446744073709551615"
+        },
+        "first_seq": "0",
+        "last_seq": "0"
+      }
+    },
+    {
+      "id": "IC3-CANON-OperationProofBody",
+      "kind": "OperationProofBody",
+      "value": {
+        "instance": {
+          "descriptor": "0101010101010101010101010101010101010101010101010101010101010101",
+          "incarnation": "δ🌿"
+        },
+        "identity": {
+          "root": "0101010101010101010101010101010101010101010101010101010101010101",
+          "intent": "00ff",
+          "zone": "δ🌿",
+          "parameters": "00ff",
+          "declaration": "00ff",
+          "declaration_version": "δ🌿",
+          "schema": "00ff",
+          "schema_identity": "δ🌿",
+          "schema_version": "δ🌿",
+          "corpus_identity": "δ🌿",
+          "corpus_version": "δ🌿",
+          "corpus_digest": "0101010101010101010101010101010101010101010101010101010101010101",
+          "proof_profile": "ic3-direct-root-ed25519/v1",
+          "recovery_profile": "ic3-records-floor/v1",
+          "retention_policy": "full-history-no-gc/v1",
+          "rejoin_policy": "exact-evidence-full-cut/v1",
+          "initial_chain_base": "-9223372036854775808",
+          "migration_generation": "8"
+        },
+        "resource": "δ🌿",
+        "operation": "00ff",
+        "certificate": "0101010101010101010101010101010101010101010101010101010101010101",
+        "signed_permit": "0101010101010101010101010101010101010101010101010101010101010101",
+        "requester": "δ🌿"
+      }
+    },
+    {
+      "id": "IC3-CANON-PermitWrapper",
+      "kind": "PermitWrapper",
+      "value": {
+        "signed_permit": {
+          "purpose": "glade/ic3/v1/descriptor\u0000",
+          "version": "1",
+          "signer": "0101010101010101010101010101010101010101010101010101010101010101",
+          "body": "00ff",
+          "signature": "09090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909"
+        },
+        "writer_proof": {
+          "purpose": "glade/ic3/v1/descriptor\u0000",
+          "version": "1",
+          "signer": "0101010101010101010101010101010101010101010101010101010101010101",
+          "body": "00ff",
+          "signature": "08080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808"
+        }
+      }
+    },
+    {
+      "id": "IC3-CANON-PolicyBody",
+      "kind": "PolicyBody",
+      "value": {
+        "instance": {
+          "descriptor": "0101010101010101010101010101010101010101010101010101010101010101",
+          "incarnation": "δ🌿"
+        },
+        "identity": {
+          "root": "0101010101010101010101010101010101010101010101010101010101010101",
+          "intent": "00ff",
+          "zone": "δ🌿",
+          "parameters": "00ff",
+          "declaration": "00ff",
+          "declaration_version": "δ🌿",
+          "schema": "00ff",
+          "schema_identity": "δ🌿",
+          "schema_version": "δ🌿",
+          "corpus_identity": "δ🌿",
+          "corpus_version": "δ🌿",
+          "corpus_digest": "0101010101010101010101010101010101010101010101010101010101010101",
+          "proof_profile": "ic3-direct-root-ed25519/v1",
+          "recovery_profile": "ic3-records-floor/v1",
+          "retention_policy": "full-history-no-gc/v1",
+          "rejoin_policy": "exact-evidence-full-cut/v1",
+          "initial_chain_base": "-9223372036854775808",
+          "migration_generation": "8"
+        },
+        "creation_root": "0101010101010101010101010101010101010101010101010101010101010101",
+        "generation": "18446744073709551615",
+        "previous": null,
+        "window": {
+          "not_before_ms": "8",
+          "not_after_ms": "18446744073709551615"
+        },
+        "grants": [
+          {
+            "requester": "δ🌿",
+            "key": "0101010101010101010101010101010101010101010101010101010101010101",
+            "action": {
+              "variant": "Append",
+              "fields": {}
+            },
+            "resource": "δ🌿"
+          }
+        ],
+        "revoked": [
+          "0101010101010101010101010101010101010101010101010101010101010101"
+        ],
+        "admitting_nodes": [
+          "0101010101010101010101010101010101010101010101010101010101010101"
+        ],
+        "replica_holders": [
+          "0101010101010101010101010101010101010101010101010101010101010101"
+        ]
+      }
+    },
+    {
+      "id": "IC3-CANON-LocalChallengeBody",
+      "kind": "LocalChallengeBody",
+      "value": {
+        "instance": {
+          "descriptor": "0101010101010101010101010101010101010101010101010101010101010101",
+          "incarnation": "δ🌿"
+        },
+        "identity": {
+          "root": "0101010101010101010101010101010101010101010101010101010101010101",
+          "intent": "00ff",
+          "zone": "δ🌿",
+          "parameters": "00ff",
+          "declaration": "00ff",
+          "declaration_version": "δ🌿",
+          "schema": "00ff",
+          "schema_identity": "δ🌿",
+          "schema_version": "δ🌿",
+          "corpus_identity": "δ🌿",
+          "corpus_version": "δ🌿",
+          "corpus_digest": "0101010101010101010101010101010101010101010101010101010101010101",
+          "proof_profile": "ic3-direct-root-ed25519/v1",
+          "recovery_profile": "ic3-records-floor/v1",
+          "retention_policy": "full-history-no-gc/v1",
+          "rejoin_policy": "exact-evidence-full-cut/v1",
+          "initial_chain_base": "-9223372036854775808",
+          "migration_generation": "8"
+        },
+        "resource": "δ🌿",
+        "node": "0101010101010101010101010101010101010101010101010101010101010101",
+        "requester": "δ🌿",
+        "writer_key": "0101010101010101010101010101010101010101010101010101010101010101",
+        "operation": "0101010101010101010101010101010101010101010101010101010101010101",
+        "role": "δ🌿",
+        "channel": "0101010101010101010101010101010101010101010101010101010101010101",
+        "session_nonce": "0101010101010101010101010101010101010101010101010101010101010101",
+        "challenge_nonce": "0101010101010101010101010101010101010101010101010101010101010101",
+        "window": {
+          "not_before_ms": "8",
+          "not_after_ms": "18446744073709551615"
+        }
+      }
+    },
+    {
+      "id": "IC3-CANON-LocalResponseBody",
+      "kind": "LocalResponseBody",
+      "value": {
+        "instance": {
+          "descriptor": "0101010101010101010101010101010101010101010101010101010101010101",
+          "incarnation": "δ🌿"
+        },
+        "node": "0101010101010101010101010101010101010101010101010101010101010101",
+        "requester": "δ🌿",
+        "writer_key": "0101010101010101010101010101010101010101010101010101010101010101",
+        "signed_challenge": "0101010101010101010101010101010101010101010101010101010101010101",
+        "operation": "0101010101010101010101010101010101010101010101010101010101010101",
+        "channel": "0101010101010101010101010101010101010101010101010101010101010101",
+        "session_nonce": "0101010101010101010101010101010101010101010101010101010101010101",
+        "challenge_nonce": "0101010101010101010101010101010101010101010101010101010101010101"
+      }
+    },
+    {
+      "id": "IC3-CANON-OriginalAdmissionBody",
+      "kind": "OriginalAdmissionBody",
+      "value": {
+        "instance": {
+          "descriptor": "0101010101010101010101010101010101010101010101010101010101010101",
+          "incarnation": "δ🌿"
+        },
+        "identity": {
+          "root": "0101010101010101010101010101010101010101010101010101010101010101",
+          "intent": "00ff",
+          "zone": "δ🌿",
+          "parameters": "00ff",
+          "declaration": "00ff",
+          "declaration_version": "δ🌿",
+          "schema": "00ff",
+          "schema_identity": "δ🌿",
+          "schema_version": "δ🌿",
+          "corpus_identity": "δ🌿",
+          "corpus_version": "δ🌿",
+          "corpus_digest": "0101010101010101010101010101010101010101010101010101010101010101",
+          "proof_profile": "ic3-direct-root-ed25519/v1",
+          "recovery_profile": "ic3-records-floor/v1",
+          "retention_policy": "full-history-no-gc/v1",
+          "rejoin_policy": "exact-evidence-full-cut/v1",
+          "initial_chain_base": "-9223372036854775808",
+          "migration_generation": "8"
+        },
+        "resource": "δ🌿",
+        "operation": "0101010101010101010101010101010101010101010101010101010101010101",
+        "certificate": "0101010101010101010101010101010101010101010101010101010101010101",
+        "signed_permit": "0101010101010101010101010101010101010101010101010101010101010101",
+        "policy": "0101010101010101010101010101010101010101010101010101010101010101",
+        "policy_generation": "8",
+        "time": {
+          "earliest_ms": "8",
+          "latest_ms": "18446744073709551615"
+        },
+        "admitting_node": "0101010101010101010101010101010101010101010101010101010101010101",
+        "storage": {
+          "variant": "VolatileTest",
+          "fields": {}
+        },
+        "stable_id": "0101010101010101010101010101010101010101010101010101010101010101"
+      }
+    },
+    {
+      "id": "IC3-CANON-ExchangeHello",
+      "kind": "ExchangeHello",
+      "value": {
+        "instance": {
+          "descriptor": "0101010101010101010101010101010101010101010101010101010101010101",
+          "incarnation": "δ🌿"
+        },
+        "identity": {
+          "root": "0101010101010101010101010101010101010101010101010101010101010101",
+          "intent": "00ff",
+          "zone": "δ🌿",
+          "parameters": "00ff",
+          "declaration": "00ff",
+          "declaration_version": "δ🌿",
+          "schema": "00ff",
+          "schema_identity": "δ🌿",
+          "schema_version": "δ🌿",
+          "corpus_identity": "δ🌿",
+          "corpus_version": "δ🌿",
+          "corpus_digest": "0101010101010101010101010101010101010101010101010101010101010101",
+          "proof_profile": "ic3-direct-root-ed25519/v1",
+          "recovery_profile": "ic3-records-floor/v1",
+          "retention_policy": "full-history-no-gc/v1",
+          "rejoin_policy": "exact-evidence-full-cut/v1",
+          "initial_chain_base": "-9223372036854775808",
+          "migration_generation": "8"
+        },
+        "source": "0101010101010101010101010101010101010101010101010101010101010101",
+        "target": "0101010101010101010101010101010101010101010101010101010101010101",
+        "dialer_endpoint": "0101010101010101010101010101010101010101010101010101010101010101",
+        "acceptor_endpoint": "0101010101010101010101010101010101010101010101010101010101010101",
+        "exporter": "0101010101010101010101010101010101010101010101010101010101010101",
+        "nonce": "0101010101010101010101010101010101010101010101010101010101010101",
+        "role": "δ🌿"
+      }
+    },
+    {
+      "id": "IC3-CANON-InventoryHeaderBody",
+      "kind": "InventoryHeaderBody",
+      "value": {
+        "instance": {
+          "descriptor": "0101010101010101010101010101010101010101010101010101010101010101",
+          "incarnation": "δ🌿"
+        },
+        "identity": {
+          "root": "0101010101010101010101010101010101010101010101010101010101010101",
+          "intent": "00ff",
+          "zone": "δ🌿",
+          "parameters": "00ff",
+          "declaration": "00ff",
+          "declaration_version": "δ🌿",
+          "schema": "00ff",
+          "schema_identity": "δ🌿",
+          "schema_version": "δ🌿",
+          "corpus_identity": "δ🌿",
+          "corpus_version": "δ🌿",
+          "corpus_digest": "0101010101010101010101010101010101010101010101010101010101010101",
+          "proof_profile": "ic3-direct-root-ed25519/v1",
+          "recovery_profile": "ic3-records-floor/v1",
+          "retention_policy": "full-history-no-gc/v1",
+          "rejoin_policy": "exact-evidence-full-cut/v1",
+          "initial_chain_base": "-9223372036854775808",
+          "migration_generation": "8"
+        },
+        "source": "0101010101010101010101010101010101010101010101010101010101010101",
+        "target": "0101010101010101010101010101010101010101010101010101010101010101",
+        "channel": "0101010101010101010101010101010101010101010101010101010101010101",
+        "nonce": "0101010101010101010101010101010101010101010101010101010101010101",
+        "number": "18446744073709551615",
+        "pages": "8",
+        "entries": "8",
+        "total_bytes": "8",
+        "manifest": "0101010101010101010101010101010101010101010101010101010101010101"
+      }
+    },
+    {
+      "id": "IC3-CANON-Inventory",
+      "kind": "Inventory",
+      "value": {
+        "instance": {
+          "descriptor": "0101010101010101010101010101010101010101010101010101010101010101",
+          "incarnation": "δ🌿"
+        },
+        "source": "0101010101010101010101010101010101010101010101010101010101010101",
+        "number": "18446744073709551615",
+        "entries": [
+          {
+            "kind": {
+              "variant": "Accepted",
+              "fields": {}
+            },
+            "origin": "δ🌿",
+            "seq": "0",
+            "operation": "0101010101010101010101010101010101010101010101010101010101010101",
+            "bundle": "0101010101010101010101010101010101010101010101010101010101010101",
+            "receipt": null
+          }
+        ],
+        "total_bytes": "8"
+      }
+    },
+    {
+      "id": "IC3-CANON-InventoryPage",
+      "kind": "InventoryPage",
+      "value": {
+        "instance": {
+          "descriptor": "0101010101010101010101010101010101010101010101010101010101010101",
+          "incarnation": "δ🌿"
+        },
+        "inventory": "0101010101010101010101010101010101010101010101010101010101010101",
+        "index": "8",
+        "count": "8",
+        "entries": [
+          {
+            "kind": {
+              "variant": "Accepted",
+              "fields": {}
+            },
+            "origin": "δ🌿",
+            "seq": "0",
+            "operation": "0101010101010101010101010101010101010101010101010101010101010101",
+            "bundle": "0101010101010101010101010101010101010101010101010101010101010101",
+            "receipt": null
+          }
+        ]
+      }
+    },
+    {
+      "id": "IC3-CANON-RecordRef",
+      "kind": "RecordRef",
+      "value": {
+        "kind": {
+          "variant": "Accepted",
+          "fields": {}
+        },
+        "origin": "δ🌿",
+        "seq": "0",
+        "operation": "0101010101010101010101010101010101010101010101010101010101010101",
+        "bundle": "0101010101010101010101010101010101010101010101010101010101010101",
+        "receipt": null
+      }
+    },
+    {
+      "id": "IC3-CANON-TransferBundle",
+      "kind": "TransferBundle",
+      "value": {
+        "instance": {
+          "descriptor": "0101010101010101010101010101010101010101010101010101010101010101",
+          "incarnation": "δ🌿"
+        },
+        "candidate": {
+          "instance": {
+            "descriptor": "0101010101010101010101010101010101010101010101010101010101010101",
+            "incarnation": "δ🌿"
+          },
+          "operation": {
+            "share": "δ🌿",
+            "glade_id": "δ🌿",
+            "key": "00ff",
+            "origin": "origin-1",
+            "seq": "0",
+            "prev": null,
+            "lamport": "1",
+            "refs": [],
+            "shape": "4",
+            "payload": "00ff"
+          },
+          "evidence": {
+            "certificate": "00ff",
+            "permit": "00ff",
+            "policy": "00ff",
+            "admission": null
+          }
+        },
+        "kind": {
+          "variant": "Accepted",
+          "fields": {}
+        },
+        "receipt": null,
+        "fork": null
+      }
+    },
+    {
+      "id": "IC3-CANON-IdentityBinding",
+      "kind": "IdentityBinding",
+      "value": {
+        "root": "0101010101010101010101010101010101010101010101010101010101010101",
+        "intent": "00ff",
+        "zone": "δ🌿",
+        "parameters": "00ff",
+        "declaration": "00ff",
+        "declaration_version": "δ🌿",
+        "schema": "00ff",
+        "schema_identity": "δ🌿",
+        "schema_version": "δ🌿",
+        "corpus_identity": "δ🌿",
+        "corpus_version": "δ🌿",
+        "corpus_digest": "0101010101010101010101010101010101010101010101010101010101010101",
+        "proof_profile": "ic3-direct-root-ed25519/v1",
+        "recovery_profile": "ic3-records-floor/v1",
+        "retention_policy": "full-history-no-gc/v1",
+        "rejoin_policy": "exact-evidence-full-cut/v1",
+        "initial_chain_base": "-9223372036854775808",
+        "migration_generation": "8"
+      }
+    },
+    {
+      "id": "IC3-CANON-SignedRecord",
+      "kind": "SignedRecord",
+      "value": {
+        "purpose": "glade/ic3/v1/descriptor\u0000",
+        "version": "1",
+        "signer": "0101010101010101010101010101010101010101010101010101010101010101",
+        "body": "00ff",
+        "signature": "09090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909"
+      }
+    },
+    {
+      "id": "IC3-CANON-empty",
+      "kind": "Inventory",
+      "value": {
+        "instance": {
+          "descriptor": "0101010101010101010101010101010101010101010101010101010101010101",
+          "incarnation": "δ🌿"
+        },
+        "source": "0101010101010101010101010101010101010101010101010101010101010101",
+        "number": "18446744073709551615",
+        "entries": [],
+        "total_bytes": "0"
+      }
+    },
+    {
+      "id": "IC3-CANON-rival-1",
+      "kind": "RecordRef",
+      "value": {
+        "kind": {
+          "variant": "Accepted",
+          "fields": {}
+        },
+        "origin": "same-origin",
+        "seq": "0",
+        "operation": "0101010101010101010101010101010101010101010101010101010101010101",
+        "bundle": "0101010101010101010101010101010101010101010101010101010101010101",
+        "receipt": null
+      }
+    },
+    {
+      "id": "IC3-CANON-rival-2",
+      "kind": "RecordRef",
+      "value": {
+        "kind": {
+          "variant": "Accepted",
+          "fields": {}
+        },
+        "origin": "same-origin",
+        "seq": "0",
+        "operation": "0202020202020202020202020202020202020202020202020202020202020202",
+        "bundle": "0101010101010101010101010101010101010101010101010101010101010101",
+        "receipt": null
+      }
+    }
+  ]
+}

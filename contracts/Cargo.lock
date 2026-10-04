@@ -75,6 +75,45 @@ version = "0.0.0"
 name = "glade-crdt-admission-core"
 version = "0.0.0"
 dependencies = [
+ "glade-crdt-admission-data",
+ "glade-crdt-storage-attempt-api",
+ "glade-wire",
+ "serde_json",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "glade-crdt-admission-data"
+version = "0.0.0"
+dependencies = [
+ "glade-crdt-storage-attempt-api",
+ "glade-wire",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "glade-crdt-evidence-api"
+version = "0.0.0"
+dependencies = [
+ "glade-crdt-admission-data",
+ "glade-crdt-storage-attempt-api",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "glade-crdt-recovery-api"
+version = "0.0.0"
+dependencies = [
+ "glade-crdt-admission-data",
+ "glade-crdt-storage-attempt-api",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "glade-crdt-recovery-codec"
+version = "0.0.0"
+dependencies = [
+ "glade-crdt-admission-data",
  "glade-crdt-storage-attempt-api",
  "glade-wire",
  "serde_json",

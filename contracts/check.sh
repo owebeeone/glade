@@ -7,12 +7,17 @@ if [ "${1:-}" = "--list" ]; then
     shift
 fi
 if [ "$#" -gt 1 ]; then
-    echo "usage: check.sh [--list] [all|binding|invocation|subscription|sync|lifecycle|persistence|carrier|clock|grant|signer|crdt-admission|crdt-storage-attempt]" >&2
+    echo "usage: check.sh [--list] [all|binding|invocation|subscription|sync|lifecycle|persistence|carrier|clock|grant|signer|crdt-admission|crdt-storage-attempt|crdt-data|crdt-evidence|crdt-recovery|crdt-codec|crdt-production]" >&2
     exit 2
 fi
 case "${1:-all}" in
-    all) packages="glade-binding-api glade-invocation-api glade-subscription-api glade-sync-api glade-lifecycle-api glade-persistence-api glade-carrier-api glade-clock-api glade-grant-api glade-signer-api glade-crdt-admission-core glade-crdt-storage-attempt-api" ;;
+    all) packages="glade-binding-api glade-invocation-api glade-subscription-api glade-sync-api glade-lifecycle-api glade-persistence-api glade-carrier-api glade-clock-api glade-grant-api glade-signer-api glade-crdt-admission-core glade-crdt-storage-attempt-api glade-crdt-admission-data glade-crdt-evidence-api glade-crdt-recovery-api glade-crdt-recovery-codec" ;;
     crdt-admission|crdt-storage-attempt) packages="glade-crdt-storage-attempt-api glade-crdt-admission-core" ;;
+    crdt-data) packages="glade-crdt-admission-data" ;;
+    crdt-evidence) packages="glade-crdt-admission-data glade-crdt-evidence-api" ;;
+    crdt-recovery) packages="glade-crdt-admission-data glade-crdt-recovery-api" ;;
+    crdt-codec) packages="glade-crdt-admission-data glade-crdt-recovery-codec" ;;
+    crdt-production) packages="glade-crdt-admission-data glade-crdt-storage-attempt-api glade-crdt-admission-core glade-crdt-evidence-api glade-crdt-recovery-api glade-crdt-recovery-codec" ;;
     binding|invocation|subscription|sync|lifecycle|persistence|carrier|clock|grant|signer) packages="glade-$1-api" ;;
     *) echo "Unknown contract selector: $1" >&2; exit 2 ;;
 esac
