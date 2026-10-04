@@ -409,8 +409,14 @@ async fn empty_full_manifest_cannot_claim_unaccounted_payload_bytes() {
 #[tokio::test(flavor = "multi_thread")]
 async fn actual_binaries_exchange_ancestry_and_security_evidence_both_arrival_orders() {
     use crate::independent::test_support::actual_binary::{port, Process};
+    // The profile's deadline (see `profile`), which also bounds the busy
+    // backoff: when both nodes dial at once both answer busy and the larger
+    // key waits one deadline before it retries (`serve`).
+    const DEADLINE_MS: u64 = 5000;
+    // Settling covers the rounds themselves (8 s) plus one such backoff.
     async fn synchronized(a: &Process, b: &Process, require_complete: bool) {
-        tokio::time::timeout(std::time::Duration::from_secs(8), async {
+        let settle = std::time::Duration::from_millis(8000 + DEADLINE_MS);
+        tokio::time::timeout(settle, async {
             loop {
                 let owned = [a.lines(), b.lines()];
                 let latest: Vec<_> = owned
@@ -498,7 +504,7 @@ async fn actual_binaries_exchange_ancestry_and_security_evidence_both_arrival_or
             // design, after which no idle cut can settle. Under the full
             // suite's load one step can take over a second, so the witness
             // uses five, as the interruption witnesses do.
-            encode(&(50_u64, 5000_u64), &limits()).unwrap(),
+            encode(&(50_u64, DEADLINE_MS), &limits()).unwrap(),
         ]
     }
     for reverse in [false, true] {
