@@ -471,6 +471,11 @@ pub(crate) async fn serve(
     let mut tick = tokio::time::interval(Duration::from_millis(replica.provision.tick_ms));
     tokio::pin!(stop);
     let result=async {
+    // One inbound attempt at a time, kept across the loop's iterations: a tick
+    // or a finished task never drops a handshake in flight (nor its
+    // connection). It is re-created only once it completes; the one pending
+    // when the loop ends is dropped once, with this block, before the drain.
+    let mut accepting=replica.carrier.accept();
     loop {
         tokio::select! {
             ()=&mut stop=> {break;}
@@ -504,7 +509,8 @@ pub(crate) async fn serve(
                     });
                 }
             }
-            accepted=replica.carrier.accept(),if tasks.len()<16=> {
+            accepted=&mut accepting,if tasks.len()<16=> {
+                accepting=replica.carrier.accept();
                 if let Ok(Some(link))=accepted {
                     let id=next;next=next.checked_add(1).ok_or_else(||invalid("link namespace exhausted"))?;
                     let link:Arc<dyn CarrierLink>=Arc::from(link);

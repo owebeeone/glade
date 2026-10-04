@@ -1049,3 +1049,194 @@ async fn directed_disconnect_in_peer_bundle_receive_retains_loss_and_obligations
         witness(&cut).await;
     }
 }
+
+/// `serve` keeps an inbound attempt across its loop's iterations. The peer's
+/// actual `serve` (real Iroh, real disk, its configured door) is reached by a
+/// raw dialer holding the node's endpoint key, whose QUIC handshake completes
+/// at once but whose stream's first word, the carrier's preamble, is withheld
+/// for `HELD_TICKS` of the peer's ticks: the attempt sits inside `serve`'s
+/// accept while the loop iterates on every tick. The word is then sent and
+/// this module's own `round` runs on the link as the dialer, exactly as the
+/// node's own dial would run it.
+mod held_accept {
+    use super::*;
+    use iroh::endpoint::{presets, Connection, PortmapperConfig, RecvStream, SendStream};
+    use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr};
+    use std::net::{Ipv4Addr, SocketAddr};
+
+    /// The carrier's first word (`iroh_carrier`'s private `PREAMBLE`).
+    const PREAMBLE: &[u8; 4] = b"gcl1";
+    /// Ticks of the peer's loop the attempt stays in flight: the timer alone
+    /// iterates `serve`'s `select!` this many times meanwhile.
+    const HELD_TICKS: u64 = 20;
+
+    /// A link on the raw dialer's connection, framed as the carrier frames
+    /// (a `u32` little-endian length, then the bytes); a read takes one whole
+    /// frame and nothing after it.
+    struct Held {
+        conn: Connection,
+        send: tokio::sync::Mutex<SendStream>,
+        recv: tokio::sync::Mutex<RecvStream>,
+    }
+    fn failed(error: impl std::fmt::Display) -> CarrierError {
+        CarrierError::Transport(error.to_string())
+    }
+    impl CarrierLink for Held {
+        fn send<'a>(&'a self, frame: &'a [u8]) -> PortFuture<'a, Result<(), CarrierError>> {
+            Box::pin(async move {
+                let len = u32::try_from(frame.len()).map_err(|_| CarrierError::FrameTooLarge)?;
+                let bytes = [&len.to_le_bytes()[..], frame].concat();
+                self.send
+                    .lock()
+                    .await
+                    .write_all(&bytes)
+                    .await
+                    .map_err(failed)
+            })
+        }
+        fn recv(&self) -> PortFuture<'_, Result<Option<Vec<u8>>, CarrierError>> {
+            Box::pin(async move {
+                let mut recv = self.recv.lock().await;
+                let mut head = [0; 4];
+                recv.read_exact(&mut head).await.map_err(failed)?;
+                let mut frame = vec![0; u32::from_le_bytes(head) as usize];
+                recv.read_exact(&mut frame).await.map_err(failed)?;
+                Ok(Some(frame))
+            })
+        }
+        fn close(&self) -> PortFuture<'_, ()> {
+            Box::pin(async move {
+                self.conn.close(0u32.into(), b"");
+            })
+        }
+        fn remote_id(&self) -> Option<TransportId> {
+            Some(TransportId(self.conn.remote_id().as_bytes().to_vec()))
+        }
+        fn channel_binding(&self, label: &[u8]) -> Option<ChannelBinding> {
+            let mut bytes = [0; 32];
+            self.conn
+                .export_keying_material(&mut bytes, label, b"")
+                .ok()?;
+            Some(ChannelBinding(bytes))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn inbound_attempt_in_flight_across_serve_iterations_completes_its_round() {
+        let base = std::env::temp_dir().canonicalize().unwrap();
+        let roots: Vec<PathBuf> = ["dialer", "peer"]
+            .iter()
+            .map(|side| {
+                let root = base.join(format!("glade-ic3-held-{side}-{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&root);
+                std::fs::create_dir_all(&root).unwrap();
+                root
+            })
+            .collect();
+        let h = history();
+        prepare(&h, UNDER_TEST, &roots[0], &h.node_ops);
+        prepare(&h, PEER, &roots[1], &h.peer_ops);
+        let ports = [port(), port()];
+        let dialer_profile = profile(&h, UNDER_TEST, &roots[0], PEER, ports[1]);
+        let peer_profile = profile(&h, PEER, &roots[1], UNDER_TEST, ports[0]);
+        let peer = open_peer(&peer_profile, ports[1]).await;
+        let peer_lines = Lines::default();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let serving = tokio::spawn(serve(
+            peer.clone(),
+            Arc::new(peer_lines.clone()),
+            async move {
+                let _ = stopped.await;
+            },
+        ));
+        // The dialer: the node's own replica, its carrier unbound; only its
+        // session hellos, receives and records.
+        crate::test_support::children::settled();
+        let provision = Arc::new(Provision::read(&dialer_profile).unwrap());
+        let module = Arc::new(NodeAssembly::builder().build());
+        let dialer = IndependentReplica::open(module, provision, IrohCarrier::new(None)).unwrap();
+        let endpoint = Endpoint::builder(presets::Minimal)
+            .secret_key(SecretKey::from_bytes(
+                &EndpointKey::from_seed(UNDER_TEST.endpoint).seed(),
+            ))
+            .portmapper_config(PortmapperConfig::Disabled)
+            .clear_ip_transports()
+            .bind_addr((Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let at = EndpointAddr::from_parts(
+            EndpointId::from_bytes(&EndpointKey::from_seed(PEER.endpoint).endpoint_id).unwrap(),
+            [TransportAddr::Ip(SocketAddr::from((
+                Ipv4Addr::LOCALHOST,
+                ports[1],
+            )))],
+        );
+        let conn = endpoint
+            .connect(at.clone(), crate::iroh_carrier::CARRIER_ALPN)
+            .await
+            .unwrap();
+        // The attempt is inside the peer's accept, awaiting its first word.
+        tokio::time::sleep(Duration::from_millis(HELD_TICKS * TICK_MS)).await;
+        let opened = async {
+            let (mut send, recv) = conn.open_bi().await.map_err(failed)?;
+            send.write_all(PREAMBLE).await.map_err(failed)?;
+            Ok::<_, CarrierError>(Held {
+                conn: conn.clone(),
+                send: tokio::sync::Mutex::new(send),
+                recv: tokio::sync::Mutex::new(recv),
+            })
+        }
+        .await;
+        let dialer_lines = Lines::default();
+        let result = match opened {
+            Ok(held) => {
+                let link: Arc<dyn CarrierLink> = Arc::new(held);
+                let result = round(&dialer, link.clone(), true, &dialer_lines).await;
+                link.close().await;
+                result.map_err(|fault| format!("{fault:?}"))
+            }
+            Err(error) => Err(format!("{error:?}")),
+        };
+        assert!(
+            result.is_ok(),
+            "an inbound attempt in flight across {HELD_TICKS} of the peer's ticks completes \
+             its round: {result:?}; dialer {:?}; peer {:?}",
+            dialer_lines.all(),
+            peer_lines.all()
+        );
+        eventually(
+            "the peer's inbound round completes",
+            || {
+                peer_lines
+                    .all()
+                    .iter()
+                    .any(|line| line.starts_with("independent exchanged "))
+            },
+            || format!("peer {:?}", peer_lines.all()),
+        )
+        .await;
+        // Stop with a second attempt held in the accept: it is dropped once,
+        // at the stop, and its connection closes; nothing keeps it after.
+        let pending = endpoint
+            .connect(at, crate::iroh_carrier::CARRIER_ALPN)
+            .await
+            .unwrap();
+        stop.send(()).unwrap();
+        serving.await.unwrap().unwrap();
+        let closed =
+            tokio::time::timeout(Duration::from_millis(DEADLINE_MS), pending.closed()).await;
+        assert!(
+            closed.is_ok(),
+            "the attempt pending at the stop is dropped with serve's loop"
+        );
+        peer.carrier.close().await;
+        peer.close().unwrap();
+        dialer.close().unwrap();
+        endpoint.close().await;
+        for root in roots {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+}
