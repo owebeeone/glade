@@ -845,6 +845,15 @@ name = "glade-clock-api"
 version = "0.0.0"
 
 [[package]]
+name = "glade-crdt-admission-core"
+version = "0.0.0"
+dependencies = [
+ "glade-crdt-admission-data",
+ "glade-crdt-storage-attempt-api",
+ "glade-wire",
+]
+
+[[package]]
 name = "glade-crdt-admission-data"
 version = "0.0.0"
 dependencies = [
@@ -896,6 +905,7 @@ dependencies = [
  "getrandom 0.4.3",
  "glade-carrier-api",
  "glade-clock-api",
+ "glade-crdt-admission-core",
  "glade-crdt-admission-data",
  "glade-crdt-evidence-api",
  "glade-crdt-recovery-api",

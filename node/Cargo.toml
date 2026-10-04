@@ -18,6 +18,8 @@ path = "src/bin/glade-node.rs"
 glade-wire = { path = "../wire-rs" }
 # IC3A: reviewed narrow owned data and required trusted ports. No physical success yet.
 glade-crdt-admission-data = { path = "../contracts/crdt-admission-data" }
+# IC3B actual callback replay/projection uses the reviewed Pure kernel.
+glade-crdt-admission-core = { path = "../contracts/crdt-admission-core" }
 glade-crdt-evidence-api = { path = "../contracts/crdt-evidence-api" }
 glade-crdt-recovery-api = { path = "../contracts/crdt-recovery-api" }
 # IC3B semantic-reviewed bounded canonical proof/physical representation edge.

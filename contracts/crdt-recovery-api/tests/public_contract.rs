@@ -106,3 +106,31 @@ fn issued_guard_identity_is_not_reissued_by_same_session() {
     let _first = owner.issue(guard()).unwrap();
     assert!(matches!(owner.issue(guard()), Err(Fault::Ownership)));
 }
+
+#[test]
+fn eligibility_queries_preserve_owned_lifecycle_and_refuse_foreign_closed_or_started() {
+    let mut owner = IngressAuthority::new(8);
+    let other = IngressAuthority::new(8);
+    let permit = owner.issue(guard()).unwrap();
+    assert_eq!(owner.can_abandon(&permit), Ok(()));
+    assert_eq!(owner.can_abandon(&permit), Ok(()));
+    assert_eq!(owner.can_settle(&permit), Err(Fault::Ownership));
+    assert_eq!(other.can_abandon(&permit), Err(Fault::Ownership));
+    assert!(!owner.can_close());
+    let mut receive = owner
+        .receive(permit, || ready(Ok(Bytes::new(vec![7]))))
+        .unwrap();
+    let waker = Waker::noop();
+    let mut cx = Context::from_waker(waker);
+    let Poll::Ready((permit, _)) = Pin::new(&mut receive).poll(&mut cx) else {
+        panic!("drained receive");
+    };
+    assert_eq!(owner.can_abandon(&permit), Err(Fault::Ownership));
+    assert_eq!(owner.can_settle(&permit), Ok(()));
+    assert_eq!(owner.can_settle(&permit), Ok(()));
+    assert!(!owner.can_close());
+    assert_eq!(owner.settle(&permit), Ok(()));
+    assert_eq!(owner.can_settle(&permit), Err(Fault::Ownership));
+    assert_eq!(owner.can_abandon(&permit), Err(Fault::Ownership));
+    assert!(owner.can_close());
+}

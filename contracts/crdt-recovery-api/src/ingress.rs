@@ -80,6 +80,30 @@ impl IngressAuthority {
     pub fn settle(&self, permit: &IngressPermit) -> Result<(), Fault> {
         self.retire(permit, true)
     }
+    /// Checks drained settlement eligibility without retiring the owned capability.
+    pub fn can_settle(&self, permit: &IngressPermit) -> Result<(), Fault> {
+        self.eligible(permit, true)
+    }
+    /// Checks never-started abandonment eligibility without retiring the capability.
+    pub fn can_abandon(&self, permit: &IngressPermit) -> Result<(), Fault> {
+        self.eligible(permit, false)
+    }
+    fn eligible(&self, permit: &IngressPermit, settle: bool) -> Result<(), Fault> {
+        if !self.owns(permit) {
+            return Err(Fault::Ownership);
+        }
+        let state = permit.status.lock().map_err(|_| Fault::Integrity)?;
+        if state.closed
+            || if settle {
+                !state.started || !state.drained
+            } else {
+                state.started
+            }
+        {
+            return Err(Fault::Ownership);
+        }
+        Ok(())
+    }
     fn retire(&self, permit: &IngressPermit, settle: bool) -> Result<(), Fault> {
         if !self.owns(permit) {
             return Err(Fault::Ownership);
@@ -125,5 +149,50 @@ impl<F: Future<Output = Result<Bytes, Fault>>> Future for GuardedReceive<F> {
                 Poll::Ready((permit, value))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn live_started_unjoined_receive_refuses_both_retirement_eligibility_queries() {
+        let guard = ReceiveGuard {
+            id: GuardId {
+                store: glade_crdt_admission_data::StoreIncarnation([1; 32]),
+                instance: glade_crdt_admission_data::Instance {
+                    descriptor: [2; 32],
+                    incarnation: "i".into(),
+                },
+                number: 1,
+            },
+            owner: glade_crdt_admission_data::Owner {
+                store: glade_crdt_admission_data::StoreIncarnation([1; 32]),
+                generation: 1,
+            },
+            lease: 1,
+            source: [3; 32],
+            channel: [4; 32],
+            role: "inventory".into(),
+            base_generation: 0,
+            base_digest: [0; 32],
+            max_bytes: 1024,
+            max_items: 8,
+            deadline_ms: 100,
+        };
+        let mut owner = IngressAuthority::new(8);
+        let permit = owner.issue(guard).unwrap();
+        let receive = owner
+            .receive(permit, std::future::pending::<Result<Bytes, Fault>>)
+            .unwrap();
+        let permit = receive.permit.as_ref().unwrap();
+        assert_eq!(owner.can_settle(permit), Err(Fault::Ownership));
+        assert_eq!(owner.can_abandon(permit), Err(Fault::Ownership));
+        assert!(!owner.can_close());
+        drop(receive);
+        assert!(
+            !owner.can_close(),
+            "dropping a pending worker is not its join/drain evidence"
+        );
     }
 }

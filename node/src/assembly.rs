@@ -315,3 +315,18 @@ impl NodeAssembly {
         crate::independent::IndependentAdapters::refusing()
     }
 }
+
+// Explicit private qualification composition; no default keys/roots/policy are supplied.
+impl NodeAssembly {
+    pub fn independent_configured<P: crate::independent::PolicyClock>(
+        &self,
+        evidence: crate::independent::EvidenceConfig,
+        source: P,
+        roots: crate::independent::DiskRootConfig,
+    ) -> Result<
+        crate::independent::ConfiguredIndependentAdapters<P>,
+        glade_crdt_admission_data::Fault,
+    > {
+        crate::independent::ConfiguredIndependentAdapters::new(evidence, source, roots)
+    }
+}

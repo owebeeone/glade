@@ -18,7 +18,27 @@ impl IndependentAdapters {
 }
 
 mod auth;
+mod disk;
 mod namespace;
 mod text_profile;
 pub use auth::{EvidenceConfig, GenuineEvidence, PolicyClock, SessionRequest, TrustedCut};
 pub use namespace::{record_bytes, sign_record, validate_namespace};
+
+mod records;
+pub use records::{DiskHost, DiskRootConfig, DiskSession};
+
+/// Explicit scoped provisioning; the default assembly remains refusing.
+pub struct ConfiguredIndependentAdapters<P: PolicyClock> {
+    pub recovery: DiskHost<P>,
+}
+impl<P: PolicyClock> ConfiguredIndependentAdapters<P> {
+    pub(crate) fn new(
+        config: EvidenceConfig,
+        source: P,
+        roots: DiskRootConfig,
+    ) -> Result<Self, glade_crdt_admission_data::Fault> {
+        Ok(Self {
+            recovery: DiskHost::new(GenuineEvidence::new(config, source)?, roots),
+        })
+    }
+}

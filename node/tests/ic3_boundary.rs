@@ -1,4 +1,4 @@
-//! Current production composition refuses; ignored success gates are real IC3B RED.
+//! Default production composition refuses; explicit fresh provisioning qualifies real providers.
 use glade_crdt_admission_data::*;
 use glade_crdt_evidence_api::*;
 use glade_crdt_recovery_api::*;
@@ -44,18 +44,25 @@ fn standalone_refuser_never_issues_a_consume_permit() {
     ));
 }
 #[test]
-#[ignore = "IC3B assembled open and validated recovery success remain RED; physical restart is deferred"]
 fn production_composition_recovers_a_genuinely_persistent_validated_image() {
     let node = NodeAssembly::builder().build();
-    let mut adapters = node.independent_adapters();
+    let (profile, source, roots) = real_config();
+    let scratch = roots.data.parent().unwrap().to_owned();
+    let mut adapters = node.independent_configured(profile, source, roots).unwrap();
     let mut session = adapters
         .recovery
-        .open_replica(open_request())
+        .open_replica(real_open())
         .expect("IC3B assembled open must supply its session");
     assert!(
         matches!(session.load(), LoadResult::Validated(_)),
         "IC3B qualified recovery not implemented"
     );
+    assert_eq!(
+        ReplicaRecoverySession::close(&mut session),
+        CloseResult::Closed
+    );
+    drop(session);
+    std::fs::remove_dir_all(scratch).unwrap();
 }
 
 #[test]
@@ -257,4 +264,74 @@ fn actual_assembled_evidence_verify_seal_and_observe_refuse() {
     let sealed = selected.evidence.seal(bound);
     assert_eq!(sealed.query, query);
     assert_eq!(sealed.verdict, Verdict::Unavailable);
+}
+
+mod ic3_auth_fixture;
+fn real_open() -> ReplicaOpen {
+    let fixture = ic3_auth_fixture::Fixture::new();
+    let intent: glade_crdt_recovery_codec::CreationIntent =
+        glade_crdt_recovery_codec::decode_profile(
+            fixture.identity.intent.value(),
+            &ic3_auth_fixture::limits(),
+        )
+        .unwrap();
+    ReplicaOpen {
+        instance: fixture.descriptor.instance.clone(),
+        descriptor: fixture.descriptor,
+        identity: fixture.identity,
+        owner: Owner {
+            store: StoreIncarnation([70; 32]),
+            generation: 1,
+        },
+        plan_namespace: [71; 32],
+        invocation_namespace: [72; 32],
+        limits: intent.limits,
+        expected_floor: [0; 32],
+    }
+}
+
+struct RealSource(glade_node::independent::TrustedCut);
+impl glade_node::independent::PolicyClock for RealSource {
+    fn current(&mut self) -> Result<glade_node::independent::TrustedCut, Fault> {
+        Ok(self.0.clone())
+    }
+}
+fn real_config() -> (
+    glade_node::independent::EvidenceConfig,
+    RealSource,
+    glade_node::independent::DiskRootConfig,
+) {
+    let fixture = ic3_auth_fixture::Fixture::new();
+    let scratch = std::fs::canonicalize("/tmp")
+        .unwrap()
+        .join(format!("glade-ic3-b2-assembly-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::create_dir(&scratch).unwrap();
+    let profile = glade_node::independent::EvidenceConfig {
+        descriptor: fixture.descriptor,
+        identity: fixture.identity,
+        trusted_root: glade_node::signing::public_key(&ic3_auth_fixture::ROOT),
+        node_seed: ic3_auth_fixture::NODE,
+        limits: real_open().limits.decode,
+        certificates: vec![fixture.certificate],
+        session_capacity: 16,
+    };
+    assert_eq!(fixture.query.mode, Mode::Historical);
+    (
+        profile,
+        RealSource(glade_node::independent::TrustedCut {
+            policy: fixture.policy,
+            time: Some(TimeInterval {
+                earliest_ms: 20,
+                latest_ms: 21,
+            }),
+            time_floor_ms: 10,
+        }),
+        glade_node::independent::DiskRootConfig {
+            data: scratch.join("data"),
+            trusted_floor: scratch.join("trusted"),
+            registration: [73; 32],
+            provision: true,
+        },
+    )
 }

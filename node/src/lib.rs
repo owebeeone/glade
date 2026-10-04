@@ -20,8 +20,8 @@ pub mod envelope;
 pub mod exchange;
 pub mod frame;
 pub mod grants;
-pub mod iroh_carrier;
 pub mod independent;
+pub mod iroh_carrier;
 pub mod lifecycle;
 pub mod mesh;
 pub mod netconf;
@@ -50,3 +50,4 @@ pub mod ws;
 // against the ONE codec runtime the wire crate owns — no second, hand-edited
 // copy.
 pub use glade_wire::cbor;
+extern crate self as glade_node;
