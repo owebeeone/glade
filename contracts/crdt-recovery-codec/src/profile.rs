@@ -36,7 +36,8 @@ pub fn encode_profile<T: ProfileBody>(value: &T, limits: &DecodeLimits) -> Resul
     Ok(Bytes::new(bytes))
 }
 pub fn decode_profile<T: ProfileBody>(bytes: &[u8], limits: &DecodeLimits) -> Result<T, Error> {
-    crate::bounds::check(bytes, limits)?;
+    let mut budget = DecodeBudget::new(limits);
+    budget.scan(bytes, 0)?;
     let value = cbor::try_decode_with(bytes, limits.depth, Some(limits.bytes))
         .map_err(|_| Error::Invalid)?;
     if cbor::encode(&value) != bytes {
@@ -51,10 +52,12 @@ pub fn decode_profile<T: ProfileBody>(bytes: &[u8], limits: &DecodeLimits) -> Re
     {
         return Err(Error::Invalid);
     }
-    T::decode_value(&Cbor::Map(
+    let value = Cbor::Map(
         map.into_iter()
             .skip(2)
             .map(|(key, value)| (key - 2, value))
             .collect(),
-    ))
+    );
+    T::preflight_value(&value, &mut budget, 0)?;
+    T::decode_value(&value)
 }

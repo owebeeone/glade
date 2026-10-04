@@ -108,6 +108,22 @@ impl Canonical for StoreIncarnation {
 }
 impl<T: Canonical> Canonical for Vec<T> {
     const KIND: &'static str = "Vec<T>";
+    fn root_identity() -> Cbor {
+        Cbor::Array(vec![Cbor::Text("Vec".into()), T::root_identity()])
+    }
+    fn preflight_value(
+        value: &Cbor,
+        budget: &mut DecodeBudget<'_>,
+        depth: usize,
+    ) -> Result<(), Error> {
+        let Cbor::Array(values) = value else {
+            return Err(Error::Invalid);
+        };
+        for value in values {
+            T::preflight_value(value, budget, depth + 1)?;
+        }
+        Ok(())
+    }
     fn encode_value(&self) -> Cbor {
         Cbor::Array(self.iter().map(Canonical::encode_value).collect())
     }
@@ -120,6 +136,20 @@ impl<T: Canonical> Canonical for Vec<T> {
 }
 impl<T: Canonical> Canonical for Option<T> {
     const KIND: &'static str = "Option<T>";
+    fn root_identity() -> Cbor {
+        Cbor::Array(vec![Cbor::Text("Option".into()), T::root_identity()])
+    }
+    fn preflight_value(
+        value: &Cbor,
+        budget: &mut DecodeBudget<'_>,
+        depth: usize,
+    ) -> Result<(), Error> {
+        match value {
+            Cbor::Null => Ok(()),
+            Cbor::Array(v) if v.len() == 1 => T::preflight_value(&v[0], budget, depth + 1),
+            _ => Err(Error::Invalid),
+        }
+    }
     fn encode_value(&self) -> Cbor {
         self.as_ref()
             .map_or(Cbor::Null, |v| Cbor::Array(vec![v.encode_value()]))
@@ -134,6 +164,16 @@ impl<T: Canonical> Canonical for Option<T> {
 }
 impl<T: Canonical> Canonical for Box<T> {
     const KIND: &'static str = "Box<T>";
+    fn root_identity() -> Cbor {
+        Cbor::Array(vec![Cbor::Text("Box".into()), T::root_identity()])
+    }
+    fn preflight_value(
+        value: &Cbor,
+        budget: &mut DecodeBudget<'_>,
+        depth: usize,
+    ) -> Result<(), Error> {
+        T::preflight_value(value, budget, depth)
+    }
     fn encode_value(&self) -> Cbor {
         (**self).encode_value()
     }
@@ -143,6 +183,27 @@ impl<T: Canonical> Canonical for Box<T> {
 }
 impl<A: Canonical, B: Canonical> Canonical for (A, B) {
     const KIND: &'static str = "(A,B)";
+    fn root_identity() -> Cbor {
+        Cbor::Array(vec![
+            Cbor::Text("Tuple2".into()),
+            A::root_identity(),
+            B::root_identity(),
+        ])
+    }
+    fn preflight_value(
+        value: &Cbor,
+        budget: &mut DecodeBudget<'_>,
+        depth: usize,
+    ) -> Result<(), Error> {
+        let Cbor::Array(v) = value else {
+            return Err(Error::Invalid);
+        };
+        if v.len() != 2 {
+            return Err(Error::Invalid);
+        }
+        A::preflight_value(&v[0], budget, depth + 1)?;
+        B::preflight_value(&v[1], budget, depth + 1)
+    }
     fn encode_value(&self) -> Cbor {
         Cbor::Array(vec![self.0.encode_value(), self.1.encode_value()])
     }
@@ -158,6 +219,33 @@ impl<A: Canonical, B: Canonical> Canonical for (A, B) {
 }
 impl<K: Canonical + Ord, V: Canonical> Canonical for BTreeMap<K, V> {
     const KIND: &'static str = "BTreeMap<K,V>";
+    fn root_identity() -> Cbor {
+        Cbor::Array(vec![
+            Cbor::Text("BTreeMap".into()),
+            K::root_identity(),
+            V::root_identity(),
+        ])
+    }
+    fn preflight_value(
+        value: &Cbor,
+        budget: &mut DecodeBudget<'_>,
+        depth: usize,
+    ) -> Result<(), Error> {
+        let Cbor::Array(v) = value else {
+            return Err(Error::Invalid);
+        };
+        for pair in v {
+            let Cbor::Array(p) = pair else {
+                return Err(Error::Invalid);
+            };
+            if p.len() != 2 {
+                return Err(Error::Invalid);
+            }
+            K::preflight_value(&p[0], budget, depth + 2)?;
+            V::preflight_value(&p[1], budget, depth + 2)?;
+        }
+        Ok(())
+    }
     fn encode_value(&self) -> Cbor {
         Cbor::Array(
             self.iter()
@@ -191,6 +279,16 @@ impl<K: Canonical + Ord, V: Canonical> Canonical for BTreeMap<K, V> {
 }
 impl Canonical for Operation {
     const KIND: &'static str = "Operation";
+    fn preflight_value(
+        value: &Cbor,
+        budget: &mut DecodeBudget<'_>,
+        depth: usize,
+    ) -> Result<(), Error> {
+        let Cbor::Bytes(bytes) = value else {
+            return Err(Error::Invalid);
+        };
+        budget.scan(bytes, depth.checked_add(1).ok_or(Error::Capacity)?)
+    }
     fn encode_value(&self) -> Cbor {
         self.canonical().encode_value()
     }

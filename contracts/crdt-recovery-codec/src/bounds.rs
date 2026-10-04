@@ -1,20 +1,41 @@
 //! Allocation-free structural preflight before the wire or owned typed decoder.
 use crate::{DecodeLimits, Error};
 pub(crate) fn check(bytes: &[u8], limits: &DecodeLimits) -> Result<(), Error> {
-    if bytes.len() > limits.bytes || limits.depth == 0 || limits.depth > 128 {
-        return Err(Error::Capacity);
+    DecodeBudget::new(limits).scan(bytes, 0)
+}
+/// Per-call budget. Outer syntax and every interpreted Operation share item/depth caps.
+/// Opaque payload/proof bytes remain opaque; only typed Operation bytes are interpreted here.
+pub struct DecodeBudget<'a> {
+    limits: &'a DecodeLimits,
+    items: usize,
+}
+impl<'a> DecodeBudget<'a> {
+    pub(crate) fn new(limits: &'a DecodeLimits) -> Self {
+        Self { limits, items: 0 }
     }
-    let mut cursor = Cursor {
-        bytes,
-        index: 0,
-        items: 0,
-        limits,
-    };
-    cursor.value(0)?;
-    if cursor.index != bytes.len() {
-        return Err(Error::Invalid);
+    pub(crate) fn with_used(limits: &'a DecodeLimits, items: usize) -> Self {
+        Self { limits, items }
     }
-    Ok(())
+    pub(crate) fn consumed(&self) -> usize {
+        self.items
+    }
+    pub(crate) fn scan(&mut self, bytes: &[u8], depth: usize) -> Result<(), Error> {
+        if bytes.len() > self.limits.bytes || self.limits.depth == 0 || self.limits.depth > 128 {
+            return Err(Error::Capacity);
+        }
+        let mut cursor = Cursor {
+            bytes,
+            index: 0,
+            items: self.items,
+            limits: self.limits,
+        };
+        cursor.value(depth)?;
+        if cursor.index != bytes.len() {
+            return Err(Error::Invalid);
+        }
+        self.items = cursor.items;
+        Ok(())
+    }
 }
 struct Cursor<'a> {
     bytes: &'a [u8],

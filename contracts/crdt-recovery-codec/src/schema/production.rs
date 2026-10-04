@@ -9,6 +9,43 @@ record!(GuardId; store, instance, number);
 record!(ReceiveGuard; id, owner, lease, source, channel, role, base_generation, base_digest, max_bytes, max_items, deadline_ms);
 impl Canonical for GuardStatus {
     const KIND: &'static str = "GuardStatus";
+
+    fn preflight_value(
+        value: &Cbor,
+        budget: &mut DecodeBudget<'_>,
+        depth: usize,
+    ) -> Result<(), Error> {
+        let Cbor::Array(values) = value else {
+            return Err(Error::Invalid);
+        };
+        let Some(Cbor::Int(tag)) = values.first() else {
+            return Err(Error::Invalid);
+        };
+        match *tag {
+            0 if values.len() == 2 => {
+                <ReceiveGuard>::preflight_value(&values[1], budget, depth + 1)?;
+                Ok(())
+            }
+            1 if values.len() == 4 => {
+                <ReceiveGuard>::preflight_value(&values[1], budget, depth + 1)?;
+                <Digest>::preflight_value(&values[2], budget, depth + 1)?;
+                <u64>::preflight_value(&values[3], budget, depth + 1)?;
+                Ok(())
+            }
+            2 if values.len() == 3 => {
+                <ReceiveGuard>::preflight_value(&values[1], budget, depth + 1)?;
+                <u64>::preflight_value(&values[2], budget, depth + 1)?;
+                Ok(())
+            }
+            3 if values.len() == 4 => {
+                <ReceiveGuard>::preflight_value(&values[1], budget, depth + 1)?;
+                <Digest>::preflight_value(&values[2], budget, depth + 1)?;
+                <u64>::preflight_value(&values[3], budget, depth + 1)?;
+                Ok(())
+            }
+            _ => Err(Error::Invalid),
+        }
+    }
     fn encode_value(&self) -> Cbor {
         match self {
             Self::Active(v0) => Cbor::Array(vec![Cbor::Int(0), v0.encode_value()]),
@@ -74,6 +111,26 @@ record!(FloorIntent; issuance, prior, next, next_attempt, invocation_high_water,
 record!(@checked ReplicaFloor; issuance, version, owner, root_registration, path_binding, lease, sequence, selected, next_attempt, invocation_high_water, guard_high_water, guards, intent; |value: &ReplicaFloor| value.version == 1);
 impl Canonical for RecordKind {
     const KIND: &'static str = "RecordKind";
+
+    fn preflight_value(
+        value: &Cbor,
+        _budget: &mut DecodeBudget<'_>,
+        _depth: usize,
+    ) -> Result<(), Error> {
+        let Cbor::Array(values) = value else {
+            return Err(Error::Invalid);
+        };
+        let Some(Cbor::Int(tag)) = values.first() else {
+            return Err(Error::Invalid);
+        };
+        match *tag {
+            0 if values.len() == 1 => Ok(()),
+            1 if values.len() == 1 => Ok(()),
+            2 if values.len() == 1 => Ok(()),
+            3 if values.len() == 1 => Ok(()),
+            _ => Err(Error::Invalid),
+        }
+    }
     fn encode_value(&self) -> Cbor {
         match self {
             Self::Accepted => Cbor::Array(vec![Cbor::Int(0)]),
@@ -107,6 +164,35 @@ record!(ExchangeHello; instance, identity, source, target, dialer_endpoint, acce
 record!(Observation; id, instance, source, channel, guard, bytes, expected);
 impl Canonical for Classification {
     const KIND: &'static str = "Classification";
+
+    fn preflight_value(
+        value: &Cbor,
+        budget: &mut DecodeBudget<'_>,
+        depth: usize,
+    ) -> Result<(), Error> {
+        let Cbor::Array(values) = value else {
+            return Err(Error::Invalid);
+        };
+        let Some(Cbor::Int(tag)) = values.first() else {
+            return Err(Error::Invalid);
+        };
+        match *tag {
+            0 if values.len() == 2 => {
+                <Digest>::preflight_value(&values[1], budget, depth + 1)?;
+                Ok(())
+            }
+            1 if values.len() == 1 => Ok(()),
+            2 if values.len() == 2 => {
+                <Bytes>::preflight_value(&values[1], budget, depth + 1)?;
+                Ok(())
+            }
+            3 if values.len() == 2 => {
+                <Bytes>::preflight_value(&values[1], budget, depth + 1)?;
+                Ok(())
+            }
+            _ => Err(Error::Invalid),
+        }
+    }
     fn encode_value(&self) -> Cbor {
         match self {
             Self::Retained(v0) => Cbor::Array(vec![Cbor::Int(0), v0.encode_value()]),
@@ -141,6 +227,25 @@ record!(ReplicaRecovery; image, authoritative_floor);
 record!(CertificateBody; instance, identity, resource, canonical_origin, epoch, display_name, writer_key, requester, creation_root, issuance);
 impl Canonical for ResourceAction {
     const KIND: &'static str = "ResourceAction";
+
+    fn preflight_value(
+        value: &Cbor,
+        _budget: &mut DecodeBudget<'_>,
+        _depth: usize,
+    ) -> Result<(), Error> {
+        let Cbor::Array(values) = value else {
+            return Err(Error::Invalid);
+        };
+        let Some(Cbor::Int(tag)) = values.first() else {
+            return Err(Error::Invalid);
+        };
+        match *tag {
+            0 if values.len() == 1 => Ok(()),
+            1 if values.len() == 1 => Ok(()),
+            2 if values.len() == 1 => Ok(()),
+            _ => Err(Error::Invalid),
+        }
+    }
     fn encode_value(&self) -> Cbor {
         match self {
             Self::Append => Cbor::Array(vec![Cbor::Int(0)]),
@@ -176,6 +281,23 @@ record!(IssuanceFloor; time_floor_ms, policy_generation, policy_digest, plan_nam
 record!(SessionCustody; challenge, response, consumed);
 impl Canonical for DeclarationShape {
     const KIND: &'static str = "DeclarationShape";
+
+    fn preflight_value(
+        value: &Cbor,
+        _budget: &mut DecodeBudget<'_>,
+        _depth: usize,
+    ) -> Result<(), Error> {
+        let Cbor::Array(values) = value else {
+            return Err(Error::Invalid);
+        };
+        let Some(Cbor::Int(tag)) = values.first() else {
+            return Err(Error::Invalid);
+        };
+        match *tag {
+            0 if values.len() == 1 => Ok(()),
+            _ => Err(Error::Invalid),
+        }
+    }
     fn encode_value(&self) -> Cbor {
         match self {
             Self::Crdt => Cbor::Array(vec![Cbor::Int(0)]),

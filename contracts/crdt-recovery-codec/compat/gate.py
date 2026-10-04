@@ -99,6 +99,9 @@ def validate_remote(root: Path, pins: dict) -> None:
 
 
 if __name__ == "__main__":
-    strict = len(sys.argv) == 3 and sys.argv[2] == "--pre-remote"
+    if len(sys.argv) not in (2, 3) or (len(sys.argv) == 3 and sys.argv[2] != "--pre-remote"):
+        print("usage: gate.py ROOT [--pre-remote]", file=sys.stderr)
+        raise SystemExit(2)
+    strict = len(sys.argv) == 3
     validate(Path(sys.argv[1]), strict=strict)
     print("Pre-remote committed corpus/B1 accepted-evidence gate PASS" if strict else "Candidate content representation PASS; unqualified for remote use until committed pin and accepted B1 crypto")

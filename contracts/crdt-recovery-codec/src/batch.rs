@@ -272,7 +272,9 @@ impl<'a> Cursor<'a> {
                 .and_then(|n| n.checked_add(std::mem::size_of::<Op>()))
                 .ok_or(Error::Capacity)?,
         )?;
-        crate::bounds::check(bytes, self.limits)?;
+        let mut budget = DecodeBudget::with_used(self.limits, self.items);
+        budget.scan(bytes, 0)?;
+        self.items = budget.consumed();
         let op = Operation::new(Op::decode(bytes).map_err(|_| Error::Invalid)?);
         if op.canonical().value() != bytes {
             return Err(Error::Invalid);

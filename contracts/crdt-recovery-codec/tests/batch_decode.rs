@@ -124,3 +124,20 @@ fn interned_blob_references_cannot_amplify_owned_decoding_past_budget() {
     l.bytes = 8192;
     assert_eq!(decode_batch(bytes.value(), &l), Err(Error::Capacity));
 }
+#[test]
+fn batch_operations_share_the_existing_aggregate_item_budget() {
+    let d = descriptor();
+    let state = State::default();
+    let mut p = plan(&d);
+    let mut c = candidate(&d);
+    c.evidence.certificate = Bytes::new(vec![]);
+    p.records = vec![c; 4];
+    let bytes = production_encoder::encode(&state, &d, &p);
+    assert!(decode_batch(bytes.value(), &limits()).is_ok());
+    let mut l = limits();
+    l.items = 120;
+    assert!(
+        matches!(decode_batch(bytes.value(), &l), Err(Error::Capacity)),
+        "embedded operation syntax must consume aggregate item budget"
+    );
+}
