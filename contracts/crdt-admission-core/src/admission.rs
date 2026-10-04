@@ -81,6 +81,13 @@ pub(crate) fn offer(s: &mut State, c: Candidate, local: bool, effects: &mut Vec<
         .any(|p| p.instance == c.instance)
         || s.preparing.keys().any(|p| p.instance == c.instance)
     {
+        if !local {
+            s.instances
+                .get_mut(&c.instance)
+                .expect("selected instance")
+                .recovery_incomplete = true;
+        }
+        effects.push(Effect::Report(Outcome::Capacity));
         lifecycle::resume(s, &c.instance, effects);
         return;
     }

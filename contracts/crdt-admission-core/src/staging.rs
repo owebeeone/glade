@@ -79,6 +79,13 @@ pub(crate) fn stage(
         .chain(s.unknown_commits.values())
         .any(|p| p.instance == instance)
     {
+        if local.is_none() {
+            s.instances
+                .get_mut(&instance)
+                .expect("selected instance")
+                .recovery_incomplete = true;
+        }
+        effects.push(Effect::Report(Outcome::Capacity));
         lifecycle::resume(s, &instance, effects);
         return;
     }
