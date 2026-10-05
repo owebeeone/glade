@@ -471,6 +471,7 @@ pub(crate) async fn accept_independent_clients(
     use std::collections::BTreeMap;
     use std::sync::Mutex as StdMutex;
     let sockets = Arc::new(StdMutex::new(BTreeMap::<u64, std::net::TcpStream>::new()));
+    let (stopping, _) = tokio::sync::watch::channel(false);
     let mut tasks = tokio::task::JoinSet::new();
     let mut next = 0_u64;
     tokio::pin!(stop);
@@ -497,13 +498,14 @@ pub(crate) async fn accept_independent_clients(
                 })();
                 let (id,stream)=match prepared {Ok(prepared)=>prepared,Err(error)=> {break Err(error);}};
                 let (worker,owned,report)=(replica.clone(),sockets.clone(),console.clone());
+                let stopped=stopping.subscribe();
                 tasks.spawn(async move {
-                    let deadline=worker.provision.deadline_ms;
-                    let consume=crate::accept::independent_local(worker,stream,report.clone());
+                    let until=tokio::time::Instant::now()+std::time::Duration::from_millis(worker.provision.deadline_ms);
+                    let consume=crate::accept::independent_local(worker,stream,report.clone(),until,stopped);
                     tokio::pin!(consume);
                     let result=tokio::select! {
                         result=&mut consume=>result,
-                        ()=tokio::time::sleep(std::time::Duration::from_millis(deadline))=> {
+                        ()=tokio::time::sleep_until(until)=> {
                             if let Some(socket)=owned.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&id) {
                                 let _=socket.shutdown(std::net::Shutdown::Both);
                             }
@@ -517,8 +519,11 @@ pub(crate) async fn accept_independent_clients(
             }
         }
     };
-    // Closing each shared OS socket makes any actual pending read finish. Its
-    // owned task then retains settlement/loss and is joined, not aborted.
+    // The stop is set before any socket closes, so a task that has not yet begun
+    // a guard sees it and begins none. Closing each shared OS socket makes any
+    // actual pending read finish. Its owned task then retains settlement/loss and
+    // is joined, not aborted.
+    stopping.send_replace(true);
     for socket in sockets
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)

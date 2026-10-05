@@ -290,12 +290,32 @@ fn hold(heads: &SharedHeads, op: &Op) {
     raise(heads_of(heads).entry(zone).or_default(), &op.origin, op.seq);
 }
 
+/// The fault a retained loss leaves the connection with: its own failure when it
+/// is not durable, otherwise the refusal that caused it.
+fn lost(
+    result: glade_crdt_recovery_api::PersistResult,
+    cause: glade_crdt_admission_data::Fault,
+) -> glade_crdt_admission_data::Fault {
+    match result {
+        glade_crdt_recovery_api::PersistResult::Committed { .. } => cause,
+        glade_crdt_recovery_api::PersistResult::Unknown => {
+            glade_crdt_admission_data::Fault::Unavailable
+        }
+        glade_crdt_recovery_api::PersistResult::Refused(fault) => fault,
+    }
+}
+
 /// Private qualification dispatch: the declared independent instance owns both
 /// authenticated writer admission and the pre-consumption local custody guard.
+/// The connection ends at `until` (its server deadline) or when `stopping` is set,
+/// whichever comes first; neither the wait for the exchange gate nor a guard
+/// outlives it.
 pub(crate) async fn independent_local(
     replica: Arc<crate::independent::node::IndependentReplica>,
     mut stream: tokio::net::TcpStream,
     console: Arc<dyn crate::lifecycle::Console>,
+    until: tokio::time::Instant,
+    mut stopping: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), glade_crdt_admission_data::Fault> {
     use glade_crdt_recovery_api::ReplicaRecoverySession;
     use glade_crdt_recovery_codec::*;
@@ -322,7 +342,13 @@ pub(crate) async fn independent_local(
     let response = crate::independent::node::read_frame(&mut stream, bound).await?;
     let response = decode_profile(response.value(), &replica.provision.request.limits.decode)
         .map_err(|_| Fault::Integrity)?;
-    let _guard_owner = replica.exchange_gate.lock().await;
+    let _guard_owner = tokio::select! {
+        owner = replica.exchange_gate.lock() => owner,
+        () = tokio::time::sleep_until(until) => return Err(Fault::Unavailable),
+        () = async { let _ = stopping.wait_for(|stopping| *stopping).await; } => {
+            return Err(Fault::Unavailable);
+        }
+    };
     let received = {
         let mut held = replica.session.lock().map_err(|_| Fault::Ownership)?;
         let session = held.as_mut().ok_or(Fault::Ownership)?;
@@ -339,6 +365,11 @@ pub(crate) async fn independent_local(
             replica.provision.deadline_ms,
         )?;
         let receive_bound = guard.max_bytes;
+        // A deadline or stop that has already cancelled this connection begins no
+        // guard: nothing was consumed, so there is nothing to lose.
+        if tokio::time::Instant::now() >= until || *stopping.borrow() {
+            return Err(Fault::Unavailable);
+        }
         let permit = session.begin_ingress(guard)?;
         console.out(&format!(
             "independent local receive {}",
@@ -355,16 +386,16 @@ pub(crate) async fn independent_local(
         let raw = match observed {
             Ok(raw) => raw,
             Err(error) => {
-                session.retain_ingress_loss(permit, Bytes::new(vec![]));
-                return Err(error);
+                let retained = session.retain_ingress_loss(permit, Bytes::new(vec![]));
+                return Err(lost(retained, error));
             }
         };
         let bundle: TransferBundle =
             match decode_profile(raw.value(), &replica.provision.request.limits.decode) {
                 Ok(bundle) => bundle,
                 Err(_) => {
-                    session.retain_ingress_loss(permit, raw);
-                    return Err(Fault::Integrity);
+                    let retained = session.retain_ingress_loss(permit, raw);
+                    return Err(lost(retained, Fault::Integrity));
                 }
             };
         let reference = crate::independent::records::node_reference(&bundle, &raw);
@@ -395,6 +426,27 @@ mod tests {
     use super::*;
     use crate::registry::G_GRANTS;
     use crate::server::Server;
+
+    /// A loss that is not retained is reported as the failure it is, never as the
+    /// refusal that caused it.
+    #[test]
+    fn a_loss_that_is_not_retained_reports_its_own_failure() {
+        use glade_crdt_admission_data::Fault;
+        use glade_crdt_recovery_api::PersistResult;
+        let retained = PersistResult::Committed {
+            generation: 1,
+            digest: [0; 32],
+        };
+        assert_eq!(lost(retained, Fault::Integrity), Fault::Integrity);
+        assert_eq!(
+            lost(PersistResult::Unknown, Fault::Integrity),
+            Fault::Unavailable
+        );
+        assert_eq!(
+            lost(PersistResult::Refused(Fault::Capacity), Fault::Integrity),
+            Fault::Capacity
+        );
+    }
 
     /// Poll `future` to completion on this thread, with no runtime, socket or
     /// clock (LBT-008). The path waits only on locks nothing else holds, so a

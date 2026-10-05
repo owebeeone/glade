@@ -6,6 +6,7 @@ use glade_carrier_api::{CarrierAddr, CarrierLink, CarrierPort};
 use glade_crdt_recovery_api::{PersistResult, ReconstructResult, ReplicaRecoverySession};
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::task::JoinSet;
 const EXPORTER: &[u8] = b"glade/ic3/node-exchange/v1";
@@ -511,6 +512,7 @@ pub(crate) async fn serve(
     stop: impl Future<Output = ()>,
 ) -> io::Result<()> {
     let links = Arc::new(Mutex::new(BTreeMap::<u64, Arc<dyn CarrierLink>>::new()));
+    let stopped = Arc::new(AtomicBool::new(false));
     let mut tasks = JoinSet::new();
     let mut next = 0_u64;
     let mut successful = BTreeMap::<Digest, Digest>::new();
@@ -542,7 +544,7 @@ pub(crate) async fn serve(
                 }
                 for (node,(_,address)) in &replica.provision.peers {
                     if active.contains(node)||successful.get(node)==Some(&current)||tasks.len()>=16 ||retry_after.get(node).is_some_and(|time|*time>tokio::time::Instant::now()) {continue;}
-                    let remote=*node;let address=address.clone();let owned=replica.clone();let report=console.clone();let held=links.clone();
+                    let remote=*node;let address=address.clone();let owned=replica.clone();let report=console.clone();let held=links.clone();let stopped=stopped.clone();
                     let id=next;next=next.checked_add(1).ok_or_else(||invalid("link namespace exhausted"))?;
                     active.insert(remote);
                     tasks.spawn(async move {
@@ -550,7 +552,10 @@ pub(crate) async fn serve(
                             let link=tokio::time::timeout(Duration::from_millis(owned.provision.deadline_ms),owned.carrier.dial(&CarrierAddr(address))).await.map_err(unavailable)?.map_err(unavailable)?;
                             let link:Arc<dyn CarrierLink>=Arc::from(link);
                             held.lock().map_err(unavailable)?.insert(id,link.clone());
-                            let result=round(&owned,link.clone(),true,report.as_ref()).await;
+                            // A dial that completes after the stop runs no round: the stop is set
+                            // before `finish_service` takes its snapshot of the links, so a link
+                            // registered after that snapshot finds it set, and one before is closed.
+                            let result=if stopped.load(Ordering::SeqCst) {Err(Fault::Unavailable)} else {round(&owned,link.clone(),true,report.as_ref()).await};
                             link.close().await;held.lock().map_err(unavailable)?.remove(&id);
                             result
                         }.await;
@@ -588,6 +593,7 @@ pub(crate) async fn serve(
     }
     Ok(())
     }.await;
+    stopped.store(true, Ordering::SeqCst);
     finish_service(result, links, tasks).await
 }
 type Work = JoinSet<(Option<Digest>, bool, Result<Digest, Fault>)>;
