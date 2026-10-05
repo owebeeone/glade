@@ -118,12 +118,22 @@ pub(super) fn drain<P: PolicyClock>(
         }
         let callback = match effect {
             Effect::Verify(query) => {
-                authentication::begin(session)?;
+                // Historical verification is pure: it reads only the query's own signed
+                // bytes and the static registry, consults no current cut and moves no
+                // custody (GladeEvidenceProviderClassification), so a crash inside it
+                // hides no observation and it takes no barrier. Local verification
+                // consults authority and moves custody, and keeps its barrier.
+                let barrier = !matches!(query.mode, Mode::Historical);
+                if barrier {
+                    authentication::begin(session)?;
+                }
                 let reply = session.evidence.verify(BoundQuery {
                     query,
                     identity: session.request.identity.clone(),
                 });
-                retain_observed(session)?;
+                if barrier {
+                    retain_observed(session)?;
+                }
                 Some(Event::EvidenceResolved(Box::new(reply)))
             }
             Effect::Seal(query) => {

@@ -293,7 +293,9 @@ impl<P: PolicyClock> ReplicaRecoverySession for DiskSession<P> {
             .guards
             .insert(guard.id.clone(), GuardStatus::Active(guard.clone()));
         loss::reserve(&pair.image, &reserved, &guard)?;
-        authentication::begin(self)?;
+        // The provider is consulted without a barrier (that reading is discarded);
+        // the observation read next writes nothing for an unchanged cut and takes
+        // the whole barrier for any other.
         self.evidence.current()?;
         let (cut, policy) = authentication::persist_observed(self)?;
         let pair = self.pair.as_mut().ok_or(Fault::Ownership)?;
