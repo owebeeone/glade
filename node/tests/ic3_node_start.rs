@@ -1285,6 +1285,32 @@ async fn local_connection_for(
     writer: &Digest,
     node: Digest,
 ) -> Result<(tokio::net::TcpStream, TransferBundle), std::io::Error> {
+    let operation = f.query.operation.canonical().digest();
+    let stream = local_possession(port, f, writer, node, operation).await?;
+    let mut evidence = f.query.evidence.clone();
+    evidence.admission = None;
+    let bundle = TransferBundle {
+        instance: f.descriptor.instance.clone(),
+        candidate: Candidate {
+            instance: f.descriptor.instance.clone(),
+            operation: f.query.operation.clone(),
+            evidence,
+        },
+        kind: RecordKind::Candidate,
+        receipt: None,
+        fork: None,
+    };
+    Ok((stream, bundle))
+}
+/// A local connection that has proved possession of `writer`'s key for `operation`:
+/// the signed request, the node's challenge, the signed response.
+async fn local_possession(
+    port: u16,
+    f: &Fixture,
+    writer: &Digest,
+    node: Digest,
+    operation: Digest,
+) -> Result<tokio::net::TcpStream, std::io::Error> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
     let request = LocalChallengeBody {
@@ -1294,7 +1320,7 @@ async fn local_connection_for(
         node,
         requester: "alice".into(),
         writer_key: glade_node::signing::public_key(writer),
-        operation: f.query.operation.canonical().digest(),
+        operation,
         role: "local-append-request".into(),
         channel: [81; 32],
         session_nonce: [82; 32],
@@ -1337,20 +1363,7 @@ async fn local_connection_for(
     let raw = envelope(&signed(writer, &response));
     stream.write_u32_le(raw.value().len() as u32).await?;
     stream.write_all(raw.value()).await?;
-    let mut evidence = f.query.evidence.clone();
-    evidence.admission = None;
-    let bundle = TransferBundle {
-        instance: f.descriptor.instance.clone(),
-        candidate: Candidate {
-            instance: f.descriptor.instance.clone(),
-            operation: f.query.operation.clone(),
-            evidence,
-        },
-        kind: RecordKind::Candidate,
-        receipt: None,
-        fork: None,
-    };
-    Ok((stream, bundle))
+    Ok(stream)
 }
 async fn local_append(port: u16, f: &Fixture) -> Result<TransferBundle, std::io::Error> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1363,6 +1376,66 @@ async fn local_append(port: u16, f: &Fixture) -> Result<TransferBundle, std::io:
     let mut raw = vec![0; length];
     stream.read_exact(&mut raw).await?;
     Ok(decode_profile(&raw, &limits()).unwrap())
+}
+
+/// A local append of `bundle` as it stands: possession of the writer's key for its
+/// operation, the bundle's frame, then the node's reply (an error once it refuses).
+async fn local_send(
+    port: u16,
+    f: &Fixture,
+    bundle: &TransferBundle,
+) -> Result<TransferBundle, std::io::Error> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let operation = bundle.candidate.operation.canonical().digest();
+    let node = glade_node::signing::public_key(&NODE);
+    let mut stream = local_possession(port, f, &WRITER, node, operation).await?;
+    let raw = encode_profile(bundle, &limits()).unwrap();
+    stream.write_u32_le(raw.value().len() as u32).await?;
+    stream.write_all(raw.value()).await?;
+    let length = stream.read_u32_le().await? as usize;
+    assert!(length <= limits().bytes);
+    let mut raw = vec![0; length];
+    stream.read_exact(&mut raw).await?;
+    Ok(decode_profile(&raw, &limits()).unwrap())
+}
+/// The plain Candidate bundle a writer appends: no admission, no receipt.
+fn plain(f: &Fixture, operation: &Operation) -> TransferBundle {
+    let mut evidence = f.query.evidence.clone();
+    evidence.admission = None;
+    TransferBundle {
+        instance: f.descriptor.instance.clone(),
+        candidate: Candidate {
+            instance: f.descriptor.instance.clone(),
+            operation: operation.clone(),
+            evidence,
+        },
+        kind: RecordKind::Candidate,
+        receipt: None,
+        fork: None,
+    }
+}
+/// The writer's second operation, the next of its chain after the fixture's.
+fn chained(f: &Fixture) -> Operation {
+    let mut op = f.query.operation.inner().clone();
+    op.seq = 1;
+    op.lamport = 2;
+    op.prev = Some(f.query.operation.canonical().digest().to_vec());
+    op.payload = br#"{"after":"a","atom_id":"b","kind":"insert","text":"B"}"#.to_vec();
+    Operation::new(op)
+}
+/// `plain`, with the evidence that operation's own permit and proofs name.
+fn plain_proven(f: &Fixture, operation: &Operation) -> TransferBundle {
+    let mut bundle = plain(f, operation);
+    bundle.candidate.evidence = Fixture::proofs(
+        &f.query.instance,
+        &f.identity,
+        &f.descriptor,
+        &f.certificate,
+        &f.policy,
+        operation,
+        None,
+    );
+    bundle
 }
 
 struct Source(glade_node::independent::TrustedCut);
@@ -1674,6 +1747,107 @@ mod actual_processes {
                 .count(),
             1
         );
+        drop(restored);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// R1: an authenticated writer's decodable input that the node's settlement
+    /// refuses is retained as loss, never left as an Active guard no one
+    /// discharges. The next valid append is admitted and SIGTERM exits 0.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn actual_binary_resent_accepted_bundle_retains_loss_and_the_next_append_is_admitted() {
+        refused_local_input("resent-accepted", true).await;
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn actual_binary_presealed_candidate_retains_loss_and_the_next_append_is_admitted() {
+        refused_local_input("presealed", false).await;
+    }
+    async fn refused_local_input(name: &str, resend_accepted: bool) {
+        let f = ic3_disk_fixture::disk_profile();
+        let root = std::fs::canonicalize("/tmp")
+            .unwrap()
+            .join(format!("ic3-c-refused-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("owned.profile");
+        let port = free_port();
+        std::fs::write(
+            &path,
+            encode(&profile_fields(&f, &root, true), &limits())
+                .unwrap()
+                .value(),
+        )
+        .unwrap();
+        let mut process = Process::start(&path, port);
+        process.wait_line("listening ").await;
+        // What the node must refuse, and the valid append that must follow it.
+        let (refused, next, accepted) = if resend_accepted {
+            let first = local_append(port, &f)
+                .await
+                .expect("the first append is admitted");
+            assert_eq!(first.kind, RecordKind::Accepted);
+            let second = plain_proven(&f, &chained(&f));
+            (first, second, 2)
+        } else {
+            let mut sealed = plain(&f, &f.query.operation);
+            sealed.candidate.evidence = f.query.evidence.clone();
+            assert!(sealed.candidate.evidence.admission.is_some());
+            (sealed, plain(&f, &f.query.operation), 1)
+        };
+        assert!(
+            local_send(port, &f, &refused).await.is_err(),
+            "the node refuses a decodable input its settlement rejects"
+        );
+        process.wait_line("independent local refused").await;
+        let admitted = local_send(port, &f, &next).await;
+        assert!(
+            admitted.is_ok(),
+            "a refused input leaves no Active guard: the next valid append is admitted, got \
+             {admitted:?}; node {:?}",
+            process.lines.lock().unwrap()
+        );
+        assert_eq!(admitted.unwrap().kind, RecordKind::Accepted);
+        process.stop().await;
+        let mut restored = reopen(&f, &root);
+        use glade_crdt_recovery_api::ReplicaRecoverySession;
+        let glade_crdt_recovery_api::LoadResult::Validated(value) = restored.load() else {
+            panic!("retained refused input unavailable");
+        };
+        let guards = &value.authoritative_floor.guards;
+        assert_eq!(
+            guards
+                .values()
+                .filter(|status| matches!(status, GuardStatus::Loss { .. }))
+                .count(),
+            1,
+            "exactly one Loss guard"
+        );
+        assert_eq!(
+            guards
+                .values()
+                .filter(|status| matches!(status, GuardStatus::Active(_)))
+                .count(),
+            0,
+            "no Active guard"
+        );
+        assert_eq!(value.image.permanent_loss.len(), 1);
+        assert_eq!(
+            value.image.state.instances[&f.descriptor.instance]
+                .accepted
+                .len(),
+            accepted
+        );
+        let request = restored.reconstruction_request().unwrap();
+        let glade_crdt_recovery_api::ReconstructResult::Cut(cut) =
+            restored.reconstruct_cut(request)
+        else {
+            panic!("loss cut unavailable");
+        };
+        assert!(!cut.complete_local && cut.permanent_loss);
+        assert!(matches!(
+            ReplicaRecoverySession::close(&mut restored),
+            CloseResult::Closed
+        ));
         drop(restored);
         std::fs::remove_dir_all(root).unwrap();
     }

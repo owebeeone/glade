@@ -119,6 +119,9 @@ mod observation_barrier;
 #[path = "tests/resume_refusal.rs"]
 mod resume_refusal;
 
+#[path = "tests/node_input_discharge.rs"]
+mod node_input_discharge;
+
 /// Every physical cut this session reaches, in order, through its own private
 /// observation hook; for `independent` witnesses outside this module too.
 pub(in crate::independent) fn record_cuts<P: PolicyClock>(

@@ -208,7 +208,7 @@ async fn guarded<F: Future<Output = Result<Bytes, Fault>>>(
                 }
             };
             with(replica, |session| {
-                session.finish_node_input(permit, raw.clone(), expected)
+                session.settle_node_input(permit, raw.clone(), expected)
             })?;
             Ok(raw)
         }

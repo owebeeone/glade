@@ -368,7 +368,7 @@ pub(crate) async fn independent_local(
                 }
             };
         let reference = crate::independent::records::node_reference(&bundle, &raw);
-        session.finish_node_input(permit, raw, vec![reference])?;
+        session.settle_node_input(permit, raw, vec![reference])?;
         let (outcomes, accepted) = session.local_result(bundle, channel, nonce)?;
         let Some(accepted) = accepted else {
             console.err(&format!("independent local outcomes: {outcomes:?}"));

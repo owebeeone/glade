@@ -3,6 +3,8 @@ use super::super::namespace::{codec_fault, signed_body};
 use super::*;
 use crate::independent::TrustedCut;
 use crate::signing::public_key;
+/// Attempts, the first included, to discharge a node input's parked continuation.
+const DISCHARGE_ATTEMPTS: usize = 3;
 impl<P: PolicyClock> DiskSession<P> {
     pub(crate) fn local_request(
         &mut self,
@@ -113,6 +115,43 @@ impl<P: PolicyClock> DiskSession<P> {
             PersistResult::Committed { .. } => Ok(()),
             PersistResult::Unknown => Err(Fault::Unavailable),
             PersistResult::Refused(fault) => Err(fault),
+        }
+    }
+    /// `finish_node_input` for the actual node's two receive sites, which must
+    /// also discharge what a failed settlement parks (the guard stays Active and
+    /// every later `begin_ingress` is refused until it is). A refused settlement,
+    /// with storage certain, is retained as permanent loss through
+    /// `retain_pending_ingress_loss`. One whose storage outcome is unknown is
+    /// retried, never turned into loss: it may have been selected. Either is
+    /// retried boundedly while storage stays Unknown. What no attempt resolves
+    /// stays parked, so close reports Pending and the durable guard is kept. The
+    /// settlement's own fault is returned, unless a retry settled the input.
+    pub(crate) fn settle_node_input(
+        &mut self,
+        permit: IngressPermit,
+        raw: Bytes,
+        expected: Vec<RecordRef>,
+    ) -> Result<(), Fault> {
+        let guard = permit.guard().id.clone();
+        let fault = match self.finish_node_input(permit, raw, expected) {
+            Ok(()) => return Ok(()),
+            Err(fault) => fault,
+        };
+        let unresolved = self.pair.as_ref().is_some_and(|pair| pair.uncertain());
+        let mut result = if unresolved {
+            self.retry_ingress(&guard)
+        } else {
+            self.retain_pending_ingress_loss(&guard)
+        };
+        for _ in 1..DISCHARGE_ATTEMPTS {
+            if !matches!(result, PersistResult::Unknown) {
+                break;
+            }
+            result = self.retry_ingress(&guard);
+        }
+        match result {
+            PersistResult::Committed { .. } if unresolved => Ok(()),
+            _ => Err(fault),
         }
     }
     pub(crate) fn classify_node_inputs(&mut self) -> Result<(), Fault> {
