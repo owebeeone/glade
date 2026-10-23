@@ -121,7 +121,7 @@ export class GladeClient {
         }
         // A link drop (node death, network loss) — fire drop listeners so a
         // supplier reattaches. A deliberate `close()` is not a drop.
-        if (!this.closing) for (const h of [...this.dropHandlers]) h();
+        if (!this.closing) { for (const h of [...this.dropHandlers]) { h(); } }
       };
     });
   }
@@ -200,7 +200,7 @@ export class GladeClient {
         corr: value.corr as string,
         payload: value.payload as Uint8Array,
       };
-      for (const h of [...this.exReqHandlers]) h(req);
+      for (const h of [...this.exReqHandlers]) { h(req); }
     } else if (tag === TAG.ExchangeRes) {
       this.exWaiters.get(value.corr as string)?.({
         ok: value.ok as boolean,
@@ -215,13 +215,39 @@ export class GladeClient {
    *  (principals minimal, GLP-0006 P0.S7): the node auto-appends an unknown
    *  principal to dir.principals — identity as data, nothing enforced.
    *  Resolves on the node's Welcome. Entirely optional: sessions that never
-   *  call it keep origin-as-identity, byte-for-byte the old behavior. */
-  hello(principal?: string): Promise<void> {
+   *  call it keep origin-as-identity, byte-for-byte the old behavior.
+   *  `resume` advertises only the Session's validated retained chain heads.
+   *  Hydrate the Session before calling; default Hello still announces no heads.
+   *  This trims replay, not a promise that locally retained edits reached the
+   *  server. Callers MUST reconcile acknowledged heads and resend missing tails.
+   *  Subscribe.from remains unchanged (R8). */
+  hello(principal?: string, options: { resume?: boolean } = {}): Promise<void> {
+    this.requireOpen();
+    const heads: ZoneHeads[] = [];
+    if (options.resume) {
+      const zones = new Map<string, { share: string; glade_id: string; key: Uint8Array; tips: Map<string, Op> }>();
+      // Session only exposes operations accepted into its contiguous hash chains.
+      for (const op of this.session.dump()) {
+        const zone = zoneKey(op.share, op.glade_id, op.key);
+        let entry = zones.get(zone);
+        if (!entry) {
+          entry = { share: op.share, glade_id: op.glade_id, key: op.key, tips: new Map() };
+          zones.set(zone, entry);
+        }
+        const old = entry.tips.get(op.origin);
+        if (!old || op.seq > old.seq) { entry.tips.set(op.origin, op); }
+        this.replays.reach(op);
+      }
+      for (const zone of zones.values()) {
+        heads.push({ share: zone.share, glade_id: zone.glade_id, key: zone.key,
+          heads: [...zone.tips.values()].map(op => ({ origin: op.origin, seq: op.seq, hash: opHash(this.schema, op as never) })) });
+      }
+    }
     return new Promise((resolve) => {
       this.welcomeAcks.push(resolve);
       this.send(frame(this.schema, TAG.Hello, "Hello", {
         session: this.session.origin, protocol: 1,
-        principal: principal ?? null, capability: null, heads: [],
+        principal: principal ?? null, capability: null, heads,
       }));
     });
   }

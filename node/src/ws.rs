@@ -28,7 +28,12 @@ fn sha1(data: &[u8]) -> [u8; 20] {
     for chunk in msg.chunks(64) {
         let mut w = [0u32; 80];
         for i in 0..16 {
-            w[i] = u32::from_be_bytes([chunk[i * 4], chunk[i * 4 + 1], chunk[i * 4 + 2], chunk[i * 4 + 3]]);
+            w[i] = u32::from_be_bytes([
+                chunk[i * 4],
+                chunk[i * 4 + 1],
+                chunk[i * 4 + 2],
+                chunk[i * 4 + 3],
+            ]);
         }
         for i in 16..80 {
             w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
@@ -41,7 +46,12 @@ fn sha1(data: &[u8]) -> [u8; 20] {
                 40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
                 _ => (b ^ c ^ d, 0xCA62C1D6),
             };
-            let tmp = a.rotate_left(5).wrapping_add(f).wrapping_add(e).wrapping_add(k).wrapping_add(*wi);
+            let tmp = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(*wi);
             e = d;
             d = c;
             c = b.rotate_left(30);
@@ -62,7 +72,9 @@ fn sha1(data: &[u8]) -> [u8; 20] {
 }
 
 pub fn accept_key(key: &str) -> String {
-    b64_encode(&sha1(format!("{}258EAFA5-E914-47DA-95CA-C5AB0DC85B11", key).as_bytes()))
+    b64_encode(&sha1(
+        format!("{}258EAFA5-E914-47DA-95CA-C5AB0DC85B11", key).as_bytes(),
+    ))
 }
 
 const B64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -70,12 +82,24 @@ const B64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456
 pub fn b64_encode(data: &[u8]) -> String {
     let mut s = String::new();
     for chunk in data.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | (b[2] as u32);
         s.push(B64[((n >> 18) & 63) as usize] as char);
         s.push(B64[((n >> 12) & 63) as usize] as char);
-        s.push(if chunk.len() > 1 { B64[((n >> 6) & 63) as usize] as char } else { '=' });
-        s.push(if chunk.len() > 2 { B64[(n & 63) as usize] as char } else { '=' });
+        s.push(if chunk.len() > 1 {
+            B64[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        s.push(if chunk.len() > 2 {
+            B64[(n & 63) as usize] as char
+        } else {
+            '='
+        });
     }
     s
 }
@@ -177,7 +201,9 @@ pub async fn accept(stream: tokio::net::TcpStream) -> std::io::Result<(WsReader,
         .lines()
         .find_map(|l| {
             let (name, val) = l.split_once(':')?;
-            name.trim().eq_ignore_ascii_case("sec-websocket-key").then(|| val.trim().to_string())
+            name.trim()
+                .eq_ignore_ascii_case("sec-websocket-key")
+                .then(|| val.trim().to_string())
         })
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "no ws key"))?;
     let resp = format!(
@@ -185,7 +211,13 @@ pub async fn accept(stream: tokio::net::TcpStream) -> std::io::Result<(WsReader,
         accept_key(&key)
     );
     write.write_all(resp.as_bytes()).await?;
-    Ok((WsReader { inner: read }, WsWriter { inner: Arc::new(Mutex::new(write)), mask: false }))
+    Ok((
+        WsReader { inner: read },
+        WsWriter {
+            inner: Arc::new(Mutex::new(write)),
+            mask: false,
+        },
+    ))
 }
 
 /// Client side: send the upgrade request (frames will be masked).
@@ -206,9 +238,18 @@ pub async fn connect(host: &str, port: u16) -> std::io::Result<(WsReader, WsWrit
         buf.push(byte[0]);
     }
     if !String::from_utf8_lossy(&buf).contains("101") {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "no 101 upgrade"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "no 101 upgrade",
+        ));
     }
-    Ok((WsReader { inner: read }, WsWriter { inner: Arc::new(Mutex::new(write)), mask: true }))
+    Ok((
+        WsReader { inner: read },
+        WsWriter {
+            inner: Arc::new(Mutex::new(write)),
+            mask: true,
+        },
+    ))
 }
 
 fn eof() -> std::io::Error {
@@ -217,13 +258,21 @@ fn eof() -> std::io::Error {
 
 impl WsReader {
     /// Read one data message (binary/text payload), skipping ping/pong. A
-    /// frame whose header claims more than `MAX_FRAME_BYTES` is refused
+    /// frame or assembled message larger than `MAX_FRAME_BYTES` is refused
     /// before its payload, as `InvalidData` (F15).
     pub async fn read(&mut self) -> std::io::Result<Msg> {
+        let mut fragments: Option<Vec<u8>> = None;
         loop {
             let mut h = [0u8; 2];
             self.inner.read_exact(&mut h).await?;
             let opcode = h[0] & 0x0f;
+            let final_frame = h[0] & 0x80 != 0;
+            if h[0] & 0x70 != 0 || !matches!(opcode, 0 | 1 | 2 | 8 | 9 | 10) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "unsupported websocket frame",
+                ));
+            }
             let masked = h[1] & 0x80 != 0;
             let mut len = u64::from(h[1] & 0x7f);
             if len == 126 {
@@ -236,6 +285,21 @@ impl WsReader {
                 len = u64::from_be_bytes(e);
             }
             let len = frame_len(len)?;
+            if opcode >= 8 && (!final_frame || len > 125) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid websocket control frame",
+                ));
+            }
+            if opcode <= 2 {
+                if (opcode == 0) != fragments.is_some() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "invalid websocket continuation sequence",
+                    ));
+                }
+                frame_len(fragments.as_ref().map_or(0, Vec::len) as u64 + len as u64)?;
+            }
             let mut mask = [0u8; 4];
             if masked {
                 self.inner.read_exact(&mut mask).await?;
@@ -248,9 +312,21 @@ impl WsReader {
                 }
             }
             match opcode {
-                0x1 | 0x2 => return Ok(Msg::Binary(payload)), // text or binary -> bytes
+                0x1 | 0x2 => {
+                    if final_frame {
+                        return Ok(Msg::Binary(payload));
+                    }
+                    fragments = Some(payload);
+                }
+                0x0 => {
+                    let message = fragments.as_mut().expect("continuation checked above");
+                    message.extend_from_slice(&payload);
+                    if final_frame {
+                        return Ok(Msg::Binary(fragments.take().unwrap()));
+                    }
+                }
                 0x8 => return Ok(Msg::Close),
-                _ => continue, // ping/pong/continuation: skip
+                _ => continue, // ping/pong do not end a fragmented data message
             }
         }
     }
@@ -289,6 +365,112 @@ impl WsWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn raw_frame(opcode: u8, final_frame: bool, payload: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![opcode | if final_frame { 0x80 } else { 0 }];
+        if payload.len() < 126 {
+            bytes.push(0x80 | payload.len() as u8);
+        } else {
+            bytes.push(0x80 | 127);
+            bytes.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+        }
+        let mask = [1, 2, 3, 4];
+        bytes.extend_from_slice(&mask);
+        bytes.extend(payload.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
+        bytes
+    }
+
+    async fn read_raw(bytes: Vec<u8>) -> std::io::Result<Msg> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let mut sender = tokio::net::TcpStream::connect(listener.local_addr()?).await?;
+        let (receiver, _) = listener.accept().await?;
+        let writer = tokio::spawn(async move {
+            let _ = sender.write_all(&bytes).await;
+            let _ = sender.shutdown().await;
+        });
+        let mut reader = WsReader {
+            inner: receiver.into_split().0,
+        };
+        let result = reader.read().await;
+        drop(reader);
+        writer.await.unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn fragmented_message_reassembles_with_control_frames() {
+        let payload = vec![42; 300_000];
+        let mut wire = raw_frame(2, false, &payload[..100_000]);
+        wire.extend(raw_frame(9, true, b"ping"));
+        wire.extend(raw_frame(0, false, &payload[100_000..200_000]));
+        wire.extend(raw_frame(10, true, b"pong"));
+        wire.extend(raw_frame(0, true, &payload[200_000..]));
+        match read_raw(wire).await.unwrap() {
+            Msg::Binary(actual) => {
+                assert_eq!(actual.len(), payload.len());
+                assert!(actual == payload);
+            }
+            Msg::Close => panic!("unexpected close"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fragmented_message_enforces_aggregate_limit_before_reading_payload() {
+        let mut wire = raw_frame(2, false, b"a");
+        wire.extend([0x80, 0xff]); // final continuation, extended length, masked
+        wire.extend_from_slice(&(crate::frame::MAX_FRAME_BYTES as u64).to_be_bytes());
+        // No mask or body: aggregate rejection must occur before attempting either.
+        assert!(
+            matches!(read_raw(wire).await, Err(e) if e.kind() == std::io::ErrorKind::InvalidData)
+        );
+    }
+
+    #[tokio::test]
+    async fn randomized_fragment_boundaries_preserve_exact_message() {
+        for seed in 1u32..=40 {
+            let mut random = seed;
+            let payload: Vec<u8> = (0..4096).map(|n| (n % 251) as u8).collect();
+            let mut wire = Vec::new();
+            let mut offset = 0;
+            while offset < payload.len() {
+                random ^= random << 13;
+                random ^= random >> 17;
+                random ^= random << 5;
+                let end = (offset + 1 + random as usize % 257).min(payload.len());
+                wire.extend(raw_frame(
+                    if offset == 0 { 2 } else { 0 },
+                    end == payload.len(),
+                    &payload[offset..end],
+                ));
+                if random % 3 == 0 {
+                    wire.extend(raw_frame(9, true, b"control"));
+                }
+                offset = end;
+            }
+            match read_raw(wire).await.unwrap() {
+                Msg::Binary(actual) => assert!(actual == payload, "fragment seed {seed}"),
+                Msg::Close => panic!("fragment seed {seed}: unexpected close"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fragmented_message_rejects_invalid_sequences_and_truncation() {
+        let cases = [
+            raw_frame(0, true, b"orphan"),
+            [raw_frame(2, false, b"first"), raw_frame(2, true, b"second")].concat(),
+            raw_frame(9, false, b"fragmented control"),
+            raw_frame(9, true, &[0; 126]),
+            raw_frame(3, true, b"reserved"),
+        ];
+        for wire in cases {
+            assert!(
+                matches!(read_raw(wire).await, Err(e) if e.kind() == std::io::ErrorKind::InvalidData)
+            );
+        }
+        assert!(matches!(read_raw(raw_frame(2, false, b"incomplete")).await,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof));
+    }
 
     /// Send `accept` an upgrade request with `extra` header lines, written by
     /// hand over a loopback socket. Returns the status line it answered and
