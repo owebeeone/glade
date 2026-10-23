@@ -46,6 +46,7 @@ impl Server {
             max,
             self_id: hex_id(&identity.node_id),
             links: Mutex::new(BTreeMap::new()),
+            maintained: Mutex::new(Default::default()),
             numbered: AtomicU64::new(0),
             forwarded: Mutex::new(BTreeMap::new()),
             door,
@@ -106,6 +107,77 @@ impl Server {
         run_link(self.shared.clone(), mesh, link, node, true).await?;
         Ok(hex_id(&node))
     }
+
+    /// Dial a configured peer once, then maintain its link in the Sessions
+    /// task scope, even if this first attempt fails. Retries use the same
+    /// endpoint, addresses and authenticated HELLO as `connect_peer`, with
+    /// delays of 1, 2, 4, 8, 16, then at most 30 seconds between failures.
+    /// A live link (including an inbound one) suppresses redundant dials.
+    /// Repeated registration is refused; an entry without addresses is admit-only.
+    /// Each attempt is bounded at 30 seconds. Shutdown cancels the task before
+    /// the peer carrier is released; no application command is retried here.
+    pub async fn maintain_peer(&self, entry: PeerEntry) -> io::Result<String> {
+        let mesh = self
+            .shared
+            .mesh
+            .get()
+            .cloned()
+            .ok_or_else(|| other("mesh not enabled"))?;
+        if entry.via.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "peer has no dial address",
+            ));
+        }
+        if !mesh.maintained.lock().await.insert(entry.key) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "peer already maintained",
+            ));
+        }
+        let result = match connected_endpoint(&mesh, &entry.key).await {
+            Some(node) => Ok(node),
+            None => dial_within(self, entry.clone()).await,
+        };
+        let server = Server {
+            shared: self.shared.clone(),
+        };
+        self.shared.tasks.spawn(Site::PeerReconnect, async move {
+            let mut delay = Duration::from_secs(1);
+            loop {
+                tokio::time::sleep(delay).await;
+                if connected_endpoint(&mesh, &entry.key).await.is_some() {
+                    delay = Duration::from_secs(1);
+                    continue;
+                }
+                match dial_within(&server, entry.clone()).await {
+                    Ok(node) => {
+                        mesh.status(&format!("peer-connected {node}"));
+                        delay = Duration::from_secs(1);
+                    }
+                    Err(error) => {
+                        mesh.report(&format!("peer {entry}: {error}"));
+                        delay = (delay * 2).min(Duration::from_secs(30));
+                    }
+                }
+            }
+        });
+        result
+    }
+}
+
+async fn dial_within(server: &Server, entry: PeerEntry) -> io::Result<String> {
+    tokio::time::timeout(Duration::from_secs(30), server.connect_peer(entry))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "peer connection timed out"))?
+}
+
+async fn connected_endpoint(mesh: &Mesh, key: &[u8; 32]) -> Option<String> {
+    let links = mesh.links.lock().await;
+    links.iter().find_map(|(node, peer)| {
+        (peer.link.remote_id().as_ref().map(|id| id.0.as_slice()) == Some(key.as_slice()))
+            .then(|| node.clone())
+    })
 }
 
 /// An accepted link's task (plan Step 4.5b): its HELLO, within

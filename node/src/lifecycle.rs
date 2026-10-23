@@ -554,9 +554,10 @@ fn assemble(start: &NodeStart, instance: &Instance) -> Result<Declared, Error> {
     Ok(Declared { workspaces, module })
 }
 
-/// Dial each of the network's peers that has an address, as the hand-written
+/// Maintain each of the network's peers that has an address, as the hand-written
 /// root does; an entry with none only configures the door. A failed dial is
-/// named by the peer's tag and the addresses dialed (plan Step 4.5). The
+/// named by the peer's tag and the addresses dialed (plan Step 4.5); its retry
+/// task belongs to Sessions, including after an initial failure. The
 /// legacy form has no mesh and dials nothing.
 async fn dial_peers(start: &NodeStart, server: &Server) {
     if start.instance.is_none() {
@@ -564,7 +565,7 @@ async fn dial_peers(start: &NodeStart, server: &Server) {
     }
     let dialed = start.settings.network.peers.iter();
     for entry in dialed.filter(|entry| !entry.via.is_empty()) {
-        match server.connect_peer(entry.clone()).await {
+        match server.maintain_peer(entry.clone()).await {
             Ok(id) => start.console.out(&format!("peer-connected {id}")),
             Err(e) => start.console.err(&format!("peer {entry}: {e}")),
         }

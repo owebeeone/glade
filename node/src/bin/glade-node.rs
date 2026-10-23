@@ -60,7 +60,10 @@
 //! and refuses every other, reporting `peer refused: endpoint <tag>:
 //! <reason>` on stderr. An entry `ID` names a key to admit and dial nothing;
 //! `ID@IP:PORT`, or `ID@RELAY-URL` with `relay n0`, names one and dials it.
-//! A failed dial says `peer <tag>@<address>: <error>` on stderr. No line
+//! A failed dial says `peer <tag>@<address>: <error>` on stderr. Addressed
+//! configured peers are maintained: failed or closed links are retried with
+//! capped backoff, without restarting the node. Admit-only entries never dial.
+//! No line
 //! holds an endpoint id: `glade-node endpoint-id --name NAME` prints one, and
 //! starts no node (plan Step 4.5): it reads the instance's `endpoint.key`, or
 //! mints one first, and prints its id alone.
@@ -484,7 +487,7 @@ async fn run(
         server.enable_mesh(peer).await?;
         println!("{line}");
         for entry in network.peers.iter().filter(|entry| !entry.via.is_empty()) {
-            match server.connect_peer(entry.clone()).await {
+            match server.maintain_peer(entry.clone()).await {
                 Ok(id) => println!("peer-connected {id}"),
                 Err(e) => eprintln!("peer {entry}: {e}"),
             }

@@ -27,7 +27,7 @@
 //! them. A node with no link and no relay notes nothing.
 
 use std::collections::btree_map::Entry;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, PoisonError};
@@ -91,6 +91,8 @@ pub struct Mesh {
     pub(crate) self_id: String,
     /// Live peer links: directory node id (hex) -> the newest link to it.
     pub(crate) links: Mutex<BTreeMap<String, Peer>>,
+    /// Endpoint keys with one configured reconnect task in this node scope.
+    maintained: Mutex<BTreeSet<[u8; 32]>>,
     /// The number the next link takes ([`Peer`]).
     numbered: AtomicU64,
     /// The forwards to claim holders, by zone, each the handle its writes
@@ -345,6 +347,7 @@ mod tests {
     mod holder;
     mod home;
     mod link;
+    mod reconnect;
     mod returning;
     mod support;
     mod two_nodes;

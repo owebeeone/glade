@@ -355,3 +355,51 @@ async fn a_newer_link_outlives_the_close_of_an_older_one_to_the_same_node() {
     let pulled = pull_from(&b.shared, b_mesh, &a_id, node_of(A_SEED)).await;
     pulled.expect("and B's");
 }
+
+/// A configured peer MUST recover after a transient link loss, without a node
+/// restart. A one-shot dial (the former startup behavior) fails this test.
+#[tokio::test(flavor = "multi_thread")]
+async fn configured_peer_reconnects_after_link_loss() {
+    let b_id = hex_id(&node_of(B_SEED));
+    let (b, _, _, at_b) =
+        noting_door("reconnect-b", (B_SEED, B_KEY), &[endpoint_of(A_KEY)], &[]).await;
+    let (a, _, notes, at_a) =
+        noting_door("reconnect-a", (A_SEED, A_KEY), &[endpoint_of(B_KEY)], &[]).await;
+    b.connect_peer(at_a)
+        .await
+        .expect("initial inbound connection");
+    let mesh = a.shared.mesh.get().unwrap();
+    let number = mesh.links.lock().await.get(&b_id).unwrap().number;
+    a.maintain_peer(at_b)
+        .await
+        .expect("maintain existing inbound link");
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert_eq!(
+        mesh.links.lock().await.get(&b_id).unwrap().number,
+        number,
+        "healthy link must not be replaced"
+    );
+    mesh.linked(&b_id).await.unwrap().end();
+    noted(&notes, |line| line == &format!("link {b_id} closed")).await;
+    let reconnected = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if mesh
+                .links
+                .lock()
+                .await
+                .get(&b_id)
+                .is_some_and(|peer| peer.number > number)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(reconnected.is_ok(), "configured peer stayed disconnected");
+    pull_from(&a.shared, mesh, &b_id, node_of(B_SEED))
+        .await
+        .expect("new link carries data");
+    a.shared.mesh.get().unwrap().port.close().await;
+    b.shared.mesh.get().unwrap().port.close().await;
+}

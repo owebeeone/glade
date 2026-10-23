@@ -42,6 +42,8 @@ pub(crate) enum Site {
     /// `mesh.rs`, the accept loop: one accepted link's HELLO, bounded, then
     /// its driver.
     AcceptedLink,
+    /// One configured peer's bounded reconnect loop; cancelled with Sessions.
+    PeerReconnect,
     /// `mesh.rs`, a link's start (plan Step 4.5b): its reader, the link's only
     /// receiver, which routes its frames, notes its path and unlinks it at
     /// its end.
